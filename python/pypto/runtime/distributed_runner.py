@@ -392,6 +392,17 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
         from .runner import _apply_ring_overrides  # noqa: PLC0415
 
         _apply_ring_overrides(call_config, run_config)
+
+    import os
+    dfx_prefix = os.environ.get("PYPTO_DISTRIBUTED_DFX_PREFIX")
+    if dfx_prefix:
+        call_config.output_prefix = dfx_prefix
+        call_config.enable_dep_gen = os.environ.get("PYPTO_DISTRIBUTED_DEP_GEN", "0") == "1"
+        l2 = os.environ.get("PYPTO_DISTRIBUTED_L2_SWIMLANE", "0")
+        try:
+            call_config.enable_l2_swimlane = int(l2)
+        except ValueError:
+            call_config.enable_l2_swimlane = l2.lower() in ("1", "true", "yes")
     return call_config
 
 
