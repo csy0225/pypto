@@ -76,6 +76,69 @@ class DeviceTensor:
             n *= d
         return n * elem
 
+    def __getitem__(self, index: "int | slice | tuple[int | slice, ...]") -> "DeviceTensor":
+        """Return a contiguous sub-view as a new :class:`DeviceTensor`.
+
+        Supports the per-rank slicing the generated distributed ``host_orch.py``
+        emits — ``device_tensor[r_idx, 0:D1, 0:D2]`` — to pull rank ``r``'s plane
+        out of a ``[world_size, ...]`` buffer with no copy: the returned handle
+        points at ``data_ptr + offset`` with the indexed dimensions dropped and
+        sliced dimensions resized.
+
+        Only memory-contiguous sub-views are representable (``DeviceTensor`` has
+        no strides): leading integer indices and a single optionally-partial
+        outermost slice are allowed, but any inner slice must cover its full
+        extent. A non-contiguous selection raises ``NotImplementedError``.
+        """
+        idx = index if isinstance(index, tuple) else (index,)
+        if len(idx) > len(self.shape):
+            raise IndexError(
+                f"too many indices for DeviceTensor of shape {self.shape}: got {len(idx)}"
+            )
+        strides: list[int] = []
+        acc = 1
+        for d in reversed(self.shape):
+            strides.insert(0, acc)
+            acc *= d
+        offset = 0
+        new_shape: list[int] = []
+        kept_dim_seen = False  # a slice/trailing dim has been kept already
+        for i, dim in enumerate(self.shape):
+            if i >= len(idx):
+                new_shape.append(dim)  # unindexed trailing dim: kept full
+                kept_dim_seen = True
+                continue
+            ix = idx[i]
+            if isinstance(ix, bool):
+                raise TypeError("DeviceTensor index must be int or slice, not bool")
+            if isinstance(ix, int):
+                if kept_dim_seen:
+                    raise NotImplementedError(
+                        "DeviceTensor: integer index after a kept dimension is non-contiguous"
+                    )
+                j = ix + dim if ix < 0 else ix
+                if not (0 <= j < dim):
+                    raise IndexError(f"index {ix} out of range for dim {i} (size {dim})")
+                offset += j * strides[i]
+            elif isinstance(ix, slice):
+                start, stop, step = ix.indices(dim)
+                if step != 1:
+                    raise NotImplementedError("DeviceTensor slice step must be 1")
+                if kept_dim_seen and not (start == 0 and stop == dim):
+                    raise NotImplementedError(
+                        "DeviceTensor: only the outermost kept slice may be partial "
+                        "(inner dims must be full for a contiguous view)"
+                    )
+                offset += start * strides[i]
+                new_shape.append(max(0, stop - start))
+                kept_dim_seen = True
+            else:
+                raise TypeError(f"DeviceTensor index must be int or slice, got {type(ix).__name__}")
+        if not new_shape:
+            raise IndexError("DeviceTensor: indexing away every dimension is not supported")
+        elem = torch.tensor([], dtype=self.dtype).element_size()
+        return DeviceTensor(self.data_ptr + offset * elem, tuple(new_shape), self.dtype)
+
     def __repr__(self) -> str:
         return f"DeviceTensor(data_ptr=0x{self.data_ptr:x}, shape={self.shape}, dtype={self.dtype})"
 

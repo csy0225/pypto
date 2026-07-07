@@ -1070,6 +1070,19 @@ class DistributedWorker(Worker):
         self._require_open("malloc")
         return int(self._orch().malloc(worker_id, nbytes))
 
+    def import_ipc(self, key: bytes, *, worker_id: int = 0) -> int:
+        """Import an ACL device-IPC *key* on chip *worker_id*; returns a device pointer.
+
+        The key is produced by ``aclrtIpcMemGetExportKey`` on the exporting process
+        (e.g. vLLM's KV-cache buffer). The import runs inside the forked chip
+        child's own ACL context, so the returned pointer is valid for kernels and
+        can back a :class:`~pypto.runtime.DeviceTensor` (``child_memory``) argument
+        with no H2D/D2H copy — the device-shared / zero-copy path. Pair the
+        returned pointer with the matching shape/dtype to build the kernel arg.
+        """
+        self._require_open("import_ipc")
+        return int(self._orch().import_ipc(worker_id, bytes(key)))
+
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_open("free")
