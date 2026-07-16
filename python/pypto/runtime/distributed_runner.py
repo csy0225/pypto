@@ -1083,6 +1083,17 @@ class DistributedWorker(Worker):
         self._require_open("import_ipc")
         return int(self._orch().import_ipc(worker_id, bytes(key)))
 
+    def import_ipc_all(self, device_key_map: dict[int, bytes]) -> dict[int, int]:
+        """Import one external ACL IPC allocation in each chip child.
+
+        ``device_key_map`` is keyed by physical device id and each value is the
+        256-byte key returned by ``aclrtIpcMemGetExportKey``.  Simpler performs
+        the imports inside the matching forked chip ACL contexts and returns
+        child-valid peer VAs.
+        """
+        self._require_open("import_ipc_all")
+        return self._w.import_ipc_all(device_key_map)
+
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_open("free")

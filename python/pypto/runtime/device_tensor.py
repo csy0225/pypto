@@ -223,13 +223,19 @@ class StackedDeviceTensor:
         return self.shards[0].dtype
 
     def __getitem__(self, idx: int | slice | tuple) -> DeviceTensor:
-        """Return shard ``i`` for a leading-index ``i`` or ``(i, <full slices>)``.
+        """Return shard ``rank`` (whole) or a contiguous sub-view within it.
 
-        The generated ``host_orch`` emits either ``x[r]`` or ``x[r, 0:N, 0:M]``,
-        and callers may use the ``x[r, ...]`` (Ellipsis) whole-shard form; all
-        resolve to shard ``r``. Any non-whole-shard trailing slice is rejected
-        loudly — a stacked tensor only supports whole-shard slicing on the
-        leading dimension.
+        The generated ``host_orch`` emits several forms, all resolved here:
+
+        - ``x[r]`` / ``x[r, ...]`` / ``x[r, 0:N, 0:M]`` (whole-shard) → shard ``r``.
+        - ``x[r, k, 0:N, 0:M]`` (per-layer sub-view of a stacked weight pool whose
+          shard is ``[L, N, M]``) → the ``k``-th plane of shard ``r`` as a new
+          :class:`DeviceTensor` at ``shard_r.data_ptr + k * layer_stride``.
+
+        The leading index always picks the shard (its worker holds the memory);
+        any remaining indices are delegated to that shard's
+        :class:`DeviceTensor.__getitem__`, which enforces contiguity and raises
+        loudly on a non-representable (strided) selection.
         """
         if isinstance(idx, tuple):
             if not idx:
@@ -241,6 +247,7 @@ class StackedDeviceTensor:
             raise TypeError(f"StackedDeviceTensor leading index must be int, got {type(rank).__name__}")
         if not 0 <= rank < len(self.shards):
             raise IndexError(f"shard index {rank} out of range [0, {len(self.shards)})")
+        shard = self.shards[rank]
         tail = self.full_shape[1:]
         # Expand a single Ellipsis into full slices so each trailing index maps
         # to a concrete shard axis; ``x[i, ...]`` is the documented whole-shard
@@ -255,14 +262,17 @@ class StackedDeviceTensor:
             rest = rest[:e] + tuple(slice(None) for _ in range(n_fill)) + rest[e + 1 :]
         if len(rest) > len(tail):
             raise IndexError(f"too many indices for StackedDeviceTensor of shape {self.full_shape}")
-        for axis, s in enumerate(rest):
-            full = slice(0, tail[axis])
-            if s != full and s != slice(None):
-                raise ValueError(
-                    f"StackedDeviceTensor only supports whole-shard slicing on the leading "
-                    f"dim; got partial slice {s} on axis {axis + 1} (shard shape {tail})"
-                )
-        return self.shards[rank]
+        # Whole-shard selection (no trailing indices, or every trailing index is
+        # a full slice): return the resident shard directly, unchanged.
+        if all(
+            isinstance(s, slice) and (s == slice(0, tail[axis]) or s == slice(None))
+            for axis, s in enumerate(rest)
+        ):
+            return shard
+        # Partial selection within the shard (e.g. per-layer plane ``[r, k, ...]``):
+        # delegate to the shard's contiguous-sub-view indexer, which computes the
+        # byte offset from the shard's strides and rejects strided selections.
+        return shard[rest]
 
     def __repr__(self) -> str:
         return (

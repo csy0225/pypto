@@ -236,6 +236,27 @@ class TestPerCallValidation:
 
 
 class TestDeviceMemoryApi:
+    def test_import_ipc_all_delegates_to_simpler_worker(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+        keys = {8: b"a" * 256, 9: b"b" * 256}
+        patched_setup["worker"].import_ipc_all.return_value = {
+            8: 0x10000008,
+            9: 0x10000009,
+        }
+
+        assert rt.import_ipc_all(keys) == {8: 0x10000008, 9: 0x10000009}
+        patched_setup["worker"].import_ipc_all.assert_called_once_with(keys)
+        rt.close()
+
+    def test_import_ipc_all_rejects_after_close(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+        rt.close()
+
+        with pytest.raises(RuntimeError, match="import_ipc_all"):
+            rt.import_ipc_all({8: b"a" * 256})
+
     def test_alloc_tensor_forwards_malloc_and_copy(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled)

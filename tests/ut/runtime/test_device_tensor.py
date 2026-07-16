@@ -189,10 +189,34 @@ class TestStackedDeviceTensorIndexing:
         with pytest.raises(IndexError, match="at most one Ellipsis"):
             _ = s[0, ..., ...]
 
-    def test_partial_tail_slice_rejected(self):
+    def test_per_layer_plane_subview(self):
+        # The form the whole-decode host_orch emits for a stacked weight pool:
+        # x[r, k, 0:N, 0:M] selects layer k's contiguous plane of shard r.
+        sh = _shards(3, shape=(2, 4, 5))  # per-shard [L=2, N=4, M=5]
+        s = StackedDeviceTensor(sh, (3, 2, 4, 5), (0, 1, 2))
+        plane = s[2, 1, 0:4, 0:5]
+        elem = torch.tensor([], dtype=torch.float32).element_size()
+        assert plane.data_ptr == sh[2].data_ptr + 1 * (4 * 5) * elem
+        assert plane.shape == (4, 5)
+        assert plane.dtype == torch.float32
+        # Layer 0 is the shard base; whole trailing slices keep the plane full.
+        assert s[0, 0, 0:4, 0:5].data_ptr == sh[0].data_ptr
+
+    def test_contiguous_partial_leading_slice_subview(self):
+        # A contiguous leading-row sub-view is now representable (offset + shape).
+        sh = _shards(3)  # per-shard [4, 5]
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        sub = s[0, 1:3, 0:5]
+        elem = torch.tensor([], dtype=torch.float32).element_size()
+        assert sub.data_ptr == sh[0].data_ptr + 1 * 5 * elem
+        assert sub.shape == (2, 5)
+
+    def test_noncontiguous_tail_slice_rejected(self):
+        # A non-contiguous selection (inner dim not full under a kept outer dim)
+        # is rejected by the shard's DeviceTensor indexer.
         s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
-        with pytest.raises(ValueError, match="whole-shard"):
-            _ = s[0, 0:2, 0:5]
+        with pytest.raises(NotImplementedError, match="outermost kept slice"):
+            _ = s[0, 0:4, 0:3]
 
     def test_out_of_range_index_raises(self):
         s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
