@@ -19,66 +19,8 @@ if TYPE_CHECKING:
     from pypto.pypto_core import ir
 
 from pypto.pypto_core import ir as _ir
-from pypto.pypto_core.ir import SplitMode
 
 from .optimizations import Optimization
-
-
-class _ChunkedLoopOptimizerCall:
-    """Result of calling chunked_loop_optimizer(split=...).
-
-    Stores the split mode to pass to the AutoInCore scope.
-
-    Bare ``pl.chunked_loop_optimizer`` intentionally maps to ``SplitMode.NONE``.
-    Callers that want explicit cross-core work splitting must pass
-    ``split=pl.SplitMode.UP_DOWN`` or ``split=pl.SplitMode.LEFT_RIGHT``.
-    """
-
-    def __init__(self, split: SplitMode = SplitMode.NONE) -> None:
-        self.split = split
-
-    def __repr__(self) -> str:
-        return f"chunked_loop_optimizer(split={self.split!r})"
-
-
-class _ChunkedLoopOptimizer:
-    """Sentinel type for optimization=pl.chunked_loop_optimizer in pl.at().
-
-    Can be used bare or called with a split mode:
-    - ``optimization=pl.chunked_loop_optimizer``
-    - ``optimization=pl.chunked_loop_optimizer(split=pl.SplitMode.NONE)``
-
-    The bare form intentionally means "no split". Explicit splitting remains
-    opt-in via the ``split=...`` call form.
-    """
-
-    def __call__(self, *, split: SplitMode = SplitMode.NONE) -> _ChunkedLoopOptimizerCall:
-        """Create an optimizer specification with an explicit split mode.
-
-        Args:
-            split: Split mode for cross-core data transfer (default: SplitMode.NONE)
-
-        Returns:
-            Optimizer call with the given split mode
-        """
-        return _ChunkedLoopOptimizerCall(split=split)
-
-    def __repr__(self) -> str:
-        return "chunked_loop_optimizer"
-
-
-chunked_loop_optimizer: _ChunkedLoopOptimizer = _ChunkedLoopOptimizer()
-"""Sentinel for optimization=pl.chunked_loop_optimizer in pl.at().
-
-Use with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer)
-to request compiler-driven chunked loop outlining (replaces pl.auto_incore()).
-Can also be called with a split mode:
-pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer(split=pl.SplitMode.NONE))
-
-Bare ``pl.chunked_loop_optimizer`` intentionally defaults to ``SplitMode.NONE``.
-Use the call form with ``split=pl.SplitMode.UP_DOWN`` or
-``split=pl.SplitMode.LEFT_RIGHT`` when explicit cross-core splitting is desired.
-"""
 
 # Range argument type: int literal or Scalar variable
 RangeArg = Union[int, "Scalar"]
@@ -109,8 +51,6 @@ class RangeIterator(Generic[T]):
         start: RangeArg = 0,
         step: RangeArg = 1,
         init_values: tuple[Any, ...] | None = None,
-        chunk: int | None = None,
-        chunk_policy: str = "guarded",
         pipeline_stages: int | None = None,
     ):
         """Initialize range iterator.
@@ -120,8 +60,6 @@ class RangeIterator(Generic[T]):
             start: Start value (default 0, int or Scalar)
             step: Step value (default 1, int or Scalar)
             init_values: Initial values for iter_args
-            chunk: Chunk size for loop chunking (None = no chunking)
-            chunk_policy: Chunk distribution policy (default: "guarded")
             pipeline_stages: Software-pipelining depth — replicates the body this
                 many times per outer iteration (None = no pipelining). Only set by
                 pl.pipeline(); validated by the parser.
@@ -130,8 +68,6 @@ class RangeIterator(Generic[T]):
         self.stop = stop
         self.step = step
         self.init_values = init_values or ()
-        self.chunk = chunk
-        self.chunk_policy = chunk_policy
         self.pipeline_stages = pipeline_stages
         self.current = start
 
@@ -189,23 +125,15 @@ class RangeIterator(Generic[T]):
 def _make_range_iterator(
     *args: RangeArg,
     init_values: tuple[Any, ...] | None = None,
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
     pipeline_stages: int | None = None,
     func_name: str = "range",
 ) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
     """Shared implementation for range(), parallel(), unroll(), and pipeline()."""
-    if chunk is not None and (not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0):
-        raise ValueError(f"{func_name}() chunk must be a positive integer, got {chunk!r}")
     if pipeline_stages is not None:
         if not isinstance(pipeline_stages, int) or isinstance(pipeline_stages, bool) or pipeline_stages < 1:
             raise ValueError(f"{func_name}() stage must be a positive integer, got {pipeline_stages!r}")
-        if chunk is not None:
-            raise ValueError(f"{func_name}() stage= and chunk= are mutually exclusive")
     kwargs = {
         "init_values": init_values,
-        "chunk": chunk,
-        "chunk_policy": chunk_policy,
         "pipeline_stages": pipeline_stages,
     }
     if len(args) == 1:
@@ -222,8 +150,6 @@ def _make_range_iterator(
 def range(
     *args: RangeArg,
     init_values: None = None,
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[Scalar]: ...
 
 
@@ -231,8 +157,6 @@ def range(
 def range(
     *args: RangeArg,
     init_values: tuple[T1],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1]]]: ...
 
 
@@ -240,8 +164,6 @@ def range(
 def range(
     *args: RangeArg,
     init_values: tuple[T1, T2],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2]]]: ...
 
 
@@ -249,8 +171,6 @@ def range(
 def range(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3]]]: ...
 
 
@@ -258,8 +178,6 @@ def range(
 def range(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3, T4],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4]]]: ...
 
 
@@ -267,23 +185,18 @@ def range(
 def range(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3, T4, T5],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4, T5]]]: ...
 
 
 def range(
     *args: RangeArg,
     init_values: tuple[Any, ...] | None = None,
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
     """Create a range iterator for for loops.
 
     Supports several patterns:
         Simple:        for i in pl.range(10):
         Iter args:     for i, (var1, var2) in pl.range(16, init_values=(init1, init2)):
-        Chunked:       for i in pl.range(0, 10, chunk=5):
 
     For software pipelining (body replication for ping-pong buffering), use
     ``pl.pipeline(N, stage=F)`` instead — it is a sibling loop iterator.
@@ -297,8 +210,6 @@ def range(
         *args: Positional arguments (stop) or (start, stop) or (start, stop, step).
             Each argument can be an int literal or a pl.Scalar value.
         init_values: Initial values for iteration arguments
-        chunk: Chunk size for loop chunking (splits loop into nested loops)
-        chunk_policy: Chunk distribution policy (default: "guarded")
 
     Returns:
         If no init_values: RangeIterator yielding loop variable (Scalar)
@@ -307,36 +218,26 @@ def range(
     return _make_range_iterator(
         *args,
         init_values=init_values,
-        chunk=chunk,
-        chunk_policy=chunk_policy,
         func_name="range",
     )
 
 
 @overload
-def parallel(
-    *args: RangeArg, init_values: None = None, chunk: int | None = None, chunk_policy: str = "guarded"
-) -> RangeIterator[Scalar]: ...
+def parallel(*args: RangeArg, init_values: None = None) -> RangeIterator[Scalar]: ...
 
 
 @overload
-def parallel(
-    *args: RangeArg, init_values: tuple[T1], chunk: int | None = None, chunk_policy: str = "guarded"
-) -> RangeIterator[tuple[Scalar, tuple[T1]]]: ...
+def parallel(*args: RangeArg, init_values: tuple[T1]) -> RangeIterator[tuple[Scalar, tuple[T1]]]: ...
 
 
 @overload
-def parallel(
-    *args: RangeArg, init_values: tuple[T1, T2], chunk: int | None = None, chunk_policy: str = "guarded"
-) -> RangeIterator[tuple[Scalar, tuple[T1, T2]]]: ...
+def parallel(*args: RangeArg, init_values: tuple[T1, T2]) -> RangeIterator[tuple[Scalar, tuple[T1, T2]]]: ...
 
 
 @overload
 def parallel(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3]]]: ...
 
 
@@ -344,8 +245,6 @@ def parallel(
 def parallel(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3, T4],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4]]]: ...
 
 
@@ -353,16 +252,12 @@ def parallel(
 def parallel(
     *args: RangeArg,
     init_values: tuple[T1, T2, T3, T4, T5],
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[tuple[Scalar, tuple[T1, T2, T3, T4, T5]]]: ...
 
 
 def parallel(
     *args: RangeArg,
     init_values: tuple[Any, ...] | None = None,
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[Scalar] | RangeIterator[tuple[Scalar, tuple[Any, ...]]]:
     """Create a parallel range iterator for parallel for loops.
 
@@ -373,22 +268,16 @@ def parallel(
         *args: Positional arguments (stop) or (start, stop) or (start, stop, step).
             Each argument can be an int literal or a pl.Scalar value.
         init_values: Initial values for iteration arguments
-        chunk: Chunk size for loop chunking
-        chunk_policy: Chunk distribution policy (default: "guarded")
 
     Returns:
         If no init_values: RangeIterator yielding loop variable (Scalar)
         If init_values: RangeIterator yielding (loop_var, (iter_args...))
     """
-    return _make_range_iterator(
-        *args, init_values=init_values, chunk=chunk, chunk_policy=chunk_policy, func_name="parallel"
-    )
+    return _make_range_iterator(*args, init_values=init_values, func_name="parallel")
 
 
 def unroll(
     *args: RangeArg,
-    chunk: int | None = None,
-    chunk_policy: str = "guarded",
 ) -> RangeIterator[Scalar]:
     """Create an unroll range iterator for compile-time loop unrolling.
 
@@ -400,8 +289,6 @@ def unroll(
     Args:
         *args: Positional arguments (stop) or (start, stop) or (start, stop, step).
             Each argument must be an int literal (compile-time constant).
-        chunk: Chunk size for loop chunking
-        chunk_policy: Chunk distribution policy (default: "guarded")
 
     Returns:
         RangeIterator yielding loop variable (Scalar)
@@ -414,7 +301,7 @@ def unroll(
     """
     return cast(
         RangeIterator["Scalar"],
-        _make_range_iterator(*args, chunk=chunk, chunk_policy=chunk_policy, func_name="unroll"),
+        _make_range_iterator(*args, func_name="unroll"),
     )
 
 
@@ -713,94 +600,6 @@ def static_assert(condition: Any, msg: str = "") -> None:
     """
 
 
-class IncoreContext:
-    """Context manager for InCore scope.
-
-    This is returned by pl.incore() and used with the 'with' statement.
-    The parser recognizes this pattern and creates a ScopeStmt(InCore).
-    """
-
-    def __init__(self, split: SplitMode = SplitMode.NONE, name_hint: str = "") -> None:
-        self.split = split
-        self.name_hint = name_hint
-
-    def __enter__(self) -> None:
-        """Enter the InCore scope context."""
-        pass
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the InCore scope context."""
-        pass
-
-
-class AutoIncoreContext:
-    """Context manager for AutoInCore scope.
-
-    This is returned by pl.auto_incore() and used with the 'with' statement.
-    The parser recognizes this pattern and creates a ScopeStmt(AutoInCore).
-    """
-
-    def __init__(self, split: SplitMode = SplitMode.NONE, name_hint: str = "") -> None:
-        self.split = split
-        self.name_hint = name_hint
-
-    def __enter__(self) -> None:
-        """Enter the AutoInCore scope context."""
-        pass
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Exit the AutoInCore scope context."""
-        pass
-
-
-def auto_incore(split: SplitMode = SplitMode.NONE, *, name_hint: str = "") -> AutoIncoreContext:
-    """Mark a region of code for automatic incore chunking.
-
-    This function returns a context manager that should be used with the 'with' statement.
-    The parser recognizes this pattern and creates a ScopeStmt with ScopeKind.AutoInCore.
-
-    Args:
-        split: Split mode for cross-core data transfer (default: SplitMode.NONE)
-
-    Returns:
-        Context manager for AutoInCore scope
-
-    Examples:
-        >>> with pl.auto_incore():
-        ...     for i in pl.parallel(0, 8, 1, chunk=4):
-        ...         x = pl.add(x, x)
-        >>> with pl.auto_incore(split=pl.SplitMode.NONE):
-        ...     for i in pl.parallel(0, 8, 1, chunk=4):
-        ...         x = pl.add(x, x)
-    """
-    return AutoIncoreContext(split=split, name_hint=name_hint)
-
-
-def incore(split: SplitMode = SplitMode.NONE, *, name_hint: str = "") -> IncoreContext:
-    """Mark a region of code as belonging to the InCore execution context.
-
-    This function returns a context manager that should be used with the 'with' statement.
-    The parser recognizes this pattern and creates a ScopeStmt with ScopeKind.InCore.
-
-    Args:
-        split: Split mode for cross-core data transfer (default: SplitMode.NONE).
-            When set, the outlined InCore function will use the specified split
-            mode for data transfer between AIC and AIV cores.
-        name_hint: Optional name hint for the outlined function (must be a valid identifier)
-
-    Returns:
-        Context manager for InCore scope
-
-    Examples:
-        >>> with pl.incore():
-        ...     y = pl.ops.add(x, x)
-        ...     z = pl.ops.mul(y, y)
-        >>> with pl.incore(split=pl.SplitMode.UP_DOWN):
-        ...     y = pl.ops.add(x, x)
-    """
-    return IncoreContext(split=split, name_hint=name_hint)
-
-
 class ClusterContext:
     """Context manager for Cluster scope.
 
@@ -835,7 +634,7 @@ def cluster(*, name_hint: str = "") -> ClusterContext:
 
     Examples:
         >>> with pl.cluster():
-        ...     with pl.incore():
+        ...     with pl.at(level=pl.Level.CORE_GROUP):
         ...         y = pl.add(x, x)
     """
     return ClusterContext(name_hint=name_hint)
@@ -859,12 +658,14 @@ class SpmdContext:
         name_hint: str = "",
         optimizations: list[Optimization] | None = None,
         deps: list[Any] | None = None,
+        allow_early_resolve: bool = False,
     ) -> None:
         self.core_num = core_num
         self.sync_start = sync_start
         self.name_hint = name_hint
         self.optimizations = optimizations
         self.deps = deps
+        self.allow_early_resolve = allow_early_resolve
 
     def __enter__(self) -> Any:
         # The parser intercepts the ``with pl.spmd(...) [as tid]:`` pattern and
@@ -900,6 +701,7 @@ def spmd(
     name_hint: str = "",
     optimizations: list[Optimization] | None = None,
     deps: list[Any] | None = None,
+    allow_early_resolve: bool = False,
 ) -> SpmdContext:
     """Dispatch a kernel with SPMD (Single Program Multiple Data) multi-block execution.
 
@@ -909,9 +711,13 @@ def spmd(
 
     Usage forms:
 
-    1. ``with pl.spmd(n):`` — body must be a single call to a pre-defined
-       InCore kernel. Can stand alone (implicit cluster) or nest inside
-       ``pl.cluster()``.
+    1. ``with pl.spmd(n):`` — body is either a single call to a pre-defined
+       InCore kernel (direct dispatch), or an inline multi-statement block that
+       is auto-outlined into a synthetic InCore kernel (like the loop form, minus
+       the auto-bound index). An inline body must read the per-block index via
+       ``pl.tile.get_block_idx()`` — without it every block runs identical work.
+       Captures no producer TaskId (use form 3 for that). Can stand alone
+       (implicit cluster) or nest inside ``pl.cluster()``.
 
     2. ``for i in pl.spmd(n):`` — loop-style. The iteration variable binds
        the per-block index (equivalent to ``pl.tile.get_block_idx()``); the
@@ -919,18 +725,16 @@ def spmd(
        tile/tensor ops work without a separate ``@pl.function(type=InCore)``
        declaration.
 
-    3. ``with pl.spmd(n, deps=[...]) as tid:`` — captures the grid dispatch's
-       producer ``Scalar[TASK_ID]`` in ``tid`` (mirroring ``with pl.at(...) as
-       tid:``), usable as a ``deps=`` edge on later tasks, stored into a
-       ``pl.array.create(N, pl.TASK_ID)``, or crossing into ``pl.manual_scope``.
-       Unlike form 1, this form accepts an inline multi-statement body (like the
-       loop form); read the per-block index inside via ``pl.tile.get_block_idx()``.
+    3. ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes as form 1, and
+       additionally captures the grid dispatch's producer ``Scalar[TASK_ID]`` in
+       ``tid`` (mirroring ``with pl.at(...) as tid:``), usable as a ``deps=`` edge
+       on later tasks, stored into a ``pl.array.create(N, pl.TASK_ID)``, or
+       crossing into ``pl.manual_scope``. TaskId capture is the only thing this
+       adds over form 1 — it is orthogonal to the inline body.
 
     Optional ``optimizations=[pl.split(mode)]`` applies to the inner InCore scope
     (auto-generated for the for-form and the ``as tid`` form, wrapped around the
-    call for the plain with-form). ``pl.auto_chunk`` is not supported on
-    ``pl.spmd`` — use ``pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk])``
-    inside the loop body for chunked parallel loops.
+    call for the plain with-form).
 
     Args:
         core_num: Number of blocks for SPMD dispatch. Positional; accepts a
@@ -946,14 +750,32 @@ def spmd(
             sentinels), accepted only with the ``as tid`` form. Lowered to the
             outlined Submit's ``manual_dep_edges``; codegen packs it into a
             ``set_dependencies(...)`` invocation (union'd with auto-deps).
+        allow_early_resolve: Opt the grid dispatch in as a speculative
+            early-dispatch producer (simpler#1065). Same hint as
+            ``pl.submit(..., allow_early_resolve=True)`` / ``pl.at(...,
+            allow_early_resolve=True)``: the scheduler may pre-stage this task's
+            consumers before it completes. Forces the dispatch to lower to an
+            ``ir.Submit`` (even without ``as tid``) so the flag rides to codegen,
+            where it emits ``Arg::set_allow_early_resolve(true)``. Pure scheduling
+            hint. Rejected on a ``pl.cluster()``-nested ``pl.spmd`` (such a scope
+            is unwrapped into the Group function and never produces a Submit, so
+            the hint would be lost).
 
     Returns:
         Context manager / loop iterator for the SPMD scope.
 
     Examples:
-        >>> # Single-kernel context-manager form
+        >>> # Single-kernel context-manager form (direct dispatch)
         >>> with pl.spmd(4):
         ...     out = self.kernel(a, b, out)
+        >>>
+        >>> # Inline context-manager form — no TaskId; read the block index yourself
+        >>> with pl.spmd(4):
+        ...     i = pl.tile.get_block_idx()
+        ...     offset = i * 128
+        ...     tile_a = pl.load(a, [offset, 0], [128, 128])
+        ...     tile_b = pl.load(b, [offset, 0], [128, 128])
+        ...     out = pl.store(pl.add(tile_a, tile_b), [offset, 0], out)
         >>>
         >>> # Loop form — body runs per-block with i = tile.get_block_idx()
         >>> for i in pl.spmd(4):
@@ -990,7 +812,97 @@ def spmd(
         name_hint=name_hint,
         optimizations=optimizations,
         deps=deps,
+        allow_early_resolve=allow_early_resolve,
     )
+
+
+class SplitAivContext:
+    """Loop iterator for the explicit AIV-split region.
+
+    The parser recognizes ``for aiv_id in pl.split_aiv(2, mode=...):`` and builds
+    a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt` region node
+    carrying the requested ``SplitMode``. Unlike the legacy whole-InCore-scope
+    split, this region is a structural node that may be nested anywhere in an
+    InCore body — inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``. The
+    loop variable is bound to ``pl.tile.get_subblock_idx()`` (the AIV lane /
+    sub-core index) at the region head. The node is consumed and erased by
+    LowerAutoVectorSplit (pass 20); it never reaches codegen.
+    """
+
+    def __init__(self, n: int, mode: ir.SplitMode) -> None:
+        self.n = n
+        self.mode = mode
+
+    def __iter__(self) -> Iterator[Any]:
+        # Lets `for aiv_id in pl.split_aiv(...)` type-check and parse at the
+        # Python level. The @pl.program / @pl.function decorators intercept the
+        # AST, so this should never actually run — if it does, the caller is
+        # using pl.split_aiv() outside the DSL interception path. Raise loudly
+        # rather than silently yielding zero iterations (mirrors SpmdContext).
+        raise RuntimeError(
+            "pl.split_aiv(...) loop form is only valid inside a @pl.program / "
+            "@pl.function body; the parser replaces the for-loop with a first-class "
+            "SplitAivScopeStmt region node. If you're seeing this, the surrounding "
+            "function was not decorated."
+        )
+
+
+def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
+    """Open an explicit AIV-split region as an SPMD-style loop.
+
+    Usage::
+
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+            ...  # body runs per AIV lane; aiv_id = pl.tile.get_subblock_idx()
+
+    The loop builds a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt`
+    region carrying the requested ``SplitMode``. Because it is a structural node
+    (not a whole-InCore-scope flag), it is **nestable**: the region may appear
+    inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``, and sibling regions
+    may carry **different** modes (multi-mode), each lowered independently. A
+    top-level ``for aiv_id in pl.split_aiv(...)`` is wrapped in an enclosing
+    ``InCore`` scope so OutlineIncoreScopes can outline it. The loop variable
+    binds the AIV lane index (equivalent to ``pl.tile.get_subblock_idx()``).
+
+    Two dispatch modes:
+
+    * **Data-parallel** (``UP_DOWN`` / ``LEFT_RIGHT``): the region's vector
+      compute is **halved** on the split axis (rows / cols), so each lane
+      processes one half of every tile.
+    * **Task-parallel** (``NONE``): **no halving** — both lanes run the *full*
+      body for disjoint work the author dispatches via ``aiv_id`` (e.g. an
+      ``aiv_id``-strided loop). Use this when the tiles cannot be halved
+      (unit dims) or a reduction must stay full-width. ``tile.aiv_shard`` /
+      ``tile.aic_gather`` are rejected here — there is no split axis.
+
+    The region survives parse -> SSA -> ResolveBackendOpLayouts as a structural
+    node (printer emits ``for aiv_id in pl.split_aiv(...):`` so parse->print->parse
+    is a fixpoint), then is consumed and erased by LowerAutoVectorSplit (pass 20);
+    it never reaches ExpandMixedKernel or codegen.
+
+    Args:
+        n: The AIV sub-core count. Positional; hardware-fixed at 2 (the two AIV
+            lanes of one AICore). Any other value is rejected by the parser.
+        mode: Required dispatch mode, no silent default. ``pl.SplitMode.NONE``
+            (task-parallel, no halving), ``pl.SplitMode.UP_DOWN`` or
+            ``pl.SplitMode.LEFT_RIGHT`` (data-parallel halving).
+
+    Returns:
+        Loop iterator for the explicit AIV-split region.
+
+    Examples:
+        >>> for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+        ...     offset = aiv_id * 128
+        ...     t = pl.load(a, [offset, 0], [128, 128])
+        ...     out = pl.store(t, [offset, 0], out)
+    """
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ValueError(f"pl.split_aiv(n): n must be the integer 2, got {n!r}")
+    if n != 2:
+        raise ValueError(f"pl.split_aiv(n): n must be the integer 2 (the two AIV lanes), got {n}")
+    if not isinstance(mode, _ir.SplitMode):
+        raise ValueError(f"pl.split_aiv(mode=...): mode must be a pl.SplitMode, got {mode!r}")
+    return SplitAivContext(n=n, mode=mode)
 
 
 class AtContext:
@@ -1000,7 +912,6 @@ class AtContext:
     'with' statement. The parser recognizes this pattern and creates:
     - ScopeStmt(InCore) when level=CORE_GROUP (no optimizations)
     - ScopeStmt(InCore, split=...) when level=CORE_GROUP with optimizations=[pl.split(...)]
-    - ScopeStmt(AutoInCore) when level=CORE_GROUP with optimizations=[pl.auto_chunk]
     - ScopeStmt(Hierarchy) for all other levels
     """
 
@@ -1014,10 +925,8 @@ class AtContext:
         no_dep_args: list[Any] | None = None,
         dumps: list[Any] | None = None,
         allow_early_resolve: bool = False,
-        # Deprecated kwargs (kept for back-compat; emit DeprecationWarning at parse time):
-        optimization: _ChunkedLoopOptimizer | _ChunkedLoopOptimizerCall | None = None,
-        split: SplitMode | None = None,
         name_hint: str = "",
+        windowize: bool = False,
     ) -> None:
         self.level = level
         self.role = role
@@ -1026,9 +935,8 @@ class AtContext:
         self.no_dep_args = no_dep_args
         self.dumps = dumps
         self.allow_early_resolve = allow_early_resolve
-        self.optimization = optimization
-        self.split = split
         self.name_hint = name_hint
+        self.windowize = windowize
 
     def __enter__(self) -> Any:
         # The parser intercepts the ``with pl.at(...) [as tid]:`` pattern and
@@ -1052,10 +960,8 @@ def at(
     no_dep_args: list[Any] | None = None,
     dumps: list[Any] | None = None,
     allow_early_resolve: bool = False,
-    # Deprecated kwargs (kept for back-compat; emit DeprecationWarning at parse time):
-    optimization: _ChunkedLoopOptimizer | _ChunkedLoopOptimizerCall | None = None,
-    split: SplitMode | None = None,
     name_hint: str = "",
+    windowize: bool = False,
 ) -> AtContext:
     """Mark a region of code for execution at a specific hierarchy level.
 
@@ -1064,8 +970,6 @@ def at(
 
     - no entries → ``ScopeStmt(InCore)``
     - ``pl.split(mode)`` → ``ScopeStmt(InCore, split=mode)``
-    - ``pl.auto_chunk`` → ``ScopeStmt(AutoInCore)``
-    - both entries → ``ScopeStmt(AutoInCore, split=mode)``
 
     For all other levels, this creates a Hierarchy scope.
 
@@ -1073,10 +977,9 @@ def at(
         level: Target hierarchy level (e.g. pl.Level.HOST, pl.Level.CORE_GROUP).
         role: Function role (Orchestrator or Worker). Default: None.
         optimizations: Optional list literal of optimization entries. Each
-            entry must be one of ``pl.auto_chunk`` or ``pl.split(mode)`` —
-            written inline at the call site, since the DSL parser inspects
-            the AST and does not accept dynamically built variables here.
-            Entries are independent and may be combined.
+            entry must be ``pl.split(mode)`` — written inline at the call
+            site, since the DSL parser inspects the AST and does not accept
+            dynamically built variables here.
         deps: Optional explicit producer-edge list (TaskId Vars and/or
             ``None`` sentinels). Lowered to the resulting Call's
             ``manual_dep_edges`` attr, which codegen packs into a
@@ -1114,17 +1017,16 @@ def at(
             scope to lower to an ``ir.Submit`` (even without ``as tid``) so the
             flag can ride to codegen, where it emits
             ``Arg::set_allow_early_resolve(true)``. Pure scheduling hint.
-        optimization: **Deprecated.** Use ``optimizations=[pl.auto_chunk]`` (or
-            ``optimizations=[pl.auto_chunk, pl.split(mode)]``) instead.
-        split: **Deprecated.** Use ``optimizations=[pl.split(mode)]`` instead.
         name_hint: Optional name hint for the outlined function (must be a
             valid identifier).
+        windowize: Explicitly allow local windowization for the outlined InCore
+            kernel. The default is False.
 
     Returns:
         Context manager for the appropriate scope.
 
     Examples:
-        >>> # InCore scope (replaces pl.incore()):
+        >>> # InCore scope:
         >>> with pl.at(level=pl.Level.CORE_GROUP):
         ...     y = pl.ops.add(x, x)
 
@@ -1132,17 +1034,6 @@ def at(
         >>> with pl.at(level=pl.Level.CORE_GROUP,
         ...            optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
         ...     y = pl.ops.add(x, x)
-
-        >>> # AutoInCore scope (replaces pl.auto_incore()):
-        >>> with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-        ...     for i in pl.parallel(0, 8, 1, chunk=4):
-        ...         x = pl.add(x, x)
-
-        >>> # AutoInCore + split hint (combined, independent entries):
-        >>> with pl.at(level=pl.Level.CORE_GROUP,
-        ...            optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
-        ...     for i in pl.parallel(0, 8, 1, chunk=4):
-        ...         x = pl.add(x, x)
 
         >>> # Hierarchy scope (unchanged behavior):
         >>> with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):
@@ -1155,9 +1046,9 @@ def at(
         deps=deps,
         no_dep_args=no_dep_args,
         dumps=dumps,
-        optimization=optimization,
-        split=split,
+        allow_early_resolve=allow_early_resolve,
         name_hint=name_hint,
+        windowize=windowize,
     )
 
 
@@ -1171,18 +1062,15 @@ __all__ = [
     "cond",
     "static_print",
     "static_assert",
-    "incore",
-    "auto_incore",
     "at",
     "cluster",
     "spmd",
-    "chunked_loop_optimizer",
+    "split_aiv",
     "RangeIterator",
     "WhileIterator",
-    "IncoreContext",
-    "AutoIncoreContext",
     "ClusterContext",
     "SpmdContext",
+    "SplitAivContext",
     "AtContext",
     "RangeArg",
     "CondArg",

@@ -21,8 +21,9 @@ chains, and:
   wraps the host_orch body in nested :class:`ir.CommDomainScopeStmt` nodes
   (outer = first declared domain, inner = last).
 
-The tests below run the pass directly on a parsed program (via
-``passes.materialize_comm_domain_scopes()(program)``). The pass's output products have
+The tests below run the late host-distributed materialization sequence directly
+on a parsed program (via ``passes.synthesize_allreduce_signals()`` followed by
+``passes.materialize_comm_domain_scopes()``). The materialized output products have
 no full *print/parse* surface syntax — the printer emits a comment-only
 descriptor of each comm-domain scope, and the parser doesn't reconstruct the
 scope at all — so a whole-``@pl.program`` ``Expected`` parsed from Python
@@ -34,7 +35,7 @@ the granularity of the pass's structurally-comparable output products: the
 ``devices`` list and ``slots`` vector of each emitted
 :class:`ir.CommDomainScopeStmt`. Slot ``WindowBuffer``s are hand-built from
 the pass's documented semantics (device-descriptor table + slot/alloc-order
-rules in ``docs/en/dev/passes/36-materialize_comm_domain_scopes.md``) and compared with
+rules in ``docs/en/dev/passes/37-materialize_comm_domain_scopes.md``) and compared with
 ``enable_auto_mapping=True`` so freshly-constructed Vars match the
 pass-produced ones by structural isomorphism rather than identity.
 
@@ -44,9 +45,14 @@ produces no scope wrapping and no rewritten view types, so it uses
 ``pytest.raises`` — the malformed-input "after" is a ``pypto::ValueError``.
 """
 
+import ast
+import textwrap
+from typing import cast
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
+from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.pypto_core import DataType, ir, passes
 
 
@@ -69,6 +75,16 @@ def _get_func(program: ir.Program, name: str) -> ir.Function:
     gvar = program.get_global_var(name)
     assert gvar is not None
     return program.functions[gvar]
+
+
+def _as_call(expr: ir.Expr) -> ir.Call:
+    assert isinstance(expr, ir.Call)
+    return expr
+
+
+def _as_var(expr: ir.Expr) -> ir.Var:
+    assert isinstance(expr, ir.Var)
+    return expr
 
 
 def _find_window_calls(func: ir.Function) -> list[ir.AssignStmt]:
@@ -101,6 +117,19 @@ def _view_var_types(func: ir.Function) -> list[ir.DistributedTensorType]:
     ]
 
 
+def _assert_window_assignments_type_symmetric(func: ir.Function) -> None:
+    """Every materialized window definition carries one shared WindowBuffer on both sides."""
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AssignTypeSymmetry)
+    assert passes.PropertyVerifierRegistry.verify(props, ir.Program([func], "window_symmetry", ir.Span.unknown())) == []
+
+    for stmt in _find_window_calls(func):
+        assert isinstance(stmt.var.type, ir.DistributedTensorType)
+        assert isinstance(stmt.value.type, ir.DistributedTensorType)
+        assert stmt.var.type.window_buffer is not None
+        assert stmt.value.type.window_buffer is stmt.var.type.window_buffer
+
+
 def _get_comm_domain_scopes(func: ir.Function) -> list[ir.CommDomainScopeStmt]:
     """Walk ``func.body`` and return every ``CommDomainScopeStmt`` it carries,
     in nesting order (outermost first, innermost last)."""
@@ -121,8 +150,24 @@ def _get_comm_domain_scopes(func: ir.Function) -> list[ir.CommDomainScopeStmt]:
     return scopes
 
 
+def _flatten_stmts(stmt: ir.Stmt) -> list[ir.Stmt]:
+    result = [stmt]
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            result.extend(_flatten_stmts(child))
+    if isinstance(stmt, ir.ScopeStmt):
+        result.extend(_flatten_stmts(stmt.body))
+    if isinstance(stmt, ir.ForStmt):
+        result.extend(_flatten_stmts(stmt.body))
+    return result
+
+
 def _apply(program: ir.Program) -> ir.Program:
-    return passes.materialize_comm_domain_scopes()(program)
+    return cast(ir.Program, passes.materialize_comm_domain_scopes()(_synthesize(program)))
+
+
+def _synthesize(program: ir.Program) -> ir.Program:
+    return cast(ir.Program, passes.synthesize_allreduce_signals()(program))
 
 
 def _expected_slot(name: str, size_bytes: int) -> ir.WindowBuffer:
@@ -154,6 +199,16 @@ def _assert_scope_fields(
     assert len(actual.slots) == len(expected_slots)
     for actual_slot, expected_slot in zip(actual.slots, expected_slots, strict=True):
         ir.assert_structural_equal(actual_slot, expected_slot, enable_auto_mapping=True)
+
+
+def _assert_rank2_signal_type(value: ir.Expr, world_size_name: str) -> None:
+    signal_type = value.type
+    assert isinstance(signal_type, ir.DistributedTensorType)
+    assert len(signal_type.shape) == 2
+    assert isinstance(signal_type.shape[0], ir.Var)
+    assert signal_type.shape[0].name_hint == world_size_name
+    assert isinstance(signal_type.shape[1], ir.ConstInt)
+    assert signal_type.shape[1].value == 1
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +250,7 @@ def test_single_alloc_all_devices_world_size_loop():
     view_types = _view_var_types(host)
     assert len(view_types) == 1
     assert view_types[0].window_buffer is wb
+    _assert_window_assignments_type_symmetric(host)
 
 
 def test_allreduce_signal_inherits_data_comm_domain():
@@ -222,6 +278,744 @@ def test_allreduce_signal_inherits_data_comm_domain():
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
     _assert_scope_fields(scopes[0], [], [_expected_slot("data_buf", 1024), _expected_slot("signal_buf", 16)])
+
+
+def test_explicit_allreduce_assignment_keeps_user_signal():
+    """Direct explicit-signal assignments stay explicit and join the data domain."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    synthetic_assigns = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert synthetic_assigns == []
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert _as_var(allreduces[0].args[1]).name_hint == "signal"
+
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == ["data_buf", "signal_buf"]
+
+
+def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
+    """A host allreduce without signal gets a private signal slot in the data domain."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    signal_windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert len(signal_windows) == 1
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert _as_var(allreduces[0].args[1]).name_hint == signal_windows[0].var.name_hint
+
+    _assert_rank2_signal_type(signal_windows[0].var, "__allreduce_signal_world_size_0")
+
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+    ]
+
+
+def test_optional_signal_allreduce_round_trips_before_materialization():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    printed = P.as_python()
+    reparsed = cast(ir.Program, pl.parse(printed))
+    host = _get_func(reparsed, "host_orch")
+    allreduces = [
+        stmt.value
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert "pld.tensor.allreduce(" in printed
+    assert "op=" in printed
+    assert "__allreduce_signal_" not in printed
+    assert len(allreduces) == 1
+    allreduce = _as_call(allreduces[0])
+    assert len(allreduce.args) == 1
+    assert allreduce.kwargs["op"] == int(pld.ReduceOp.Sum)
+
+
+def test_synthesize_allreduce_signals_normalizes_host_allreduce():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    synthesized = _synthesize(P)
+    host = _get_func(synthesized, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+    signal_windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert len(signal_windows) == 1
+    assert _as_var(allreduces[0].args[1]).name_hint == signal_windows[0].var.name_hint
+
+
+def test_synthesized_allreduce_signal_round_trips_after_materialization():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    materialized = _apply(P)
+    printed = materialized.as_python()
+    reparsed = cast(ir.Program, pl.parse(printed))
+    host = _get_func(reparsed, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    allocs = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+        and stmt.var.name_hint.startswith("__allreduce_signal_buf_")
+    ]
+    windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+
+    printed_ast = ast.parse(printed)
+    alloc_call_nodes = [
+        node
+        for node in ast.walk(printed_ast)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "alloc_window_buffer"
+    ]
+    assert alloc_call_nodes
+    for node in alloc_call_nodes:
+        assert "name" not in {keyword.arg for keyword in node.keywords}
+    assert len(allocs) == 1
+    alloc_call = _as_call(allocs[0].value)
+    assert alloc_call.kwargs["name"] == allocs[0].var.name_hint
+    assert len(windows) == 1
+    window_call = _as_call(windows[0].value)
+    assert _as_var(window_call.args[0]).name_hint == allocs[0].var.name_hint
+    signal_type = windows[0].var.type
+    assert isinstance(signal_type, ir.DistributedTensorType)
+    assert len(signal_type.shape) == 2
+    assert isinstance(signal_type.shape[0], ir.Var)
+    assert signal_type.shape[0].name_hint.startswith("__allreduce_signal_world_size_")
+    assert isinstance(signal_type.shape[1], ir.ConstInt)
+    assert signal_type.shape[1].value == 1
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert _as_var(allreduces[0].args[1]).name_hint == windows[0].var.name_hint
+
+
+def test_implicit_allreduce_signal_names_are_program_unique():
+    program = cast(
+        ir.Program,
+        pl.parse(
+            textwrap.dedent(
+                """
+            @pl.program
+            class P:
+                @pl.function(type=pl.FunctionType.Orchestration)
+                def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+                    return data
+
+                @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+                def host_orch_a(self):
+                    data_buf = pld.alloc_window_buffer(1024)
+                    __allreduce_signal_world_size_0 = pld.world_size()
+                    __allreduce_signal_buf_0 = pld.alloc_window_buffer(pld.world_size() * 4)
+                    __allreduce_signal_0 = pld.window(
+                        __allreduce_signal_buf_0,
+                        [pld.world_size(), 1],
+                        dtype=pl.INT32,
+                    )
+                    __allreduce_result_0 = pld.window(data_buf, [256], dtype=pl.FP32)
+                    data = pld.window(data_buf, [256], dtype=pl.FP32)
+                    for r in pl.range(pld.world_size()):
+                        self.chip_orch(data, device=r)
+                    data = pld.tensor.allreduce(data, __allreduce_signal_0, op=pld.ReduceOp.Sum)
+                    data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+                    return data
+
+                @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+                def host_orch_b(self):
+                    data_buf_b = pld.alloc_window_buffer(1024)
+                    data = pld.window(data_buf_b, [256], dtype=pl.FP32)
+                    for r in pl.range(pld.world_size()):
+                        self.chip_orch(data, device=r)
+                    data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+                    return data
+            """
+            )
+        ),
+    )
+
+    result = _apply(program)
+    hosts = [_get_func(result, "host_orch_a"), _get_func(result, "host_orch_b")]
+    allreduce_signal_args = [
+        _as_var(_as_call(stmt.value).args[1]).name_hint
+        for host in hosts
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+    world_size_vars = [
+        stmt.var.name_hint
+        for host in hosts
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint.startswith("__allreduce_signal_world_size_")
+    ]
+    signal_slots = [
+        slot.base.name_hint
+        for host in hosts
+        for scope in _get_comm_domain_scopes(host)
+        for slot in scope.slots
+        if slot.base.name_hint.startswith("__allreduce_signal_buf_")
+    ]
+
+    assert allreduce_signal_args == [
+        "__allreduce_signal_0",
+        "__allreduce_signal_1",
+        "__allreduce_signal_2",
+    ]
+    assert world_size_vars == [
+        "__allreduce_signal_world_size_0",
+        "__allreduce_signal_world_size_1",
+        "__allreduce_signal_world_size_2",
+    ]
+    assert signal_slots == [
+        "__allreduce_signal_buf_0",
+        "__allreduce_signal_buf_1",
+        "__allreduce_signal_buf_2",
+    ]
+    assert len(signal_slots) == len(set(signal_slots))
+
+
+def test_consecutive_implicit_allreduces_get_fresh_signal_slots():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+        "__allreduce_signal_buf_1",
+    ]
+
+
+def test_synthesize_allreduce_signals_reserves_existing_alloc_names():
+    span = ir.Span.unknown()
+    existing_alloc = dist_tensor_ops.alloc_window_buffer(
+        16,
+        name="__allreduce_signal_buf_0",
+        span=span,
+    )
+    existing_buf = ir.Var("user_named_buf", existing_alloc.type, span)
+    existing_assign = ir.AssignStmt(existing_buf, existing_alloc, span)
+
+    data_type = ir.DistributedTensorType([ir.ConstInt(256, DataType.INT64, span)], DataType.FP32)
+    data = ir.Var("data", data_type, span)
+    allreduce = dist_tensor_ops.allreduce(data, op=ir.ReduceOp.Sum, span=span)
+    allreduce_assign = ir.AssignStmt(ir.Var("data_out", allreduce.type, span), allreduce, span)
+
+    host = ir.Function(
+        "host_orch",
+        [data],
+        [],
+        ir.SeqStmts([existing_assign, allreduce_assign], span),
+        span,
+        ir.FunctionType.Opaque,
+        ir.Level.HOST,
+        ir.Role.Orchestrator,
+    )
+    synthesized = _synthesize(ir.Program([host], "P", span))
+    alloc_names = [
+        stmt.value.kwargs["name"]
+        for stmt in _flatten_stmts(_get_func(synthesized, "host_orch").body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+    ]
+
+    assert alloc_names == ["__allreduce_signal_buf_0", "__allreduce_signal_buf_1"]
+
+
+def test_ssa_allreduce_result_keeps_source_window_lineage():
+    """Post-SSA allreduce result Vars still resolve to the original data window."""
+
+    program = cast(
+        ir.Program,
+        pl.parse(
+            textwrap.dedent(
+                """
+                @pl.program
+                class P:
+                    @pl.function(type=pl.FunctionType.Orchestration)
+                    def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+                        return data
+
+                    @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+                    def host_orch(self):
+                        data_buf = pld.alloc_window_buffer(1024)
+                        signal_buf = pld.alloc_window_buffer(16)
+                        data = pld.window(data_buf, [256], dtype=pl.FP32)
+                        signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+                        for r in pl.range(pld.world_size()):
+                            self.chip_orch(data, device=r)
+                        data_1 = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+                        data_2 = pld.tensor.allreduce(data_1, op=pld.ReduceOp.Sum)
+                        return data_2
+                """
+            )
+        ),
+    )
+
+    result = _apply(program)
+    host = _get_func(result, "host_orch")
+    scopes = _get_comm_domain_scopes(host)
+
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "signal_buf",
+        "__allreduce_signal_buf_0",
+    ]
+
+
+def test_return_implicit_allreduce_is_lifted_for_host_lowering():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            return pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    allreduce_assigns = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+    returns = [stmt for stmt in stmts if isinstance(stmt, ir.ReturnStmt)]
+
+    assert len(allreduce_assigns) == 1
+    assert allreduce_assigns[0].var.name_hint.startswith("__allreduce_result_")
+    allreduce_call = _as_call(allreduce_assigns[0].value)
+    assert len(allreduce_call.args) == 2
+    assert _as_var(allreduce_call.args[1]).name_hint == "__allreduce_signal_0"
+    _assert_rank2_signal_type(allreduce_call.args[1], "__allreduce_signal_world_size_0")
+    assert len(returns) == 1
+    assert isinstance(returns[0].value[0], ir.Var)
+    assert returns[0].value[0] is allreduce_assigns[0].var
+
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+    ]
+
+
+def test_return_explicit_allreduce_is_lifted_for_host_lowering():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            return pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    synthetic_assigns = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduce_assigns = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+    returns = [stmt for stmt in stmts if isinstance(stmt, ir.ReturnStmt)]
+
+    assert synthetic_assigns == []
+    assert len(allreduce_assigns) == 1
+    assert allreduce_assigns[0].var.name_hint.startswith("__allreduce_result_")
+    assert _as_var(_as_call(allreduce_assigns[0].value).args[1]).name_hint == "signal"
+    assert len(returns) == 1
+    assert isinstance(returns[0].value[0], ir.Var)
+    assert returns[0].value[0] is allreduce_assigns[0].var
+
+
+def test_implicit_allreduce_eval_stmt_gets_signal():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return 0
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    allreduces = [
+        stmt.expr
+        for stmt in stmts
+        if isinstance(stmt, ir.EvalStmt)
+        and isinstance(stmt.expr, ir.Call)
+        and stmt.expr.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert _as_var(allreduces[0].args[1]).name_hint == "__allreduce_signal_0"
+    _assert_rank2_signal_type(allreduces[0].args[1], "__allreduce_signal_world_size_0")
+
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+    ]
+
+
+def test_explicit_allreduce_eval_stmt_keeps_user_signal():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    synthetic_assigns = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.expr
+        for stmt in stmts
+        if isinstance(stmt, ir.EvalStmt)
+        and isinstance(stmt.expr, ir.Call)
+        and stmt.expr.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert synthetic_assigns == []
+    assert len(allreduces) == 1
+    assert _as_var(allreduces[0].args[1]).name_hint == "signal"
+
+
+def test_implicit_allreduce_in_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            for _ in pl.range(2):
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        _apply(P)
+
+
+def test_implicit_allreduce_in_while_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            while True:
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        _apply(P)
+
+
+def test_explicit_allreduce_in_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            for _ in pl.range(2):
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        _apply(P)
+
+
+def test_explicit_allreduce_in_while_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [pld.world_size(), 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            while True:
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        _apply(P)
+
+
+def test_nested_explicit_allreduce_expression_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            signal_buf = pld.alloc_window_buffer(16)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            wrapped = (pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum),)
+            return wrapped
+
+    with pytest.raises(Exception, match="must be a direct assignment"):
+        _apply(P)
+
+
+def test_nested_implicit_allreduce_expression_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            wrapped = (pld.tensor.allreduce(data, op=pld.ReduceOp.Sum),)
+            return wrapped
+
+    with pytest.raises(Exception, match="must be a direct assignment"):
+        _apply(P)
 
 
 # ---------------------------------------------------------------------------

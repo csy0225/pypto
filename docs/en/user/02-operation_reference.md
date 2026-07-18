@@ -14,6 +14,12 @@ Auto-selects between tensor and tile implementation based on input type.
 | `sub` | `(lhs: T, rhs: T \| int \| float \| Scalar) -> T` | Element-wise subtraction |
 | `mul` | `(lhs: T, rhs: T \| int \| float \| Scalar) -> T` | Element-wise multiplication |
 | `div` | `(lhs: T, rhs: T \| int \| float \| Scalar) -> T` | Element-wise division |
+| `part_add` | `(lhs: T, rhs: T) -> T` | Partial add (copies the only valid input) |
+| `part_mul` | `(lhs: T, rhs: T) -> T` | Partial multiply (copies the only valid input) |
+| `part_max` | `(lhs: T, rhs: T) -> T` | Partial max (copies the only valid input) |
+| `part_min` | `(lhs: T, rhs: T) -> T` | Partial min (copies the only valid input) |
+| `fmod` | `(lhs: T, rhs: T \| int \| float \| Scalar) -> T` | Floating-point remainder (`torch.fmod`) |
+| `fmods` | `(lhs: T, rhs: int \| float \| Scalar) -> T` | Floating-point remainder with scalar |
 | `maximum` | `(lhs: T, rhs: T) -> T` | Element-wise maximum |
 | `exp` | `(input: T) -> T` | Element-wise exponential |
 | `cast` | `(input: T, target_type: int \| DataType, mode="round") -> T` | Type cast (`mode`: none, rint, round, floor, ceil, trunc, odd) |
@@ -24,9 +30,15 @@ Auto-selects between tensor and tile implementation based on input type.
 | `matmul_acc` | `(acc: T, lhs: T, rhs: T, a_trans=False, b_trans=False) -> T` | Matrix multiply with accumulation: `acc += lhs @ rhs` |
 | `row_max` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise max (tile path requires `tmp_tile`) |
 | `row_sum` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise sum (tile path requires `tmp_tile`) |
+| `row_prod` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise product (tile path requires `tmp_tile`) |
 | `col_sum` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise sum. On Tile, passing `tmp_tile` activates binary-tree reduction; omitting it uses sequential reduction. Tensor input lowers to the sequential path. |
 | `col_max` | `(input: T) -> T` | Column-wise max |
 | `col_min` | `(input: T) -> T` | Column-wise min |
+| `col_prod` | `(input: T) -> T` | Column-wise product |
+| `row_argmax` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise argmax (column index of per-row max, int32 output; tile path requires `tmp_tile`) |
+| `row_argmin` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Row-wise argmin (column index of per-row min, int32 output; tile path requires `tmp_tile`) |
+| `col_argmax` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise argmax (row index of per-column max, int32 output; tile path requires `tmp_tile`) |
+| `col_argmin` | `(input: T, tmp_tile: Tile \| None = None) -> T` | Column-wise argmin (row index of per-column min, int32 output; tile path requires `tmp_tile`) |
 | `rsqrt` | `(input: T, high_precision: bool = False) -> T` | Reciprocal square root; `high_precision=True` selects the high-precision path (tensor input only — tile callers must use `pl.tile.rsqrt(src, tmp=...)`) |
 | `create` / `create_tile` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem) -> Tile` | Tile-only (promoted from `pl.tile.create`): create tile at specific memory space |
 | `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices (dispatched by source type). Sugar: `A[i, j]` |
@@ -45,8 +57,9 @@ Operate on `Tensor` objects (DDR memory).
 | `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor` | Slice. Sugar: `A[0:16, :]` |
 | `reshape` | `(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor` | Reshape |
 | `transpose` | `(tensor: Tensor, axis1: int, axis2: int) -> Tensor` | Swap two axes |
-| `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Write source into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source`. `atomic=AtomicType.Add` accumulates instead of overwriting (split-K) — only valid when the target is a function output (global memory); non-deterministic FP, target must be pre-zeroed, dtypes fp32/fp16/int32/int16/int8 |
+| `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Write source into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source`. `atomic=AtomicType.Add` accumulates instead of overwriting (split-K) — only valid when the target is a function output (global memory); non-deterministic FP, target must be pre-zeroed, dtypes fp32/bf16/fp16/int32/int16/int8 (bf16 requires the Ascend910B/A2/A3 profile) |
 | `scatter_update` | `(input: Tensor, dim: int, index: Tensor, src: Tensor) -> Tensor` | Update rows of `input` at sparse positions given by `index` with values from `src`. `input`/`src`: 2D `[rows, d]` or 4D `[B, S, 1, d]`; `index`: 2D `[b, s]` integer. Only `dim=-2` is supported |
+| `random` | `(key0, key1, counter0, counter1, counter2, counter3: int \| Scalar, shape: Sequence[IntLike], dtype: DataType = UINT32, rounds: int = 10) -> Tensor` | Counter-based (Philox/ChaCha-style) RNG; lowers to `tile.random`. Deterministic from the key + counter seeds. `dtype` ∈ {INT32, UINT32}; `rounds` ∈ {7, 10}. Top-level alias `pl.random`. **A5 only** |
 | `add` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Element-wise add |
 | `sub` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Element-wise subtract |
 | `mul` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Element-wise multiply |
@@ -55,12 +68,24 @@ Operate on `Tensor` objects (DDR memory).
 | `subs` | `(lhs: Tensor, rhs: int \| float \| Scalar) -> Tensor` | Subtract scalar |
 | `muls` | `(lhs: Tensor, rhs: int \| float \| Scalar) -> Tensor` | Multiply by scalar |
 | `divs` | `(lhs: Tensor, rhs: int \| float \| Scalar) -> Tensor` | Divide by scalar |
+| `part_add` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Partial add (copies the only valid input) |
+| `part_mul` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Partial multiply (copies the only valid input) |
+| `part_max` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Partial max (copies the only valid input) |
+| `part_min` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Partial min (copies the only valid input) |
+| `fmod` | `(lhs: Tensor, rhs: Tensor \| int \| float \| Scalar) -> Tensor` | Floating-point remainder (`torch.fmod`) |
+| `fmods` | `(lhs: Tensor, rhs: int \| float \| Scalar) -> Tensor` | Floating-point remainder with scalar |
 | `maximum` | `(lhs: Tensor, rhs: Tensor) -> Tensor` | Element-wise maximum |
 | `row_max` | `(input: Tensor) -> Tensor` | Row-wise max reduction |
 | `row_sum` | `(input: Tensor) -> Tensor` | Row-wise sum reduction |
+| `row_prod` | `(input: Tensor) -> Tensor` | Row-wise product reduction |
 | `col_sum` | `(input: Tensor) -> Tensor` | Column-wise sum reduction (reduces along axis=-2) |
 | `col_max` | `(input: Tensor) -> Tensor` | Column-wise max reduction (reduces along axis=-2) |
 | `col_min` | `(input: Tensor) -> Tensor` | Column-wise min reduction (reduces along axis=-2) |
+| `col_prod` | `(input: Tensor) -> Tensor` | Column-wise product reduction (reduces along axis=-2) |
+| `row_argmax` | `(input: Tensor) -> Tensor` | Row-wise argmax reduction (int32 index output) |
+| `row_argmin` | `(input: Tensor) -> Tensor` | Row-wise argmin reduction (int32 index output) |
+| `col_argmax` | `(input: Tensor) -> Tensor` | Column-wise argmax reduction (reduces along axis=-2, int32 index output) |
+| `col_argmin` | `(input: Tensor) -> Tensor` | Column-wise argmin reduction (reduces along axis=-2, int32 index output) |
 | `rsqrt` | `(input: Tensor, high_precision: bool = False) -> Tensor` | Element-wise reciprocal square root; `high_precision=True` allocates a scratch tile during lowering for the higher-precision PTO path (requires static tile shape, same constraint as `row_max`/`row_sum`) |
 | `exp` | `(input: Tensor) -> Tensor` | Element-wise exponential |
 | `cast` | `(input: Tensor, target_type: DataType, mode="round") -> Tensor` | Type cast |
@@ -73,8 +98,8 @@ Transfer data between memory hierarchy levels.
 
 | Name | Signature | Description |
 | ---- | --------- | ----------- |
-| `load` | `(tensor: Tensor, offsets: Sequence[IntLike], shapes: Sequence[IntLike], target_memory: Mem = Mem.Vec, transpose: bool = False) -> Tile` | DDR → on-chip tile (transpose only for Mat). Both `offsets` and `shapes` use the source tensor's coordinate system. |
-| `store` | `(tile: Tile, offsets: Sequence[IntLike], output_tensor: Tensor, *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Tile → DDR (pipe inferred from source memory). `atomic=AtomicType.Add` accumulates the tile into existing DDR contents (split-K); non-deterministic FP, destination must be pre-zeroed, dtypes fp32/fp16/int32/int16/int8 |
+| `load` | `(tensor: Tensor, offsets: Sequence[IntLike], shapes: Sequence[IntLike], target_memory: Mem = Mem.Vec) -> Tile` | DDR → on-chip tile. Both `offsets` and `shapes` use the source tensor's coordinate system. For a transposed matmul operand, apply `transpose_view` to the loaded tile. |
+| `store` | `(tile: Tile, offsets: Sequence[IntLike], output_tensor: Tensor, *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Tile → DDR (pipe inferred from source memory). `atomic=AtomicType.Add` accumulates the tile into existing DDR contents (split-K); non-deterministic FP, destination must be pre-zeroed, dtypes fp32/bf16/fp16/int32/int16/int8 (bf16 requires the Ascend910B/A2/A3 profile) |
 | `assemble` | `(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile` | Write source tile into target at offset. Sugar (pre-SSA only): `target[i:i+H, j:j+W] = source` |
 | `scatter_update` | `(input: Tile, dim: int, index: Tile, src: Tile) -> Tile` | Update rows of `input` tile at sparse positions given by `index` tile with values from `src` tile. `input`/`src`: 2D `[rows, d]` or 4D `[B, S, 1, d]`; `index`: 2D `[b, s]` integer. Lowered to `tile.scatter` (pto.tscatter, whole-row flat indices). Only `dim=-2` is supported |
 | `read` | `(tile: Tile, indices: IntLike \| Sequence[IntLike]) -> Scalar` | Read scalar at indices. Sugar: `A[i, j]` |
@@ -82,7 +107,9 @@ Transfer data between memory hierarchy levels.
 | `move` | `(tile: Tile, target_memory: Mem) -> Tile` | Move tile between memory levels (including Vec→Vec) |
 | `create` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem = Mem.Vec) -> Tile` | Create tile at memory space |
 | `full` | `(shape: list[int], dtype: DataType, value: int \| float) -> Tile` | Create tile filled with constant |
+| `random` | `(key0, key1, counter0, counter1, counter2, counter3: int \| Scalar, shape: Sequence[int], valid_shape: Sequence[int] \| None = None, dtype: DataType = UINT32, rounds: int = 10) -> Tile` | Fill a tile with counter-based (Philox/ChaCha-style) pseudo-random values from a 64-bit key + 128-bit counter. Deterministic: same seeds → same tile. Optional `valid_shape` (each dim `<= shape`) writes only the valid rows/cols, leaving the rest untouched. `dtype` ∈ {INT32, UINT32}; `rounds` ∈ {7, 10}. 2D shape only. **A5 only** (`pto.trandom`) |
 | `fillpad` | `(input: Tensor \| Tile, pad_value: PadValue \| int \| float = PadValue.zero) -> Tensor \| Tile` | Fill invalid view elements using the requested pad value; accepts the `PadValue.zero/max/min` enum or the literal sugars `0`, `0.0`, `math.inf`, `-math.inf` (other values raise). Tensor inputs lower to tile fillpad in InCore code |
+| `fillpad_expand` | `(input: Tensor \| Tile, shape: Sequence[IntLike], pad_value: PadValue \| int \| float = PadValue.zero) -> Tensor \| Tile` | Like `fillpad` but the destination `shape` may be **larger** than the source in either dimension: the source's valid region is copied to the top-left and every other element is filled with `pad_value`. Each destination dimension must be `>=` the source. Tensor inputs lower to tile fillpad_expand in InCore code |
 | `get_block_idx` | `() -> Scalar` | Get current hardware block index (UINT64) |
 
 ## Tile Arithmetic (`pl.tile.*`)
@@ -137,9 +164,15 @@ Transfer data between memory hierarchy levels.
 | `row_max` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise max (requires tmp buffer) |
 | `row_sum` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise sum (requires tmp buffer) |
 | `row_min` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise min (requires tmp buffer) |
+| `row_prod` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise product (requires tmp buffer) |
 | `col_sum` | `(tile: Tile, tmp_tile: Tile \| None = None) -> Tile` | Column-wise sum. Passing `tmp_tile` activates binary-tree reduction; omitting it uses sequential reduction. |
 | `col_max` | `(tile: Tile) -> Tile` | Column-wise max |
 | `col_min` | `(tile: Tile) -> Tile` | Column-wise min |
+| `col_prod` | `(tile: Tile) -> Tile` | Column-wise product |
+| `row_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise argmax, column index of per-row max (requires tmp buffer, int32 output) |
+| `row_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise argmin, column index of per-row min (requires tmp buffer, int32 output) |
+| `col_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmax, row index of per-column max (requires tmp buffer, int32 output) |
+| `col_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmin, row index of per-column min (requires tmp buffer, int32 output) |
 | `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | Sum along axis |
 | `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Max along axis |
 | `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Min along axis |
@@ -164,11 +197,17 @@ Transfer data between memory hierarchy levels.
 | `row_expand_sub` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile - row_vec` broadcast |
 | `row_expand_mul` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile * row_vec` broadcast |
 | `row_expand_div` | `(tile: Tile, row_vec: Tile) -> Tile` | `tile / row_vec` broadcast |
+| `row_expand_max` | `(tile: Tile, row_vec: Tile) -> Tile` | `max(tile, row_vec)` broadcast |
+| `row_expand_min` | `(tile: Tile, row_vec: Tile) -> Tile` | `min(tile, row_vec)` broadcast |
+| `row_expand_expdif` | `(tile: Tile, row_vec: Tile) -> Tile` | `exp(tile - row_vec[M,1])` broadcast |
 | `col_expand` | `(target: Tile, col_vec: Tile) -> Tile` | Expand `col_vec[1,N]` to `target[M,N]` |
 | `col_expand_mul` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile * col_vec` broadcast |
 | `col_expand_div` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile / col_vec` broadcast |
 | `col_expand_sub` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile - col_vec` broadcast |
 | `col_expand_add` | `(tile: Tile, col_vec: Tile) -> Tile` | `tile + col_vec[1,N]` broadcast |
+| `col_expand_max` | `(tile: Tile, col_vec: Tile) -> Tile` | `max(tile, col_vec)` broadcast |
+| `col_expand_min` | `(tile: Tile, col_vec: Tile) -> Tile` | `min(tile, col_vec)` broadcast |
+| `col_expand_expdif` | `(tile: Tile, col_vec: Tile) -> Tile` | `exp(tile - col_vec[1,N])` broadcast |
 | `expands` | `(target: Tile, scalar: int \| float \| Scalar) -> Tile` | Expand scalar to tile shape |
 
 ## Comparison / Selection (`pl.tile.*`)
@@ -201,6 +240,12 @@ scratch tile to materialize numeric results on A2/A3.
 | `shrs` | `(lhs: Tile, rhs: int \| Scalar) -> Tile` | Right shift by scalar |
 | `rem` | `(lhs: Tile, rhs: Tile) -> Tile` | Remainder / modulo |
 | `rems` | `(lhs: Tile, rhs: int \| float \| Scalar) -> Tile` | Remainder with scalar |
+| `part_add` | `(lhs: Tile, rhs: Tile) -> Tile` | Partial add (copies the only valid input) |
+| `part_mul` | `(lhs: Tile, rhs: Tile) -> Tile` | Partial multiply (copies the only valid input) |
+| `part_max` | `(lhs: Tile, rhs: Tile) -> Tile` | Partial max (copies the only valid input) |
+| `part_min` | `(lhs: Tile, rhs: Tile) -> Tile` | Partial min (copies the only valid input) |
+| `fmod` | `(lhs: Tile, rhs: Tile) -> Tile` | Floating-point remainder (`torch.fmod`) |
+| `fmods` | `(lhs: Tile, rhs: int \| float \| Scalar) -> Tile` | Floating-point remainder with scalar |
 
 ## Activations (`pl.tile.*`)
 

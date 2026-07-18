@@ -44,7 +44,7 @@ Orchestration function (A5):
 ```text
 Cube InCore function:                    Vector InCore function:
 ┌─────────────────────┐                 ┌─────────────────────┐
-│  tpush_to_aiv       │   ??? how to   │  consumer_buf =     │
+│  tpush_to_aiv       │   how to get   │  consumer_buf =     │
 │  DMA to Vector's UB │ ──────────────▶ │  UB[BASE..BASE+SIZE]│
 │  at what address?   │   get address?  │  // local segment   │
 └─────────────────────┘                 └─────────────────────┘

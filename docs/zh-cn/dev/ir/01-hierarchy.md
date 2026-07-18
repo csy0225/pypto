@@ -32,7 +32,7 @@
 <return_stmt> ::= "return" [ <var_list> ]
 <eval_stmt>  ::= <expr>
 <seq_stmts>  ::= <stmt> { ";" <stmt> }
-<scope_stmt> ::= "with" "pl.incore" "(" ")" ":" <stmt_list>
+<scope_stmt> ::= "with" "pl.at" "(" "level" "=" "pl.Level.CORE_GROUP" ")" ":" <stmt_list>
 <break_stmt> ::= "break"
 <continue_stmt> ::= "continue"
 
@@ -73,6 +73,7 @@
 | **ConstBool** | `value_` | 布尔常量（始终为 BOOL dtype） |
 | **ConstFloat** | `value_`, `dtype_` | 浮点常量 |
 | **Call** | `op_`, `args_`, `kwargs_`, `attrs_` | 函数/运算符调用（参见 [Call attrs 与 kwargs 的区别](#call-attrs-与-kwargs-的区别)） |
+| **Submit** | `op_`, `args_`, `deps_`, `core_num_`, `sync_start_`, `allow_early_resolve_`, `kwargs_`, `attrs_` | 任务启动（`pl.submit(...)` / `pl.spmd_submit(...)`）。`core_num_`/`sync_start_` 携带 SPMD 启动规格；`allow_early_resolve_` 是推测式提前派发（speculative early-dispatch）的开关（下沉为 `Arg::set_allow_early_resolve(true)`）。参见 [Submit 与 Call 的区别](#submit-与-call-的区别)。 |
 | **TupleGetItemExpr** | `tuple_`, `index_` | 元组元素访问 |
 
 ### Var 的标识（Identity）
@@ -150,6 +151,32 @@ gvar = ir.GlobalVar("helper"); call = ir.Call(gvar, [x], span)  # Internal
 `IRProperty::CallDirectionsResolved` 校验的就是该 attr 在 `DeriveCallDirections`
 pass 之后是否存在。
 
+### Submit 与 Call 的区别
+
+`Submit` 是与 `Call` 并列的一等 IR 类型（first-class IR kind），表示在
+`pl.manual_scope` 体内由 `pl.submit(...)` 发起的任务启动（task launch）。两者
+在语义上截然不同，pass 作者必须同时考虑——分派规则参见
+[`.claude/rules/pass-submit-awareness.md`](../../../../.claude/rules/pass-submit-awareness.md)。
+
+| 方面 | `Call` | `Submit` |
+| ---- | ------ | -------- |
+| 语义 | 同步函数调用 | 异步任务启动 |
+| 出现位置 | 任意位置 | `manual_scope` 体内（由 parser 产生），以及作为 `pl.at(..., deps=[...])` 作用域外提后的派发点（缺失 `as tid` 绑定时会得到一个合成的未使用 TaskId Var）；在整个流水线中保持不变 |
+| 返回类型 | 被调方声明的返回 | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
+| 是否有 `deps` | 无 —— 普通 `Call` 从不携带依赖边（`attrs["manual_dep_edges"]` 仅出现在由 `pl.at` 产生的 `ScopeStmt` 上，在作用域外提时被消费；由 ManualDepsOnSubmitOnly 校验） | 一等的 `deps_` 字段 —— `Scalar[TASK_ID]` Var / `Array[N, TASK_ID]` Var |
+| SPMD 启动规格 | 无 | `core_num_`（`optional<ExprPtr>` 块数）+ `sync_start_`（bool），仅由 `pl.spmd_submit` 设置；`sync_start_` 仅在 `core_num_` 存在时才有意义（构造函数强制 `sync_start ⇒ core_num`）；`nullopt` ⇒ 普通单块 submit |
+| Use-def 链 | 仅 `args_` | `args_`、`deps_`，**以及** `core_num_` |
+| Python 语法 | `out = self.foo(...)` | `out, tid = pl.submit(self.foo, ...)`（或 `pl.spmd_submit(self.foo, ..., core_num=N)`） |
+
+parser 发出 `Submit`；printer / structural-equal / structural-hash / visitor /
+mutator（Python 钩子 `visit_submit`）/ DCE / SSA 全部直接按 `Submit` 类型分派，
+且 `Submit` 会在整个流水线中存活——没有任何 pass 会把它下沉为普通 `Call`。
+形如 Call 的消费者（`DeriveCallDirections`、`ExpandManualPhaseFence`、
+orchestration codegen）通过临时的 `SubmitToCallView` 检视 `Submit`，该 view 把
+`Submit::deps_` 合成为一个 `attrs["manual_dep_edges"]` 条目。该 attrs 编码
+**仅存在于 view 中**：它永远不会落到 IR 的 `Call` 节点上，并且
+ManualDepsOnSubmitOnly 结构属性 verifier 会在每个 pass 前后校验这一点。
+
 ### IterArg - 循环携带值
 
 `IterArg` 扩展 `Var`，添加 `initValue_` 以支持静态单赋值 (SSA) 风格的循环。作用域限定在循环体内，通过 `yield` 更新，最终值存储在 `return_vars` 中。
@@ -171,10 +198,10 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 | **ForStmt** | `loop_var_` (DefField), `start_`, `stop_`, `step_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField), `kind_` | 带可选迭代参数的 for 循环 |
 | **WhileStmt** | `condition_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField) | 带条件和迭代参数的 while 循环 |
 | **InCoreScopeStmt** | `name_hint_`, `body_`, `split_`（可选） | InCore 区域；由 `OutlineIncoreScopes` 提取为 `Function(InCore)` |
-| **AutoInCoreScopeStmt** | `name_hint_`, `body_`, `split_`（可选） | Auto-InCore 区域；由 `InterchangeChunkLoops` 消费 |
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster 区域；由 `OutlineClusterScopes` 提取为 `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_`（可选） | 给定 Level/Role 的流水线阶段区域 |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_`（整型 `Expr`）, `sync_start_` | SPMD 启动区域；提取为 `Function(Spmd)` |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_`（`SplitMode`，永不为 `None`）, `count_`（= 2） | 显式 AIV 切分区域（`pl.split_aiv`）；可嵌套；由 `LowerAutoVectorSplit`（pass 21）消费并擦除 |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator 运行时区域（`PTO2_SCOPE`）；`manual_=true` 选择手工依赖模式 |
 | **YieldStmt** | `values_` | 在循环迭代中产出值 |
 | **EvalStmt** | `expr_` | 为副作用求值表达式 |
@@ -240,23 +267,20 @@ while_stmt = ir.WhileStmt(condition, [x_iter], body, [x_final], span)
 
 ### ScopeStmt 详细说明
 
-`ScopeStmt` 是一个**抽象基类**，用于标记具有特定执行上下文的区域。下列六个具体子类
+`ScopeStmt` 是一个**抽象基类**，用于标记具有特定执行上下文的区域。下列五个具体子类
 各自只携带其类型有效的字段——非法组合在构造时即不可表达。在 `ScopeStmt` 类型的引用上，
 可使用 `s.scope_kind`（C++ 中为 `s.GetScopeKind()`）来取回类型，或使用
 `isinstance(s, InCoreScopeStmt)` 在具体类型上分派。
 
-六个子类共享公共基类字段 `name_hint_: str` 和 `body_: StmtPtr`。注意：
-`pl.at(level=Level.CORE_GROUP)` 实际下沉到 `InCoreScopeStmt` /
-`AutoInCoreScopeStmt`，而非 `HierarchyScopeStmt`——解析器会在 `CORE_GROUP`
+五个子类共享公共基类字段 `name_hint_: str` 和 `body_: StmtPtr`。注意：
+`pl.at(level=Level.CORE_GROUP)` 实际下沉到 `InCoreScopeStmt`，
+而非 `HierarchyScopeStmt`——解析器会在 `CORE_GROUP`
 拒绝 `role=`。`HierarchyScopeStmt` 仅用于非 `CORE_GROUP` 的层级
 （host、cluster、global），并不是 in-core 作用域的通用替代。
 
 ```python
-# with pl.incore(): y = pl.add(x, x)
+# with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x)
 in_core = ir.InCoreScopeStmt(name_hint="", body=body, span=span)
-
-# with pl.auto_incore():       (split 可选)
-auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 
 # with pl.cluster():
 cluster = ir.ClusterScopeStmt(name_hint="", body=body, span=span)
@@ -268,6 +292,10 @@ hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker,
 # with pl.spmd(8):
 spmd = ir.SpmdScopeStmt(core_num=ir.ConstInt(8, DataType.INDEX, span),
                         sync_start=False, name_hint="", body=body, span=span)
+
+# for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  (显式 AIV 切分区域)
+split_aiv = ir.SplitAivScopeStmt(split=ir.SplitMode.UP_DOWN, count=2,
+                                 name_hint="", body=body, span=span)
 
 # with pl.manual_scope(): (orchestrator 运行时区域，使用手工依赖模式)
 runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
@@ -292,14 +320,26 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   `SpmdScopeStmt.core_num_` 为非空 `ExprPtr`。表达式可以是任何整型 IR
   值——`Simplify` 会折叠闭包算术为 `ConstInt`，codegen 则按闭合函数作用
   域解析 `Var` 引用。
-- `InCoreScopeStmt` / `AutoInCoreScopeStmt` 已计划弃用；新代码应优先使用
-  `HierarchyScopeStmt` 或其它将保留的子类。
+- `InCoreScopeStmt` 是 `pl.at(level=Level.CORE_GROUP)` 的下沉目标；
+  解析器会在 `CORE_GROUP` 拒绝 `role=`，因此 `HierarchyScopeStmt` 仅用于其它层级。
 - Pass 行为：
-  - `InterchangeChunkLoops` 消费 `AutoInCoreScopeStmt`
   - `OutlineIncoreScopes` 将 `InCoreScopeStmt` 提取为 `Function(InCore)`
   - `OutlineClusterScopes` 将 `ClusterScopeStmt` 提取为 `Function(Group)`，
     将独立的 `SpmdScopeStmt` 提取为 `Function(Spmd)`
   - `OutlineHierarchyScopes` 提取 `HierarchyScopeStmt`
+  - `SplitAivScopeStmt` **不被提取**：它对 SSA 与各 outliner 透明（保留在被
+    提取出的 `Function(InCore)` 体内），随后由 `LowerAutoVectorSplit`
+    （pass 21）消费并**擦除**。它永不到达 `ExpandMixedKernel`（pass 22）或
+    codegen——下游只看到逐算子的 `aiv_shard` / `aic_gather` / `tpush` /
+    `tpop` 标记；若有 `SplitAivScopeStmt` 残留到此，PTO codegen 守卫会显式
+    报错。
+  - `SplitAivScopeStmt` **可嵌套**：经由通用的 `BeginScope`/`EndScope` 构建，
+    可置于任意父上下文（`pl.range` / `pl.pipeline` 循环或 `if`）。同级区域可
+    携带**不同**的 `split_` 模式（多模式）；pass 21 的减半是按区域局部进行
+    的，因此每个区域独立减半，区域外的向量计算保持全宽。顶层
+    `for aiv_id in pl.split_aiv(...)` 会被 parser 包裹在外层
+    `InCoreScopeStmt` 中（以便 `OutlineIncoreScopes` 提取），即
+    `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`。
   - 对于 `RuntimeScopeStmt(manual=true)` 内的每个 `pl.submit(kernel, ...,
     deps=[tid1, tid2])`，parser 发出一个 `Submit` 节点，并把用户 `deps=`
     kwarg 直接填入其一等的 `deps_` 字段（每项为 `Scalar[TASK_ID]` —— 由
@@ -318,7 +358,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
 **变换示例：**
 
 ```python
-# Before: with pl.incore(): y = pl.add(x, x); return y
+# Before: with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x); return y
 # After: main_incore_0(x) -> y; main(x): y = main_incore_0(x); return y
 ```
 
@@ -510,7 +550,7 @@ add_func = program.get_function("add")  # Access by name
 | **一元运算** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **调用/访问** | 2 | Call, TupleGetItemExpr |
 | **操作** | 2 | Op, GlobalVar |
-| **语句** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, AutoInCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
+| **语句** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **类型** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **函数** | 2 | Function, Program |
 

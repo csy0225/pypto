@@ -28,9 +28,8 @@ Both use the ``pld.system.notify`` / ``pld.system.wait`` handshake as the
 barrier that orders the synchronous put against the local read-back (see
 :file:`test_l3_notify_wait.py` for the handshake contract in isolation).
 
-The non-atomic full-slice and row-offset scenarios are enabled as the canonical
-e2e contract for ``pld.tensor.put``. The atomic-add scenario remains skipped
-until the current runtime/PTOAS stack can execute it reliably.
+The non-atomic full-slice, row-offset, and atomic-add scenarios are enabled as
+the canonical e2e contract for ``pld.tensor.put``.
 """
 
 import sys
@@ -128,6 +127,85 @@ def _build_ring_put_program():
     return RingPut
 
 
+# Pipeline (ping-pong) ring put: a window larger than the chunk so pto-isa TPUT
+# slides the transfer through two staging tiles. [PIPE_ROWS, PIPE_COLS] with a
+# [chunk_rows, chunk_cols] sub-tile gives a 2x2 chunk grid (>1 chunk) so the
+# ping-pong path actually engages.
+PIPE_ROWS = 8
+PIPE_COLS = 128
+PIPE_CHUNK_ROWS = 4
+PIPE_CHUNK_COLS = 64
+
+
+def _build_ring_put_pipeline_program():
+    """Ring put that double-buffers the cross-rank write (``pipeline=True``)."""
+
+    @pl.program
+    class RingPutPipeline:
+        @pl.function(type=pl.FunctionType.InCore)
+        def ring_step(
+            self,
+            inp: pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32]],
+            src: pld.DistributedTensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            dst: pld.DistributedTensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            signal: pld.DistributedTensor[[1, 1], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32]:
+            local = pl.load(inp, [0, 0], [PIPE_ROWS, PIPE_COLS])
+            src = pl.store(local, [0, 0], src)
+
+            # Double-buffered TPUT: pto-isa ping-pongs the [8, 128] transfer
+            # through two [4, 64] staging tiles.
+            pld.tensor.put(
+                dst,
+                peer=peer,
+                src=src,
+                atomic=pld.AtomicType.None_,
+                chunk_rows=PIPE_CHUNK_ROWS,
+                chunk_cols=PIPE_CHUNK_COLS,
+                pipeline=True,
+            )
+
+            pld.system.notify(target=signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(signal=signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+            recv = pl.load(dst, [0, 0], [PIPE_ROWS, PIPE_COLS])
+            return pl.store(recv, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32]],
+            src: pld.DistributedTensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            dst: pld.DistributedTensor[[PIPE_ROWS, PIPE_COLS], pl.FP32],
+            signal: pld.DistributedTensor[[1, 1], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[PIPE_ROWS, PIPE_COLS], pl.FP32]:
+            return self.ring_step(inp, out, src, dst, signal, peer)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            inputs: pl.Tensor[[2, PIPE_ROWS, PIPE_COLS], pl.FP32],
+            outputs: pl.Out[pl.Tensor[[2, PIPE_ROWS, PIPE_COLS], pl.FP32]],
+        ) -> pl.Tensor[[2, PIPE_ROWS, PIPE_COLS], pl.FP32]:
+            nbytes = PIPE_ROWS * PIPE_COLS * 4
+            src_buf = pld.alloc_window_buffer(nbytes)
+            dst_buf = pld.alloc_window_buffer(nbytes)
+            signal_buf = pld.alloc_window_buffer(4)
+
+            for r in pl.range(pld.world_size()):
+                src = pld.window(src_buf, [PIPE_ROWS, PIPE_COLS], dtype=pl.FP32)
+                dst = pld.window(dst_buf, [PIPE_ROWS, PIPE_COLS], dtype=pl.FP32)
+                signal = pld.window(signal_buf, [1, 1], dtype=pl.INT32)
+                self.chip_orch(inputs[r], outputs[r], src, dst, signal, (r + 1) % pld.world_size(), device=r)
+            return outputs
+
+    return RingPutPipeline
+
+
 def _build_atomic_add_program():
     """Build the ``atomic=Add`` accumulation program at call time.
 
@@ -147,8 +225,11 @@ def _build_atomic_add_program():
             acc: pld.DistributedTensor[[16, 16], pl.INT32],
             signal: pld.DistributedTensor[[1, 1], pl.INT32],
             root: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[16, 16], pl.INT32]:
+            ctx = pld.get_comm_ctx(acc)
+            my_rank = pld.rank(ctx)
+            nranks = pld.nranks(ctx)
+
             # Phase 1: stage our contribution into our own src cell.
             local = pl.load(inp, [0, 0], [16, 16])
             src = pl.store(local, [0, 0], src)
@@ -158,8 +239,11 @@ def _build_atomic_add_program():
             # device-side atomic_add is what makes this correct.
             pld.tensor.put(acc, peer=root, src=src, atomic=pld.AtomicType.Add)
 
-            # Phase 3: every rank bumps the root's signal; the root waits until
-            # all nranks contributions (including its own) have landed.
+            # Phase 3: every rank bumps the root's signal; only the root waits
+            # on that root-local cell until all contributions, including its
+            # own, have landed. Non-root ranks must not wait on their local
+            # signal cells because nobody increments them in this reduce-to-root
+            # protocol.
             pld.system.notify(
                 target=signal,
                 peer=root,
@@ -167,16 +251,19 @@ def _build_atomic_add_program():
                 value=1,
                 op=pld.NotifyOp.AtomicAdd,
             )
-            pld.system.wait(
-                signal=signal,
-                offsets=[0, 0],
-                expected=nranks,
-                cmp=pld.WaitCmp.Ge,
-            )
 
-            # Phase 4: the root reads the accumulated sum from its acc cell.
-            recv = pl.load(acc, [0, 0], [16, 16])
-            return pl.store(recv, [0, 0], out)
+            if my_rank == root:
+                pld.system.wait(
+                    signal=signal,
+                    offsets=[0, 0],
+                    expected=nranks,
+                    cmp=pld.WaitCmp.Ge,
+                )
+
+                # Phase 4: the root reads the accumulated sum from its acc cell.
+                recv = pl.load(acc, [0, 0], [16, 16])
+                return pl.store(recv, [0, 0], out)
+            return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
         def chip_orch(
@@ -187,9 +274,8 @@ def _build_atomic_add_program():
             acc: pld.DistributedTensor[[16, 16], pl.INT32],
             signal: pld.DistributedTensor[[1, 1], pl.INT32],
             root: pl.Scalar[pl.INT32],
-            nranks: pl.Scalar[pl.INT32],
         ) -> pl.Tensor[[16, 16], pl.INT32]:
-            return self.add_step(inp, out, src, acc, signal, root, nranks)
+            return self.add_step(inp, out, src, acc, signal, root)
 
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
@@ -206,7 +292,7 @@ def _build_atomic_add_program():
                 acc = pld.window(acc_buf, [16, 16], dtype=pl.INT32)
                 signal = pld.window(signal_buf, [1, 1], dtype=pl.INT32)
                 # All ranks accumulate into root rank 0.
-                self.chip_orch(inputs[r], outputs[r], src, acc, signal, 0, pld.world_size(), device=r)
+                self.chip_orch(inputs[r], outputs[r], src, acc, signal, 0, device=r)
             return outputs
 
     return AtomicAddReduce
@@ -248,7 +334,40 @@ class TestL3Put:
             f"ring put mismatch: max diff = {(outputs - expected).abs().max().item()}"
         )
 
-    @pytest.mark.skip(reason="atomic-add put still fails on the current runtime/PTOAS stack")
+    def test_ring_shuffle_pipeline(self, test_config, device_ids):
+        """Double-buffered overwrite: same ring shuffle, but the TPUT ping-pongs the
+        [8, 128] transfer through two [4, 64] staging tiles (``pipeline=True``)."""
+        if len(device_ids) < 2:
+            pytest.skip(f"ring put needs 2 devices, got {device_ids}")
+
+        program = _build_ring_put_pipeline_program()
+        compiled = ir.compile(
+            program,
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:2],
+                num_sub_workers=0,
+            ),
+        )
+
+        # rank 0 holds 0..N-1; rank 1 holds 1000..1000+N-1. After the ring push,
+        # rank r's slice is overwritten by (r - 1) % nranks.
+        n = PIPE_ROWS * PIPE_COLS
+        inputs = torch.stack(
+            [
+                torch.arange(n, dtype=torch.float32).reshape(PIPE_ROWS, PIPE_COLS),
+                torch.arange(1000.0, 1000.0 + n, dtype=torch.float32).reshape(PIPE_ROWS, PIPE_COLS),
+            ]
+        )
+        outputs = torch.zeros((2, PIPE_ROWS, PIPE_COLS), dtype=torch.float32)
+
+        compiled(inputs, outputs)
+
+        expected = torch.stack([inputs[1], inputs[0]])
+        assert torch.allclose(outputs, expected), (
+            f"pipeline ring put mismatch: max diff = {(outputs - expected).abs().max().item()}"
+        )
+
     def test_atomic_add_accumulate(self, test_config, device_ids):
         """Atomic add: all ranks accumulate into root rank 0's single cell."""
         if len(device_ids) < 2:
@@ -389,6 +508,127 @@ class TestL3PutSubregion:
         expected = torch.stack([inputs[1, 0].reshape(1, SIZE), inputs[0, 0].reshape(1, SIZE)])
         assert torch.allclose(outputs, expected), (
             f"row put mismatch: max diff = {(outputs - expected).abs().max().item()}"
+        )
+
+
+CHUNK_ROWS = 8
+CHUNK_COLS = 64
+
+
+def _build_chunked_ring_put_program():
+    """Build a ring-put program whose staging tile is smaller than the transfer.
+
+    The ``[CHUNK_ROWS, CHUNK_COLS]`` window is pushed with ``chunk_rows=2,
+    chunk_cols=32`` so ``ConvertTensorToTileOps`` allocates a ``[2, 32]`` VEC
+    staging tile while the ``pto.comm.tput`` partition views keep the full
+    ``[8, 64]`` extent. pto-isa TPUT must therefore 2-D-slide the full transfer
+    through the sub-tile (4 row-chunks × 2 col-chunks). The end-to-end result
+    must equal the unchunked ring shuffle — this is the device-level proof that
+    the auto-chunk path is correct, not just that the codegen is well-formed.
+    """
+
+    @pl.program
+    class ChunkedRingPut:
+        @pl.function(type=pl.FunctionType.InCore)
+        def ring_step(
+            self,
+            inp: pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32]],
+            src: pld.DistributedTensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            dst: pld.DistributedTensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            signal: pld.DistributedTensor[[1, 1], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32]:
+            # Phase 1: stage-in — local input → this rank's own src window slice.
+            local = pl.load(inp, [0, 0], [CHUNK_ROWS, CHUNK_COLS])
+            src = pl.store(local, [0, 0], src)
+
+            # Phase 2: push our full src into the peer's dst slice, but force the
+            # VEC staging tile down to [2, 32] so TPUT auto-chunks the transfer.
+            pld.tensor.put(
+                dst,
+                peer=peer,
+                src=src,
+                atomic=pld.AtomicType.None_,
+                chunk_rows=2,
+                chunk_cols=32,
+            )
+
+            # Phase 3: handshake — signal the peer, wait for the rank targeting us.
+            pld.system.notify(signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(signal=signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+            # Phase 4: read our own dst slice back — written by the rank whose peer is us.
+            recv = pl.load(dst, [0, 0], [CHUNK_ROWS, CHUNK_COLS])
+            return pl.store(recv, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            out: pl.Out[pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32]],
+            src: pld.DistributedTensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            dst: pld.DistributedTensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            signal: pld.DistributedTensor[[1, 1], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ) -> pl.Tensor[[CHUNK_ROWS, CHUNK_COLS], pl.FP32]:
+            return self.ring_step(inp, out, src, dst, signal, peer)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            inputs: pl.Tensor[[2, CHUNK_ROWS, CHUNK_COLS], pl.FP32],
+            outputs: pl.Out[pl.Tensor[[2, CHUNK_ROWS, CHUNK_COLS], pl.FP32]],
+        ) -> pl.Tensor[[2, CHUNK_ROWS, CHUNK_COLS], pl.FP32]:
+            src_buf = pld.alloc_window_buffer(CHUNK_ROWS * CHUNK_COLS * 4)
+            dst_buf = pld.alloc_window_buffer(CHUNK_ROWS * CHUNK_COLS * 4)
+            signal_buf = pld.alloc_window_buffer(4)
+
+            for r in pl.range(pld.world_size()):
+                src = pld.window(src_buf, [CHUNK_ROWS, CHUNK_COLS], dtype=pl.FP32)
+                dst = pld.window(dst_buf, [CHUNK_ROWS, CHUNK_COLS], dtype=pl.FP32)
+                signal = pld.window(signal_buf, [1, 1], dtype=pl.INT32)
+                self.chip_orch(inputs[r], outputs[r], src, dst, signal, (r + 1) % pld.world_size(), device=r)
+            return outputs
+
+    return ChunkedRingPut
+
+
+class TestL3PutChunked:
+    """L3 distributed runtime: cross-rank write whose staging tile is sub-tiled,
+    exercising pto-isa TPUT's auto-chunk (2-D sliding) path on device."""
+
+    def test_chunked_ring_shuffle(self, test_config, device_ids):
+        """A sub-tile staging buffer must still move the full transfer correctly."""
+        if len(device_ids) < 2:
+            pytest.skip(f"chunked ring put needs 2 devices, got {device_ids}")
+
+        program = _build_chunked_ring_put_program()
+        compiled = ir.compile(
+            program,
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:2],
+                num_sub_workers=0,
+            ),
+        )
+
+        # rank 0 holds 0..511; rank 1 holds 1000..1511 (reshaped to [8, 64]).
+        n = CHUNK_ROWS * CHUNK_COLS
+        inputs = torch.stack(
+            [
+                torch.arange(n, dtype=torch.float32).reshape(CHUNK_ROWS, CHUNK_COLS),
+                torch.arange(1000.0, 1000.0 + n, dtype=torch.float32).reshape(CHUNK_ROWS, CHUNK_COLS),
+            ]
+        )
+        outputs = torch.zeros((2, CHUNK_ROWS, CHUNK_COLS), dtype=torch.float32)
+
+        compiled(inputs, outputs)
+
+        # Same ring contract as the unchunked case: outputs[r] = inputs[(r - 1) % nranks].
+        expected = torch.stack([inputs[1], inputs[0]])
+        assert torch.allclose(outputs, expected), (
+            f"chunked ring put mismatch: max diff = {(outputs - expected).abs().max().item()}"
         )
 
 

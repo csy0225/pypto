@@ -27,7 +27,7 @@ import torch
 
 from pypto.backend import BackendType
 from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_level
-from pypto.runtime.device_tensor import DeviceTensor
+from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
 from .compiled_program import (
     CallArg,
@@ -38,6 +38,7 @@ from .compiled_program import (
     _ParamInfo,
     _to_torch_dtype,
     _validate_device_tensor,
+    _validate_stacked_tensor,
 )
 
 # Filename of the small JSON sidecar persisted alongside the build artifacts so
@@ -144,11 +145,6 @@ class DistributedCompiledProgram:
         self._param_infos = _param_infos
         self._output_indices = _output_indices
         self._return_types = _return_types
-
-        # RunTiming from the most recent __call__ (host_wall_us; device_wall_us
-        # is 0 for the L3 DAG), or None before the first on-device run. Surfaced
-        # as a side channel so the call return value stays outputs/None.
-        self.last_run_timing: Any = None
 
         # Only the fresh-compile path (live IR) writes artifacts. The reload
         # path must not clobber a user's hand-edited debug/run.py or the
@@ -345,13 +341,25 @@ class DistributedCompiledProgram:
         self,
         *args: CallArg,
         config: "RunConfig | None" = None,
-    ) -> torch.Tensor | DeviceTensor | tuple[torch.Tensor | DeviceTensor, ...] | None:
+    ) -> (
+        torch.Tensor
+        | DeviceTensor
+        | StackedDeviceTensor
+        | tuple[torch.Tensor | DeviceTensor | StackedDeviceTensor, ...]
+        | None
+    ):
         """Execute the distributed program via simpler Worker(level=3).
 
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-        ``ring_dep_pool``) size this dispatch's runtime ring buffers. Other
-        (compile-side / DFX) fields are not consumed on the L3 dispatch path.
+        ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
+        runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu`` /
+        ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
+        written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
+        (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
+        keep separate artifacts; swimlane co-enables dep_gen and emits
+        ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
+        fields are not consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
 
@@ -374,11 +382,17 @@ class DistributedCompiledProgram:
                 f"Parameters: {[p.name for p in param_infos]}"
             )
 
-        # Validate and coerce args. Tensor params accept a host ``torch.Tensor``
-        # or a worker-resident ``DeviceTensor`` (skips H2D/D2H), matching the L2
-        # ``CompiledProgram`` calling convention.
-        coerced: list[torch.Tensor | DeviceTensor] = []
+        # Validate and coerce args. Tensor params accept a host ``torch.Tensor``,
+        # a worker-resident ``DeviceTensor``, or a ``StackedDeviceTensor`` whose
+        # per-rank shards are resident (both skip H2D/D2H) — matching the L2
+        # ``CompiledProgram`` and the ``DistributedWorker.run`` calling
+        # conventions.
+        coerced: list[torch.Tensor | DeviceTensor | StackedDeviceTensor] = []
         for info, arg in zip(param_infos, all_args, strict=True):
+            if isinstance(arg, StackedDeviceTensor):
+                _validate_stacked_tensor(arg, info)
+                coerced.append(arg)
+                continue
             if isinstance(arg, DeviceTensor):
                 _validate_device_tensor(arg, info)
                 coerced.append(arg)
@@ -386,12 +400,12 @@ class DistributedCompiledProgram:
             if not isinstance(arg, torch.Tensor):
                 raise TypeError(
                     f"Distributed programs only support tensor parameters "
-                    f"(torch.Tensor host or DeviceTensor worker-resident). "
+                    f"(torch.Tensor host, DeviceTensor, or StackedDeviceTensor worker-resident). "
                     f"Parameter {info.name!r} got {type(arg).__name__}"
                 )
             coerced.append(arg)
 
-        self.last_run_timing = execute_distributed(self, coerced, config)
+        execute_distributed(self, coerced, config)
 
         if not return_style:
             return None
@@ -418,7 +432,7 @@ class DistributedCompiledProgram:
 
         Per-call inputs and outputs are reused-in-place **shared-memory** host
         ``torch.Tensor`` buffers (allocated before ``prepare()``) and/or
-        worker-resident ``DeviceTensor`` / ``ContinuousTensor`` arguments.
+        worker-resident ``DeviceTensor`` / simpler ``Tensor`` arguments.
         Non-shared host tensors are rejected (the forked chip worker cannot see
         a buffer allocated after the fork). The convenience host-to-device
         upload of arbitrary host ``torch.Tensor`` inputs is only available on

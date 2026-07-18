@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -142,6 +142,7 @@ print(pto_code)
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.add(a, b, c)` | `pto.taddc` (3-operand add) |
 | `tile.adds(tile, scalar)` | `pto.tadds` (tile + scalar) |
+| `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)` (the `shape` tuple is type-deduction only; the larger `dst` and its pad come from the result type) |
 
 **`tile.slice` / `tile.assemble` lowering details.**  Both ops are lowered
 through `pto.subview`, which is a pure view alias of the source tile (no
@@ -178,6 +179,8 @@ sub-window carved out by `pto.subview`.
 | `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector pipe init (`slot_num`/`local_slot_num` emitted only when set; otherwise PTOAS uses its defaults) |
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | Reserve buffer |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
+| `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | Cross-core all-participant barrier (hard/FFTS form) |
+| `system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview, %scratch, %used : !pto.partition_tensor_view<...xi32>, !pto.tile_buf<loc=vec, ...i32>, i32) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<aiv_only>` | Soft/GM-polling barrier (partial occupancy; `gm_workspace` lowers to a `pto.partition_view`, scratch tile is compiler-synthesized) |
 
 **Notes:**
 
@@ -278,6 +281,31 @@ Based on TileType variables collected from the function body. Each tile variable
 - One allocation per tile variable (not per unique MemRef)
 - `addr` attribute from `MemRef.addr_`, emitted as `arith.constant ... : i64`
 - Variables sharing the same MemRef produce the same `addr` SSA value
+
+#### Who plans memory: `compile(memory_planner=...)`
+
+Who assigns the physical `addr` is selected by the `memory_planner` option
+(`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | PTOAS)`, default
+`PYPTO`). It threads to both the pass pipeline (via `PassContext`) and codegen:
+
+| Mode | Pipeline | `pto.alloc_tile` | ptoas |
+| ---- | -------- | ---------------- | ----- |
+| `PYPTO` (default) | runs `MaterializeSemanticAliases` + `MemoryReuse` + `AllocateMemoryAddr` | emits `addr = <const>` (from `MemRef.byte_offset_`) | `--pto-level=level3` (trusts baked addresses) |
+| `PTOAS` | runs `MaterializeSemanticAliases`; **skips** `MemoryReuse` + `AllocateMemoryAddr` | omits `addr` (`PTOCodegen.generate(emit_tile_addr=False)`) | `--pto-level=level2` (ptoas `PlanMemory` does reuse + addresses) |
+
+Memory planning is split into two passes: **`MaterializeSemanticAliases`**
+forces *semantics-required* aliasing (loop-carried accumulators, in-place ops)
+to share one MemRef, while **`MemoryReuse`** does *opportunistic* lifetime-based
+coalescing of independent buffers. `InitMemRef` + `MaterializeSemanticAliases`
+run in both modes, so the must-alias buffers survive; in `PTOAS` mode codegen
+renders those shared MemRefs as a single `tile_buf` handle with an in-place
+`outs(%acc)`, and ptoas `PlanMemory` (which `level2` requires, rejecting any
+`addr` operand) does the lifetime reuse and address assignment.
+
+> **Caveat:** `PTOAS` mode skips the Ascend910B `load + tpop_from_aic` in-place
+> hazard guard (part of `MemoryReuse`) and reserve-buffer base resolution
+> (`AllocateMemoryAddr`); those are deferred to ptoas. `compile()` emits a
+> warning — verify affected kernels on-device.
 
 ### Load Operation Transformation
 
@@ -573,14 +601,16 @@ The wrapper unpacks `int64_t* args` following the standard convention:
 | `TensorType` | `Tensor*` → `buffer.addr` → typed pointer |
 | `ScalarType` | `uint64_t` → union decode → typed value |
 
-### SPMD Block Identity Parameters
+### SPMD Identity Parameters
 
-`tile.get_block_idx()` and `tile.get_block_num()` lower to two synthetic
-`i32` parameters that PTOCodegen appends at the **end** of the `func.func`
-signature using named SSAs (`%__pypto_spmd_block_idx`,
-`%__pypto_spmd_block_num`). The IR contract for these ops is unchanged —
-the synthetic params live only in the generated MLIR / C++ and never appear
-in `Function.params`.
+`tile.get_block_idx()`, `tile.get_block_num()`, and `tile.get_subblock_idx()`
+lower to synthetic `i32` parameters that PTOCodegen appends at the **end** of
+the `func.func` signature using named SSAs (`%__pypto_spmd_block_idx`,
+`%__pypto_spmd_block_num`, `%__pypto_spmd_subblock_idx`). The IR contract for
+these ops is unchanged — the synthetic params live only in the generated
+MLIR / C++ and never appear in `Function.params`. They are appended in the
+canonical order `block_idx, block_num, subblock_idx`, each gated
+independently on the ops the function actually uses.
 
 ```mlir
 func.func @spmd_kernel(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
@@ -610,16 +640,31 @@ void kernel_entry(__gm__ int64_t* args) {
 }
 ```
 
+**subblock_idx (AIV lane).** `tile.get_subblock_idx()` uses the same
+synthetic-param channel: the wrapper resolves it from
+`intrinsic.h::get_sub_block_id(args)` (the runtime per-core lane id the
+scheduler stores in `GlobalContext.sub_block_id`) and appends
+`__pypto_spmd_subblock_idx` after any block-identity args. It deliberately
+reads the runtime lane id rather than the ccec `get_subblockid()` register,
+which returns a stale value under the `tensormap_and_ringbuffer` dispatch.
+This is independent of — and coexists with — the `get_subblockid()` macro
+bridge (`pypto_runtime_subblock_id`) that A2A3 dual-AIV wrappers install for
+ptoas-*internal* pipe-slot offsets. Like block identity, it is emitted
+unconditionally (no `__CPU_SIM` fork) because `GlobalContext.sub_block_id` is
+populated by the scheduler on every platform.
+
 **Detection scope.** Both layers detect SPMD usage on a per-function basis:
 
-- `FunctionUsesSpmdBlockOps` (C++, `src/codegen/pto/pto_codegen.cpp`) drives
-  whether PTOCodegen appends the two params to a given function's signature.
-- `_uses_spmd_block_ops` (Python, `python/pypto/backend/pto_backend.py`)
-  drives whether the wrapper appends the two locals to the inner call site.
+- `MemRefCollectorVisitor::UsesSpmdBlockOps` / `UsesSubblockOp` (C++,
+  `src/codegen/pto/pto_codegen.cpp`) drive whether PTOCodegen appends the
+  block / subblock params to a given function's signature.
+- `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id` (Python,
+  `python/pypto/backend/pto_backend.py`) drive whether the wrapper appends the
+  matching locals to the inner call site.
 
 For non-SPMD sibling functions in an SPMD group (`group_uses_spmd=True` but
 the function itself does not call `tile.get_block_*`), the wrapper still
-declares the two locals because the `__gm_pipe_buffer` sharding logic in
+declares the two block locals because the `__gm_pipe_buffer` sharding logic in
 `_generate_arg_unpacking` consumes them — but it does **not** append them to
 the inner call, matching the function's MLIR signature.
 

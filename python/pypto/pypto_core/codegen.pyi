@@ -24,11 +24,15 @@ class PTOCodegen:
     def __init__(self) -> None:
         """Create a new PTO code generator."""
 
-    def generate(self, program: Program) -> str:
+    def generate(self, program: Program, emit_tile_addr: bool = True) -> str:
         """Generate PTO assembly from PyPTO IR Program.
 
         Args:
             program: Input PyPTO IR Program
+            emit_tile_addr: When True (default), emit the physical ``addr`` operand
+                on ``pto.alloc_tile`` (ptoas ``--pto-level=level3``). When False,
+                omit ``addr`` so the ptoas PlanMemory pass allocates instead
+                (``--pto-level=level2``).
 
         Returns:
             PTO assembly code string (.pto format) with instructions like tmul, tadd, FOR/ENDFOR, etc.
@@ -60,6 +64,11 @@ class OrchestrationResult:
     @property
     def func_name_to_signature(self) -> dict[str, list[str]]:
         """Kernel name to tensor-arg ArgDirection name list (scalars excluded), in task-payload order."""
+        ...
+
+    @property
+    def orchestration_signature(self) -> list[str]:
+        """Orchestration entry per-tensor ArgDirection names (scalars excluded), in orch_args tensor order."""
         ...
 
 class BuiltinNextLevelSpec:

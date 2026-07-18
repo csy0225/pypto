@@ -40,6 +40,7 @@
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/normalize_stmt_structure.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -59,13 +60,34 @@ bool IsViewOperation(const std::string& op_name) {
 }
 
 // Whether an inherit-input op *permutes* data rather than just reinterpreting
-// it (tile.transpose).  A pure metadata view (slice/reshape/extract/...) may
-// alias any sub-region of its input's buffer, but a permuting op's output must
-// not alias a sub-region of a larger live buffer: its fractal-padded write
-// would clobber the buffer's other tiles.  Whole-tile permuting inputs are
-// fine (the op's scratch tmp stages the data), so this only gates the
-// sub-region case in InitMemRef below.
-bool IsDataPermutingInheritOp(const std::string& op_name) { return op_name == "tile.transpose"; }
+// it (tile.transpose).  A pure metadata view (slice/reshape/extract/...) aliases
+// its input's buffer, but a permuting op's output must never alias the input:
+// pto.ttrans is not in-place safe (the unaligned scalar path writes dst directly
+// from src), so InitMemRef gives the transpose output a fresh buffer.
+bool IsDataPermutingInheritOp(const OpPtr& op) { return IsOp(op, "tile.transpose"); }
+
+// A tile owns no general-pool buffer ("buffer-less by design") when its defining
+// value is a cross-core tpop result, or a non-permuting zero-copy view / plain
+// alias chained off a buffer-less source. `source_buffer_less` reports whether a
+// source Var is itself buffer-less (the MemRef-creating mutator queries the type;
+// the HasMemRefs verifier consults its tracked set). tile.transpose is excluded —
+// pto.ttrans is not in-place safe and always needs a fresh buffer.
+template <typename SourceBufferLess>
+bool ProducesBufferLessTile(const ExprPtr& value, const SourceBufferLess& source_buffer_less) {
+  if (auto call = std::dynamic_pointer_cast<const Call>(value)) {
+    if (!call->op_) return false;
+    if (IsOp(call, "tile.tpop_from_aic") || IsOp(call, "tile.tpop_from_aiv")) {
+      return true;
+    }
+    if (op_predicates::IsBufferAliasingViewOp(call->op_->name_) && !call->args_.empty()) {
+      auto in = AsVarLike(call->args_[0]);
+      return in && source_buffer_less(in.get());
+    }
+    return false;
+  }
+  auto v = AsVarLike(value);
+  return v && source_buffer_less(v.get());
+}
 
 // Check if an operation's output should reuse the MemRef of a specific input argument.
 // Returns the input arg index whose MemRef to share, or nullopt.
@@ -138,10 +160,6 @@ class InitMemRefMutator : public IRMutator {
 
     auto base =
         std::make_shared<Var>(BuildBasePtrName(*memory_space, next_id_++), GetPtrType(), Span::unknown());
-    // Remember the full allocation size of this base so InitMemRef can tell
-    // whether a later view is a sub-region of a larger buffer (used by the
-    // transpose in-place hazard guard below).
-    base_alloc_size_[base.get()] = size_bytes;
     return std::make_shared<MemRef>(base, static_cast<int64_t>(0), size_bytes);
   }
 
@@ -292,9 +310,43 @@ class InitMemRefMutator : public IRMutator {
     return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
   }
 
+  // Rebuild an AssignStmt whose LHS tile var keeps its TileType + memory_space but
+  // carries no MemRef. Used for tiles that own no general-pool buffer: cross-core
+  // tpop results and zero-copy views over them (codegen lowers those to
+  // pto.treshape over the source rather than a fresh alloc_tile).
+  StmtPtr MakeMemRefLessAssign(const AssignStmtPtr& op, const ExprPtr& new_value) {
+    auto var_expr = std::static_pointer_cast<const Expr>(op->var_);
+    if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var_expr->GetType())) {
+      for (size_t i = 0; i < tile_type->shape_.size(); ++i) {
+        INTERNAL_CHECK_SPAN(As<ConstInt>(tile_type->shape_[i]), op->var_->span_)
+            << "InitMemRef requires static shape for variable '" << op->var_->name_hint_
+            << "', but shape element " << i
+            << " is dynamic. Fix the upstream op to keep TileType.shape static and put runtime "
+               "extent in TileView.valid_shape instead.";
+      }
+    }
+    TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
+        var_expr->GetType(), std::nullopt, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+        ResolveTileMemorySpace(var_expr->GetType()));
+    auto new_var = std::make_shared<Var>(op->var_->name_hint_, new_type, op->var_->span_);
+    var_map_[op->var_] = new_var;
+    return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
+  }
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     // First visit the value (RHS)
     auto new_value = VisitExpr(op->value_);
+
+    // A tile that owns no general-pool buffer — a cross-core tpop result (its
+    // data lives in the reserved C2V/V2C slot, addressed via the pipe), or a
+    // zero-copy view / plain alias chained off one — stays MemRef-less, so
+    // AllocateMemoryAddr reserves no phantom buffer and no fresh, disconnected
+    // buffer is created.
+    if (As<TileType>(op->var_->GetType()) && ProducesBufferLessTile(new_value, [](const Var* v) {
+          return !GetTypeMemRef(v->GetType()).has_value();
+        })) {
+      return MakeMemRefLessAssign(op, new_value);
+    }
 
     // Check if the RHS is a Call expression
     if (auto call = std::dynamic_pointer_cast<const Call>(op->value_)) {
@@ -302,22 +354,16 @@ class InitMemRefMutator : public IRMutator {
                 << call->op_->name_;
 
       // Handle view operations: output should share MemRef with input tile.
-      // A pure metadata view (slice/reshape/...) inherits unconditionally.  A
-      // permuting inherit-input op — tile.transpose — may inherit its input's
-      // buffer only when the input is a *whole* tile: if the input is a
-      // sub-region of a larger live buffer, the fractal-padded transpose write
-      // would clobber the buffer's other regions (e.g. neighbouring per-page
-      // tiles), so it falls through to a fresh buffer.  When the input is the
-      // whole buffer the in-place transpose is safe (its scratch tmp stages the
-      // data and there is no other data to clobber), preserving the memory
-      // saving.
+      // A pure metadata view (slice/reshape/...) inherits its input's buffer.  A
+      // permuting inherit-input op — tile.transpose — must NOT: pto.ttrans is
+      // not in-place safe (the unaligned scalar path writes dst directly from
+      // src), so the transpose output always gets a fresh buffer.
       if (IsViewOperation(call->op_->name_) && call->args_.size() > 0) {
         LOG_DEBUG << "Detected view operation: " << call->op_->name_;
         // Get the input tile (first argument) after mutation
         auto new_call = std::dynamic_pointer_cast<const Call>(new_value);
         if (new_call && !new_call->args_.empty()) {
-          const bool may_inherit =
-              !IsDataPermutingInheritOp(call->op_->name_) || !InputIsSubRegion(new_call->args_[0]);
+          const bool may_inherit = !IsDataPermutingInheritOp(call->op_);
           if (may_inherit) {
             auto result = ShareMemRefFrom(new_call->args_[0], op, new_value);
             if (result) {
@@ -411,12 +457,6 @@ class InitMemRefMutator : public IRMutator {
       new_return_vars.push_back(new_rv);
     }
 
-    // Visit chunk_size if present
-    std::optional<ChunkConfig> new_chunk_config = op->chunk_config_;
-    if (op->chunk_config_.has_value()) {
-      new_chunk_config = ChunkConfig{VisitExpr(op->chunk_config_->size), op->chunk_config_->policy};
-    }
-
     auto new_for = MutableCopy(op);
     new_for->loop_var_ = new_loop_var;
     new_for->start_ = new_start;
@@ -425,7 +465,6 @@ class InitMemRefMutator : public IRMutator {
     new_for->iter_args_ = new_iter_args;
     new_for->body_ = new_body;
     new_for->return_vars_ = new_return_vars;
-    new_for->chunk_config_ = new_chunk_config;
 
     // Patch return_vars so each shares its iter_arg's MemRef (inherited from initValue).
     // This establishes the invariant that initValue/iter_arg/return_var all share the
@@ -501,27 +540,7 @@ class InitMemRefMutator : public IRMutator {
     return {std::move(patched), changed};
   }
 
-  // Whether @p input is a sub-region of a larger buffer (a view/slice whose
-  // MemRef covers only part of its base allocation, or sits at a non-zero
-  // offset).  A not-in-place-safe inherit-input op (tile.transpose) may share
-  // its input's buffer only when the input is a whole tile — writing the
-  // permuted result at a sub-offset of a larger live buffer would clobber the
-  // buffer's other regions (e.g. neighbouring per-page tiles).
-  bool InputIsSubRegion(const ExprPtr& input) const {
-    auto tile = As<TileType>(input->GetType());
-    if (!tile || !tile->memref_.has_value()) return false;
-    const auto& mr = tile->memref_.value();
-    if (!mr || !mr->base_) return false;
-    if (auto off = As<ConstInt>(mr->byte_offset_)) {
-      if (off->value_ != 0) return true;
-    }
-    auto it = base_alloc_size_.find(mr->base_.get());
-    if (it == base_alloc_size_.end()) return false;  // base size unknown — assume whole
-    return mr->size_ < it->second;
-  }
-
   std::map<VarPtr, VarPtr> var_map_;
-  std::map<const Var*, uint64_t> base_alloc_size_;  ///< base ptr -> full allocation size
   uint64_t next_id_ = 0;
 };
 
@@ -624,22 +643,30 @@ class HasMemRefsVerifier : public IRVisitor {
   explicit HasMemRefsVerifier(std::vector<Diagnostic>& diagnostics) : diagnostics_(diagnostics) {}
 
   void VisitStmt_(const AssignStmtPtr& op) override {
-    if (!op) return;
-    CheckVarMemRef(op->var_);
+    if (!op || !op->var_ || !op->var_->GetType()) return;
+    auto tile_type = std::dynamic_pointer_cast<const TileType>(op->var_->GetType());
+    if (tile_type && !tile_type->memref_.has_value()) {
+      if (IsBufferLessByDesign(op)) {
+        buffer_less_.insert(op->var_.get());
+      } else {
+        diagnostics_.emplace_back(
+            DiagnosticSeverity::Error, "HasMemRefs", 0,
+            "TileType variable '" + op->var_->name_hint_ + "' has no MemRef initialized", op->var_->span_);
+      }
+    }
     IRVisitor::VisitStmt_(op);
   }
 
  private:
-  void CheckVarMemRef(const VarPtr& var) {
-    if (!var || !var->GetType()) return;
-    auto tile_type = std::dynamic_pointer_cast<const TileType>(var->GetType());
-    if (tile_type && !tile_type->memref_.has_value()) {
-      diagnostics_.emplace_back(DiagnosticSeverity::Error, "HasMemRefs", 0,
-                                "TileType variable '" + var->name_hint_ + "' has no MemRef initialized",
-                                var->span_);
-    }
+  // A cross-core tpop result (its data lives in the reserved C2V/V2C slot, not a
+  // tile MemRef) and any zero-copy view / plain alias chained off such a result
+  // legitimately carry no MemRef. Shares the rule with the MemRef-creating mutator
+  // via ProducesBufferLessTile; here a source is buffer-less iff it is tracked.
+  [[nodiscard]] bool IsBufferLessByDesign(const AssignStmtPtr& op) const {
+    return ProducesBufferLessTile(op->value_, [this](const Var* v) { return buffer_less_.count(v) > 0; });
   }
 
+  std::set<const Var*> buffer_less_;
   std::vector<Diagnostic>& diagnostics_;
 };
 

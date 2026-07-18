@@ -26,10 +26,13 @@ Layout mirrors the ``tile.alloc`` / ``MemRef`` / ``TileType`` triple:
   rewrites it to a ``tile.create`` VEC staging tile plus a ``pld.tile.put``
   call so the stage participates in memory allocation/lowering before backend
   codegen.
-* ``get`` is a synchronous cross-rank bulk read: both ``dst`` and ``src`` are
-  window-bound :class:`pld.DistributedTensor` (GM/tensor-level) views — the
-  VEC staging tile that TGET bounces through is synthesised at codegen, so it
-  stays a tensor-level op rather than a tile-level one.
+* ``get`` is a synchronous cross-rank bulk read: ``dst`` may be a window-bound
+  :class:`pld.DistributedTensor` or a plain :class:`pl.Tensor` — TGET only
+  needs a writable local GM region on the destination side; ``src`` must be a
+  window-bound :class:`pld.DistributedTensor` (the peer needs a window slot to
+  read from). ``ConvertTensorToTileOps`` rewrites it to a ``tile.create`` VEC
+  staging tile plus a ``pld.tile.get`` call so the stage participates in memory
+  allocation/lowering before backend codegen.
 
 ``alloc_window_buffer`` is intercepted at the AssignStmt level by the parser
 so the buffer's ``name`` kwarg can be derived from the LHS — the body of that
@@ -38,6 +41,7 @@ site singular.
 """
 
 from collections.abc import Sequence
+from typing import overload
 
 from pypto.ir.op.distributed import tensor_ops as _ir_tensor
 from pypto.language.typing import IntLike, Ptr
@@ -48,6 +52,40 @@ from pypto.pypto_core.ir import AtomicType, Call, Expr, ReduceOp
 
 from ..typing.distributed_tensor import DistributedTensor
 from ._utils import _normalize_intlike, _unwrap, _unwrap_distributed_tensors
+
+_ALLREDUCE_SIGNAL_MISSING = object()
+
+
+def _validate_chunk(chunk_rows: int, chunk_cols: int, op_name: str) -> None:
+    """Validate the put/get staging-tile chunk dims (``0`` = full, else positive int).
+
+    ``chunk_rows`` / ``chunk_cols`` size the VEC staging tile to a sub-tile of the
+    flattened transfer ``[rows, cols]`` extent so pto-isa auto-chunks the full
+    transfer through it. The staging-tile shape is a compile-time constant, so the
+    dims must be non-negative Python ints (``0`` meaning "full extent").
+    """
+    for name, value in (("chunk_rows", chunk_rows), ("chunk_cols", chunk_cols)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{op_name} {name} must be an int (static), got {type(value).__name__}")
+        if value < 0:
+            raise ValueError(f"{op_name} {name} must be non-negative (0 = full), got {value}")
+
+
+def _validate_pipeline(pipeline: bool, chunk_rows: int, chunk_cols: int, op_name: str) -> None:
+    """Validate the put/get ``pipeline`` (ping-pong double-buffering) kwarg.
+
+    Double-buffering only helps a chunked transfer (pto-isa slides it through two
+    staging tiles with overlapped TLOAD/TSTORE), so ``pipeline=True`` requires
+    both ``chunk_rows`` and ``chunk_cols`` to be set. The C++ deducer enforces the
+    same rule; this front check yields a clearer DSL-level error.
+    """
+    if not pipeline:
+        return
+    if not (chunk_rows > 0 and chunk_cols > 0):
+        raise ValueError(
+            f"{op_name} pipeline=True requires both chunk_rows>0 and chunk_cols>0 "
+            f"(got chunk_rows={chunk_rows}, chunk_cols={chunk_cols})"
+        )
 
 
 def alloc_window_buffer(size: IntLike, *, name: str = "") -> Ptr:
@@ -133,6 +171,9 @@ def put(
     shape: Sequence[IntLike] | None = None,
     *,
     atomic: AtomicType = AtomicType.None_,
+    chunk_rows: int = 0,
+    chunk_cols: int = 0,
+    pipeline: bool = False,
 ) -> Call:
     """Cross-rank put: write the local slice ``src`` into the peer rank's slice of ``dst``.
 
@@ -171,7 +212,21 @@ def put(
         atomic: :class:`pld.AtomicType` selecting plain-store
             (``AtomicType.None_``, the default) vs atomic-add
             (``AtomicType.Add``) combine semantics (keyword-only).
+        chunk_rows: Optional VEC staging-tile row extent (keyword-only,
+            ``0`` = full). Sizes the staging tile to a sub-tile of the flattened
+            transfer (``rows`` = product of leading dims), so pto-isa TPUT
+            auto-chunks the full transfer through it — transfers larger than UB
+            no longer need to fit in one staging tile. Oversized values are
+            clamped to the transfer extent.
+        chunk_cols: Optional VEC staging-tile column extent (keyword-only,
+            ``0`` = full innermost dim). Pairs with ``chunk_rows``.
+        pipeline: Enable ping-pong double-buffering (keyword-only). When True,
+            ``ConvertTensorToTileOps`` allocates two staging tiles and pto-isa
+            TPUT overlaps TLOAD/TSTORE across chunks through them. Requires both
+            ``chunk_rows`` and ``chunk_cols`` to be set (> 0).
     """
+    _validate_chunk(chunk_rows, chunk_cols, "pld.tensor.put")
+    _validate_pipeline(pipeline, chunk_rows, chunk_cols, "pld.tensor.put")
     dst_expr = _unwrap(dst)
     src_expr = _unwrap(src)
     if not isinstance(dst_expr, Expr) or not isinstance(dst_expr.type, _ir.DistributedTensorType):
@@ -187,7 +242,15 @@ def put(
         raise ValueError("pld.tensor.put dst_offsets, src_offsets, and shape must be provided together")
 
     if not has_region:
-        return _ir_tensor.put(dst_expr, _unwrap(peer), src_expr, atomic=atomic)
+        return _ir_tensor.put(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            atomic=atomic,
+            chunk_rows=chunk_rows,
+            chunk_cols=chunk_cols,
+            pipeline=pipeline,
+        )
     assert dst_offsets is not None
     assert src_offsets is not None
     assert shape is not None
@@ -199,16 +262,23 @@ def put(
         src_offsets=_normalize_intlike(src_offsets),
         shape=_normalize_intlike(shape),
         atomic=atomic,
+        chunk_rows=chunk_rows,
+        chunk_cols=chunk_cols,
+        pipeline=pipeline,
     )
 
 
 def get(
-    dst: DistributedTensor,
+    dst: DistributedTensor | Tensor,
     peer: IntLike,
     src: DistributedTensor,
     dst_offsets: Sequence[IntLike] | None = None,
     src_offsets: Sequence[IntLike] | None = None,
     shape: Sequence[IntLike] | None = None,
+    *,
+    chunk_rows: int = 0,
+    chunk_cols: int = 0,
+    pipeline: bool = False,
 ) -> Call:
     """Cross-rank get: read the peer rank's slice of ``src`` into local ``dst``.
 
@@ -224,24 +294,55 @@ def get(
     provided together.
 
     Args:
-        dst: Local window-bound :class:`pld.DistributedTensor` destination.
+        dst: Local destination — either a window-bound
+            :class:`pld.DistributedTensor` or a plain :class:`pl.Tensor`.
+            TGET only needs a writable local GM region to receive into;
+            window membership is not required on the destination side.
         peer: Peer rank index.
         src: Peer rank's window-bound :class:`pld.DistributedTensor` source.
         dst_offsets: Optional offsets into the local ``dst`` slice.
         src_offsets: Optional offsets into the peer ``src`` slice.
         shape: Optional static transfer shape. Required when either offset
             argument is provided.
+        chunk_rows: Optional VEC staging-tile row extent (keyword-only,
+            ``0`` = full) sizing the staging tile to a sub-tile of the flattened
+            transfer so pto-isa TGET auto-chunks the full transfer through it.
+            Oversized values are clamped to the transfer extent.
+        chunk_cols: Optional VEC staging-tile column extent (keyword-only,
+            ``0`` = full innermost dim). Pairs with ``chunk_rows``.
+        pipeline: Enable ping-pong double-buffering (keyword-only). When True,
+            ``ConvertTensorToTileOps`` allocates two staging tiles and pto-isa
+            TGET overlaps TLOAD/TSTORE across chunks through them. Requires both
+            ``chunk_rows`` and ``chunk_cols`` to be set (> 0).
 
     Returns:
         The underlying IR Call.
     """
-    dst_expr, src_expr = _unwrap_distributed_tensors("pld.tensor.get", dst=dst, src=src)
+    _validate_chunk(chunk_rows, chunk_cols, "pld.tensor.get")
+    _validate_pipeline(pipeline, chunk_rows, chunk_cols, "pld.tensor.get")
+    dst_expr = _unwrap(dst)
+    src_expr = _unwrap(src)
+    if not isinstance(dst_expr, Expr) or not isinstance(
+        dst_expr.type, (_ir.TensorType, _ir.DistributedTensorType)
+    ):
+        got = _ir.python_print_type(dst_expr.type) if isinstance(dst_expr, Expr) else type(dst_expr).__name__
+        raise TypeError(f"pld.tensor.get expects a Tensor or DistributedTensor dst; got {got}")
+    if not isinstance(src_expr, Expr) or not isinstance(src_expr.type, _ir.DistributedTensorType):
+        got = _ir.python_print_type(src_expr.type) if isinstance(src_expr, Expr) else type(src_expr).__name__
+        raise TypeError(f"pld.tensor.get expects a DistributedTensor src (window-bound); got {got}")
     has_region = dst_offsets is not None or src_offsets is not None or shape is not None
     if has_region and (dst_offsets is None or src_offsets is None or shape is None):
         raise ValueError("pld.tensor.get dst_offsets, src_offsets, and shape must be provided together")
 
     if not has_region:
-        return _ir_tensor.get(dst_expr, _unwrap(peer), src_expr)
+        return _ir_tensor.get(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            chunk_rows=chunk_rows,
+            chunk_cols=chunk_cols,
+            pipeline=pipeline,
+        )
     assert dst_offsets is not None
     assert src_offsets is not None
     assert shape is not None
@@ -252,12 +353,28 @@ def get(
         dst_offsets=_normalize_intlike(dst_offsets),
         src_offsets=_normalize_intlike(src_offsets),
         shape=_normalize_intlike(shape),
+        chunk_rows=chunk_rows,
+        chunk_cols=chunk_cols,
+        pipeline=pipeline,
     )
+
+
+@overload
+def allreduce(target: DistributedTensor, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensor: ...
+
+
+@overload
+def allreduce(
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    *,
+    op: ReduceOp = ReduceOp.Sum,
+) -> DistributedTensor: ...
 
 
 def allreduce(
     target: DistributedTensor,
-    signal: DistributedTensor,
+    signal: DistributedTensor | object = _ALLREDUCE_SIGNAL_MISSING,
     *,
     op: ReduceOp = ReduceOp.Sum,
 ) -> DistributedTensor:
@@ -271,31 +388,34 @@ def allreduce(
 
         pub = pld.tensor.allreduce(pub, sig, op=pld.ReduceOp.Sum)
 
-    LowerCompositeOps expands this single Call into the 4-phase
+    LowerCompositeOps expands the explicit-signal InCore form into the 4-phase
     notify/wait/remote_load+accumulate/store decomposition; the kernel sees
-    only the lowered primitives. ``signal`` must be a window-bound INT32
-    :class:`pld.DistributedTensor` used as the cross-rank barrier (one slot
-    per rank); the host orchestrator allocates and zero-initialises it via
-    :func:`alloc_window_buffer` + :func:`window`.
+    only the lowered primitives. Host-orchestrator code can omit ``signal``
+    outside ``for`` and ``while`` loops; the compiler synthesizes a private
+    INT32 signal window of shape ``[pld.world_size(), 1]`` for that call.
 
-    **Signal buffer is single-shot per call.** The lowering uses two
+    **Signal buffers are single-shot per call.** The lowering uses two
     barrier waves on the same cells (Set 1 → wait ≥1, then AtomicAdd 1
     → wait ≥2), so by the time the call returns every cell sits at
     ``2`` rather than its initial ``0``. **Do not reuse the same signal
     buffer for a back-to-back allreduce** — the second call's first
     wait would pass immediately on the stale ``≥1``, breaking the
     barrier and racing Phase 3 against the previous reduction's
-    Phase 4. Callers issuing multiple allreduces must allocate a fresh
-    signal buffer (``alloc_window_buffer`` + ``window``) for each
-    call. A self-resetting variant is blocked on a runtime fix —
-    PTOAS issue #797.
+    Phase 4. Explicit-signal callers issuing multiple allreduces must allocate
+    a fresh signal buffer (``alloc_window_buffer`` + ``window``) for each
+    allreduce call. All allreduce calls in ``for`` and ``while`` loops are
+    rejected because the current signal protocol cannot provide a fresh signal
+    for every dynamic iteration. A self-resetting variant is blocked on a
+    runtime fix — PTOAS issue #797.
 
     Args:
         target: Window-bound :class:`pld.DistributedTensor` holding per-rank
             data. The C++ verifier refuses a plain :class:`pl.Tensor`.
-        signal: Window-bound INT32 :class:`pld.DistributedTensor` whose shape
-            is ``[nranks, 1]`` (or any shape providing one cell per rank).
-            Must be **freshly allocated for this call** (see warning above).
+        signal: Optional window-bound INT32 :class:`pld.DistributedTensor`.
+            In InCore code this remains required. In host-orchestrator code,
+            omitting it outside ``for`` and ``while`` loops lets the compiler
+            synthesize a private signal of shape ``[pld.world_size(), 1]``.
+            Allreduce calls in those loops are rejected for both signatures.
         op: :class:`pld.ReduceOp` selecting the reduction operator
             (keyword-only). Defaults to :attr:`pld.ReduceOp.Sum`. First-version
             lowering accepts only ``Sum``; ``Max`` / ``Min`` / ``Prod`` are
@@ -305,6 +425,15 @@ def allreduce(
         The rebound :class:`pld.DistributedTensor` view of ``target`` —
         identical shape / dtype / window-buffer binding, post-reduce content.
     """
+    if signal is _ALLREDUCE_SIGNAL_MISSING:
+        (target_expr,) = _unwrap_distributed_tensors("pld.tensor.allreduce", target=target)
+        call = _ir_tensor.allreduce(target_expr, op=op)
+        return DistributedTensor(expr=call)
+    if signal is None:
+        raise TypeError(
+            "pld.tensor.allreduce signal cannot be None; omit the signal argument for host synthesis"
+        )
+
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allreduce", target=target, signal=signal
     )
@@ -312,4 +441,201 @@ def allreduce(
     return DistributedTensor(expr=call)
 
 
-__all__ = ["alloc_window_buffer", "allreduce", "get", "put", "window"]
+def barrier(
+    signal: DistributedTensor,
+) -> DistributedTensor:
+    """Cross-rank barrier synchronisation.
+
+    Blocks until all ranks in the comm group have reached the barrier.
+    Uses a window-bound INT32 ``signal`` matrix for cross-rank
+    synchronisation (one slot per rank).  LowerCompositeOps expands this
+    into a notify-all / wait-all sequence.
+
+    .. code-block:: python
+
+        sig = pld.tensor.barrier(sig)
+
+    **Signal buffer is single-shot per call.**  The lowering uses
+    ``Set(1)`` + ``Ge(1)`` — cells go from 0 to 1.  Do not reuse the
+    same signal buffer for back-to-back barriers without reallocation.
+
+    Args:
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` whose
+            shape provides one cell per rank.  Must be freshly allocated
+            for this call.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` view of ``signal``.
+    """
+    signal_expr: Expr
+    (signal_expr,) = _unwrap_distributed_tensors("pld.tensor.barrier", signal=signal)
+    call = _ir_tensor.barrier(signal_expr)
+    return DistributedTensor(expr=call)
+
+
+def broadcast(
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    *,
+    root: int,
+) -> DistributedTensor:
+    """Broadcast root rank's data to all ranks.
+
+    After this call returns, every rank's slice of ``target`` holds
+    root's data.  Uses a window-bound INT32 ``signal`` matrix for the
+    cross-rank barrier.
+
+    .. code-block:: python
+
+        # Root stages data; non-root skip.
+        if my_rank == ROOT_RANK:
+            data = pl.store(local, [0, 0], data)
+        data = pld.tensor.broadcast(data, sig, root=ROOT_RANK)
+        # Every rank now has root's data in data[0, 0:SIZE].
+
+    Args:
+        target: Window-bound :class:`pld.DistributedTensor` holding per-rank
+            data.  Root must stage its data before the call; non-root slots
+            are ignored on input.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` for the
+            cross-rank barrier.  Single-shot per call.
+        root: Root rank index (int, keyword-only).  Must be non-negative.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` view of ``target``.
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.broadcast", target=target, signal=signal
+    )
+    call = _ir_tensor.broadcast(target_expr, signal_expr, root)
+    return DistributedTensor(expr=call)
+
+
+def allgather(
+    local_data: Tensor | DistributedTensor,
+    target: DistributedTensor | None = None,
+    signal: DistributedTensor | None = None,
+    out: Tensor | None = None,
+) -> Tensor | DistributedTensor:
+    """Gather data from all ranks, either as an InCore composite or HOST builtin.
+
+        **InCore composite (4 args):** ``pld.tensor.allgather(local_data, target, signal, out)`` —
+        ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk.
+        The intrinsic handles ``pl.load``, stage-in, notify/wait, and per-peer
+        ``remote_load`` into ``out``.
+
+        **HOST builtin (2 args):** ``pld.tensor.allgather(data, signal)`` —
+        each rank's chunk is already staged in ``data[my_rank, :]`` via a prior
+    publish step.  The host lowering emits ``builtin.tensor.barrier`` per chip
+            (the allgather AIV kernel requires concurrent cross-chip dispatch;
+            a barrier synchronises pre-staged window data).
+
+        Args:
+            local_data: For InCore: :class:`pl.Tensor` [1, SIZE].  For HOST:
+                window-bound :class:`pld.DistributedTensor` [NR, SIZE] with
+                pre-staged chunks.
+            target: InCore only: :class:`pld.DistributedTensor` [NR, SIZE] staging window.
+            signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
+            out: InCore only: :class:`pl.Tensor` [1, NR*SIZE] output.
+
+        Returns:
+            InCore: the ``out`` :class:`pl.Tensor`.  HOST: the rebound
+            :class:`pld.DistributedTensor`.
+    """
+    if isinstance(target, DistributedTensor) and signal is None and out is None:
+        # 2-arg HOST builtin path: allgather(data, signal)
+        # Positional mapping: data→local_data, signal→target
+        data_expr, signal_expr = _unwrap_distributed_tensors(
+            "pld.tensor.allgather", target=local_data, signal=target
+        )
+        call = _ir_tensor.allgather(data_expr, signal_expr)
+        return DistributedTensor(expr=call)
+    # 4-arg InCore composite path
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.allgather", target=target, signal=signal
+    )
+    local_data_expr = _unwrap(local_data)
+    out_expr = _unwrap(out)
+    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr, out_expr)
+    return Tensor(expr=call)
+
+
+def reduce_scatter(
+    target: DistributedTensor,
+    signal: DistributedTensor,
+    *,
+    op: ReduceOp = ReduceOp.Sum,
+) -> DistributedTensor:
+    """Reduce-scatter: reduce chunks across ranks, one reduced chunk per rank.
+
+    ``target`` has shape [NR, SIZE] — one row per chunk.  Each rank must
+    stage all NR chunks before calling::
+
+        for j in range(nranks):
+            data = pl.store(chunk_j, [j, 0], data)
+        data = pld.tensor.reduce_scatter(data, sig, op=pld.ReduceOp.Sum)
+        # data[my_rank, 0:SIZE] now holds this rank's reduced chunk.
+
+    Args:
+        target: Window-bound :class:`pld.DistributedTensor` of shape
+            [NR, SIZE].  Each rank stages all NR chunks, one per row.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` for
+            the cross-rank barrier.  Single-shot per call.
+        op: :class:`pld.ReduceOp` (keyword-only).  ``Sum`` only in
+            first version; ``Max`` / ``Min`` / ``Prod`` reserved.
+
+    Returns:
+        The rebound :class:`pld.DistributedTensor` — rank r's row
+        [r, 0:SIZE] holds the reduced chunk r.
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.reduce_scatter", target=target, signal=signal
+    )
+    call = _ir_tensor.reduce_scatter(target_expr, signal_expr, op)
+    return DistributedTensor(expr=call)
+
+
+def all_to_all(
+    input: Tensor,
+    target: DistributedTensor,
+    signal: DistributedTensor,
+) -> DistributedTensor:
+    """All-to-all: symmetric personalized exchange (push-based).
+
+    3-arg InCore composite: ``pld.tensor.all_to_all(input, target, signal)``
+    Every rank pushes its per-destination chunks directly to every peer's
+    window via ``pld.tensor.put`` (TPUT), then synchronises with a notify/wait
+    barrier.  Returns ``target`` in-place (window-as-result — same idiom as
+    ``reduce_scatter`` / ``broadcast``).
+
+    Args:
+        input: :class:`pl.Tensor` [NR, SIZE] with per-destination chunks.
+            ``input[dest, :]`` is the chunk destined for rank ``dest``.
+        target: :class:`pld.DistributedTensor` [NR, SIZE] window that receives
+            the result in-place.  After the call,
+            ``target[src, :]`` holds the chunk received from rank ``src``.
+        signal: :class:`pld.DistributedTensor` [NR, 1] INT32 barrier.
+
+    Returns:
+        The ``target`` :class:`pld.DistributedTensor` (window-as-result).
+    """
+    target_expr, signal_expr = _unwrap_distributed_tensors(
+        "pld.tensor.all_to_all", target=target, signal=signal
+    )
+    input_expr = _unwrap(input)
+    call = _ir_tensor.all_to_all(input_expr, target_expr, signal_expr)
+    return DistributedTensor(expr=call)
+
+
+__all__ = [
+    "all_to_all",
+    "alloc_window_buffer",
+    "allgather",
+    "allreduce",
+    "barrier",
+    "broadcast",
+    "get",
+    "put",
+    "reduce_scatter",
+    "window",
+]

@@ -44,7 +44,7 @@ On A5, the ring buffer resides in the **consumer's local SRAM** (UB or L1). This
 ```text
 Cube InCore function:                    Vector InCore function:
 ┌─────────────────────┐                 ┌─────────────────────┐
-│  tpush_to_aiv       │   ??? how to   │  consumer_buf =     │
+│  tpush_to_aiv       │   how to get   │  consumer_buf =     │
 │  DMA to Vector's UB │ ──────────────▶ │  UB[BASE..BASE+SIZE]│
 │  at what address?   │   get address?  │  // local segment   │
 └─────────────────────┘                 └─────────────────────┘

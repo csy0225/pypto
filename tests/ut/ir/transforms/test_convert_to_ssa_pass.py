@@ -2201,8 +2201,8 @@ class TestScopeTransparentToSSA:
 class TestScopeOutlineBoundary:
     """For non-``RuntimeScopeStmt`` scopes, ``ConvertScope`` blocks
     inner-loop escaping-var promotion for variables first-defined inside
-    the scope body. ``cur_`` stays transparent (later passes such as
-    ``InterchangeChunkLoops`` rely on scope-local vars flowing out for
+    the scope body. ``cur_`` stays transparent (later passes that outline
+    scope bodies rely on scope-local vars flowing out for
     sequential references), but the escaping path is gated to avoid the
     ``init_values=(foo__FREE_VAR,)`` failure mode. Regression for #1351."""
 
@@ -2333,6 +2333,99 @@ class TestScopeOutlineBoundary:
         # Successful SSA verification is the key signal — pl.scope() must
         # stay transparent so the carry-yield inside it threads through.
         passes.run_verifier(ps)(After)
+
+
+class TestSplitAivRegionTransparentToSSA:
+    """``SplitAivScopeStmt`` is non-boundary / transparent to SSA: it is never
+    outlined and is lowered in place by LowerAutoVectorSplit (pass 21), so its
+    body shares SSA state with the enclosing function. ConvertToSSA must thread
+    values through it and version the in-body ``aiv_id`` binding normally."""
+
+    def test_split_aiv_region_ssa_transparent(self):
+        """A value defined and consumed across the region threads through SSA; the
+        region node survives transparently. The Expected pins the post-SSA form:
+        the ``SplitAivScopeStmt`` is preserved (not outlined / erased), the
+        store result defined *inside* it is versioned and read in the outer
+        ``return`` — which holds SSA only because the region is transparent (no
+        phi / iter-arg boundary)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                    offset = aiv_id * 128
+                    t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                    out = pl.store(pl.add(t, t), [offset, 0], out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        offset: pl.Scalar[pl.INDEX] = aiv_id * 128
+                        t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                        out_1: pl.Tensor[[256, 128], pl.FP32] = pl.store(pl.add(t, t), [offset, 0], out)
+                return out_1
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_split_aiv_region_ssa_loop_nested(self):
+        """A region nested in a ``pl.range`` rebinds ``aiv_id`` per iteration via
+        ordinary AssignStmt versioning — the SSA versioner must not hoist it. The
+        Expected pins the post-SSA form (region preserved inside the loop, the
+        in-region store result yielded as the loop carry); a structural match
+        subsumes the "no ``__FREE_VAR`` placeholder" intent (a leaked free var
+        could not appear in a fully-resolved Expected)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for i, (acc,) in pl.range(2, init_values=(out,)):
+                    for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                        offset = aiv_id * 128
+                        t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                        acc = pl.store(pl.add(t, t), [offset, 0], acc)
+                    acc = pl.yield_(acc)
+                return acc
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for i, (acc,) in pl.range(2, init_values=(out,)):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
+                            offset: pl.Scalar[pl.INDEX] = aiv_id * 128
+                            t: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
+                            acc_inner: pl.Tensor[[256, 128], pl.FP32] = pl.store(
+                                pl.add(t, t), [offset, 0], acc
+                            )
+                    acc_out = pl.yield_(acc_inner)
+                return acc_out
+
+        After = passes.convert_to_ssa()(Before)
+        ir.assert_structural_equal(After, Expected)
 
 
 if __name__ == "__main__":

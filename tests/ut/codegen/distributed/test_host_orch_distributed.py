@@ -14,12 +14,13 @@ Covers four orthogonal pieces of the host_orch emit:
 1. Programs with at least one comm domain wrap the body in
    ``with orch.allocate_domain(name=..., workers=..., window_size=...,
    buffers=[CommBufferSpec(...)]) as __comm_d0:``.
-2. DistributedTensor formal → ``add_tensor(ContinuousTensor.make(data=__comm_d0[<r>]
+2. DistributedTensor formal → ``add_tensor(Tensor.make(data=__comm_d0[<r>]
    .buffer_ptrs["<name>"], shapes=..., dtype=..., child_memory=True), ...)``.
-3. Per-DistributedTensor trailing ctx scalar:
+3. Explicit CommCtx scalar:
    ``add_scalar(__comm_d0[<r>].device_ctx)`` placed AFTER all tensor adds,
-   in IR-arg order (matches the incore func.func trailing-ctx segment).
-4. dispatch ``device=`` attr → ``submit_next_level(..., worker=<r>)`` kwarg.
+   in IR-arg order (matching the materialized incore function signature).
+4. dispatch ``device=`` attr → ``_submit_chip(orch, ..., config, <r>)`` (the
+   rank-pinned wrapper that namespaces per-rank DFX ``output_prefix``).
 
 Plus regressions:
 
@@ -31,6 +32,7 @@ Plus regressions:
 """
 
 import re
+from importlib import resources
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -40,6 +42,12 @@ from pypto.backend import pto_backend
 from pypto.pypto_core import passes  # match the import path used by ut/conftest.py
 
 SIZE = 64
+
+# Runtime-only dynamic dims for the #1873 host-orch dynamic-dim recovery tests.
+M = pl.dynamic("M")
+N = pl.dynamic("N")
+NR = pl.dynamic("NR")
+NRANKS = 2
 
 
 @pytest.fixture(autouse=True)
@@ -59,16 +67,19 @@ def pass_verification_context():
 
 
 def _lower(program) -> str:
-    """Apply ``MaterializeCommDomainScopes`` (so ``DistributedTensorType.window_buffer_``
-    is populated), then run distributed codegen directly."""
+    """Apply the late host-distributed pipeline, then run distributed codegen directly."""
+    program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
     cg = codegen.DistributedCodegen()
     return cg.generate(program)
 
 
 def _lower_host_collectives(program):
+    program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
     program = passes.lower_host_tensor_collectives()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
     cg = codegen.DistributedCodegen()
     code = cg.generate(program)
     return code, cg
@@ -76,7 +87,7 @@ def _lower_host_collectives(program):
 
 # ---------------------------------------------------------------------------
 # Positive: DistributedTensor formals + device= → with orch.allocate_domain
-# + ContinuousTensor.make + add_scalar(ctx) + worker= + world_size lowering
+# + Tensor.make + add_scalar(ctx) + worker= + world_size lowering
 # ---------------------------------------------------------------------------
 
 
@@ -113,25 +124,24 @@ def test_dist_tensor_formal_emits_continuous_tensor_make():
 
     # for r in range(..., world_size, ...):  ← world_size lowering in loop bound.
     assert re.search(r"for \w+ in range\(.*\bworld_size\b.*\):", code), code
-    # ContinuousTensor.make for the DistributedTensor formal — keyed on
+    # Tensor.make for the DistributedTensor formal — keyed on
     # the alloc op's LHS name_hint (``data_buf``).
     assert re.search(
-        r'ContinuousTensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["data_buf"\],'
+        r'Tensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["data_buf"\],'
         r" shapes=\(64,\), dtype=DataType\.FLOAT32, child_memory=True\)",
         code,
     ), code
     # Trailing per-DistributedTensor ctx scalar — same rank index as
-    # the ContinuousTensor.make above.
+    # the Tensor.make above.
     assert re.search(r"\.add_scalar\(__comm_d0\[\w+\]\.device_ctx\)", code), code
-    # ``device=r`` → ``worker=r`` kwarg on submit_next_level.
-    assert re.search(r"submit_next_level\(callables\[\"chip_orch\"\],.*config, worker=\w+\)", code), code
+    assert "pld.system.get_comm_ctx" not in code, code
+    # ``device=r`` → rank-pinned dispatch routes through ``_submit_chip`` (which
+    # namespaces the per-rank DFX ``output_prefix``), passing the rank last.
+    assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, \w+\)", code), code
 
 
-def test_two_dist_tensor_formals_emit_two_ctx_scalars():
-    """Two ``DistributedTensor`` formals emit two
-    ``add_scalar(__comm_d0[r].device_ctx)`` in IR-arg order, both after all
-    ``add_tensor`` lines (PTOParam tensor-first invariant + trailing-ctx
-    convention)."""
+def test_two_dist_tensor_formals_emit_two_explicit_ctx_scalars():
+    """Two explicit ``CommCtx`` args emit two device_ctx scalars after tensors."""
 
     @pl.program
     class Prog:
@@ -155,9 +165,9 @@ def test_two_dist_tensor_formals_emit_two_ctx_scalars():
 
     code = _lower(Prog)
 
-    # Two ContinuousTensor.make lines — one per DistributedTensor formal.
+    # Two Tensor.make lines — one per DistributedTensor formal.
     cont_makes = re.findall(
-        r'ContinuousTensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["([^"]+)"\],'
+        r'Tensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["([^"]+)"\],'
         r" shapes=(\([^)]*\)), dtype=DataType\.([A-Z0-9]+),",
         code,
     )
@@ -171,9 +181,36 @@ def test_two_dist_tensor_formals_emit_two_ctx_scalars():
     assert scalars[0] == scalars[1], scalars  # both subscript the same rank
 
 
+def test_wrapper_forwards_explicit_comm_ctx_param_as_scalar_name():
+    """A materialized wrapper ctx param is already a scalar value, not a get_comm_ctx local."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_inner(self, data: pld.DistributedTensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return data  # type: ignore[return-value]
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_wrapper(self, data: pld.DistributedTensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return self.chip_inner(data)  # type: ignore[return-value]
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self) -> pl.Tensor[[SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_wrapper(data, device=r)
+            return data  # type: ignore[return-value]
+
+    code = _lower(Prog)
+
+    assert re.search(r"\.add_scalar\(__comm_d0\[\w+\]\.device_ctx\)", code), code
+    assert "pld.system.get_comm_ctx" not in code, code
+
+
 def test_const_device_kwarg_renders_literal_worker():
-    """``device=0`` (ConstInt) lowers to ``worker=0`` literal — both the
-    ``submit_next_level`` worker kwarg AND the ``__comm_d0[0]`` subscript.
+    """``device=0`` (ConstInt) lowers to the literal rank ``0`` — both the
+    trailing ``_submit_chip(..., config, 0)`` arg AND the ``__comm_d0[0]`` subscript.
 
     The dispatch call is in an ``AssignStmt`` (rather than the outer ``return``)
     because DistributedCodegen routes chip-orch dispatches through
@@ -199,7 +236,7 @@ def test_const_device_kwarg_renders_literal_worker():
             return result
 
     code = _lower(Prog)
-    assert "submit_next_level" in code and "worker=0" in code, code
+    assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, 0\)", code), code
     assert "__comm_d0[0].buffer_ptrs" in code, code
     assert "__comm_d0[0].device_ctx" in code, code
 
@@ -276,10 +313,10 @@ def test_comm_less_dispatch_omits_worker_kwarg():
 
     code = _lower(Prog)
     # The dispatch shape stays intact; the comm-less path emits no wrapper
-    # and no ctx-scalar / ContinuousTensor.make / handle subscript.
+    # and no ctx-scalar / Tensor.make / handle subscript.
     assert "submit_next_level(" in code, code
     assert "worker=" not in code, code
-    assert "ContinuousTensor.make" not in code, code
+    assert "Tensor.make" not in code, code
     assert "__comm_d0[" not in code, code
     assert "allocate_domain" not in code, code
     assert "with orch" not in code, code
@@ -424,14 +461,14 @@ def test_two_groups_emit_nested_allocate_domain():
     assert d1_indent > d0_indent, (d0_line, d1_line)
 
     # Each dispatch's DistributedTensor arg routes through the right handle.
-    # group A dispatches: ContinuousTensor.make(... __comm_d0[...].buffer_ptrs["buf_a"] ...)
+    # group A dispatches: Tensor.make(... __comm_d0[...].buffer_ptrs["buf_a"] ...)
     # and add_scalar(__comm_d0[...].device_ctx).
     assert re.search(
-        r'ContinuousTensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["buf_a"\],',
+        r'Tensor\.make\(data=__comm_d0\[\w+\]\.buffer_ptrs\["buf_a"\],',
         code,
     ), code
     assert re.search(
-        r'ContinuousTensor\.make\(data=__comm_d1\[\w+\]\.buffer_ptrs\["buf_b"\],',
+        r'Tensor\.make\(data=__comm_d1\[\w+\]\.buffer_ptrs\["buf_b"\],',
         code,
     ), code
     # The trailing per-tensor ctx scalar uses the matching handle too.
@@ -471,10 +508,10 @@ def test_two_groups_handle_routing_is_per_dispatch_not_state_bleed():
 
     code = _lower(Prog)
 
-    # Each dispatch site emits one ContinuousTensor.make line; the handle
+    # Each dispatch site emits one Tensor.make line; the handle
     # prefix uniquely identifies the group.
     cont_makes = re.findall(
-        r'ContinuousTensor\.make\(data=(__comm_d\d+)\[\w+\]\.buffer_ptrs\["([^"]+)"\],',
+        r'Tensor\.make\(data=(__comm_d\d+)\[\w+\]\.buffer_ptrs\["([^"]+)"\],',
         code,
     )
     assert cont_makes == [
@@ -482,7 +519,7 @@ def test_two_groups_handle_routing_is_per_dispatch_not_state_bleed():
         ("__comm_d1", "buf_b"),
     ], (cont_makes, code)
 
-    # Each dispatch's trailing ctx scalar follows the same routing.
+    # Each dispatch's explicit ctx scalar follows the same routing.
     scalars = re.findall(r"\.add_scalar\((__comm_d\d+)\[\w+\]\.device_ctx\)", code)
     assert scalars == ["__comm_d0", "__comm_d1"], (scalars, code)
 
@@ -533,6 +570,38 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
 
 
+def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            self.chip_orch(data, device=0)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
+    assert 'buffer_ptrs["__allreduce_signal_buf_0"]' in generated, generated
+    assert 'buffer_ptrs["data_buf"]' in generated, generated
+    assert 'buffer_ptrs["signal_buf"]' not in generated, generated
+    assert "orch.submit_next_level" in generated, generated
+    assert ".add_scalar(__comm_d0[" in generated and "].domain_size)" in generated, generated
+    assert "data = data" not in generated, generated
+
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    assert specs[0].variant == "builtin.tensor.allreduce__sum__fp32"
+
+
 def test_host_allreduce_builtin_variant_is_recorded_once():
     @pl.program
     class Prog:
@@ -544,12 +613,14 @@ def test_host_allreduce_builtin_variant_is_recorded_once():
         def host_orch(self):
             data_buf = pld.alloc_window_buffer(SIZE * 4)
             signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            signal_buf_1 = pld.alloc_window_buffer(pld.world_size() * 4)
             data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
             signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            signal_1 = pld.window(signal_buf_1, [pld.world_size()], dtype=pl.INT32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
             pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            pld.tensor.allreduce(data, signal_1, op=pld.ReduceOp.Sum)
             return 0
 
     generated, cg = _lower_host_collectives(Prog)
@@ -578,6 +649,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
 
     program = passes.materialize_comm_domain_scopes()(Prog)
     program = passes.lower_host_tensor_collectives()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
     files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
@@ -597,6 +669,255 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp"]
     assert "platform_comm/comm_context.h" in kernel_cpp
     assert "data_tensor->ndims" in kernel_cpp
+
+
+# ---------------------------------------------------------------------------
+# Dynamic-dim recovery preamble (issue #1873). A HOST orchestrator that slices a
+# per-rank sub-tensor whose bound uses a ``pl.dynamic()`` dim must bind that dim
+# from a runtime tensor shape at the top of the body — otherwise the bare symbol
+# is a free name and executing ``host_orch`` raises ``NameError``. Mirrors the
+# device-side ``_append_dynamic_dim_unpacking``, sharing
+# ``collect_vars_from_shape_expr`` as the single source of truth.
+# ---------------------------------------------------------------------------
+
+
+def test_host_orch_binds_bare_dynamic_dims_from_shape():
+    """Bare dynamic dims (``M``, ``N``) carried by a per-rank-sliced param are
+    recovered from ``tensors["x"].shape[<i>]`` before the loop references them."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(
+            self,
+            x: pl.Tensor[[M, N], pl.FP32],
+            y: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
+            return y
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            x: pl.Tensor[[NRANKS, M, N], pl.FP32],
+            y: pl.Out[pl.Tensor[[NRANKS, M, N], pl.FP32]],
+        ):
+            for r in pl.range(NRANKS):
+                # Manually hoist the per-rank slices into AssignStmt position
+                # (FlattenCallExpr does this in the full pipeline) so the slice
+                # bounds ``0:M, 0:N`` land in the emitted host_orch body.
+                x_r = x[r]
+                y_r = y[r]
+                self.chip(x_r, y_r, device=r)
+
+    code = _lower(Prog)
+
+    # Each dim is recovered from the first param that exposes it (``x``),
+    # at the matching shape index.
+    assert re.search(r'^\s*M = tensors\["x"\]\.shape\[1\]\s*$', code, re.M), code
+    assert re.search(r'^\s*N = tensors\["x"\]\.shape\[2\]\s*$', code, re.M), code
+    # The per-rank slice that uses the symbols must come AFTER the bindings —
+    # i.e. ``M`` / ``N`` are no longer free names at the point of use.
+    assert "0:M, 0:N]" in code, code
+    assert code.index('M = tensors["x"].shape[1]') < code.index("0:M, 0:N]"), code
+
+
+def test_host_orch_binds_composite_dynamic_dim_from_shape():
+    """A composite dim ``NR * 64`` in a per-rank-sliced param is recovered by
+    inverting the affine form to ``NR = (tensors["outputs"].shape[2] // 64)``
+    (regression for #1803). Integer ``//`` keeps the slice bound int-typed."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip(self, o: pl.Out[pl.Tensor[[1, NR * 64], pl.FP32]]) -> pl.Tensor[[1, NR * 64], pl.FP32]:
+            return o
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, outputs: pl.Out[pl.Tensor[[NRANKS, 1, NR * 64], pl.FP32]]):
+            for r in pl.range(NRANKS):
+                o_r = outputs[r]
+                self.chip(o_r, device=r)
+
+    code = _lower(Prog)
+
+    assert re.search(r'^\s*NR = \(tensors\["outputs"\]\.shape\[2\] // 64\)\s*$', code, re.M), code
+    # The raw symbol is bound before the composite slice bound consumes it.
+    assert "0:(NR * 64)" in code, code
+    assert code.index("NR = (tensors") < code.index("0:(NR * 64)"), code
+
+
+def test_backend_materializes_barrier_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, data: pld.DistributedTensor[[SIZE], pl.FP32], sig: pld.DistributedTensor[[SIZE], pl.INT32]
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.barrier(signal)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.barrier__fp32",
+        signature='"signature": [_D.INOUT]',
+        kernel_snippet="TNOTIFY",
+    )
+
+
+def test_backend_materializes_broadcast_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, data: pld.DistributedTensor[[SIZE], pl.FP32], sig: pld.DistributedTensor[[SIZE], pl.INT32]
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.broadcast(data, signal, root=0)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.broadcast__root0__fp32",
+        signature='"signature": [_D.INOUT, _D.INOUT]',
+        kernel_snippet="kRoot = 0",
+    )
+
+
+def test_backend_materializes_reduce_scatter_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[4, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[SIZE], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(4 * SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [4, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.reduce_scatter__sum__fp32",
+        signature='"signature": [_D.INOUT, _D.INOUT]',
+        kernel_snippet="TADD",
+    )
+
+
+def test_backend_materializes_allgather_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[4, SIZE], pl.FP32],
+            sig: pld.DistributedTensor[[SIZE], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(4 * SIZE * 4)
+            signal_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [4, SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [SIZE], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, signal, device=r)
+            pld.tensor.allgather(data, signal)
+            return 0
+
+    _assert_host_collective_next_level_files(
+        Prog,
+        tmp_path,
+        variant="builtin.tensor.barrier__fp32",
+        signature='"signature": [_D.INOUT]',
+        kernel_snippet="platform_comm/comm_context.h",
+    )
+
+
+def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, signature, kernel_snippet):
+    program = passes.materialize_comm_domain_scopes()(program_cls)
+    program = passes.lower_host_tensor_collectives()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+
+    entry = variant.replace(".", "_")
+    base = f"next_levels/{variant}"
+    assert f"{base}/kernel_config.py" in files
+    assert f"{base}/orchestration/{entry}.cpp" in files
+    assert f"{base}/kernels/aiv/{entry}_kernel.cpp" in files
+
+    kernel_config = files[f"{base}/kernel_config.py"]
+    assert signature in kernel_config
+    assert '"block_dim": 1' in kernel_config
+
+    kernel_cpp = files[f"{base}/kernels/aiv/{entry}_kernel.cpp"]
+    assert kernel_snippet in kernel_cpp
+
+
+@pytest.mark.parametrize(
+    ("package_name", "variant"),
+    [
+        ("barrier", "builtin.tensor.barrier__fp32"),
+        ("broadcast", "builtin.tensor.broadcast__root0__fp32"),
+        ("reduce_scatter", "builtin.tensor.reduce_scatter__sum__fp32"),
+    ],
+)
+def test_host_collective_builtin_template_package_exists(package_name, variant):
+    """Each host collective builtin must ship a template package under collectives/."""
+    root = resources.files("pypto.runtime.builtins.collectives") / package_name
+    templates = root / "templates"
+    assert templates.is_dir(), f"missing templates/ for {package_name}"
+    for name in ("entry.cpp.in", "kernel.cpp.in", "kernel_config.py.in"):
+        assert (templates / name).is_file(), f"missing {name} in {package_name}"
+    assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
+    assert variant.startswith("builtin.tensor."), variant
+
+
+def test_allgather_builtin_template_package_reserved_for_future_use():
+    """allgather builtin template package exists but is NOT YET WIRED.
+
+    The HOST allgather path lowers to builtin.tensor.barrier (see
+    test_backend_materializes_allgather_next_level_files). The
+    builtin.tensor.allgather op/templates are reserved for future
+    concurrent-dispatch lowering and must carry a NOT YET WIRED marker.
+    """
+    root = resources.files("pypto.runtime.builtins.collectives") / "allgather"
+    init_content = (root / "__init__.py").read_text()
+    assert "NOT YET WIRED" in init_content, (
+        "allgather __init__.py must carry a NOT YET WIRED marker until the concurrent-dispatch lowering lands"
+    )
 
 
 if __name__ == "__main__":

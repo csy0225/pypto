@@ -132,11 +132,16 @@ class PassManager:
             ("FlattenCallExpr", lambda: passes.flatten_call_expr()),
         ]
         tensor_only_passes: list[PassSpec] = [
-            ("SplitChunkedLoops", lambda: passes.split_chunked_loops()),
-            ("InterchangeChunkLoops", lambda: passes.interchange_chunk_loops()),
             ("OutlineHierarchyScopes", lambda: passes.outline_hierarchy_scopes()),
             ("OutlineIncoreScopes", lambda: passes.outline_incore_scopes()),
             ("OutlineClusterScopes", lambda: passes.outline_cluster_scopes()),
+            # Some whole-network builders keep a layer-level CHIP
+            # Orchestration helper as an explicit call boundary. Expand only
+            # helpers marked inline_orchestration *after* InCore/Cluster
+            # outlining and before tensor-to-tile conversion, so each task kernel
+            # retains its own memory-planning boundary while the enclosing chip
+            # callable remains one graph.
+            ("InlineOrchestrationHelpers", lambda: passes.inline_orchestration_helpers()),
             ("ConvertTensorToTileOps", lambda: passes.convert_tensor_to_tile_ops()),
             ("OptimizeOrchTensors", lambda: passes.optimize_orch_tensors()),
         ]
@@ -146,26 +151,38 @@ class PassManager:
             ("AutoTileMatmulL0", lambda: passes.auto_tile_matmul_l0()),
             ("CanonicalizeTileSlice", lambda: passes.canonicalize_tile_slice()),
             ("InferTileMemorySpace", lambda: passes.infer_tile_memory_space()),
-            ("LowerTransposeLoadParamLayout", lambda: passes.lower_transpose_load_param_layout()),
             ("ResolveBackendOpLayouts", lambda: passes.resolve_backend_op_layouts()),
+            # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit
+            # split_aiv form (aiv_shard/aic_gather + halved vector sub-region) so
+            # ExpandMixedKernel folds them into split-stamped tpush/tpop uniformly. This
+            # is the live auto-split lowering path; after it runs every split function
+            # reaches SplitVectorKernel already split_aiv-marked, so SplitVectorKernel
+            # only stamps attrs. Runs immediately before ExpandMixedKernel.
+            ("LowerAutoVectorSplit", lambda: passes.lower_auto_vector_split()),
             ("ExpandMixedKernel", lambda: passes.expand_mixed_kernel()),
             ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
             ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
+            # Copy each cross-core tpop's split/pipe-id onto its matching tfree op so
+            # codegen reads them from the op (no codegen-side tpop lookup table). Runs
+            # right after SplitVectorKernel finalizes split on tpops and before
+            # SkewCrossCorePipeline clones tpop/tfree pairs (so clones carry split).
+            ("StampTfreeSplit", lambda: passes.stamp_tfree_split()),
             ("NormalizeReturnOrder", lambda: passes.normalize_return_order()),
             ("SkewCrossCorePipeline", lambda: passes.skew_cross_core_pipeline()),
             ("LowerPipelineLoops", lambda: passes.lower_pipeline_loops()),
             ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).
-            # Active in the default pipeline starting at P6 — by this point
-            # LowerTransposeLoadParamLayout has produced canonical-form DN
-            # parameters, so the materialized strides match the IR shape
-            # without going through the legacy `dn_swap` codegen path.
             ("MaterializeTensorStrides", lambda: passes.materialize_tensor_strides()),
             ("InitMemRef", lambda: passes.init_mem_ref()),
-            # MemoryReuse coalesces tile buffers; on Ascend910B split-AIV it also
-            # avoids the load + tpop_from_aic in-place hazard so a separate
-            # legalisation pass is no longer needed.
+            # MaterializeSemanticAliases forces loop-carried / in-place buffers to
+            # share one MemRef (semantics-required aliasing). It always runs; only
+            # the opportunistic lifetime coalescing (MemoryReuse) is skippable when
+            # ptoas owns reuse (memory_planner=PTOAS).
+            ("MaterializeSemanticAliases", lambda: passes.materialize_semantic_aliases()),
+            # MemoryReuse coalesces independent tile buffers by lifetime; on
+            # Ascend910B split-AIV it also avoids the load + tpop_from_aic in-place
+            # hazard so a separate legalisation pass is no longer needed.
             ("MemoryReuse", lambda: passes.memory_reuse()),
             ("AllocateMemoryAddr", lambda: passes.allocate_memory_addr()),
             ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
@@ -173,18 +190,20 @@ class PassManager:
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
             ("AutoDeriveTaskDependencies", lambda: passes.auto_derive_task_dependencies()),
             ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
-            # Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)
-            # in each host_orch, materialise WindowBuffer back-references on
-            # every DistributedTensorType view, and wrap the host_orch body
-            # in nested CommDomainScopeStmts (one per inferred comm domain).
-            # Runs at the end of the pipeline because nothing between
-            # InlineFunctions and here touches the host_orch
-            # alloc/window/dispatch chain (host_orch is never tile-lowered),
-            # so the alloc/view/dispatch sites are still discoverable. Runs
-            # before the final Simplify so any constant folding it does on the
-            # collected sizes is applied uniformly.
+            # First normalize host allreduce calls that omit signal into the
+            # explicit internal allreduce(data, signal, op=...) form. Then
+            # trace pld.tensor.alloc_window_buffer -> pld.tensor.window ->
+            # dispatch(device=r) / allreduce in each host_orch, materialize
+            # WindowBuffer back-references on every DistributedTensorType view,
+            # and wrap the host_orch body in nested CommDomainScopeStmts.
+            # This sequence runs late, immediately before
+            # LowerHostTensorCollectives, because host_orch is never
+            # tile-lowered and the alloc/window/dispatch/allreduce chain is
+            # still discoverable.
+            ("SynthesizeAllReduceSignals", lambda: passes.synthesize_allreduce_signals()),
             ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
             ("LowerHostTensorCollectives", lambda: passes.lower_host_tensor_collectives()),
+            ("MaterializeDistTensorCtx", lambda: passes.materialize_dist_tensor_ctx()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
@@ -211,15 +230,19 @@ class PassManager:
             analyze_auto_scopes_for_deps: If True, enable compiler-derived task
                 dependency analysis for AUTO runtime scopes. The default stays
                 False so runtime AUTO tracking remains the only AUTO-scope
-                dependency mechanism. User-written manual scopes are not
-                analyzed by this pass.
+                dependency mechanism. User-written manual scopes are skipped:
+                they do not get compiler deps or automatic NoDep/OutputExisting
+                direction rewrites.
 
         Returns:
             A PassManager instance configured with the appropriate passes
         """
         if not cls._strategy_passes:
             cls._register_passes()
-        return cls(strategy, analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps)
+        return cls(
+            strategy,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        )
 
     def __init__(
         self,
@@ -239,8 +262,23 @@ class PassManager:
         self.passes: list[passes.Pass] = []
         self.pass_names: list[str] = []
 
+        # When the active PassContext selects ptoas as the memory planner, skip
+        # the opportunistic lifetime reuse (MemoryReuse) and address assignment
+        # (AllocateMemoryAddr) so ptoas PlanMemory owns them (codegen emits no
+        # `pto.alloc_tile addr` and ptoas runs at --pto-level=level2).
+        # MaterializeSemanticAliases still runs, so semantics-required aliasing
+        # (loop-carried accumulators, in-place ops) is preserved as a shared
+        # MemRef that codegen renders as one tile_buf handle — ptoas cannot
+        # recover that from independent addr-less allocs. Read here because
+        # __init__ runs inside the compile() PassContext (see compile.py).
+        ctx = passes.PassContext.current()
+        skip_mem_planning = ctx is not None and ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        _mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
+
         # Build pass list
         for pass_name, pass_factory in self._strategy_passes[strategy]:
+            if skip_mem_planning and pass_name in _mem_planning_passes:
+                continue
             if pass_name == "AutoDeriveTaskDependencies":
                 self.passes.append(
                     passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps)

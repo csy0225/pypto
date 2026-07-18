@@ -18,16 +18,12 @@ from simpler.task_interface import (  # pyright: ignore[reportMissingImports]
     CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
-    ContinuousTensor,
     CoreCallable,
     DataType,
+    Tensor,
     scalar_to_uint64,
 )
-
-# ``RunTiming`` is a native ``_task_interface`` nanobind type re-exported by
-# ``simpler.worker`` (not by ``simpler.task_interface``), so import it alongside
-# ``Worker`` from there.
-from simpler.worker import RunTiming, Worker  # pyright: ignore[reportMissingImports]
+from simpler.worker import Worker  # pyright: ignore[reportMissingImports]
 from simpler_setup.torch_interop import (  # pyright: ignore[reportMissingImports]
     make_tensor_arg,
     torch_dtype_to_datatype,
@@ -36,8 +32,8 @@ from simpler_setup.torch_interop import (  # pyright: ignore[reportMissingImport
 from .device_tensor import DeviceTensor
 
 
-def device_tensor_to_continuous(dt: DeviceTensor) -> ContinuousTensor:
-    """Wrap a worker-resident :class:`DeviceTensor` as a ``ContinuousTensor``.
+def device_tensor_to_tensor(dt: DeviceTensor) -> Tensor:
+    """Wrap a worker-resident :class:`DeviceTensor` as a simpler ``Tensor``.
 
     ``child_memory=True`` tells the runtime the buffer is already on the device,
     so it skips the H2D/D2H copies — the buffer stays caller-managed. Shared by
@@ -48,19 +44,18 @@ def device_tensor_to_continuous(dt: DeviceTensor) -> ContinuousTensor:
         dt_enum = torch_dtype_to_datatype(dt.dtype)
     except KeyError as e:
         raise ValueError(f"Unsupported DeviceTensor dtype: {dt.dtype}") from e
-    return ContinuousTensor.make(data=dt.data_ptr, shapes=dt.shape, dtype=dt_enum, child_memory=True)
+    return Tensor.make(data=dt.data_ptr, shapes=dt.shape, dtype=dt_enum, child_memory=True)
 
 
 __all__ = [
     "CallConfig",
     "ChipCallable",
     "ChipStorageTaskArgs",
-    "ContinuousTensor",
     "CoreCallable",
     "DataType",
-    "RunTiming",
+    "Tensor",
     "Worker",
-    "device_tensor_to_continuous",
+    "device_tensor_to_tensor",
     "make_tensor_arg",
     "scalar_to_uint64",
     "torch_dtype_to_datatype",

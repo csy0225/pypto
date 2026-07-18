@@ -12,7 +12,7 @@ pytest flag in `tests/st/conftest.py`, so the two surfaces stay aligned.
 | `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
 | `enable_dump_tensor: int` | `--dump-tensor [LEVEL]` (bare = `1`) | `enable_dump_tensor` (`0` off, `1` partial, `2` full) | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer` (manual) |
 | `enable_pmu: int` | `--enable-pmu [N]` (bare = `2`) | `enable_pmu` (`0` off, `>0` event type) | `pmu.csv` | — |
-| `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_to_graph` (manual) |
+| `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_viewer` (manual) |
 | `enable_scope_stats: bool` | `--enable-scope-stats` | `enable_scope_stats` | `scope_stats/scope_stats.jsonl` | `scope_stats_plot` (manual) |
 
 The five flags are **fully independent** and may be combined in any
@@ -60,7 +60,7 @@ twice, transparently:
 Both passes write into the same `dfx_outputs/`, so `swimlane_converter`
 auto-joins the sibling `deps.json` with the records. Adding `--enable-dep-gen`
 explicitly changes nothing about the passes (the graph pass already produced
-`deps.json`); it only makes the run additionally print the `deps_to_graph` render
+`deps.json`); it only makes the run additionally print the `deps_viewer` render
 hint. Simulator platforms (`*sim`) stay single-pass — swimlane conversion is
 skipped there regardless.
 
@@ -87,7 +87,7 @@ run(
     config=RunConfig(
         platform="a2a3sim",
         enable_l2_swimlane=True,     # produces l2_swimlane_records.json
-        enable_dep_gen=True,         # produces deps.json (render with deps_to_graph on demand)
+        enable_dep_gen=True,         # produces deps.json (render with deps_viewer on demand)
         enable_pmu=4,                # PMU event = MEMORY
     ),
 )
@@ -202,20 +202,25 @@ caused outer schedulers (e.g. taskqueue daemons) to SIGKILL the entire
 job tree. Render on demand instead:
 
 ```bash
-# Default — Graphviz `dot` engine, hierarchical layout (<500 nodes).
-python -m simpler_setup.tools.deps_to_graph <work_dir>/dfx_outputs/deps.json
+# Text summary (default) — grep-friendly, no Graphviz required.
+python -m simpler_setup.tools.deps_viewer <work_dir>/dfx_outputs/deps.json
+
+# HTML graph — Graphviz `dot` engine, hierarchical layout (<500 nodes).
+python -m simpler_setup.tools.deps_viewer <work_dir>/dfx_outputs/deps.json \
+    --format html
 
 # Large graphs — switch to the scalable force-directed engine.
-python -m simpler_setup.tools.deps_to_graph <work_dir>/dfx_outputs/deps.json \
-    --engine sfdp
+python -m simpler_setup.tools.deps_viewer <work_dir>/dfx_outputs/deps.json \
+    --format html --engine sfdp
 ```
 
-The output is written next to the input as `deps_graph.html` (override
-with `-o <path>`). Supported `--engine` values, mirroring Graphviz:
-`dot | sfdp | fdp | neato | circo | twopi`. `dot` is the default and
-gives the cleanest DAG-style layout up to ~500 nodes; for larger graphs
-prefer `sfdp` (O(N log N) layout, scales to 10k+ nodes). The runner
-prints this same hint at the end of every dep_gen-enabled run.
+The output is written next to the input as `deps_viewer.txt` (text, the
+default) or `deps_viewer.html` (`--format html`), override with
+`-o <path>`. `--engine` applies to HTML only; supported values mirror
+Graphviz: `dot | sfdp | fdp | neato | circo | twopi`. `dot` is the
+default and gives the cleanest DAG-style layout up to ~500 nodes; for
+larger graphs prefer `sfdp` (O(N log N) layout, scales to 10k+ nodes).
+The runner prints this same hint at the end of every dep_gen-enabled run.
 
 Requires Graphviz on `PATH` (`apt install graphviz` /
 `brew install graphviz`). Open the resulting HTML in any browser —
@@ -231,7 +236,7 @@ SceneTest harness writes this file; pypto does not use SceneTest, so when
 `<work_dir>/dfx_outputs/name_map_<case>.json` from the `func_id` / `name`
 fields already in `kernel_config.py`. It is consumed automatically:
 `swimlane_converter` is invoked with `--func-names <name_map>`, and
-`deps_to_graph` auto-discovers the sibling `name_map_*.json`. No manual
+`deps_viewer` auto-discovers the sibling `name_map_*.json`. No manual
 step is required.
 
 ## Rendering `scope_stats.jsonl` to HTML
@@ -247,7 +252,7 @@ python runtime/tools/scope_stats_plot.py \
 ```
 
 The report is written next to the input as `scope_stats.html`. Like
-`deps_to_graph`, it is **not** invoked automatically — the runner prints
+`deps_viewer`, it is **not** invoked automatically — the runner prints
 this hint at the end of every scope-stats-enabled run.
 
 ## Implementation map

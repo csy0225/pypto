@@ -60,7 +60,7 @@ b: pl.Tensor[[N, K], pl.FP32]
 b: pl.Tensor[[K, N], pl.FP32, pl.DN]   # → 解析期触发 DeprecationWarning
 ```
 
-> **为什么弃用 `pl.Tensor[..., pl.DN]`。** layout-only 简写迫使用户脑子里同时持有两套坐标系（IR 逻辑后视图 shape 与 runtime 行优先 shape）—— 恰恰是 RFC #1300 想要消除的歧义。改用：去掉 layout 标记，写 runtime shape —— matmul B^T 场景用 `pl.load(..., transpose=True)` 加载行优先 tensor（参见下文「数据搬运」）；DN-producing op 之后的 slice 自动继承父 layout。
+> **为什么弃用 `pl.Tensor[..., pl.DN]`。** layout-only 简写迫使用户脑子里同时持有两套坐标系（IR 逻辑后视图 shape 与 runtime 行优先 shape）—— 恰恰是 RFC #1300 想要消除的歧义。改用：去掉 layout 标记，写 runtime shape —— matmul B^T 场景给 `pl.matmul` 传 `b_trans=True`（或 `a_trans=True`），或自然 load 后用 `pl.tile.transpose_view(...)`（参见下文「数据搬运」）；DN-producing op 之后的 slice 自动继承父 layout。
 
 如需 NZ（硬件 tile layout），写 `pl.Tile[..., pl.NZ]` —— NZ 是 tile-only，不允许作为 TensorType annotation。`pl.NZ` 常量保留用于 tile annotation 和 IR 内部使用。
 
@@ -459,7 +459,7 @@ orchestrator（`@pl.jit.host`）和 inline 子函数（`@pl.jit.inline`）上
 只是手放 scope 会嵌套在编译器 AUTO scope 之内）。`.incore` / `.opaque`
 仍会拒绝它——它们外提为独立 kernel。它会 specialize 成
 `@pl.function(..., auto_scope=False)`——具体的 scope 放置语义见
-[MaterializeRuntimeScopes pass](../dev/passes/39-materialize_runtime_scopes.md)。
+[MaterializeRuntimeScopes pass](../dev/passes/41-materialize_runtime_scopes.md)。
 
 ### `@pl.inline`
 
@@ -501,50 +501,17 @@ class Model:
 将代码区域标记为 InCore 执行，无需创建单独的函数：
 
 ```python
-# 推荐用法（新 API）：
 with pl.at(level=pl.Level.CORE_GROUP):
     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-
-# 已弃用（请改用 pl.at）：
-with pl.incore():
-    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
 ```
 
-如需编译器驱动的 chunked 循环 outline（AutoInCore），在 `optimizations` 列表中传入
-`pl.auto_chunk`：
+如需为 `ExpandMixedKernel` Pass 指定跨核 split 模式，使用 `pl.split(...)`：
 
 ```python
-# 推荐用法（新 API）：
-with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):
-    for i in pl.parallel(0, 8, 1, chunk=4):
-        x = pl.add(x, x)
-
-# 已弃用（仍可用，会触发 DeprecationWarning）：
-with pl.at(level=pl.Level.CORE_GROUP, optimization=pl.chunked_loop_optimizer):
-    ...
-
-with pl.auto_incore():
-    ...
-```
-
-如需为 `ExpandMixedKernel` Pass 指定跨核 split 模式，使用 `pl.split(...)` —— 它与
-`pl.auto_chunk` 互相独立，可任意组合：
-
-```python
-# 普通 InCore + split 提示：
+# InCore + split 提示：
 with pl.at(level=pl.Level.CORE_GROUP,
            optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
-
-# AutoInCore + split 提示（独立条目，自由组合）：
-with pl.at(level=pl.Level.CORE_GROUP,
-           optimizations=[pl.auto_chunk, pl.split(pl.SplitMode.UP_DOWN)]):
-    for i in pl.parallel(0, 8, 1, chunk=4):
-        x = pl.add(x, x)
-
-# 已弃用的单关键字形式（仍可用，会触发 DeprecationWarning）：
-with pl.at(level=pl.Level.CORE_GROUP, split=pl.SplitMode.UP_DOWN):
-    ...
 ```
 
 ## 内存与数据搬运
@@ -633,20 +600,17 @@ output_dir = ir.compile(
 2. **CtrlFlowTransform** —— 将控制流改写为结构化 IR
 3. **ConvertToSSA** —— 转换为静态单赋值形式
 4. **FlattenCallExpr** —— 展平嵌套函数调用
-5. **SplitChunkedLoops** —— 将分块循环拆分为独立循环
-6. **InterchangeChunkLoops** —— 交换分块循环顺序
-7. **OutlineHierarchyScopes** —— 提取 hierarchy 作用域
-8. **OutlineIncoreScopes** —— 将 InCore 作用域提取为独立函数
-9. **OutlineClusterScopes** —— 提取 cluster 作用域
-10. **ConvertTensorToTileOps** —— 将张量操作转换为 tile 操作
-11. **FlattenTileNdTo2D** —— 将 ND tile 操作规范化为 2D
-12. **InferTileMemorySpace** —— 推断 tile 内存空间
-13. **LowerTransposeLoadParamLayout** —— 修复转置布局处理
-14. **ResolveBackendOpLayouts** —— 修复 backend 受限的 tile 布局
-15. **ExpandMixedKernel** —— 在需要时拆分 mixed kernel
-16. **InitMemRef** —— 分配内存空间并插入缓冲区分配
-17. **MemoryReuse** —— 共享生命周期不重叠的缓冲区
-18. **AllocateMemoryAddr** —— 分配具体内存地址
+5. **OutlineHierarchyScopes** —— 提取 hierarchy 作用域
+6. **OutlineIncoreScopes** —— 将 InCore 作用域提取为独立函数
+7. **OutlineClusterScopes** —— 提取 cluster 作用域
+8. **ConvertTensorToTileOps** —— 将张量操作转换为 tile 操作
+9. **FlattenTileNdTo2D** —— 将 ND tile 操作规范化为 2D
+10. **InferTileMemorySpace** —— 推断 tile 内存空间
+11. **ResolveBackendOpLayouts** —— 修复 backend 受限的 tile 布局
+12. **ExpandMixedKernel** —— 在需要时拆分 mixed kernel
+13. **InitMemRef** —— 分配内存空间并插入缓冲区分配
+14. **MemoryReuse** —— 共享生命周期不重叠的缓冲区
+15. **AllocateMemoryAddr** —— 分配具体内存地址
 
 ### `JITFunction.compile()`（用于 `@pl.jit` 内核）
 

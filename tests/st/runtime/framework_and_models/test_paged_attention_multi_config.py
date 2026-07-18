@@ -56,9 +56,13 @@ class SoftmaxPrepareTestCase(PTOTestCase):
         super().__init__(**kwargs)
         self.n_blocks = n_blocks
         self.scale = scale
-        # BF16 exp+cast in softmax produces ~1e-3 precision; default 1e-5 is too tight
-        self.config.atol = 1e-3
-        self.config.rtol = 1e-3
+        # BF16 exp+cast softmax: pij is a BF16 output, so one bf16 ULP (up to 2^-8 ~
+        # 3.9e-3 near 0.5) must be admitted; rtol must be >= one bf16 ULP relative
+        # (eps_bf16 = 2^-7 ~ 7.8e-3). 1.6e-2 = PyTorch bf16 default; the 1e-5 default
+        # (and 1e-3) are too tight.
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 1.6e-2
 
     def get_name(self) -> str:
         return f"softmax_prepare_nb{self.n_blocks}"

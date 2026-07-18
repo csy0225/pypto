@@ -600,6 +600,42 @@ class TestDistributedCodegen:
         alloc_block = code[alloc_idx:host_idx]
         assert "    pass" in alloc_block
 
+    def test_host_tensor_reshape_uses_complete_result_shape(self):
+        """HOST reshape lowers to a runtime tensor view, not an undefined op.
+
+        The input rank plane may be a torch.Tensor or a worker-resident
+        DeviceTensor. Both support metadata-only ``reshape(shape)``. The
+        generated target shape must contain every result dimension; the generic
+        fallback previously emitted ``tensor.reshape(x, trailing_dim)``.
+        """
+
+        @pl.program
+        class Input:
+            @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def chip_orch(
+                self,
+                weight: pl.Tensor[[8, 2], pl.FP32],
+            ):
+                pass
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(
+                self,
+                weight: pl.Tensor[[2, 4, 2, 2], pl.FP32],
+            ):
+                for r in pl.range(2):
+                    rank_weight = pl.reshape(weight[r], [8, 2])
+                    self.chip_orch(rank_weight, device=r)
+
+        program = passes.convert_to_ssa()(Input)
+        program = passes.normalize_stmt_structure()(program)
+        program = passes.flatten_call_expr()(program)
+        code = codegen.DistributedCodegen().generate(program)
+
+        assert ".reshape((8, 2))" in code
+        assert "tensor.reshape(" not in code
+        compile(code, "<generated-host-orch>", "exec")
+
     def test_tuple_return_pl_tuple(self):
         """Tuple-return worker (pl.Tuple) populates per-element tensors aliases."""
 

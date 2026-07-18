@@ -120,9 +120,8 @@ class TestMatmulBTranspose(PTOTestCase):
                 c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
                 tile_a_l1 = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
-                tile_b_l1 = pl.load(
-                    b, offsets=[0, 0], shapes=[N, K], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
+                tile_b_nat = pl.load(b, offsets=[0, 0], shapes=[N, K], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.tile.transpose_view(tile_b_nat)
                 tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
                 tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
                 tile_c_l0c = pl.matmul(tile_a_l0a, tile_b_l0b)
@@ -181,9 +180,8 @@ class TestMatmulATranspose(PTOTestCase):
                 b: pl.Tensor[[K, N], pl.FP32],
                 c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
-                tile_a_l1 = pl.load(
-                    a, offsets=[0, 0], shapes=[K, M], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
+                tile_a_nat = pl.load(a, offsets=[0, 0], shapes=[K, M], target_memory=pl.MemorySpace.Mat)
+                tile_a_l1 = pl.tile.transpose_view(tile_a_nat)
                 tile_b_l1 = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
                 tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
                 tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
@@ -243,12 +241,10 @@ class TestMatmulABTranspose(PTOTestCase):
                 b: pl.Tensor[[N, K], pl.FP32],
                 c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
             ) -> pl.Tensor[[M, N], pl.FP32]:
-                tile_a_l1 = pl.load(
-                    a, offsets=[0, 0], shapes=[K, M], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
-                tile_b_l1 = pl.load(
-                    b, offsets=[0, 0], shapes=[N, K], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
+                tile_a_nat = pl.load(a, offsets=[0, 0], shapes=[K, M], target_memory=pl.MemorySpace.Mat)
+                tile_a_l1 = pl.tile.transpose_view(tile_a_nat)
+                tile_b_nat = pl.load(b, offsets=[0, 0], shapes=[N, K], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.tile.transpose_view(tile_b_nat)
                 tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
                 tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
                 tile_c_l0c = pl.matmul(tile_a_l0a, tile_b_l0b)
@@ -393,6 +389,403 @@ class TestMatmulAutoL0BF16(PTOTestCase):
         tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
 
 
+class TestMatmulAutoL0NonAlignedK(PTOTestCase):
+    """BF16 matmul whose K is not a multiple of the chosen tile k — the
+    AutoTileMatmulL0 K-boundary peel (non-divisor k).
+
+    M=128, N=192, K=688 (bf16): K=688 is 16-aligned but its only 16-aligned divisors
+    are 16 and 688 (688 = 16·43), so the roofline chooser picks a non-divisor k rather
+    than a tiny k=16 — here k=80, pipelining floor(688/80)=8 full K-blocks (640) and
+    peeling a straight-line ``matmul_acc`` tail of 688-640=48.  Every tile dim (k=80,
+    tail 48, K=688) stays 16-aligned — ptoas requires 16-aligned tile cols, so the
+    operand dimensions themselves must be 16-aligned (non-16-aligned dims are not
+    supported).  The [128, 192] FP32 output fits L0c (no M/N grid) and the [128, 688]
+    + [688, 192] Mat operands fit L1, so this is a clean K-only peel.
+
+    N is 192 (not 128) on purpose: at N=128 the chooser picks a *k=128* peel whose
+    codegen emits an acc->acc ``pto.tmov`` (the peeled loop-carried accumulator move
+    that MemoryReuse coalescing / #1924 removes) which ptoas rejects on a2a3.  N=192
+    caps the L0B-bound k at 80, so the chosen peel stays on the codegen-clean path
+    while still exercising the non-divisor K-boundary peel."""
+
+    __test__ = False
+
+    def __init__(self, m: int = 128, k: int = 688, n: int = 192, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"matmul_autol0_nonaligned_k_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
+            TensorSpec("b", [self.K, self.N], DataType.BF16, init_value=torch.randn),
+            TensorSpec("c", [self.M, self.N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class NonAlignedKProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def matmul(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                tile_c = pl.matmul(tile_a, tile_b)
+                return pl.store(tile_c, offsets=[0, 0], output_tensor=c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.matmul(a, b, out_c)
+
+        return NonAlignedKProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
+
+
+class TestMatmulAutoL0AStationary(PTOTestCase):
+    """BF16 matmul where the roofline chooser picks A-stationary (k == K).
+
+    M=272, N=272, K=64 (bf16): the [272, 272] FP32 output exceeds L0c, so the pass
+    tiles M/N; with k == K == 64 the chooser holds the full A panel [272, 64]
+    single-buffered in L0A (A-stationary) and streams B double-buffered, realized
+    as a ``ForKind::Sequential`` outer loop over the moving N grid + a pipelined
+    inner loop.  Validates the operand-stationary schedule numerically on device."""
+
+    __test__ = False
+
+    def __init__(self, m: int = 272, k: int = 64, n: int = 272, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"matmul_autol0_a_stationary_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
+            TensorSpec("b", [self.K, self.N], DataType.BF16, init_value=torch.randn),
+            TensorSpec("c", [self.M, self.N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class AStationaryProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def matmul(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                tile_c = pl.matmul(tile_a, tile_b)
+                return pl.store(tile_c, offsets=[0, 0], output_tensor=c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.matmul(a, b, out_c)
+
+        return AStationaryProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
+
+
+class TestChainedMatmulMatScratch(PTOTestCase):
+    """Chained matmul ``x = (a @ b) @ e`` with the intermediate kept on-chip in an
+    L1/Mat scratch — AutoTileMatmulL0's Mat-scratch assembly path.
+
+    a=[256,256] @ b=[256,256] -> c=[256,256]; c is oversized for L0c and consumed
+    ONLY as a matmul operand (after a bf16 cast), so the pass tiles it into a
+    [256,256] Mat scratch via per-sub-tile Acc->Mat assembles (the bf16 downcast
+    fused into the FIXPIPE writeback), and the consumer d = cb @ e (e=[256,64])
+    reads the scratch from L1.  No DDR round-trip (the L0C->L1->L0A trip).  Dims are
+    chosen so both matmuls are output-stationary (matching 32 KB L0 buffer shapes),
+    so the producer's L0 buffers pack into the consumer's in MemoryReuse."""
+
+    __test__ = False
+
+    def __init__(
+        self,
+        m: int = 256,
+        k: int = 256,
+        nmid: int = 256,
+        n: int = 64,
+        *,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.NMID = nmid
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"chained_matmul_mat_scratch_{self.M}x{self.K}x{self.NMID}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        M, K, NMID, N = self.M, self.K, self.NMID, self.N
+
+        # Activation `a` is natural; the weights `b`/`e` are scaled by 1/sqrt(fan-in)
+        # so the intermediate and the output stay O(1) (the gate_up s-test pattern).
+        # With |out| ~ O(1) the inherent bf16 rounding error sits under atol=2e-2 even
+        # on the chain's cancellation elements -- unscaled randn gives |out| ~ 170, at
+        # which a per-element allclose intermittently fails on those near-zero elements
+        # (a numerically-correct bf16 (a@b)@e chain differs from torch only by fp32
+        # accumulation order, which flips a few intermediates across a bf16 boundary).
+        # Seeded generators make the data deterministic (the harness does not seed torch).
+        def seeded(rows, cols, seed, scale=1.0):
+            return torch.randn(rows, cols, generator=torch.Generator().manual_seed(seed)) * scale
+
+        return [
+            TensorSpec("a", [M, K], DataType.BF16, init_value=lambda: seeded(M, K, 1)),
+            TensorSpec("b", [K, NMID], DataType.BF16, init_value=lambda: seeded(K, NMID, 2, 1 / K**0.5)),
+            TensorSpec("e", [NMID, N], DataType.BF16, init_value=lambda: seeded(NMID, N, 3, 1 / NMID**0.5)),
+            TensorSpec("out", [M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, NMID, N = self.M, self.K, self.NMID, self.N
+
+        @pl.program
+        class ChainedMatScratchProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def chained(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, NMID], pl.BF16],
+                e: pl.Tensor[[NMID, N], pl.BF16],
+                out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, NMID], target_memory=pl.MemorySpace.Mat)
+                c = pl.matmul(tile_a, tile_b, out_dtype=pl.FP32)  # [M, NMID] -> Mat scratch
+                cb = pl.cast(c, pl.BF16, mode="rint")  # downcast fused into FIXPIPE writeback
+                tile_e = pl.load(e, offsets=[0, 0], shapes=[NMID, N], target_memory=pl.MemorySpace.Mat)
+                d = pl.matmul(cb, tile_e, out_dtype=pl.FP32)  # consumes the scratch on-chip
+                return pl.store(d, offsets=[0, 0], output_tensor=out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, NMID], pl.BF16],
+                e: pl.Tensor[[NMID, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.chained(a, b, e, out_c)
+
+        return ChainedMatScratchProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        b = tensors["b"].to(torch.float32)
+        e = tensors["e"].to(torch.float32)
+        c_bf16 = torch.matmul(a, b).to(torch.bfloat16).to(torch.float32)  # FIXPIPE downcast to bf16
+        tensors["out"][:] = torch.matmul(c_bf16, e)
+
+
+class TestMatmulAutoL0BStationary(PTOTestCase):
+    """BF16 matmul where the chooser picks B-stationary — the mirror of A-stationary.
+
+    M=256, N=272, K=64 (bf16): the [256, 272] FP32 output exceeds L0c, so the pass
+    tiles M/N; with k == K == 64 the chooser holds the full B panel [64, 272]
+    single-buffered in L0B (B-stationary) and streams A double-buffered, realized as a
+    Sequential outer (N) loop + a pipelined inner (M) loop.  Validates the held-B
+    operand-stationary schedule on device."""
+
+    __test__ = False
+
+    def __init__(self, m: int = 256, k: int = 64, n: int = 272, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"matmul_autol0_b_stationary_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
+            TensorSpec("b", [self.K, self.N], DataType.BF16, init_value=torch.randn),
+            TensorSpec("c", [self.M, self.N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class BStationaryProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def matmul(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                return pl.store(pl.matmul(tile_a, tile_b), offsets=[0, 0], output_tensor=c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.matmul(a, b, out_c)
+
+        return BStationaryProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
+
+
+class TestMatmulAutoL0MNGrid(PTOTestCase):
+    """BF16 matmul whose [M, N] output exceeds L0c — AutoTileMatmulL0 tiles it into an
+    output-stationary M/N grid stored to DDR (the DirectGmPlacer path).
+
+    M=512, N=512, K=64 (bf16): the [512, 512] FP32 output (1 MiB) far exceeds L0c, so
+    the chooser picks (256, 128, 64) output-stationary → a 2×4 grid of full-K [256, 128]
+    sub-tiles, each stored to its DDR offset.  Validates the M/N grid + direct-store on
+    device (the other AutoL0 s-tests are K-only)."""
+
+    __test__ = False
+
+    def __init__(self, m: int = 512, k: int = 64, n: int = 512, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"matmul_autol0_mn_grid_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
+            TensorSpec("b", [self.K, self.N], DataType.BF16, init_value=torch.randn),
+            TensorSpec("c", [self.M, self.N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class MNGridProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def matmul(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                return pl.store(pl.matmul(tile_a, tile_b), offsets=[0, 0], output_tensor=c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.matmul(a, b, out_c)
+
+        return MNGridProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
+
+
+class TestMatmulAutoL0MNBoundaryPeel(PTOTestCase):
+    """BF16 matmul whose chosen tile does not divide M/N — the L-shaped boundary peel.
+
+    M=272, N=416, K=32 (bf16): output [272, 416] exceeds L0c; the chooser picks
+    (144, 208, 32) output-stationary.  144 does not divide 272, so the pass pipelines
+    the ``[0,144)×[0,416)`` interior and peels the ``[144,272)`` M-tail into straight-line
+    partial tiles (no collapse to a tiny exact-divisor tile).  Validates the boundary
+    peel on device."""
+
+    __test__ = False
+
+    def __init__(self, m: int = 272, k: int = 32, n: int = 416, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"matmul_autol0_mn_boundary_peel_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("a", [self.M, self.K], DataType.BF16, init_value=torch.randn),
+            TensorSpec("b", [self.K, self.N], DataType.BF16, init_value=torch.randn),
+            TensorSpec("c", [self.M, self.N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class MNBoundaryPeelProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def matmul(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                tile_a = pl.load(a, offsets=[0, 0], shapes=[M, K], target_memory=pl.MemorySpace.Mat)
+                tile_b = pl.load(b, offsets=[0, 0], shapes=[K, N], target_memory=pl.MemorySpace.Mat)
+                return pl.store(pl.matmul(tile_a, tile_b), offsets=[0, 0], output_tensor=c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.BF16],
+                b: pl.Tensor[[K, N], pl.BF16],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                return self.matmul(a, b, out_c)
+
+        return MNBoundaryPeelProgram
+
+    def compute_expected(self, tensors, params=None):
+        tensors["c"][:] = torch.matmul(tensors["a"].to(torch.float32), tensors["b"].to(torch.float32))
+
+
 class TestMatmulOuterPipelinedBF16(PTOTestCase):
     """BF16 matmul mirroring qwen3 kv_proj's outer-pl.pipeline + if/else pattern.
 
@@ -481,7 +874,7 @@ class TestPipelineMatmulAccGateUp(PTOTestCase):
 
     Reproduces the gate_up_silu pattern from the Qwen3-32B decode kernel that
     triggered the bug: two independent accumulators (gate_acc, up_acc) are built
-    inside a ``pl.at(CORE_GROUP, split=UP_DOWN)`` scope, each following the
+    inside a ``pl.at(CORE_GROUP, optimizations=[pl.split(UP_DOWN)])`` scope, each following the
     prolog-then-pipeline pattern::
 
         gate_acc = pl.matmul(x_chunk_0, wg_0, out_dtype=pl.FP32)
@@ -861,6 +1254,73 @@ class TestATransMatmul(PTOTestCase):
         tensors["c"][:] = torch.matmul(a.T, b)
 
 
+class TestMixedAddBTrans(PTOTestCase):
+    """Mixed-kernel probe: a Vec compute result feeds a ``b_trans=True`` 2D matmul.
+
+    ``bt = b0 + b1`` is a vector (Vec/UB) op result; ``c = a @ bt^T``. The
+    transposed operand originates from a compute op, NOT a load, so the
+    transpose cannot ride a transposed load. This exercises whether the 2D
+    ``tile.transpose_view`` + Vec->Mat ``tile.move`` path transposes a
+    compute-sourced operand correctly. Probe for the ND batch_matmul migration.
+    """
+
+    __test__ = False
+
+    def __init__(self, m: int = 16, k: int = 64, n: int = 128, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"mixed_add_btrans_{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        M, K, N = self.M, self.K, self.N
+        return [
+            TensorSpec("a", [M, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b0", [N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b1", [N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("c", [M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        M, K, N = self.M, self.K, self.N
+
+        @pl.program
+        class MixedAddBTransProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def mixed_add_btrans(
+                self,
+                a: pl.Tensor[[M, K], pl.FP32],
+                b0: pl.Tensor[[N, K], pl.FP32],
+                b1: pl.Tensor[[N, K], pl.FP32],
+                c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                bt = pl.add(b0, b1)  # Vec compute -> [N, K]
+                cm = pl.matmul(a, bt, b_trans=True, out_dtype=pl.FP32)  # a @ bt^T -> [M, N]
+                out_c = pl.assemble(c, cm, offset=[0, 0])
+                return out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[M, K], pl.FP32],
+                b0: pl.Tensor[[N, K], pl.FP32],
+                b1: pl.Tensor[[N, K], pl.FP32],
+                out_c: pl.Out[pl.Tensor[[M, N], pl.FP32]],
+            ) -> pl.Tensor[[M, N], pl.FP32]:
+                out_c = self.mixed_add_btrans(a, b0, b1, out_c)
+                return out_c
+
+        return MixedAddBTransProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        bt = tensors["b0"].to(torch.float32) + tensors["b1"].to(torch.float32)
+        tensors["c"][:] = torch.matmul(a, bt.T)
+
+
 class TestMatmulOperations:
     """Test suite for matrix multiplication (matmul) operations."""
 
@@ -892,6 +1352,13 @@ class TestMatmulOperations:
         result = test_runner.run(TestMatmulABTranspose(m=m, k=k, n=n, platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("m,k,n", [(16, 64, 128)])
+    def test_matmul_mixed_add_btranspose(self, test_runner, platform, m, k, n):
+        """Mixed-kernel: a Vec compute (add) result feeds a b_trans=True 2D matmul."""
+        result = test_runner.run(TestMixedAddBTrans(m=m, k=k, n=n, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
     def test_matmulacc(self, test_config):
         """Test matmul_acc_64 (@pl.jit): K=64 split into two K=32 chunks."""
         matmul_acc_64._cache.clear()
@@ -919,6 +1386,63 @@ class TestMatmulOperations:
         """BF16 matmul on Mat-resident operands — qwen3 kv_proj per-matmul shape."""
         cfg = RunConfig(platform=platform, rtol=_AUTOL0_RTOL, atol=_AUTOL0_ATOL)
         result = test_runner.run(TestMatmulAutoL0BF16(m=m, k=k, n=n, platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    # --- Roofline-chooser paths: K-boundary peel, operand-stationary, Mat-scratch ---
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_matmul_autol0_nonaligned_k(self, test_runner, platform):
+        """Non-divisor k (128x688x192): AutoTileMatmulL0 pipelines the 8 full k=80
+        blocks and peels a straight-line matmul_acc tail of 48 (all 16-aligned).
+        Validates the K-boundary peel numerically on device. (N=192 keeps the pick on
+        the k=80 codegen-clean peel; see the case class docstring.)"""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        result = test_runner.run(TestMatmulAutoL0NonAlignedK(platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_matmul_autol0_a_stationary(self, test_runner, platform):
+        """Operand-stationary L0 schedule (272x272x64): the chooser holds the full A
+        panel single-buffered (A-stationary) and streams B double-buffered, realized
+        as a Sequential outer + pipelined inner loop. Validates it on device."""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        result = test_runner.run(TestMatmulAutoL0AStationary(platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_chained_matmul_mat_scratch(self, test_runner, platform):
+        """Chained (a@b)@e with the oversized intermediate kept on-chip in an L1/Mat
+        scratch (per-sub-tile Acc->Mat assembles, bf16 downcast fused), consumed by
+        the second matmul from L1 — no DDR round-trip. Validates the Mat-scratch
+        assembly path numerically on device. Weights are scaled 1/sqrt(fan-in) so the
+        bf16 intermediate keeps the output O(1) (see define_tensors) -- a per-element
+        allclose at rtol=atol=2e-2 is then robust on the chain's cancellation elements."""
+        cfg = RunConfig(platform=platform, rtol=2e-2, atol=2e-2)
+        result = test_runner.run(TestChainedMatmulMatScratch(platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_matmul_autol0_b_stationary(self, test_runner, platform):
+        """B-stationary held-operand schedule (256x272x64) — mirror of A-stationary:
+        the full B panel is single-buffered in L0B, A streams double-buffered."""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        result = test_runner.run(TestMatmulAutoL0BStationary(platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_matmul_autol0_mn_grid(self, test_runner, platform):
+        """Output-stationary M/N grid stored to DDR (512x512x64) — the DirectGmPlacer
+        path on a large output (the other AutoL0 s-tests are K-only)."""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        result = test_runner.run(TestMatmulAutoL0MNGrid(platform=platform, config=cfg))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_matmul_autol0_mn_boundary_peel(self, test_runner, platform):
+        """M/N grid whose tile does not divide M/N (272x416x32) — the L-shaped boundary
+        peeled into straight-line partial tiles."""
+        cfg = RunConfig(platform=platform, rtol=2e-3, atol=2e-3)
+        result = test_runner.run(TestMatmulAutoL0MNBoundaryPeel(platform=platform, config=cfg))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.skip(

@@ -118,7 +118,7 @@ def test_sin_is_decomposed_to_primitives():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec, transpose=False)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
             y_tile__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             y_tile__k_i_tmp_v1 = pl.tile.cast(y_tile__pi_inv_x_tmp_v0, target_type=pl.INT32, mode="round")
             y_tile__k_f_tmp_v2 = pl.tile.cast(y_tile__k_i_tmp_v1, target_type=pl.FP32, mode="none")
@@ -195,7 +195,7 @@ def test_cos_is_decomposed_to_primitives():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec, transpose=False)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
             y_tile__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             y_tile__k_pre_tmp_v1 = pl.tile.adds(y_tile__pi_inv_x_tmp_v0, 0.5)
             y_tile__k_i_tmp_v2 = pl.tile.cast(y_tile__k_pre_tmp_v1, target_type=pl.INT32, mode="rint")
@@ -331,7 +331,7 @@ def test_both_sin_and_cos_in_same_function():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec, transpose=False)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
             a__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             a__k_i_tmp_v1 = pl.tile.cast(a__pi_inv_x_tmp_v0, target_type=pl.INT32, mode="round")
             a__k_f_tmp_v2 = pl.tile.cast(a__k_i_tmp_v1, target_type=pl.FP32, mode="none")
@@ -562,6 +562,140 @@ def test_allreduce_in_host_orchestrator_is_left_for_host_collective_lowering():
     assert "pld.tile.remote_load" not in op_names
 
 
+def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_lowering():
+    """barrier/broadcast/allgather/reduce_scatter skipped by LowerCompositeOps in HOST orch."""
+    SIZE = 64
+    NR = 2
+
+    @pl.program
+    class HostCollectives:
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
+            signal: pld.DistributedTensor[[NR, 1], pl.INT32],
+        ):
+            pld.tensor.barrier(signal)
+            data = pld.tensor.broadcast(data, signal, root=0)
+            pld.tensor.allgather(data, signal)
+            data = pld.tensor.reduce_scatter(data, signal)
+            return 0
+
+    After = passes.lower_composite_ops()(HostCollectives)
+    op_names = set(_collect_op_names(After))
+
+    for op_name in (
+        "pld.tensor.barrier",
+        "pld.tensor.broadcast",
+        "pld.tensor.allgather",
+        "pld.tensor.reduce_scatter",
+    ):
+        assert op_name in op_names, f"HOST collective {op_name!r} should survive LowerCompositeOps"
+    assert "pld.system.notify" not in op_names
+
+
+def test_allreduce_without_signal_is_rejected_outside_host_orchestrator():
+    SIZE = _ALLREDUCE_SIZE
+
+    @pl.program
+    class MissingSignal:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+            local = pl.load(inp, [0, 0], [1, SIZE])
+            data = pl.store(local, [0, 0], data)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            acc = pl.load(data, [0, 0], [1, SIZE])
+            return pl.store(acc, [0, 0], out)
+
+    with pytest.raises(Exception, match="requires an explicit signal outside host orchestrator"):
+        passes.lower_composite_ops()(MissingSignal)
+
+
+def test_allreduce_eval_stmt_without_signal_is_rejected_outside_host_orchestrator():
+    SIZE = _ALLREDUCE_SIZE
+
+    @pl.program
+    class MissingSignalEval:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="requires an explicit signal outside host orchestrator"):
+        passes.lower_composite_ops()(MissingSignalEval)
+
+
+def test_allreduce_eval_stmt_with_signal_is_decomposed():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class EvalAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(EvalAllreduce)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.allreduce" not in op_names
+    missing = _ALLREDUCE_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_allreduce_in_for_loop_is_rejected():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class LoopAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        passes.lower_composite_ops()(LoopAllreduce)
+
+
+def test_allreduce_in_while_loop_is_rejected():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class LoopAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            while True:
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        passes.lower_composite_ops()(LoopAllreduce)
+
+
 def test_allreduce_emits_for_and_if_control_flow():
     """The recipe emits five ForStmts and five IfStmts:
 
@@ -664,6 +798,314 @@ def test_allreduce_deducer_rejects_unsupported_reduce_op():
                 signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
             ) -> pl.Tensor[[1, SIZE], pl.FP32]:
                 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max)
+                return data
+
+
+# ============================================================================
+# pld.tensor.barrier lowering
+# ============================================================================
+
+_BARRIER_NRANKS = 2
+_BARRIER_REQUIRED_OPS = {
+    "pld.system.get_comm_ctx",
+    "pld.system.nranks",
+    "pld.system.rank",
+    "pld.system.notify",
+    "pld.system.wait",
+}
+
+
+def _build_barrier_before():
+    """Build a minimal Before program that calls ``pld.tensor.barrier``."""
+    nr = _BARRIER_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def barrier_step(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    return Before
+
+
+def test_barrier_is_decomposed_to_primitives():
+    """The composite ``pld.tensor.barrier`` Call is replaced by notify-all +
+    wait-all; no occurrence survives the pass."""
+    Before = _build_barrier_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.barrier" not in op_names, (
+        "lower_composite_ops must remove the composite barrier call entirely"
+    )
+    missing = _BARRIER_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_barrier_emits_for_and_if_control_flow():
+    """Barrier emits 2 ForStmts + 2 IfStmts: notify-all + wait-all."""
+    Before = _build_barrier_before()
+    After = passes.lower_composite_ops()(Before)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+
+    assert collector.for_count == 2, f"expected 2 ForStmts (notify, wait), got {collector.for_count}"
+    assert collector.if_count == 2, f"expected 2 IfStmts (one per ForStmt body), got {collector.if_count}"
+
+
+def test_barrier_lowering_is_idempotent():
+    """Running the pass on already-lowered barrier IR is a no-op."""
+    Before = _build_barrier_before()
+    once = passes.lower_composite_ops()(Before)
+    twice = passes.lower_composite_ops()(once)
+    ir.assert_structural_equal(twice, once)
+
+
+# ============================================================================
+# pld.tensor.broadcast lowering
+# ============================================================================
+
+_BROADCAST_SIZE = 16
+_BROADCAST_NRANKS = 2
+_BROADCAST_REQUIRED_OPS = {
+    "pld.system.get_comm_ctx",
+    "pld.system.nranks",
+    "pld.system.rank",
+    "pld.system.notify",
+    "pld.system.wait",
+    "tile.create",
+    "pld.tile.get",
+}
+
+
+def _build_broadcast_before():
+    """Build a minimal Before program that calls ``pld.tensor.broadcast``."""
+    SIZE = _BROADCAST_SIZE
+    nr = _BROADCAST_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    return Before
+
+
+def test_broadcast_is_decomposed_to_primitives():
+    """The composite ``pld.tensor.broadcast`` Call is replaced by its
+    3-phase decomposition; no occurrence survives the pass."""
+    Before = _build_broadcast_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.broadcast" not in op_names, (
+        "lower_composite_ops must remove the composite broadcast call entirely"
+    )
+    missing = _BROADCAST_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_broadcast_emits_for_and_if_control_flow():
+    """Broadcast emits 2 ForStmts + 2 IfStmts: notify-all + wait-all.
+    Phase 3 (tile.create + pld.tile.get) has no loop."""
+    Before = _build_broadcast_before()
+    After = passes.lower_composite_ops()(Before)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+
+    assert collector.for_count == 2, f"expected 2 ForStmts (notify, wait), got {collector.for_count}"
+    assert collector.if_count == 2, f"expected 2 IfStmts (one per ForStmt body), got {collector.if_count}"
+
+
+def test_broadcast_lowering_is_idempotent():
+    """Running the pass on already-lowered broadcast IR is a no-op."""
+    Before = _build_broadcast_before()
+    once = passes.lower_composite_ops()(Before)
+    twice = passes.lower_composite_ops()(once)
+    ir.assert_structural_equal(twice, once)
+
+
+# ============================================================================
+# pld.tensor.allgather lowering
+# ============================================================================
+
+_ALLGATHER_SIZE = 16
+_ALLGATHER_NRANKS = 2
+_ALLGATHER_REQUIRED_OPS = {
+    "pld.system.get_comm_ctx",
+    "pld.system.nranks",
+    "pld.system.rank",
+    "pld.system.notify",
+    "pld.system.wait",
+    "tile.create",
+    "pld.tile.get",
+    "tile.store",
+    "tile.load",
+}
+
+
+def _build_allgather_before():
+    """Build a minimal Before program that calls ``pld.tensor.allgather``."""
+    SIZE = _ALLGATHER_SIZE
+    nr = _ALLGATHER_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
+            result = pld.tensor.allgather(inp, data, signal, out)
+            return result
+
+    return Before
+
+
+def test_allgather_is_decomposed_to_primitives():
+    """The composite ``pld.tensor.allgather`` Call is replaced by its
+    decompose; no occurrence survives the pass."""
+    Before = _build_allgather_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.allgather" not in op_names, (
+        "lower_composite_ops must remove the composite allgather call entirely"
+    )
+    missing = _ALLGATHER_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_allgather_emits_for_and_if_control_flow():
+    """Allgather emits 3 ForStmts + 2 IfStmts: notify-all, wait-all, gather.
+
+    Phase 3 (gather) now uses a runtime ForStmt over nranks_idx (matching
+    the barrier phases) instead of a compile-time unrolled loop — this
+    keeps the gather consistent with the notify/wait bounds regardless of
+    the actual comm-group size.  The gather ForStmt body emits pld.tile.get
+    for every peer (self-read via HCCL identity mapping), so there is no
+    per-rank IfStmt inside the gather loop."""
+    Before = _build_allgather_before()
+    After = passes.lower_composite_ops()(Before)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+
+    assert collector.for_count == 3, f"expected 3 ForStmts (notify, wait, gather), got {collector.for_count}"
+    assert collector.if_count == 2, f"expected 2 IfStmts (notify-all + wait-all), got {collector.if_count}"
+
+
+def test_allgather_lowering_is_idempotent():
+    """Running the pass on already-lowered allgather IR is a no-op."""
+    Before = _build_allgather_before()
+    once = passes.lower_composite_ops()(Before)
+    twice = passes.lower_composite_ops()(once)
+    ir.assert_structural_equal(twice, once)
+
+
+# ============================================================================
+# pld.tensor.reduce_scatter lowering
+# ============================================================================
+
+_REDUCE_SCATTER_SIZE = 16
+_REDUCE_SCATTER_NRANKS = 2
+_REDUCE_SCATTER_REQUIRED_OPS = {
+    "pld.system.get_comm_ctx",
+    "pld.system.nranks",
+    "pld.system.rank",
+    "pld.system.notify",
+    "pld.system.wait",
+    "pld.tile.remote_load",
+    "tile.add",
+    "tile.load",
+    "tile.store",
+}
+
+
+def _build_reduce_scatter_before():
+    """Build a minimal Before program that calls ``pld.tensor.reduce_scatter``."""
+    SIZE = _REDUCE_SCATTER_SIZE
+    nr = _REDUCE_SCATTER_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    return Before
+
+
+def test_reduce_scatter_is_decomposed_to_primitives():
+    """The composite ``pld.tensor.reduce_scatter`` Call is replaced by its
+    5-phase decomposition; no occurrence survives the pass."""
+    Before = _build_reduce_scatter_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.reduce_scatter" not in op_names, (
+        "lower_composite_ops must remove the composite reduce_scatter call entirely"
+    )
+    missing = _REDUCE_SCATTER_REQUIRED_OPS - op_names
+    assert not missing, f"lowered IR missing expected ops: {missing}"
+
+
+def test_reduce_scatter_emits_for_and_if_control_flow():
+    """Reduce-scatter emits 5 ForStmts + 5 IfStmts (same shape as allreduce):
+    notify, wait, reduce, re-notify, re-wait."""
+    Before = _build_reduce_scatter_before()
+    After = passes.lower_composite_ops()(Before)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+
+    assert collector.for_count == 5, (
+        f"expected 5 ForStmts (notify, wait, reduce, re-notify, re-wait), got {collector.for_count}"
+    )
+    assert collector.if_count == 5, f"expected 5 IfStmts (one per ForStmt body), got {collector.if_count}"
+
+
+def test_reduce_scatter_lowering_is_idempotent():
+    """Running the pass on already-lowered reduce_scatter IR is a no-op."""
+    Before = _build_reduce_scatter_before()
+    once = passes.lower_composite_ops()(Before)
+    twice = passes.lower_composite_ops()(once)
+    ir.assert_structural_equal(twice, once)
+
+
+def test_reduce_scatter_deducer_rejects_unsupported_reduce_op():
+    """First-version lowering supports ``ReduceOp.Sum`` only — the deducer
+    must reject other variants."""
+    SIZE = _REDUCE_SCATTER_SIZE
+    nr = _REDUCE_SCATTER_NRANKS
+
+    with pytest.raises((ValueError, TypeError, ParserError)):
+
+        @pl.program
+        class BadOp:
+            @pl.function(type=pl.FunctionType.InCore)
+            def f(
+                self,
+                data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            ) -> pl.Tensor[[nr, SIZE], pl.FP32]:
+                data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Max)
                 return data
 
 

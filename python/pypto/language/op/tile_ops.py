@@ -33,11 +33,15 @@ __all__ = [
     "scatter_update",
     "concat",
     "move",
+    "aiv_shard",
+    "aic_gather",
     "full",
     "ci",
     "arange",
+    "random",
     "fillpad",
     "fillpad_inplace",
+    "fillpad_expand",
     "get_block_idx",
     "get_subblock_idx",
     "get_block_num",
@@ -71,20 +75,32 @@ __all__ = [
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
     "maximum",
     "row_expand",
     "row_expand_sub",
     "row_expand_div",
     "row_expand_mul",
     "row_expand_add",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand",
     "col_expand_mul",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "expands",
     "minimum",
     "cmp",
@@ -95,9 +111,16 @@ __all__ = [
     "slice",
     "reshape",
     "transpose",
+    "transpose_view",
     "set_validshape",
     "rem",
     "rems",
+    "part_add",
+    "part_mul",
+    "part_max",
+    "part_min",
+    "fmod",
+    "fmods",
     "and_",
     "ands",
     "or_",
@@ -138,7 +161,15 @@ from pypto.ir.op import tile_ops as _ir_ops
 from pypto.ir.utils import _get_span_or_capture, _normalize_expr
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TileLayout
+from pypto.pypto_core.ir import (
+    AtomicType,
+    Expr,
+    MemorySpace,
+    PadValue,
+    PtrType,
+    Span,
+    TileLayout,
+)
 
 from ..typing import IntLike, Scalar, Tensor, Tile
 from .system_ops import (  # noqa: F401
@@ -155,6 +186,13 @@ from .system_ops import (  # noqa: F401
 # ``output_tensor.__class__(expr=call_expr)``; no DistributedTensor import is
 # needed here (which avoids a circular dependency on ``..distributed``).
 _TensorT = TypeVar("_TensorT", bound=Tensor)
+
+# Constrained TypeVar for the split-axis reshape wrappers (aiv_shard / aic_gather):
+# the operand is either a Tile (legacy @pl.program form) or a Tensor (@pl.jit /
+# pl.spmd form), and the result is the SAME kind as the input. A constrained
+# TypeVar keeps that correlation (Tile -> Tile, Tensor -> Tensor) instead of a
+# ``Tensor | Tile`` union, which would type every result as the union.
+_SplitOperandT = TypeVar("_SplitOperandT", Tensor, Tile)
 
 
 class MemRefType:
@@ -265,6 +303,8 @@ def create(
     dtype: DataType,
     target_memory: MemorySpace = MemorySpace.Vec,
     transpose: bool | None = None,
+    *,
+    flat_layout: bool | None = None,
 ) -> Tile:
     """Create a tile from a shape.
 
@@ -275,6 +315,11 @@ def create(
         transpose: When True, allocate the transposed Mat (ZN) fractal layout for a
             matmul ``b_trans`` B-operand (the layout a DN-source ``gather_row`` fills).
             Default ``None`` keeps the canonical layout and is omitted from the op.
+        flat_layout: Keyword-only. When True, allocate a flat (non-fractal,
+            slayout=none_box) L1/cbuf tile — a contiguous staging buffer rather
+            than the boxed NZ layout Mat tiles normally carry. Requires
+            ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
+            Default ``None`` keeps the canonical layout.
 
     Returns:
         Tile wrapping the create operation
@@ -286,6 +331,7 @@ def create(
         dtype,
         target_memory,
         transpose,
+        flat_layout=flat_layout,
     )
     return Tile(expr=call_expr)
 
@@ -335,7 +381,6 @@ def load(
     shapes: Sequence[IntLike],
     valid_shapes: Sequence[IntLike] | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
-    transpose: bool = False,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
 
@@ -344,14 +389,11 @@ def load(
         offsets: Offsets in each dimension. Always in the source tensor's
             coordinate system.
         shapes: Shape of the region to load in each dimension. Always in the
-            source tensor's coordinate system, even when transpose=True. The
-            output TileType shape will be transposed automatically.
+            source tensor's coordinate system.
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes.
-        transpose: Whether to transpose the tile during load (default: False).
-            Only supported when target_memory is MemorySpace.Mat (L1).
 
     Returns:
         Tile wrapping the load operation
@@ -359,9 +401,6 @@ def load(
     Example:
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
-        >>> # 2D load with transpose to L1 (tensor is [N, K], output tile is [K, N])
-        >>> tile = load(tensor, offsets=[0, 0], shapes=[N, K],
-        ...             target_memory=pl.MemorySpace.Mat, transpose=True)
     """
     if valid_shapes is None:
         valid_shapes = shapes
@@ -371,7 +410,6 @@ def load(
         _normalize_intlike(shapes),
         _normalize_intlike(valid_shapes),
         target_memory,
-        transpose,
     )
     return Tile(expr=call_expr)
 
@@ -399,7 +437,9 @@ def store(
             NOTE: atomic-add accumulation order across cores is not fixed, so
             floating-point results are non-deterministic. The destination must
             be zero-initialised before the kernel runs. Supported tile dtypes:
-            fp32 / fp16 / int32 / int16 / int8 (not bf16).
+            fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
+            available on the Ascend910B (A2/A3) profile; it is not supported on
+            A5, where an fp32 accumulator + cast is required instead.
 
     Returns:
         Tensor wrapping the store operation
@@ -524,6 +564,60 @@ def move(
     return Tile(expr=call_expr)
 
 
+def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
+    """Shard a 2D operand into half along the split axis (full -> half).
+
+    The split mode is **inherited** from the enclosing
+    ``for aiv_id in pl.split_aiv(mode=...)`` scope — it is not passed here.
+    This wrapper therefore only resolves inside a parsed kernel, where the
+    parser intercepts the call and fills the inherited mode. Calling it eagerly
+    (outside a parsed program) raises, since there is no scope to read the mode
+    from.
+
+    The operand may be a ``Tile`` (legacy ``@pl.program`` form -> ``tile.aiv_shard``)
+    or a high-level ``Tensor`` (``@pl.jit`` / ``pl.spmd`` form -> ``tensor.aiv_shard``,
+    lowered 1:1 to ``tile.aiv_shard`` at ConvertTensorToTileOps). The Tensor form
+    is region-only. Distributed tensors are not supported.
+
+    Args:
+        x: Input operand (2D Tile or Tensor)
+        span: Optional source span
+
+    Returns:
+        Operand of the same kind with the split axis halved.
+    """
+    raise RuntimeError(
+        "pl.aiv_shard must be used inside a 'for aiv_id in pl.split_aiv(...)' "
+        "loop, which supplies the split mode"
+    )
+
+
+def aic_gather(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
+    """Gather a 2D operand into full along the split axis (half -> full).
+
+    Inverse of :func:`aiv_shard`. Like :func:`aiv_shard`, the split mode is
+    **inherited** from the enclosing ``for aiv_id in pl.split_aiv(mode=...)``
+    scope and must not be passed here. Calling it eagerly (outside a parsed
+    program) raises, since there is no scope to read the mode from.
+
+    The operand may be a ``Tile`` (legacy ``@pl.program`` form -> ``tile.aic_gather``)
+    or a high-level ``Tensor`` (``@pl.jit`` / ``pl.spmd`` form -> ``tensor.aic_gather``,
+    lowered 1:1 to ``tile.aic_gather`` at ConvertTensorToTileOps). The Tensor form
+    is region-only. Distributed tensors are not supported.
+
+    Args:
+        x: Input operand (2D Tile or Tensor)
+        span: Optional source span
+
+    Returns:
+        Operand of the same kind with the split axis doubled.
+    """
+    raise RuntimeError(
+        "pl.aic_gather must be used inside a 'for aiv_id in pl.split_aiv(...)' "
+        "loop, which supplies the split mode"
+    )
+
+
 def full(shape: list[int], dtype: DataType, value: int | float) -> Tile:
     """Create a tile from a shape and fill with value in Vec.
 
@@ -566,6 +660,44 @@ def ci(
 arange = ci
 
 
+def random(
+    key0: int | Scalar,
+    key1: int | Scalar,
+    counter0: int | Scalar,
+    counter1: int | Scalar,
+    counter2: int | Scalar,
+    counter3: int | Scalar,
+    shape: Sequence[int],
+    valid_shape: Sequence[int] | None = None,
+    dtype: DataType = DataType.UINT32,
+    rounds: int = 10,
+) -> Tile:
+    """Generate counter-based pseudo-random values into a tile.
+
+    Implements a counter-based (Philox/ChaCha-style) RNG. Each element is derived
+    deterministically from the 64-bit key ``(key0, key1)`` and 128-bit counter
+    ``(counter0..counter3)`` plus the element position, so the same seeds always
+    reproduce the same tile. Maps to ``pto.trandom``.
+
+    Args:
+        key0, key1: The two INT32 key words (plain ints or Scalars).
+        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        shape: Shape of the destination tile (static).
+        valid_shape: Optional written region (each dim ``<= shape``); ``pto.trandom``
+            only fills the valid rows/cols. Defaults to the full shape.
+        dtype: Destination dtype. One of {INT32, UINT32}. Defaults to UINT32.
+        rounds: Cipher round count, 7 or 10. Defaults to 10.
+
+    Returns:
+        Tile wrapping the random operation.
+    """
+    raw_seeds = (key0, key1, counter0, counter1, counter2, counter3)
+    seeds = [v.unwrap() if isinstance(v, Scalar) else v for v in raw_seeds]
+    vshape = list(valid_shape) if valid_shape is not None else None
+    call_expr = _ir_ops.random(*seeds, list(shape), valid_shape=vshape, dtype=dtype, rounds=rounds)
+    return Tile(expr=call_expr)
+
+
 def fillpad(tile: Tile, pad_value: PadValue | int | float = PadValue.zero) -> Tile:
     """Fill remaining tile elements with specified padding value.
 
@@ -601,6 +733,31 @@ def fillpad_inplace(tile: Tile, pad_value: PadValue | int | float = PadValue.zer
         Tile with padding filled (shares memory with the input tile).
     """
     call_expr = _ir_ops.fillpad_inplace(tile.unwrap(), pad_value=pad_value)
+    return Tile(expr=call_expr)
+
+
+def fillpad_expand(
+    tile: Tile, shape: Sequence[IntLike], pad_value: PadValue | int | float = PadValue.zero
+) -> Tile:
+    """Copy a smaller source tile into a larger destination tile, padding the rest.
+
+    Unlike :func:`fillpad` (which keeps the same physical shape and only fills the
+    valid-region expansion), this op produces a *larger* output tile: the source's
+    valid region is copied to the top-left and every other element is filled with
+    ``pad_value``. Equivalent to TFILLPAD_EXPAND on the hardware.
+
+    Args:
+        tile: Source tile
+        shape: Destination shape; each dimension must be >= the source dimension
+        pad_value: ``PadValue`` enum (``zero`` / ``max`` / ``min``), or one of
+            the literal sugars ``0``, ``math.inf``, ``-math.inf``. Default is
+            ``PadValue.zero``. Other values raise — the hardware only supports
+            the three padding modes.
+
+    Returns:
+        Tile wrapping the fillpad_expand operation (a new, larger tile).
+    """
+    call_expr = _ir_ops.fillpad_expand(tile.unwrap(), _normalize_intlike(shape), pad_value=pad_value)
     return Tile(expr=call_expr)
 
 
@@ -1081,6 +1238,20 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise product reduction.
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_prod operation
+    """
+    call_expr = _ir_ops.row_prod(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
 def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
     """Column-wise sum reduction.
 
@@ -1123,6 +1294,75 @@ def col_min(tile: Tile) -> Tile:
         Tile wrapping the col_min operation
     """
     call_expr = _ir_ops.col_min(tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_prod(tile: Tile) -> Tile:
+    """Column-wise product reduction.
+
+    Args:
+        tile: Input tile
+
+    Returns:
+        Tile wrapping the col_prod operation
+    """
+    call_expr = _ir_ops.col_prod(tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise argmax (column index of the per-row maximum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_argmax operation
+    """
+    call_expr = _ir_ops.row_argmax(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Row-wise argmin (column index of the per-row minimum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the row_argmin operation
+    """
+    call_expr = _ir_ops.row_argmin(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Column-wise argmax (row index of the per-column maximum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the col_argmax operation
+    """
+    call_expr = _ir_ops.col_argmax(tile.unwrap(), tmp_tile.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
+    """Column-wise argmin (row index of the per-column minimum, int32 output).
+
+    Args:
+        tile: Input tile
+        tmp_tile: Temporary tile
+
+    Returns:
+        Tile wrapping the col_argmin operation
+    """
+    call_expr = _ir_ops.col_argmin(tile.unwrap(), tmp_tile.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -1277,6 +1517,90 @@ def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
         Tile wrapping the col_expand_add operation
     """
     call_expr = _ir_ops.col_expand_add(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise broadcast maximum: max(tile, row_vec broadcasted).
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_max operation
+    """
+    call_expr = _ir_ops.row_expand_max(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise broadcast minimum: min(tile, row_vec broadcasted).
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_min operation
+    """
+    call_expr = _ir_ops.row_expand_min(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
+    """Row-wise exp-diff: exp(tile - row_vec) with per-row scalar.
+
+    Args:
+        tile: Input tile [M, N]
+        row_vec: Row vector providing per-row scalar [M, 1]
+
+    Returns:
+        Tile wrapping the row_expand_expdif operation
+    """
+    call_expr = _ir_ops.row_expand_expdif(tile.unwrap(), row_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and take element-wise maximum with tile.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_max operation
+    """
+    call_expr = _ir_ops.col_expand_max(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and take element-wise minimum with tile.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_min operation
+    """
+    call_expr = _ir_ops.col_expand_min(tile.unwrap(), col_vec.unwrap())
+    return Tile(expr=call_expr)
+
+
+def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
+    """Expand column vector and compute exp-diff with per-column scalar.
+
+    Args:
+        tile: Input tile [M, N]
+        col_vec: Column vector providing per-column scalar [1, N]
+
+    Returns:
+        Tile wrapping the col_expand_expdif operation
+    """
+    call_expr = _ir_ops.col_expand_expdif(tile.unwrap(), col_vec.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -1506,6 +1830,26 @@ def transpose(tile: Tile, axis1: int, axis2: int, tmp_tile: Tile | None = None) 
     return Tile(expr=call_expr)
 
 
+def transpose_view(tile: Tile) -> Tile:
+    """Zero-copy fractal-layout reinterpretation (NZ<->ZN) of a tile.
+
+    Swaps the trailing two dims together with the block/scatter layouts, aliasing
+    the source buffer byte-for-byte: an NZ ``[..., N, K]`` tile and a ZN
+    ``[..., K, N]`` tile over the same L1 bytes are mutual transposes. Emits no
+    data movement, so one GM->L1 load can feed both a ``b_trans=True`` and a
+    ``b_trans=False`` matmul on a shared operand.
+
+    Args:
+        tile: Input tile (TileType, >=2D; typically Mat-resident).
+
+    Returns:
+        Tile wrapping the transposed-layout view.
+    """
+    tile_expr = tile.unwrap()
+    call_expr = _ir_ops.transpose_view(tile_expr)
+    return Tile(expr=call_expr)
+
+
 def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile:
     """Update valid-shape metadata of a tile without data movement.
 
@@ -1528,7 +1872,7 @@ def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile
     return Tile(expr=call_expr)
 
 
-def rem(lhs: Tile, rhs: Tile) -> Tile:
+def rem(lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
@@ -1536,15 +1880,16 @@ def rem(lhs: Tile, rhs: Tile) -> Tile:
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile
+        tmp: Temporary tile (same shape/dtype) required by the hardware
 
     Returns:
         Tile wrapping the rem operation
     """
-    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap(), tmp.unwrap())
     return Tile(expr=call_expr)
 
 
-def rems(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+def rems(lhs: Tile, rhs: int | float | Expr | Scalar, tmp: Tile) -> Tile:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
@@ -1552,12 +1897,116 @@ def rems(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
     Args:
         lhs: Tile
         rhs: Scalar value
+        tmp: Temporary tile (same shape/dtype) required by the hardware
 
     Returns:
         Tile wrapping the rems operation
     """
     rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
-    call_expr = _ir_ops.rems(lhs.unwrap(), rhs_expr)
+    call_expr = _ir_ops.rems(lhs.unwrap(), rhs_expr, tmp.unwrap())
+    return Tile(expr=call_expr)
+
+
+def part_add(src0: Tile, src1: Tile) -> Tile:
+    """Partial element-wise add of two tiles.
+
+    Adds over the destination valid region; where only one source is valid the
+    result copies that source. Maps to the TPARTADD hardware intrinsic.
+
+    Args:
+        src0: First source tile
+        src1: Second source tile
+
+    Returns:
+        Tile wrapping the part_add operation
+    """
+    call_expr = _ir_ops.part_add(src0.unwrap(), src1.unwrap())
+    return Tile(expr=call_expr)
+
+
+def part_mul(src0: Tile, src1: Tile) -> Tile:
+    """Partial element-wise multiply of two tiles.
+
+    Multiplies over the destination valid region; where only one source is valid
+    the result copies that source. Maps to the TPARTMUL hardware intrinsic.
+
+    Args:
+        src0: First source tile
+        src1: Second source tile
+
+    Returns:
+        Tile wrapping the part_mul operation
+    """
+    call_expr = _ir_ops.part_mul(src0.unwrap(), src1.unwrap())
+    return Tile(expr=call_expr)
+
+
+def part_max(src0: Tile, src1: Tile) -> Tile:
+    """Partial element-wise max of two tiles.
+
+    Takes the max over the destination valid region; where only one source is
+    valid the result copies that source. Maps to the TPARTMAX hardware intrinsic.
+
+    Args:
+        src0: First source tile
+        src1: Second source tile
+
+    Returns:
+        Tile wrapping the part_max operation
+    """
+    call_expr = _ir_ops.part_max(src0.unwrap(), src1.unwrap())
+    return Tile(expr=call_expr)
+
+
+def part_min(src0: Tile, src1: Tile) -> Tile:
+    """Partial element-wise min of two tiles.
+
+    Takes the min over the destination valid region; where only one source is
+    valid the result copies that source. Maps to the TPARTMIN hardware intrinsic.
+
+    Args:
+        src0: First source tile
+        src1: Second source tile
+
+    Returns:
+        Tile wrapping the part_min operation
+    """
+    call_expr = _ir_ops.part_min(src0.unwrap(), src1.unwrap())
+    return Tile(expr=call_expr)
+
+
+def fmod(lhs: Tile, rhs: Tile) -> Tile:
+    """Element-wise floating-point remainder of two tiles.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMOD hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the fmod operation
+    """
+    call_expr = _ir_ops.fmod(lhs.unwrap(), rhs.unwrap())
+    return Tile(expr=call_expr)
+
+
+def fmods(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
+    """Element-wise floating-point remainder of tile and scalar.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMODS hardware intrinsic.
+
+    Args:
+        lhs: Tile
+        rhs: Scalar value
+
+    Returns:
+        Tile wrapping the fmods operation
+    """
+    rhs_expr = rhs.unwrap() if isinstance(rhs, Scalar) else rhs
+    call_expr = _ir_ops.fmods(lhs.unwrap(), rhs_expr)
     return Tile(expr=call_expr)
 
 
@@ -2092,7 +2541,10 @@ def scatter_mask(dst: Tile, src: Tile, mask_pattern: int) -> Tile:
     For each row, the elements of ``src`` are written into the columns of
     ``dst`` selected by ``mask_pattern`` (the inverse of :func:`gather_mask`).
 
-    This form is intended for A3 / CPU-sim style backends; A5 rejects it.
+    Unlike :func:`gather_mask` (a real ``pto.tgather`` ISA op on A2/A3 and A5),
+    mask-pattern scatter is not a distinct pto-isa instruction — PyPTO emits it
+    as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim style lowering
+    paths.
 
     Args:
         dst: Destination tile (rewritten on positions selected by ``mask_pattern``)

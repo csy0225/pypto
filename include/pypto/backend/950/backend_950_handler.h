@@ -45,6 +45,12 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] bool RequiresVtoCFractalAdapt() const override { return true; }
   [[nodiscard]] bool RequiresRuntimeSubblockBridge() const override { return false; }
   [[nodiscard]] bool RequiresNoSplitDualAivDispatch() const override { return false; }
+  // A5 acc->mat tinsert accepts dst=f32, so the Mat scratch may stay f32.
+  [[nodiscard]] bool RequiresLowPrecisionMatScratch() const override { return false; }
+
+  // A5 store pipe does NOT support bf16 atomic-add (pto-isa SetAtomicAdd<T>
+  // rejects bfloat16_t on the a5 path); require an fp32 accumulator + cast.
+  [[nodiscard]] bool SupportsBf16AtomicAdd() const override { return false; }
 
   [[nodiscard]] ir::TileView BuildCrossCoreTransferView(ir::MemorySpace dest_ms,
                                                         const ir::TileView& original_view) const override;
@@ -57,6 +63,11 @@ class Ascend950Handler : public BackendHandler {
   [[nodiscard]] uint32_t GetL0aCapacityBytes() const override { return 64ULL * 1024; }
   [[nodiscard]] uint32_t GetL0bCapacityBytes() const override { return 64ULL * 1024; }
   [[nodiscard]] uint32_t GetL0cCapacityBytes() const override { return 256ULL * 1024; }
+  [[nodiscard]] uint64_t GetMatCapacityBytes() const override { return 512ULL * 1024; }
+
+  // TODO(a5-calibration): explicit placeholder. The roofline constants inherited
+  // from BackendHandler are a2a3-calibrated until a5 op-sim/device data exists.
+  [[nodiscard]] L0CostModel GetL0CostModel() const override { return L0CostModel{}; }
 
  private:
   Ascend950Handler() = default;

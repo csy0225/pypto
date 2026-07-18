@@ -276,22 +276,6 @@ for i in pl.parallel(start, stop, step):
 
 **要点:** 循环携带值使用 `pl.range()` 或 `pl.parallel()` 的 `init_values`, 元组解包 `(sum,)` 声明 iter_args, `pl.yield_()` 为下一次迭代更新值, 循环结束后 iter_args 包含最终值。`pl.parallel()` 生成 `ForKind.Parallel` 循环, `pl.range()` 生成 `ForKind.Sequential` (默认)。
 
-#### 分块循环 (Chunked Loops)
-
-```python
-# 将循环拆分为每块 C 次迭代的嵌套循环
-for i in pl.range(10, chunk=5):
-    body_statements
-
-for i in pl.parallel(8, chunk=4):
-    body_statements
-
-for i in pl.unroll(12, chunk=4):
-    body_statements
-```
-
-**要点:** `chunk=C` 将循环拆分为外层顺序循环和 `C` 次迭代的内层循环。内层循环保留原始类型 (Sequential/Parallel/Unroll)。`chunk=` 循环支持与 `init_values` 一起使用（iter_args 会贯穿生成的外层/内层/余数循环）。`chunk=` 循环只能出现在 `with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):` 内；在该作用域外，parser 会直接报错。参见 [SplitChunkedLoops Pass](../passes/07-split_chunked_loops.md)。
-
 ### While 循环 (带 iter_args 的 SSA 风格)
 
 ```python
@@ -327,29 +311,25 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | ---- | ---------- | ---- |
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | CORE_GROUP 级固定边界 outline |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + 跨核 split 提示 |
-| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk])` | `AutoInCore` | 编译器驱动的 chunked 循环 split |
-| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(MODE)])` | `AutoInCore` | AutoInCore + split 提示（条目独立） |
 | `pl.at(level=pl.Level.HOST)`（或任意非 `CORE_GROUP` 级别） | `Hierarchy` | 分布式层级作用域 |
 | `pl.cluster()` | `Cluster` | AIC+AIV 协同调度组 |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd`（for-form 内嵌 `InCore`） | SPMD 多 block 派发——见 [pl.spmd](#plspmd-多-block-派发) |
 | `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | split 提示作用于内层 InCore（两种形式均适用） |
 | `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | orchestrator 的 MANUAL scope——由用户管理任务排序。两种 `auto_scope` 模式下都可用（它是依赖语义选择）。见[手工依赖原语](#手工依赖原语) |
-| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/39-materialize_runtime_scopes.md) |
-| `pl.incore()` *(已弃用)* | `InCore` | 请改用 `pl.at(level=pl.Level.CORE_GROUP)` |
-| `pl.auto_incore(split=...)` *(已弃用)* | `AutoInCore` | 请改用 `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(...)])` |
-| `pl.at(..., optimization=pl.chunked_loop_optimizer[(split=...)])` *(已弃用)* | `AutoInCore` | 请改用 `pl.at(..., optimizations=[pl.auto_chunk, pl.split(...)])` |
-| `pl.at(..., split=...)` *(已弃用)* | `InCore` | 请改用 `pl.at(..., optimizations=[pl.split(...)])` |
+| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) |
 
 #### `pl.spmd` 多 block 派发
 
 `pl.spmd(N)` 把一个 kernel 派发到 `N` 个 block。形式：
 
-- `with pl.spmd(N): kernel(...)` —— body 必须是对一个已声明 InCore kernel 的单次调用。
+- `with pl.spmd(N): ...` —— body **既可以**是对一个已声明 InCore kernel 的单次调用（直接派发，`SpmdScopeStmt(body=Call)`，无内层 InCore 包裹），**也可以**是一段内联多语句块，自动外包成一段隐式 InCore 区域（与 for-form 相同，只是不自动绑定索引）。内联 body 必须通过 `pl.tile.get_block_idx()` 读取每个 block 的索引——否则所有 block 执行完全相同的工作，parser 会拒绝。不捕获 producer TaskId。
 - `for i in pl.spmd(N): ...` —— 循环变量绑定到每个 block 的索引（`pl.tile.get_block_idx()`）；body 自动外包成一段隐式 InCore 区域。
-- `with pl.spmd(N, deps=[...]) as tid: ...` —— **捕获形式**：与 `with pl.at(...) as tid:` 对称。在 `tid` 中捕获该分发的 grid 级 producer `pl.Scalar[pl.TASK_ID]`（可用作 `deps=` 边、存入 `pl.array.create(N, pl.TASK_ID)`、或跨入 `pl.manual_scope`），并像 for-form 一样接受内联多语句 body（在 body 内通过 `pl.tile.get_block_idx()` 读取每个 block 的索引）。lower 成一个 `ir.Submit`，其尾部 tuple 元素即 grid TaskId；`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上。参见下文“手动依赖原语”小节。
+- `with pl.spmd(N, deps=[...]) as tid: ...` —— **捕获形式**：与 `with pl.at(...) as tid:` 对称。body 形态与上面的普通形式相同，并额外在 `tid` 中捕获该分发的 grid 级 producer `pl.Scalar[pl.TASK_ID]`（可用作 `deps=` 边、存入 `pl.array.create(N, pl.TASK_ID)`、或跨入 `pl.manual_scope`）。TaskId 捕获与内联 body 正交——这是该形式相比普通形式唯一多出来的能力。lower 成一个 `ir.Submit`，其尾部 tuple 元素即 grid TaskId；`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上。参见下文“手动依赖原语”小节。
 - `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` —— **submit 形式**：将 kernel 在 `N` 个 block 上分发，同时捕获该分发的 producer `pl.Scalar[pl.TASK_ID]`（针对已声明 kernel 的 `pl.submit` 版本）。参见下文“手动依赖原语”小节。
 
-可选 `optimizations=[pl.split(MODE)]`（**不支持** `pl.auto_chunk`；chunk 循环请在内层使用 `pl.at(..., optimizations=[pl.auto_chunk])`）：
+以上三种形式也都接受 `allow_early_resolve=True`（布尔字面量；与 `pl.submit` / `pl.at` 相同的 early-dispatch 选项）。即使不写 `as tid` 也会强制走 `ir.Submit` 形态，并 lower 为 `Arg::set_allow_early_resolve(true)`。在嵌套于 `pl.cluster()` 内的 `pl.spmd` 上会被拒绝（此类 scope 会被 unwrap 进 Group 函数、永远不会产生 Submit，提示会丢失）。
+
+可选 `optimizations=[pl.split(MODE)]`：
 
 | 条目 | 适用形式 | 作用 |
 | ---- | -------- | ---- |
@@ -388,7 +368,7 @@ DSL 暴露**两套正交的机制**，用户可任意组合：
 | `result, tid = pl.submit(kernel, *args, deps=[...], allow_early_resolve=False)` | 单个 kernel 调用 | 尾部 `tid` 是 producer `pl.Scalar[pl.TASK_ID]`。它是 parser construct（类似 `pl.range`），不是 runtime 函数。`allow_early_resolve=True` 将该 task 标记为推测式 early-dispatch producer（让调度器提前预置其 consumer；lower 为 `Arg::set_allow_early_resolve(true)`）。 |
 | `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | 单个 SPMD task launch | `pl.submit` 的 SPMD 版本：将 kernel 在 `N` 个 block 上分发（一个 orchestration task → 一个 `tid`）。`core_num` 是必填关键字参数（正整数表达式）；`sync_start=True` 强制所有 block 原子启动。callee 可以是 InCore / AIC / AIV / Group。launch spec 记录在 `Submit.core_num` / `Submit.sync_start` 上。同样接受 `allow_early_resolve=True`（与 `pl.submit` 相同的 early-dispatch 选项）。 |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-块 | 整块被 outline 成 InCore kernel + `Submit`；`tid` 捕获被合成的 Submit 的 TaskId，可作为后续 `pl.submit` / `pl.at` 的 dep。不写 `as tid` 时 outliner 会合成一个未使用的 TaskId Var——deps 始终走 `Submit::deps_`。同样接受 `allow_early_resolve=True`（与 `pl.submit` 相同的 early-dispatch 选项）；即使不写 `as tid` 也会强制走 `Submit` 形态，并 lower 为 `Arg::set_allow_early_resolve(true)`。 |
-| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD 分发 | `pl.at ... as tid` 形式的 SPMD 版本。内联 body 自动外包成 InCore kernel 并在 `N` 个 block 上分发；`tid` 捕获 grid 级 producer TaskId。`deps=` 仅在带 `as tid` 时可用。`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上（lower 出的 `Submit.core_num` 为 `None`）；codegen 通过 launch-function 回退读取。不能嵌套在 `pl.cluster()` 内。 |
+| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD 分发 | `pl.at ... as tid` 形式的 SPMD 版本。内联 body 自动外包成 InCore kernel 并在 `N` 个 block 上分发；`tid` 捕获 grid 级 producer TaskId。`deps=` 仅在带 `as tid` 时可用。`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上（lower 出的 `Submit.core_num` 为 `None`）；codegen 通过 launch-function 回退读取。同样接受 `allow_early_resolve=True`（与 `pl.submit` / `pl.at` 相同的 early-dispatch 选项；`pl.spmd` 三种形式均可用，即使不写 `as tid` 也会强制走 `Submit` 形态）。不能嵌套在 `pl.cluster()` 内。 |
 | `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | 不提交 kernel。返回的 TaskId 是一个紧凑的 fan-in 点，可供后续 `deps=[barrier]` 使用。 |
 | `None`（Python 字面量） | 种子 / dep 条目 | "暂无 producer" 的哨兵。`prev_tid = None` 用作 TaskId 循环 iter_arg 的种子；`deps=[None]` 中的 `None` 被丢弃（不贡献任何边）。下沉为 `system.task_invalid` → `PTO2TaskId::invalid()`。 |
 

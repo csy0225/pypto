@@ -33,7 +33,7 @@ are the only dep consumers this pass inspects.
 ## Position in the pipeline
 
 ```text
-... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> MaterializeCommDomainScopes -> Simplify (final)
+... -> DeriveCallDirections -> AutoDeriveTaskDependencies -> ExpandManualPhaseFence -> SynthesizeAllReduceSignals -> MaterializeCommDomainScopes -> LowerHostTensorCollectives -> Simplify (final)
 ```
 
 `DeriveCallDirections` must run first so call-like nodes carry resolved

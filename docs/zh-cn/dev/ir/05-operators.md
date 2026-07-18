@@ -112,9 +112,9 @@ REGISTER_OP("tensor.matmul")
 
 在 tile 层，`tile.batch_matmul` 为 `TileType` 操作数提供批量语义。它接受 rank >= 2 的
 tile，广播前导批量维度，并保持与 `tile.matmul` 相同的纯操作数接口风格。如果批量操作数
-需要转置语义，可以通过两种等价方式表达：在输入上显式使用 `tile.transpose(...)`，或让
-输入来自 `tile.load(..., transpose=True)`。在后续降级到 2D `tile.matmul` 时，这两种
-写法都会被统一识别为操作数转置语义。
+需要转置语义，可以通过两种等价方式表达：在输入上显式使用 `tile.transpose(...)`，或在
+自然 `tile.load` 上叠加零拷贝 `tile.transpose_view(...)`。在后续降级到 2D `tile.matmul`
+时，这两种写法都会被统一识别为操作数转置语义。
 
 `tile.batch_matmul_acc(acc, lhs, rhs)` 是批量路径上的累加版本：`acc = acc + lhs @ rhs`，
 遵循与 `tile.batch_matmul` 一致的 rank>=2 + batch 广播规则。acc 的 batch 形状必须与
@@ -224,7 +224,7 @@ UINT32 + INT32 → INT32 (signed precedence)
 **位置**：`src/ir/op/tensor_ops/`
 **Python API**：`from pypto.ir.op import tensor`
 
-**操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（内部 API，更新 valid_shape 元数据，不搬移数据 — 仅供编译器生成代码使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按行展开为 `tile.gather` 循环），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列；仅 A3 / CPU-sim 后端支持，A5 拒绝），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace）
+**操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（内部 API，更新 valid_shape 元数据，不搬移数据 — 仅供编译器生成代码使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按行展开为 `tile.gather` 循环），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`；见[掩码模式](#掩码模式)），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列 —— 见[掩码模式](#掩码模式)），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace）
 
 **示例：**
 
@@ -267,9 +267,25 @@ with ib.function("tensor_example") as f:
 | - | `tile.ci` | 生成连续整数序列（升序 start+k 或降序 start-k）；dtype ∈ {INT16, INT32}；最内维 != 1 |
 | **规约** | `tile.sum` | 沿轴规约（axis, keepdim） |
 | **散布** | `tile.scatter` | 按行索引把 `src` 散布到 `dst`（`pto.tscatter` 索引形式；DPS：`dst` 为 in/out，结果别名为 `dst`）。`src` / `dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}；`indexes` dtype ∈ {I16, I32}；元素宽度匹配规则：4 字节 dst ↔ INT32，2 字节 dst ↔ INT16，1 字节 dst ↔ INT16。 |
-| - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（`pto.tscatter` 掩码形式；DPS）。掩码 P0101 (1) / P1010 (2) 步幅 2；P0001..P1000 (3-6) 步幅 4；P1111 (7) 不扩展。仅 A3 / CPU-sim 后端支持，A5 拒绝。 |
+| - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO codegen 层形式，下降为 `pto.tscatter` 掩码发射 —— **并非**独立的 pto-isa 指令（与 `tile.gather_mask` 不同）。掩码语义见[掩码模式](#掩码模式)。 |
 
 **数据流：** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
+
+### 掩码模式
+
+`*.gather_mask` / `*.scatter_mask` 使用编译期 `MaskPattern`（`pl.tile.MaskPattern`，整数取值 1–7，与硬件 `VREDUCEv2` 的 pattern mode 一致）按行标记列的一个子集（模式名**从右往左**读，最右位对应列 0）。同一标记集合驱动两个算子做**相反方向**的操作。**`gather_mask`** *选择并紧凑*：从宽输入中读取被标记的列，紧凑写入较窄输出的前若干列（`out_cols = cols / stride`）；这是真实的 pto-isa 指令（`pto.tgather` 掩码形式），A2/A3 **与 A5** 均支持。**`scatter_mask`** *放置并扩展*：把紧凑输入写入更宽 `dst` 的被标记列（`dst_cols = cols * stride`），未标记列保留 `dst` 原值（DPS）；这是 **PyPTO codegen 层形式，并非独立的 pto-isa 指令** —— 不存在 `pto.tscatter` 掩码指令（与 gather 不同）—— PyPTO 为 A2/A3 / CPU-sim 类下降路径发射它。例如对 `[a0 a1 a2 a3 a4 a5 a6 a7]`：gather `P0101 → [a0 a2 a4 a6]`；对 `[s0 s1 s2 s3]` 做 scatter `P0101 → [s0 · s1 · s2 · s3 ·]`（`·` 表示保留的 `dst`）。
+
+| 模式 | 整数 | 标记列 `c` 的条件 | 被标记的列 | 步长 |
+| ---- | ---- | ----------------- | ---------- | ---- |
+| `P0101` | 1 | `c % 2 == 0` | 0, 2, 4, … | 2 |
+| `P1010` | 2 | `c % 2 == 1` | 1, 3, 5, … | 2 |
+| `P0001` | 3 | `c % 4 == 0` | 0, 4, 8, … | 4 |
+| `P0010` | 4 | `c % 4 == 1` | 1, 5, 9, … | 4 |
+| `P0100` | 5 | `c % 4 == 2` | 2, 6, 10, … | 4 |
+| `P1000` | 6 | `c % 4 == 3` | 3, 7, 11, … | 4 |
+| `P1111` | 7 | 全选 | 全部 | 1 |
+
+最后一维须能被步长整除。`gather_mask` 另接受可选的同位宽 `output_dtype`（按位重解释，而非数值转换）。参考：gather 的选择语义见 `pto-isa` 的 `MaskSelect`（`include/pto/cpu/TGather.hpp`）；pypto 类型推导见 `src/ir/op/tile_ops/gather.cpp`（gather）/ `src/ir/op/tile_ops/scatter.cpp`（scatter）。
 
 ### 使用示例
 
@@ -305,10 +321,21 @@ with ib.function("tile_computation") as f:
 | `system.bar_all` | 全局屏障 | 无 |
 | `system.bar_v` | 向量屏障 | 无 |
 | `system.bar_m` | 矩阵屏障 | 无 |
+| `system.syncall` | 跨核全员屏障（`pto::SYNCALL`）。`mode="hard"`（FFTS，无 operand）或 `mode="soft"`（GM 轮询，带 operand） | `core_type`（`"aiv_only"` \| `"aic_only"` \| `"mix"`）、`mode`（`"hard"` \| `"soft"`） |
 | `system.sync_src` | 设置同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | 等待同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.task_invalid` | `PTO2TaskId::invalid()` 哨兵——TaskId carry 的 "暂无 producer" 种子 | 无 |
 | `system.task_is_valid` | 测试某个 `TASK_ID` 值是否为有效（非哨兵）handle | 无；唯一位置参数是 TaskId Var |
+
+`system.syncall` 有两种 mode。**hard** 形态（`mode="hard"`，默认）下沉为 FFTS 屏障，等待所选 `core_type` 的**全部**物理核到达；kernel 必须以满占用方式启动（每个物理核一个 block），否则屏障死锁（AICore 错误 507018）。**soft** 形态（`mode="soft"`）轮询一段共享 GM workspace，因此可在**部分**占用下工作。`gm_workspace` 是共享、清零的 GM `INT32` tensor，含 `used_cores * 8` 个 slot（请作为 kernel 参数传入，使所有 block 共享同一缓冲）；暂存 tile 由编译器合成；`used_cores` 是参与核数。soft 形态对每种 `core_type` 都支持，operand 随参与核集合而不同：
+
+- `aiv_only`：`[gm_workspace, ub_scratch, used_cores]` —— 一个 UB（Vec）暂存 tile。
+- `aic_only`：`[gm_workspace, l1_scratch, used_cores]` —— 一个扁平 L1（Mat，`slayout=none_box`）暂存 tile。
+- `mix`：`[gm_workspace, ub_scratch, l1_scratch, used_cores]` —— UB 与扁平 L1 各一个。该屏障汇合 AIC + AIV 核，故 `used_cores` 是**总**参与数（AIC block 数 + AIV subblock 数）。该 op 会被复制到 cube 与 vector 两条流上，每条流各用自己的 tile（另一个在该流上是死代码），与 pto-isa 的 soft-mix 下沉一致。
+
+扁平 L1 暂存 tile 通过 `pl.tile.create(..., target_memory=pl.Mem.Mat, flat_layout=True)` 创建，保持连续的 `slayout=none_box` 布局（普通的 boxed NZ Mat tile 会错位 8 个 int32 计数槽）。
+
+统一的 `mode=` 关键字 API（`mode="hard"` / `mode="soft"`）是 **DSL** 层接口（`pl.system.syncall`）。`pypto.ir.op.system` 下的 Python IR 辅助函数则是拆开的：`syncall(core_type=...)` 构造 hard 形态，`syncall_soft(core_type, args)` 构造 soft 形态。
 
 `system.task_invalid` 返回类型为 [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype)。当 Python 字面量 `None` 出现在 TaskId 位置（`deps=[None]` 条目或 TaskId 循环 iter_arg 种子）时，它就是 `None` 在 `with pl.manual_scope():` 区域内的下沉目标。不存在 `system.task_id_of` op —— producer task id 由 `pl.submit(...)` parser construct 返回的二元组第二个元素获得，而非来自 builtin。源码：`src/ir/op/sync_ops/task.cpp`。
 

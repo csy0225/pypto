@@ -104,6 +104,12 @@ class DistributedCodegen : public CodegenBase {
   /// Resolve a dispatch call's ``device=`` attr to a Python rank expression.
   [[nodiscard]] std::string ResolveRankExpr(const ir::CallPtr& call) const;
 
+  /// Lower a ``CommCtxType`` call argument. get_comm_ctx-derived locals map to
+  /// the runtime device_ctx expression for the current dispatch rank; explicit
+  /// CommCtx params are forwarded as scalar names.
+  [[nodiscard]] std::string ResolveCommCtxArg(const ir::ExprPtr& arg, const std::string& rank_expr,
+                                              const ir::Span& span) const;
+
   /// Return the emitted Python handle variable for the comm domain that owns
   /// ``wb``.
   [[nodiscard]] std::string GetCommDomainHandleVar(const ir::WindowBufferPtr& wb) const;
@@ -212,6 +218,26 @@ class DistributedCodegen : public CodegenBase {
   /// AssignStmt — so referenced temps are not yet bound in the emitted Python
   /// when the scope's ``window_size`` / ``CommBufferSpec`` lines are written.
   void CollectHostOrchVarDefs(const ir::FunctionPtr& func);
+
+  /// Emit ``<dim> = tensors["<param>"].shape[<i>]`` (or an inverted affine
+  /// form) at the top of a HOST-orchestrator body for every ``pl.dynamic()``
+  /// shape dim carried by a tensor parameter. Without this, a per-rank host
+  /// slice that references a dynamic dim (e.g. ``tensors["x"][r, 0:M, 0:N]``)
+  /// emits the bare symbol ``M`` with no binding, raising ``NameError`` at
+  /// runtime (#1873). Mirrors the device-side ``_append_dynamic_dim_unpacking``,
+  /// sharing ``CollectVarsFromShapeExpr`` as the single source of truth so host
+  /// and device recover dims in lockstep.
+  void EmitHostOrchDynamicDimBindings(const ir::FunctionPtr& func);
+
+  /// Return a Python expression that recovers ``target_var`` from
+  /// ``shape_access`` (e.g. ``tensors["x"].shape[1]``), or an empty string if
+  /// the shape dim is not invertible for that var. Supports ``var`` and the
+  /// single-var affine forms ``var +/- c``, ``c - var``, ``var * c`` / ``c *
+  /// var`` (-> ``shape // c``) and ``var // c`` (-> ``shape * c``). Python
+  /// mirror of the device-side ``_invert_shape_dim_for_var`` (integer ``//``
+  /// keeps slice bounds int-typed).
+  [[nodiscard]] std::string InvertShapeDimForVar(const ir::ExprPtr& dim_expr, const ir::VarPtr& target_var,
+                                                 const std::string& shape_access) const;
 
   /// Lower a comm-domain slot ``size_`` expression for ``window_size`` /
   /// ``CommBufferSpec`` emission, unwrapping hoisted scalar temps via

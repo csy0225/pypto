@@ -16,10 +16,13 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/codegen/orchestration/orchestration_analysis.h"
+#include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -29,6 +32,104 @@ namespace ir {
 namespace pass {
 
 namespace {
+
+using ::pypto::codegen::IsBuiltinOp;
+
+constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
+constexpr const char* kAttrCompilerAutoManualLayerCandidate = "__compiler_auto_manual_layer_candidate";
+
+bool HasAttr(const std::vector<std::pair<std::string, std::any>>& attrs, const char* key) {
+  for (const auto& [k, v] : attrs) {
+    (void)v;
+    if (k == key) return true;
+  }
+  return false;
+}
+
+std::vector<std::pair<std::string, std::any>> StripAttr(
+    const std::vector<std::pair<std::string, std::any>>& attrs, const char* key) {
+  std::vector<std::pair<std::string, std::any>> stripped;
+  stripped.reserve(attrs.size());
+  for (const auto& attr : attrs) {
+    if (attr.first != key) {
+      stripped.push_back(attr);
+    }
+  }
+  return stripped;
+}
+
+class CompilerAutoManualScopeScanner : public IRVisitor {
+ public:
+  bool ShouldWrap(const StmtPtr& body) {
+    VisitStmt(body);
+    return has_target_candidate_ && all_task_calls_are_target_candidates_ && !has_nested_runtime_scope_;
+  }
+
+ protected:
+  void VisitStmt_(const RuntimeScopeStmtPtr& op) override {
+    has_nested_runtime_scope_ = true;
+    (void)op;
+  }
+
+  void VisitExpr_(const CallPtr& call) override {
+    RecordCall(call ? call->op_->name_ : std::string(), call ? call->attrs_ : kEmptyAttrs);
+    IRVisitor::VisitExpr_(call);
+  }
+
+  void VisitExpr_(const SubmitPtr& submit) override {
+    RecordCall(submit ? submit->op_->name_ : std::string(), submit ? submit->attrs_ : kEmptyAttrs);
+    IRVisitor::VisitExpr_(submit);
+  }
+
+ private:
+  void RecordCall(const std::string& name, const std::vector<std::pair<std::string, std::any>>& attrs) {
+    if (name.empty() || IsBuiltinOp(name)) return;
+    const bool candidate = HasAttr(attrs, kAttrCompilerAutoManualScopeCandidate);
+    if (!candidate) {
+      all_task_calls_are_target_candidates_ = false;
+      return;
+    }
+    has_target_candidate_ = true;
+  }
+
+  inline static const std::vector<std::pair<std::string, std::any>> kEmptyAttrs = {};
+  bool has_target_candidate_ = false;
+  bool all_task_calls_are_target_candidates_ = true;
+  bool has_nested_runtime_scope_ = false;
+};
+
+class CompilerAutoManualCallAttrStripper : public IRMutator {
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto base = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(base);
+    if (!call) return base;
+
+    auto stripped_attrs = StripAttr(call->attrs_, kAttrCompilerAutoManualScopeCandidate);
+    if (stripped_attrs.size() == call->attrs_.size()) return call;
+    return std::make_shared<const Call>(call->op_, call->args_, call->kwargs_, std::move(stripped_attrs),
+                                        call->GetType(), call->span_);
+  }
+
+  ExprPtr VisitExpr_(const SubmitPtr& op) override {
+    auto base = IRMutator::VisitExpr_(op);
+    auto submit = As<Submit>(base);
+    if (!submit) return base;
+
+    auto stripped_attrs = StripAttr(submit->attrs_, kAttrCompilerAutoManualScopeCandidate);
+    if (stripped_attrs.size() == submit->attrs_.size()) return submit;
+    return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
+                                          std::move(stripped_attrs), submit->GetType(), submit->span_,
+                                          submit->core_num_, submit->sync_start_,
+                                          submit->allow_early_resolve_);
+  }
+};
+
+bool ShouldWrapCompilerAutoManualScope(const StmtPtr& body) {
+  if (!body) return false;
+  CompilerAutoManualScopeScanner scanner;
+  return scanner.ShouldWrap(body);
+}
 
 /// True when @p stmt is already a compiler-inserted AUTO RuntimeScopeStmt.
 /// Used to keep the pass idempotent and to avoid double-wrapping a body that
@@ -53,6 +154,28 @@ StmtPtr WrapAuto(const StmtPtr& body) {
   return std::make_shared<RuntimeScopeStmt>(/*manual=*/false, /*name_hint=*/"", body, body->span_);
 }
 
+StmtPtr WrapCompilerAutoManual(const StmtPtr& body) {
+  std::vector<std::pair<std::string, std::any>> attrs;
+  attrs.emplace_back(kAttrCompilerAutoManualScopeCandidate, true);
+  return std::make_shared<RuntimeScopeStmt>(/*manual=*/true, /*name_hint=*/"", body, body->span_,
+                                            std::vector<std::string>{}, std::move(attrs));
+}
+
+StmtPtr WrapCompilerAutoManualLayer(const StmtPtr& body) {
+  return std::make_shared<RuntimeScopeStmt>(/*manual=*/true, /*name_hint=*/"", body, body->span_,
+                                            std::vector<std::string>{},
+                                            std::vector<std::pair<std::string, std::any>>{});
+}
+
+StmtPtr WrapAutoOrCompilerManual(const StmtPtr& body) {
+  return ShouldWrapCompilerAutoManualScope(body) ? WrapCompilerAutoManual(body) : WrapAuto(body);
+}
+
+StmtPtr StripCompilerAutoManualCallCandidates(const StmtPtr& body) {
+  CompilerAutoManualCallAttrStripper stripper;
+  return stripper.VisitStmt(body);
+}
+
 /// Inserts AUTO RuntimeScopeStmt nodes around ForStmt and IfStmt bodies,
 /// replicating the orchestration codegen's former implicit ``PTO2_SCOPE()``
 /// wrapping. Insertion is suppressed inside a manual RuntimeScopeStmt — the
@@ -75,7 +198,7 @@ class InsertAutoScopeMutator : public IRMutator {
     auto for_stmt = As<ForStmt>(base);
     if (!for_stmt || !for_stmt->body_ || IsAutoScope(for_stmt->body_)) return base;
     auto copy = MutableCopy(for_stmt);
-    copy->body_ = WrapAuto(for_stmt->body_);
+    copy->body_ = WrapAutoOrCompilerManual(for_stmt->body_);
     return copy;
   }
 
@@ -88,12 +211,12 @@ class InsertAutoScopeMutator : public IRMutator {
     bool changed = false;
     StmtPtr then_body = if_stmt->then_body_;
     if (then_body && !IsAutoScope(then_body)) {
-      then_body = WrapAuto(then_body);
+      then_body = WrapAutoOrCompilerManual(then_body);
       changed = true;
     }
     std::optional<StmtPtr> else_body = if_stmt->else_body_;
     if (else_body.has_value() && *else_body && !IsAutoScope(*else_body)) {
-      else_body = WrapAuto(*else_body);
+      else_body = WrapAutoOrCompilerManual(*else_body);
       changed = true;
     }
     if (!changed) return base;
@@ -124,12 +247,18 @@ Pass MaterializeRuntimeScopes() {
     // emitting zero compiler scopes is valid. Leave such functions untouched.
     if (!func->GetAttr<bool>("auto_scope", true)) return func;
 
-    InsertAutoScopeMutator mutator;
-    auto inner = mutator.VisitStmt(func->body_);
+    const bool whole_layer_manual = func->GetAttr<bool>(kAttrCompilerAutoManualLayerCandidate, false);
+    StmtPtr inner = func->body_;
+    if (!whole_layer_manual) {
+      InsertAutoScopeMutator mutator;
+      inner = mutator.VisitStmt(func->body_);
+    }
 
     // Always wrap the whole function body in an AUTO scope, matching the
     // always-on outermost ``PTO2_SCOPE()`` codegen emitted at function entry.
-    StmtPtr new_body = IsAutoScope(inner) ? inner : WrapAuto(inner);
+    StmtPtr new_body = whole_layer_manual ? WrapCompilerAutoManualLayer(inner)
+                                          : (IsAutoScope(inner) ? inner : WrapAuto(inner));
+    new_body = StripCompilerAutoManualCallCandidates(new_body);
 
     // Mark the function ``auto_scope=False`` now that scopes are materialized.
     // This makes the pass idempotent (a second run early-returns) and lets the
@@ -139,7 +268,9 @@ Pass MaterializeRuntimeScopes() {
     std::vector<std::pair<std::string, std::any>> new_attrs;
     new_attrs.reserve(func->attrs_.size() + 1);
     for (const auto& kv : func->attrs_) {
-      if (kv.first != "auto_scope") new_attrs.push_back(kv);
+      if (kv.first != "auto_scope" && kv.first != kAttrCompilerAutoManualLayerCandidate) {
+        new_attrs.push_back(kv);
+      }
     }
     new_attrs.emplace_back("auto_scope", std::any(false));
 

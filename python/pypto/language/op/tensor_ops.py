@@ -27,9 +27,11 @@ __all__ = [
     "dim",
     "slice",
     "fillpad",
+    "fillpad_expand",
     "full",
     "ci",
     "arange",
+    "random",
     "matmul",
     "matmul_acc",
     "mul",
@@ -40,25 +42,43 @@ __all__ = [
     "subs",
     "div",
     "divs",
+    "part_add",
+    "part_mul",
+    "part_max",
+    "part_min",
+    "fmod",
+    "fmods",
     "maximum",
     "minimum",
     "cmp",
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
     "row_expand",
     "row_expand_mul",
     "row_expand_div",
     "row_expand_add",
     "row_expand_sub",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand_mul",
     "col_expand",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "expands",
     "expand_clone",
     "exp",
@@ -438,6 +458,31 @@ def fillpad(tensor: Tensor, pad_value: PadValue | int | float = PadValue.zero) -
     return Tensor(expr=call_expr)
 
 
+def fillpad_expand(
+    tensor: Tensor, shape: Sequence[IntLike], pad_value: PadValue | int | float = PadValue.zero
+) -> Tensor:
+    """Copy a smaller source tensor into a larger destination tensor, padding the rest.
+
+    Unlike :func:`fillpad` (which keeps the same shape and only fills the invalid
+    view region), the destination ``shape`` may be larger than the source in
+    either dimension. The source's valid region is copied into the top-left of
+    the destination and every other element is filled with ``pad_value``.
+
+    Args:
+        tensor: Source tensor
+        shape: Destination shape; each dimension must be >= the source dimension
+        pad_value: ``PadValue`` enum (``zero`` / ``max`` / ``min``), or one of
+            the literal sugars ``0``, ``math.inf``, ``-math.inf``. Default is
+            ``PadValue.zero``. Other values raise — the hardware only supports
+            the three padding modes.
+
+    Returns:
+        Tensor wrapping the fillpad_expand operation (a new, larger tensor).
+    """
+    call_expr = _ir_ops.fillpad_expand(tensor.unwrap(), _normalize_intlike(shape), pad_value=pad_value)
+    return Tensor(expr=call_expr)
+
+
 def set_validshape(tensor: Tensor, valid_rows: IntLike, valid_cols: IntLike) -> Tensor:
     """Update valid-shape metadata of a tensor without data movement.
 
@@ -500,6 +545,40 @@ def ci(
 
 
 arange = ci
+
+
+def random(
+    key0: int | Scalar,
+    key1: int | Scalar,
+    counter0: int | Scalar,
+    counter1: int | Scalar,
+    counter2: int | Scalar,
+    counter3: int | Scalar,
+    shape: Sequence[IntLike],
+    dtype: DataType = DataType.UINT32,
+    rounds: int = 10,
+) -> Tensor:
+    """Generate counter-based pseudo-random values into a tensor.
+
+    Implements a counter-based (Philox/ChaCha-style) RNG. Each element is derived
+    deterministically from the 64-bit key ``(key0, key1)`` and 128-bit counter
+    ``(counter0..counter3)`` plus the element position, so the same seeds always
+    reproduce the same tensor. Lowers to ``tile.random`` → ``pto.trandom``.
+
+    Args:
+        key0, key1: The two INT32 key words (plain ints or Scalars).
+        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        shape: Destination tensor shape (static).
+        dtype: Destination dtype. One of {INT32, UINT32}. Defaults to UINT32.
+        rounds: Cipher round count, 7 or 10. Defaults to 10.
+
+    Returns:
+        Tensor wrapping the random operation.
+    """
+    raw_seeds = (key0, key1, counter0, counter1, counter2, counter3)
+    seeds = [v.unwrap() if isinstance(v, Scalar) else v for v in raw_seeds]
+    call_expr = _ir_ops.random(*seeds, _normalize_intlike(shape), dtype=dtype, rounds=rounds)
+    return Tensor(expr=call_expr)
 
 
 def matmul(
@@ -684,6 +763,96 @@ def divs(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
     return Tensor(expr=call_expr)
 
 
+def part_add(lhs: Tensor, rhs: Tensor) -> Tensor:
+    """Partial element-wise add of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+
+    Returns:
+        Tensor wrapping the part_add operation
+    """
+    call_expr = _ir_ops.part_add(lhs.unwrap(), rhs.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def part_mul(lhs: Tensor, rhs: Tensor) -> Tensor:
+    """Partial element-wise multiply of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+
+    Returns:
+        Tensor wrapping the part_mul operation
+    """
+    call_expr = _ir_ops.part_mul(lhs.unwrap(), rhs.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def part_max(lhs: Tensor, rhs: Tensor) -> Tensor:
+    """Partial element-wise max of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+
+    Returns:
+        Tensor wrapping the part_max operation
+    """
+    call_expr = _ir_ops.part_max(lhs.unwrap(), rhs.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def part_min(lhs: Tensor, rhs: Tensor) -> Tensor:
+    """Partial element-wise min of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+
+    Returns:
+        Tensor wrapping the part_min operation
+    """
+    call_expr = _ir_ops.part_min(lhs.unwrap(), rhs.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def fmod(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise floating-point remainder of tensor and tensor or scalar.
+
+    Automatically selects between tensor.fmod (tensor, tensor) and
+    tensor.fmods (tensor, scalar) based on the rhs type. The result matches
+    ``torch.fmod`` (the remainder takes the sign of the dividend).
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
+
+    Returns:
+        Tensor wrapping the fmod operation
+    """
+    lhs_expr = lhs.unwrap()
+    call_expr = _ir_ops.fmod(lhs_expr, _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def fmods(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
+    """Element-wise floating-point remainder of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side scalar (int/float/Expr/Scalar)
+
+    Returns:
+        Tensor wrapping the fmods operation
+    """
+    lhs_expr = lhs.unwrap()
+    call_expr = _ir_ops.fmods(lhs_expr, _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
 def maximum(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
     """Element-wise maximum of tensor and tensor or scalar.
 
@@ -781,6 +950,20 @@ def row_min(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
+def row_prod(input: Tensor) -> Tensor:
+    """Row-wise product reduction (reduces along last axis, keeps dim).
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the row_prod operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.row_prod(input_expr)
+    return Tensor(expr=call_expr)
+
+
 def col_sum(input: Tensor) -> Tensor:
     """Column-wise sum reduction (reduces along axis=-2, keeps dim).
 
@@ -826,6 +1009,86 @@ def col_min(input: Tensor) -> Tensor:
     """
     input_expr = input.unwrap()
     call_expr = _ir_ops.col_min(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_prod(input: Tensor) -> Tensor:
+    """Column-wise product reduction (reduces along axis=-2, keeps dim).
+
+    Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the col_prod operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.col_prod(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_argmax(input: Tensor) -> Tensor:
+    """Row-wise argmax: index of the per-row maximum (int32, reduces along last axis).
+
+    Output shape is ``[..., M, 1]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the row_argmax operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.row_argmax(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_argmin(input: Tensor) -> Tensor:
+    """Row-wise argmin: index of the per-row minimum (int32, reduces along last axis).
+
+    Output shape is ``[..., M, 1]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the row_argmin operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.row_argmin(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_argmax(input: Tensor) -> Tensor:
+    """Column-wise argmax: index of the per-column maximum (int32, reduces along axis=-2).
+
+    Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the col_argmax operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.col_argmax(input_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_argmin(input: Tensor) -> Tensor:
+    """Column-wise argmin: index of the per-column minimum (int32, reduces along axis=-2).
+
+    Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+
+    Returns:
+        Tensor wrapping the col_argmin operation
+    """
+    input_expr = input.unwrap()
+    call_expr = _ir_ops.col_argmin(input_expr)
     return Tensor(expr=call_expr)
 
 
@@ -909,6 +1172,54 @@ def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
+def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise broadcast maximum: max(tensor[i,:], row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_max operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_max(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise broadcast minimum: min(tensor[i,:], row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_min operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_min(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
+    """Row-wise exp-diff: exp(tensor[i,:] - row_vec[i,0]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector providing per-row scalar (TensorType [M, 1])
+
+    Returns:
+        Tensor wrapping the row_expand_expdif operation
+    """
+    tensor_expr = tensor.unwrap()
+    row_vec_expr = row_vec.unwrap()
+    call_expr = _ir_ops.row_expand_expdif(tensor_expr, row_vec_expr)
+    return Tensor(expr=call_expr)
+
+
 def col_expand_mul(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast multiplication: tensor[:,j] * col_vec[0,j].
 
@@ -986,6 +1297,54 @@ def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
     tensor_expr = tensor.unwrap()
     col_vec_expr = col_vec.unwrap()
     call_expr = _ir_ops.col_expand_add(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise broadcast maximum: max(tensor[:,j], col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_max operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_max(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise broadcast minimum: min(tensor[:,j], col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_min operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_min(tensor_expr, col_vec_expr)
+    return Tensor(expr=call_expr)
+
+
+def col_expand_expdif(tensor: Tensor, col_vec: Tensor) -> Tensor:
+    """Column-wise exp-diff: exp(tensor[:,j] - col_vec[0,j]).
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector providing per-column scalar (TensorType [1, N])
+
+    Returns:
+        Tensor wrapping the col_expand_expdif operation
+    """
+    tensor_expr = tensor.unwrap()
+    col_vec_expr = col_vec.unwrap()
+    call_expr = _ir_ops.col_expand_expdif(tensor_expr, col_vec_expr)
     return Tensor(expr=call_expr)
 
 
@@ -1193,7 +1552,9 @@ def assemble(
             NOTE: atomic-add accumulation order across cores is not fixed, so
             floating-point results are non-deterministic. The target must be
             zero-initialised before the kernel runs. Supported dtypes:
-            fp32 / fp16 / int32 / int16 / int8 (not bf16).
+            fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
+            available on the Ascend910B (A2/A3) profile; it is not supported on
+            A5, where an fp32 accumulator + cast is required instead.
 
     Returns:
         Tensor wrapping the assemble operation
@@ -1255,11 +1616,10 @@ def as_layout(tensor: Tensor, layout: TensorLayout) -> Tensor:
     """Flip a tensor's layout tag over the same physical memory (RFC #1300 §3.3).
 
     .. note::
-        Internal API — intended for compiler-generated code only. Passes such
-        as ``LowerTransposeLoadParamLayout`` inject ``tensor.as_layout`` at
-        orch ↔ InCore call sites to bridge ND ↔ DN views over one physical
-        buffer. It is wrapped here so DSL-level test programs and tooling can
-        name it with static type-checking; end users should not need it.
+        Internal API — intended for compiler-generated code only. It bridges
+        ND ↔ DN views over one physical buffer at orch ↔ InCore call sites. It
+        is wrapped here so DSL-level test programs and tooling can name it with
+        static type-checking; end users should not need it.
 
     The trailing-two-dim shape swap that accompanies a cross-layout flip is
     derived from the source — callers do not pass a target shape (RFC §4.2:
@@ -1692,7 +2052,10 @@ def scatter(
         Writes each row of ``input`` into the columns of ``dst`` selected by the
         hardware mask pattern. ``dst.cols`` equals ``input.cols * stride``
         (stride = 2 for P0101/P1010, 4 for P0001..P1000, 1 for P1111).
-        Targeted at A3 / CPU-sim style backends — A5 rejects this form.
+        Unlike the gather mask form (a real ``pto.tgather`` ISA op on A2/A3 and
+        A5), mask-pattern scatter is not a distinct pto-isa instruction — PyPTO
+        emits it as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim
+        style lowering paths.
 
     Args:
         input: Base tensor (FP16/FP32/BF16/INT8/INT16/INT32, 2D).

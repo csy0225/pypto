@@ -174,6 +174,47 @@ def ci(
 arange = ci
 
 
+def _to_int32_scalar(value: int | Expr, span: Span) -> Expr:
+    """Normalize a seed value to an INT32 scalar expression."""
+    if isinstance(value, Expr):
+        if isinstance(value, ConstInt) and value.dtype != DataType.INT32:
+            return ConstInt(value.value, DataType.INT32, span)
+        return value
+    return ConstInt(value, DataType.INT32, span)
+
+
+def random(
+    key0: int | Expr,
+    key1: int | Expr,
+    counter0: int | Expr,
+    counter1: int | Expr,
+    counter2: int | Expr,
+    counter3: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    dtype: DataType = DataType.UINT32,
+    rounds: int = 10,
+    span: Span | None = None,
+) -> Call:
+    """Generate counter-based pseudo-random values into a tensor (lowers to tile.random).
+
+    Args:
+        key0, key1: The two INT32 key words.
+        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        shape: Destination shape (static, tuple of integers).
+        dtype: Destination dtype. One of {INT32, UINT32}. Defaults to UINT32.
+        rounds: Cipher round count, 7 or 10. Defaults to 10.
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression that returns a TensorType filled with random values.
+    """
+    actual_span = _get_span_or_capture(span)
+    seeds = [_to_int32_scalar(v, actual_span) for v in (key0, key1, counter0, counter1, counter2, counter3)]
+    shape_tuple = _to_make_tuple(shape, actual_span)
+    kwargs: dict[str, Any] = {"dtype": dtype, "rounds": rounds}
+    return _ir_core.create_op_call("tensor.random", [*seeds, shape_tuple], kwargs, actual_span)
+
+
 def read(
     tensor: Expr, indices: Expr | list[int | Expr] | _ir_core.MakeTuple, span: Span | None = None
 ) -> Call:
@@ -326,6 +367,40 @@ def fillpad(
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call(
         "tensor.fillpad", [tensor], {"pad_value": normalize_pad_value(pad_value)}, actual_span
+    )
+
+
+def fillpad_expand(
+    tensor: Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    pad_value: PadValue | int | float = PadValue.zero,
+    span: Span | None = None,
+) -> Call:
+    """Copy a smaller source tensor into a larger destination tensor, padding the rest.
+
+    Unlike :func:`fillpad` (which keeps the same shape and only fills the invalid
+    view region), the destination ``shape`` may be larger than the source in
+    either dimension. The source's valid region is copied into the top-left of
+    the destination and every other element is filled with ``pad_value``.
+
+    Args:
+        tensor: Source tensor expression
+        shape: Destination shape; each dimension must be >= the source dimension
+        pad_value: ``PadValue`` enum (``zero`` / ``max`` / ``min``), or one of
+            the literal sugars ``0``, ``math.inf``, ``-math.inf``. Other values
+            raise — the hardware only supports the three padding modes.
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression creating the expanded and padded tensor
+    """
+    actual_span = _get_span_or_capture(span)
+    shape_tuple = _to_make_tuple(shape, actual_span)
+    return _ir_core.create_op_call(
+        "tensor.fillpad_expand",
+        [tensor, shape_tuple],
+        {"pad_value": normalize_pad_value(pad_value)},
+        actual_span,
     )
 
 
@@ -584,6 +659,115 @@ def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
 
 
+def part_add(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise add of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise add
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.part_add", [lhs, rhs], {}, actual_span)
+
+
+def part_mul(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise multiply of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise multiply
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.part_mul", [lhs, rhs], {}, actual_span)
+
+
+def part_max(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise max of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise max
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.part_max", [lhs, rhs], {}, actual_span)
+
+
+def part_min(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise min of two tensors.
+
+    Args:
+        lhs: First source tensor
+        rhs: Second source tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise min
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.part_min", [lhs, rhs], {}, actual_span)
+
+
+def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise floating-point remainder of tensor and tensor or scalar.
+
+    Automatically selects between tensor.fmod (tensor, tensor) and
+    tensor.fmods (tensor, scalar) based on the rhs type. The result matches
+    ``torch.fmod`` (the remainder takes the sign of the dividend).
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor or scalar (int/float/Expr)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise floating-point remainder
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+
+    rhs_type = rhs_expr.type
+    if isinstance(rhs_type, ScalarType):
+        return _ir_core.create_op_call("tensor.fmods", [lhs, rhs_expr], {}, actual_span)
+    else:
+        return _ir_core.create_op_call("tensor.fmod", [lhs, rhs_expr], {}, actual_span)
+
+
+def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise floating-point remainder of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor
+        rhs: Right-hand side scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise floating-point remainder with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("tensor.fmods", [lhs, rhs_expr], {}, actual_span)
+
+
 def maximum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """Element-wise maximum of tensor and tensor or scalar.
 
@@ -699,6 +883,20 @@ def row_min(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.row_min", [input], {}, actual_span)
 
 
+def row_prod(input: Expr, span: Span | None = None) -> Call:
+    """Row-wise product reduction (reduces along last axis, keeps dim).
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise product reduction
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_prod", [input], {}, actual_span)
+
+
 def col_sum(input: Expr, span: Span | None = None) -> Call:
     """Column-wise sum reduction (reduces along axis=-2, keeps dim).
 
@@ -745,6 +943,86 @@ def col_min(input: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.col_min", [input], {}, actual_span)
+
+
+def col_prod(input: Expr, span: Span | None = None) -> Call:
+    """Column-wise product reduction (reduces along axis=-2, keeps dim).
+
+    Output shape is ``[..., 1, N]`` for an input of shape ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise product reduction
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_prod", [input], {}, actual_span)
+
+
+def row_argmax(input: Expr, span: Span | None = None) -> Call:
+    """Row-wise argmax: index of the per-row maximum (reduces along last axis, keeps dim).
+
+    Output dtype is int32. Output shape is ``[..., M, 1]`` for input ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise argmax
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_argmax", [input], {}, actual_span)
+
+
+def row_argmin(input: Expr, span: Span | None = None) -> Call:
+    """Row-wise argmin: index of the per-row minimum (reduces along last axis, keeps dim).
+
+    Output dtype is int32. Output shape is ``[..., M, 1]`` for input ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise argmin
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_argmin", [input], {}, actual_span)
+
+
+def col_argmax(input: Expr, span: Span | None = None) -> Call:
+    """Column-wise argmax: index of the per-column maximum (reduces along axis=-2, keeps dim).
+
+    Output dtype is int32. Output shape is ``[..., 1, N]`` for input ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise argmax
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_argmax", [input], {}, actual_span)
+
+
+def col_argmin(input: Expr, span: Span | None = None) -> Call:
+    """Column-wise argmin: index of the per-column minimum (reduces along axis=-2, keeps dim).
+
+    Output dtype is int32. Output shape is ``[..., 1, N]`` for input ``[..., M, N]``.
+
+    Args:
+        input: Input tensor
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise argmin
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_argmin", [input], {}, actual_span)
 
 
 def row_expand(target: Expr, row_vec: Expr, span: Span | None = None) -> Call:
@@ -834,6 +1112,59 @@ def row_expand_sub(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Cal
     return _ir_core.create_op_call("tensor.row_expand_sub", [tensor, row_vec], {}, actual_span)
 
 
+def row_expand_max(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast maximum.
+
+    Takes the element-wise maximum of each row and the row vector value.
+    max(tensor[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_expand_max", [tensor, row_vec], {}, actual_span)
+
+
+def row_expand_min(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast minimum.
+
+    Takes the element-wise minimum of each row and the row vector value.
+    min(tensor[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector (TensorType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_expand_min", [tensor, row_vec], {}, actual_span)
+
+
+def row_expand_expdif(tensor: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise exp-diff with per-row scalar.
+
+    Computes exp(tensor[i, :] - row_vec[i, 0]) for all i.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        row_vec: Row vector providing per-row scalar (TensorType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.row_expand_expdif", [tensor, row_vec], {}, actual_span)
+
+
 def col_expand_mul(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
     """Column-wise broadcast multiplication.
 
@@ -883,6 +1214,57 @@ def col_expand_sub(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Cal
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.col_expand_sub", [tensor, col_vec], {}, actual_span)
+
+
+def col_expand_max(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Column-wise broadcast maximum.
+
+    max(tensor[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_expand_max", [tensor, col_vec], {}, actual_span)
+
+
+def col_expand_min(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Column-wise broadcast minimum.
+
+    min(tensor[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector (TensorType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_expand_min", [tensor, col_vec], {}, actual_span)
+
+
+def col_expand_expdif(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Column-wise exp-diff with per-column scalar.
+
+    Computes exp(tensor[:, j] - col_vec[0, j]) for all j.
+
+    Args:
+        tensor: Input tensor (TensorType [M, N])
+        col_vec: Column vector providing per-column scalar (TensorType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.col_expand_expdif", [tensor, col_vec], {}, actual_span)
 
 
 def col_expand_div(tensor: Expr, col_vec: Expr, span: Span | None = None) -> Call:
@@ -1247,11 +1629,9 @@ def as_layout(
     .. note::
         Internal API — intended for compiler-generated code only, though a
         thin DSL wrapper exists at ``pl.tensor.as_layout`` for test programs
-        and tooling. Passes (e.g. ``LowerTransposeLoadParamLayout`` in P6)
-        inject ``tensor.as_layout`` at orch ↔ InCore call sites to bridge
-        ND ↔ DN views over the same physical buffer. The op emits no PTOAS
-        instruction; downstream ``make_tensor_view`` consumes the new view
-        directly.
+        and tooling. It bridges ND ↔ DN views over the same physical buffer at
+        orch ↔ InCore call sites. The op emits no PTOAS instruction; downstream
+        ``make_tensor_view`` consumes the new view directly.
 
     The trailing-two-dim shape swap that comes with a cross-layout flip is
     mechanical (RFC §4.2: row-major ``[..., a, b]`` ND ≡ ``[..., b, a]``
@@ -1811,7 +2191,10 @@ def scatter(  # noqa: PLR0913
         write each row of ``input`` into the columns of ``dst`` selected by the
         hardware mask pattern. ``dst.cols`` equals ``input.cols * stride``
         (stride = 2 for P0101/P1010, 4 for P0001..P1000, 1 for P1111).
-        Targeted at A3 / CPU-sim style backends — A5 rejects this form.
+        Unlike the gather mask form (a real ``pto.tgather`` ISA op on A2/A3 and
+        A5), mask-pattern scatter is not a distinct pto-isa instruction — PyPTO
+        emits it as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim
+        style lowering paths.
 
     Args:
         input: Base tensor supplying unwritten elements (TensorType, 2D).

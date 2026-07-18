@@ -31,8 +31,10 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -42,7 +44,7 @@ namespace ir {
 namespace {
 
 // =============================================================================
-// Cycle detection in the Inline → Inline call graph
+// Cycle detection in an expandable call graph
 // =============================================================================
 
 class CalledInlineCollector : public IRVisitor {
@@ -66,6 +68,24 @@ class CalledInlineCollector : public IRVisitor {
  private:
   const std::unordered_set<std::string>& inline_names_;
 };
+
+bool HasOnlyPlainHelperCallMetadata(const CallPtr& call) {
+  if (!call || !call->kwargs_.empty()) return false;
+  for (const auto& [key, value] : call->attrs_) {
+    (void)value;
+    // Selective dump describes observability only. Every launch/dependency/
+    // direction override is rejected: the helper Call is consumed by this
+    // pass, so there is no call-site object left on which those semantics
+    // could be re-materialized. In particular, arg_directions is not merely
+    // descriptive metadata; it can contain NoDep/OutputExisting and therefore
+    // changes the runtime dependency graph.
+    if (key == kAttrDumpVars) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
 
 void DetectInlineCycles(const std::unordered_map<std::string, FunctionPtr>& inline_fns) {
   std::unordered_set<std::string> inline_names;
@@ -181,6 +201,67 @@ class NestedReturnCounter : public IRVisitor {
   }
 };
 
+bool IsAutoRuntimeScope(const StmtPtr& stmt) {
+  auto scope = As<RuntimeScopeStmt>(stmt);
+  return scope && !scope->manual_;
+}
+
+StmtPtr WrapAutoRuntimeScope(const StmtPtr& body) {
+  INTERNAL_CHECK(body) << "InlineOrchestrationHelpers: cannot wrap a null runtime-scope body";
+  return std::make_shared<RuntimeScopeStmt>(/*manual=*/false, /*name_hint=*/"", body, body->span_);
+}
+
+// Preserve the same nested AUTO boundaries that MaterializeRuntimeScopes would
+// have emitted for a standalone orchestration helper. Manual scopes remain
+// authoritative and suppress AUTO insertion below them.
+class HelperRuntimeScopeMaterializer : public IRMutator {
+ protected:
+  StmtPtr VisitStmt_(const RuntimeScopeStmtPtr& op) override {
+    if (op->manual_) ++manual_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    if (op->manual_) --manual_depth_;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    auto base = IRMutator::VisitStmt_(op);
+    if (manual_depth_ > 0) return base;
+    auto loop = As<ForStmt>(base);
+    if (!loop || !loop->body_ || IsAutoRuntimeScope(loop->body_)) return base;
+    auto copy = MutableCopy(loop);
+    copy->body_ = WrapAutoRuntimeScope(loop->body_);
+    return copy;
+  }
+
+  StmtPtr VisitStmt_(const IfStmtPtr& op) override {
+    auto base = IRMutator::VisitStmt_(op);
+    if (manual_depth_ > 0) return base;
+    auto branch = As<IfStmt>(base);
+    if (!branch) return base;
+
+    bool changed = false;
+    StmtPtr then_body = branch->then_body_;
+    if (then_body && !IsAutoRuntimeScope(then_body)) {
+      then_body = WrapAutoRuntimeScope(then_body);
+      changed = true;
+    }
+    std::optional<StmtPtr> else_body = branch->else_body_;
+    if (else_body.has_value() && *else_body && !IsAutoRuntimeScope(*else_body)) {
+      else_body = WrapAutoRuntimeScope(*else_body);
+      changed = true;
+    }
+    if (!changed) return base;
+
+    auto copy = MutableCopy(branch);
+    copy->then_body_ = std::move(then_body);
+    copy->else_body_ = std::move(else_body);
+    return copy;
+  }
+
+ private:
+  int manual_depth_ = 0;
+};
+
 // Result of splicing an inline call's body without yet wiring up its return
 // values into a specific caller statement. The caller picks the wiring form
 // (assign / drop / return / ...) based on its own statement kind.
@@ -201,7 +282,9 @@ struct SplicedInlineBody {
 //      actual, ...)` whenever the actual arg is a Var.
 //   3. Split the cloned body into pre-return statements and the trailing
 //      return value(s); reject any non-trailing return.
-SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args) {
+SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                  bool add_runtime_scope = false,
+                                  const ProgramPtr& program = nullptr) {
   INTERNAL_CHECK_SPAN(callee->params_.size() == args.size(), callee->span_)
       << "Internal error: inline call to '" << callee->name_ << "' has " << args.size()
       << " argument(s) but callee expects " << callee->params_.size()
@@ -286,13 +369,60 @@ SplicedInlineBody CloneInlineBody(const FunctionPtr& callee, const std::vector<E
       << "' contains a non-trailing ReturnStmt; only a single trailing return is "
          "supported (early-return inside an If/For/While branch is rejected)";
 
+  if (add_runtime_scope) {
+    // The helper is a layer-level CHIP orchestration. Its task launches must
+    // remain enclosed by the same AUTO PTO2 scope that
+    // MaterializeRuntimeScopes would have emitted for the standalone helper.
+    auto scoped_body = SeqStmts::Flatten(std::move(spliced), callee->span_);
+    HelperRuntimeScopeMaterializer nested_scope_materializer;
+    scoped_body = nested_scope_materializer.VisitStmt(scoped_body);
+    if (!IsAutoRuntimeScope(scoped_body)) {
+      scoped_body = WrapAutoRuntimeScope(scoped_body);
+    }
+    spliced.clear();
+    spliced.push_back(std::move(scoped_body));
+
+    // The standalone helper's Tensor return is only an SSA summary of writes
+    // into a persistent Out/InOut parameter. Do not expose that task-return
+    // descriptor beyond the preserved PTO2 scope; replace it with the
+    // caller-owned actual buffer descriptor.
+    const auto returned_params = return_lineage::ReturnedParamIndices(callee, program);
+    INTERNAL_CHECK_SPAN(returned_params.size() == return_values.size(), callee->span_)
+        << "InlineOrchestrationHelpers: return-lineage arity mismatch for helper '"
+        << callee->name_ << "'";
+    for (size_t ret_idx = 0; ret_idx < return_values.size(); ++ret_idx) {
+      if (!AsTensorTypeLike(return_values[ret_idx]->GetType())) continue;
+      INTERNAL_CHECK_SPAN(returned_params[ret_idx].has_value(), callee->span_)
+          << "InlineOrchestrationHelpers: unproven Tensor return " << ret_idx << " for helper '"
+          << callee->name_ << "'";
+      const size_t param_idx = returned_params[ret_idx].value();
+      INTERNAL_CHECK_SPAN(param_idx < args.size(), callee->span_)
+          << "InlineOrchestrationHelpers: returned parameter index " << param_idx
+          << " is outside call arity " << args.size() << " for helper '" << callee->name_ << "'";
+      INTERNAL_CHECK_SPAN(AsVarLike(args[param_idx]), callee->span_)
+          << "InlineOrchestrationHelpers: Tensor return " << ret_idx << " of helper '"
+          << callee->name_
+          << "' must be wired to a caller-owned Var-like Out/InOut actual; "
+             "a temporary/view expression cannot escape the helper runtime scope";
+      INTERNAL_CHECK_SPAN(
+          structural_equal(callee->params_[param_idx]->GetType(), args[param_idx]->GetType(),
+                            /*enable_auto_mapping=*/true),
+          callee->span_)
+          << "InlineOrchestrationHelpers: returned Out/InOut actual type does not "
+             "match helper formal " << param_idx << " for '" << callee->name_ << "'";
+      return_values[ret_idx] = args[param_idx];
+    }
+  }
+
   return SplicedInlineBody{std::move(spliced), std::move(return_values), has_return};
 }
 
 // Splice an EvalStmt-shaped call (no LHS) — drop the return, return only
 // the pre-return statements.
-std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std::vector<ExprPtr>& args) {
-  auto body = CloneInlineBody(callee, args);
+std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
+                                            bool add_runtime_scope = false,
+                                            const ProgramPtr& program = nullptr) {
+  auto body = CloneInlineBody(callee, args, add_runtime_scope, program);
   return std::move(body.stmts);
 }
 
@@ -300,8 +430,10 @@ std::vector<StmtPtr> SpliceInlineCallAsEval(const FunctionPtr& callee, const std
 // if the callee returns multiple values — multi-return goes through
 // SpliceInlineCallAsTupleSub, which avoids the dead `LHS = MakeTuple(...)`.
 std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                              const VarPtr& lhs, const Span& call_site_span) {
-  auto body = CloneInlineBody(callee, args);
+                                              const VarPtr& lhs, const Span& call_site_span,
+                                              bool add_runtime_scope = false,
+                                              const ProgramPtr& program = nullptr) {
+  auto body = CloneInlineBody(callee, args, add_runtime_scope, program);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -331,8 +463,10 @@ std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const s
 // _tuple_tmp[i]`) means every LHS use is a TupleGetItemExpr — substituting
 // makes the LHS unreferenced and the binding effectively dead.
 std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                                std::vector<ExprPtr>& out_substitution) {
-  auto body = CloneInlineBody(callee, args);
+                                                std::vector<ExprPtr>& out_substitution,
+                                                bool add_runtime_scope = false,
+                                                const ProgramPtr& program = nullptr) {
+  auto body = CloneInlineBody(callee, args, add_runtime_scope, program);
   INTERNAL_CHECK_SPAN(body.has_return, callee->span_)
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
@@ -350,8 +484,10 @@ std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const
 // values directly. Single-return → ReturnStmt({v}); multi-return →
 // ReturnStmt({v0, v1, ...}). No MakeTuple, no temporary.
 std::vector<StmtPtr> SpliceInlineCallAsReturn(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                              const Span& call_site_span) {
-  auto body = CloneInlineBody(callee, args);
+                                              const Span& call_site_span,
+                                              bool add_runtime_scope = false,
+                                              const ProgramPtr& program = nullptr) {
+  auto body = CloneInlineBody(callee, args, add_runtime_scope, program);
   INTERNAL_CHECK_SPAN(body.has_return, call_site_span)
       << "Internal error: inline function '" << callee->name_
       << "' is used as a return value but has no return statement (parser should reject "
@@ -403,10 +539,10 @@ class InlineDumpVarTransfer : public IRMutator {
   explicit InlineDumpVarTransfer(std::vector<VarPtr> dump_vars) : dump_vars_(std::move(dump_vars)) {}
 
   StmtPtr VisitStmt_(const InCoreScopeStmtPtr& op) override { return Attach<InCoreScopeStmt>(op); }
-  StmtPtr VisitStmt_(const AutoInCoreScopeStmtPtr& op) override { return Attach<AutoInCoreScopeStmt>(op); }
   StmtPtr VisitStmt_(const HierarchyScopeStmtPtr& op) override { return Attach<HierarchyScopeStmt>(op); }
   StmtPtr VisitStmt_(const ClusterScopeStmtPtr& op) override { return Attach<ClusterScopeStmt>(op); }
   StmtPtr VisitStmt_(const SpmdScopeStmtPtr& op) override { return Attach<SpmdScopeStmt>(op); }
+  StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override { return Attach<SplitAivScopeStmt>(op); }
 
   ExprPtr VisitExpr_(const CallPtr& op) override {
     // Recurse first so nested args (this pass runs pre-flatten, so a call arg
@@ -482,8 +618,13 @@ class InlineDumpVarTransfer : public IRMutator {
 
 class InlineCallsMutator : public IRMutator {
  public:
-  explicit InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& inline_fns)
-      : inline_fns_(inline_fns) {}
+  InlineCallsMutator(const std::unordered_map<std::string, FunctionPtr>& expandable_fns,
+                     const FunctionPtr& caller, bool allow_chip_orchestration,
+                     ProgramPtr program = nullptr)
+      : expandable_fns_(expandable_fns),
+        caller_(caller),
+        allow_chip_orchestration_(allow_chip_orchestration),
+        program_(std::move(program)) {}
 
   bool Changed() const { return changed_; }
 
@@ -565,12 +706,14 @@ class InlineCallsMutator : public IRMutator {
     std::optional<std::vector<StmtPtr>> spliced;
     std::vector<VarPtr> call_dump_vars;
     if (auto call = transform_utils::GetCallFromStmt(stmt)) {
-      if (auto callee = LookupInlineCallee(call)) {
+      if (auto callee = LookupExpandableCallee(call)) {
         call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
+        const bool add_runtime_scope = callee->func_type_ == FunctionType::Orchestration;
         if (auto assign = As<AssignStmt>(stmt)) {
-          spliced = SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_);
+          spliced =
+              SpliceAssignCallSite(callee, call->args_, assign->var_, assign->span_, add_runtime_scope);
         } else if (auto eval = As<EvalStmt>(stmt)) {
-          spliced = SpliceInlineCallAsEval(callee, call->args_);
+          spliced = SpliceInlineCallAsEval(callee, call->args_, add_runtime_scope, program_);
         }
       }
     }
@@ -580,9 +723,16 @@ class InlineCallsMutator : public IRMutator {
     if (!spliced.has_value()) {
       if (auto ret = As<ReturnStmt>(stmt); ret && ret->value_.size() == 1) {
         if (auto call = As<Call>(ret->value_[0])) {
-          if (auto callee = LookupInlineCallee(call)) {
+          if (auto callee = LookupExpandableCallee(call)) {
             call_dump_vars = call->GetAttr<std::vector<VarPtr>>(kAttrDumpVars);
-            spliced = SpliceInlineCallAsReturn(callee, call->args_, ret->span_);
+            const bool add_runtime_scope = callee->func_type_ == FunctionType::Orchestration;
+            INTERNAL_CHECK_SPAN(!add_runtime_scope, ret->span_)
+                << "InlineOrchestrationHelpers: marked CHIP helper '" << callee->name_
+                << "' cannot be used as a return expression; invoke it as a "
+                   "value-discarding plain statement with persistent Out/InOut "
+                   "buffers";
+            spliced =
+                SpliceInlineCallAsReturn(callee, call->args_, ret->span_, add_runtime_scope, program_);
           }
         }
       }
@@ -602,26 +752,45 @@ class InlineCallsMutator : public IRMutator {
   // multi-return → record `LHS → values` for downstream TupleGetItemExpr
   // substitution and emit no LHS assignment.
   std::vector<StmtPtr> SpliceAssignCallSite(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
-                                            const VarPtr& lhs, const Span& span) {
+                                            const VarPtr& lhs, const Span& span,
+                                            bool add_runtime_scope = false) {
     if (callee->return_types_.size() > 1) {
       std::vector<ExprPtr> sub;
-      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub);
+      auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub, add_runtime_scope, program_);
       tuple_subs_[lhs.get()] = std::move(sub);
       return stmts;
     }
-    return SpliceInlineCallAsAssign(callee, args, lhs, span);
+    return SpliceInlineCallAsAssign(callee, args, lhs, span, add_runtime_scope, program_);
   }
 
-  FunctionPtr LookupInlineCallee(const CallPtr& call) const {
+  FunctionPtr LookupExpandableCallee(const CallPtr& call) const {
     auto gv = As<GlobalVar>(call->op_);
     if (!gv) return nullptr;
-    auto it = inline_fns_.find(gv->name_);
-    if (it == inline_fns_.end()) return nullptr;
-    return it->second;
+    auto it = expandable_fns_.find(gv->name_);
+    if (it == expandable_fns_.end()) return nullptr;
+    const auto& callee = it->second;
+    if (callee->func_type_ == FunctionType::Inline) return callee;
+
+    // A chip-level orchestration helper may only be expanded into another
+    // chip-level orchestration. Never cross the HOST -> CHIP hierarchy edge:
+    // that edge is the real rank-local chip submission boundary.
+    if (allow_chip_orchestration_ && callee->func_type_ == FunctionType::Orchestration && caller_ &&
+        caller_->level_.has_value() && *caller_->level_ == Level::CHIP && callee->level_.has_value() &&
+        *callee->level_ == Level::CHIP) {
+      INTERNAL_CHECK_SPAN(HasOnlyPlainHelperCallMetadata(call), call->span_)
+          << "InlineOrchestrationHelpers: marked CHIP helper '" << callee->name_
+          << "' must be invoked by a plain Call without device/dependency/task-id/"
+             "allow_early_resolve/launch metadata";
+      return callee;
+    }
+    return nullptr;
   }
 
  private:
-  const std::unordered_map<std::string, FunctionPtr>& inline_fns_;
+  const std::unordered_map<std::string, FunctionPtr>& expandable_fns_;
+  FunctionPtr caller_;
+  bool allow_chip_orchestration_;
+  ProgramPtr program_;
   bool changed_ = false;
   // LHS Var → return values, populated by SpliceAssignCallSite for multi-return
   // call sites. Subsequent TupleGetItemExpr uses of the Var are substituted
@@ -707,7 +876,7 @@ Pass InlineFunctions() {
       }
 
       for (auto& [name, fn] : current) {
-        InlineCallsMutator mutator(latest_inline);
+        InlineCallsMutator mutator(latest_inline, fn, /*allow_chip_orchestration=*/false);
         auto new_body = mutator.VisitStmt(fn->body_);
         if (mutator.Changed()) {
           auto updated = MutableCopy(fn);
@@ -737,6 +906,252 @@ Pass InlineFunctions() {
   };
 
   return CreateProgramPass(pass_func, "InlineFunctions", kInlineFunctionsProperties);
+}
+
+/**
+ * @brief Expand explicitly-marked CHIP Orchestration helpers after InCore and
+ *        Cluster scopes have already been outlined.
+ *
+ * This is deliberately separate from ``InlineFunctions``. Expanding a layer
+ * orchestration before ``OutlineIncoreScopes`` duplicates all tensor compute
+ * into the outer orchestration and can merge per-layer Mat/UB lifetimes. By
+ * running after the task boundaries are outlined, this pass only splices
+ * orchestration control flow and calls to already-independent InCore /
+ * Group / Spmd functions.
+ *
+ * A helper opts in with ``attrs={"inline_orchestration": True}``. The pass
+ * never crosses HOST -> CHIP: marked helpers must be consumed entirely by
+ * another CHIP orchestration. Any remaining reference is rejected before the
+ * helper definitions are dropped.
+ */
+Pass InlineOrchestrationHelpers() {
+  auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    constexpr const char* kInlineOrchestrationAttr = "inline_orchestration";
+
+    std::unordered_map<std::string, FunctionPtr> helpers;
+    for (const auto& [gvar, fn] : program->functions_) {
+      if (fn->func_type_ != FunctionType::Orchestration) continue;
+      if (!fn->level_.has_value() || *fn->level_ != Level::CHIP) continue;
+      if (!fn->GetAttr<bool>(kInlineOrchestrationAttr, false)) continue;
+      INTERNAL_CHECK_SPAN(fn->GetAttr<bool>("auto_scope", true), fn->span_)
+          << "InlineOrchestrationHelpers: marked CHIP helper '" << fn->name_
+          << "' must use compiler-managed auto_scope so an equivalent layer "
+             "runtime scope can be preserved after expansion";
+
+      // A preserved AUTO scope may not leak a task-return Tensor descriptor
+      // into the caller. Every Tensor return of a marked helper must be
+      // traceable to one of its persistent formal parameters; the generator
+      // uses an Out/InOut buffer for this handoff. This check is deliberately
+      // based on return lineage rather than names, so SSA rebinds and
+      // tensor.assemble/tile.store writeback remain valid.
+      const auto returned_params = return_lineage::ReturnedParamIndices(fn, program);
+      INTERNAL_CHECK_SPAN(returned_params.size() == fn->return_types_.size(), fn->span_)
+          << "InlineOrchestrationHelpers: cannot prove return lineage for marked CHIP helper '"
+          << fn->name_ << "'";
+      for (size_t ret_idx = 0; ret_idx < fn->return_types_.size(); ++ret_idx) {
+        if (!AsTensorTypeLike(fn->return_types_[ret_idx])) continue;
+        INTERNAL_CHECK_SPAN(returned_params[ret_idx].has_value(), fn->span_)
+            << "InlineOrchestrationHelpers: Tensor return " << ret_idx << " of marked CHIP helper '"
+            << fn->name_
+            << "' is not a persistent formal/output parameter; task-return Tensor "
+               "descriptors cannot cross the helper runtime scope";
+        const size_t param_idx = returned_params[ret_idx].value();
+        INTERNAL_CHECK_SPAN(param_idx < fn->param_directions_.size(), fn->span_)
+            << "InlineOrchestrationHelpers: invalid returned parameter index " << param_idx
+            << " for helper '" << fn->name_ << "'";
+        INTERNAL_CHECK_SPAN(fn->param_directions_[param_idx] == ParamDirection::Out ||
+                                fn->param_directions_[param_idx] == ParamDirection::InOut,
+                            fn->span_)
+            << "InlineOrchestrationHelpers: Tensor return " << ret_idx << " of helper '" << fn->name_
+            << "' must resolve to an Out/InOut formal parameter";
+      }
+      helpers.emplace(fn->name_, fn);
+    }
+    if (helpers.empty()) return program;
+
+    DetectInlineCycles(helpers);
+
+    std::unordered_map<std::string, FunctionPtr> current;
+    for (const auto& [gvar, fn] : program->functions_) {
+      current.emplace(fn->name_, fn);
+    }
+
+    const size_t max_iters = helpers.size() + 1;
+    for (size_t iter = 0; iter < max_iters; ++iter) {
+      bool any_changed = false;
+      std::unordered_map<std::string, FunctionPtr> latest_helpers;
+      for (const auto& [name, fn] : helpers) {
+        latest_helpers.emplace(name, current.at(name));
+      }
+
+      for (auto& [name, fn] : current) {
+        InlineCallsMutator mutator(latest_helpers, fn, /*allow_chip_orchestration=*/true, program);
+        auto new_body = mutator.VisitStmt(fn->body_);
+        if (!mutator.Changed()) continue;
+        auto updated = MutableCopy(fn);
+        updated->body_ = new_body;
+        fn = updated;
+        any_changed = true;
+      }
+
+      if (!any_changed) break;
+      INTERNAL_CHECK(iter + 1 < max_iters)
+          << "InlineOrchestrationHelpers did not reach a fixpoint within " << max_iters
+          << " iterations; this indicates an undetected helper cycle";
+    }
+
+    class RemainingHelperUseCollector : public IRVisitor {
+     public:
+      explicit RemainingHelperUseCollector(const std::unordered_map<std::string, FunctionPtr>& helpers)
+          : helpers_(helpers) {}
+
+      void VisitExpr_(const CallPtr& call) override {
+        if (call) {
+          if (auto gv = As<GlobalVar>(call->op_); gv && helpers_.count(gv->name_) > 0) {
+            remaining_.insert(gv->name_);
+          }
+        }
+        IRVisitor::VisitExpr_(call);
+      }
+
+      void VisitExpr_(const SubmitPtr& submit) override {
+        if (submit) {
+          if (auto gv = As<GlobalVar>(submit->op_); gv && helpers_.count(gv->name_) > 0) {
+            remaining_.insert(gv->name_);
+          }
+        }
+        IRVisitor::VisitExpr_(submit);
+      }
+
+      std::unordered_set<std::string> remaining_;
+
+     private:
+      const std::unordered_map<std::string, FunctionPtr>& helpers_;
+    };
+
+    RemainingHelperUseCollector collector(helpers);
+    for (const auto& [name, fn] : current) {
+      if (helpers.count(name) > 0) continue;
+      collector.VisitStmt(fn->body_);
+    }
+    INTERNAL_CHECK_SPAN(collector.remaining_.empty(), program->span_)
+        << "CHIP orchestration helper(s) marked inline_orchestration still have "
+           "unsupported callers or Submit uses after expansion: "
+        << [&]() {
+             std::string names;
+             for (const auto& name : collector.remaining_) {
+               if (!names.empty()) names += ", ";
+               names += name;
+             }
+             return names;
+           }();
+
+    class NestedChipOrchestrationCollector : public IRVisitor {
+     public:
+      NestedChipOrchestrationCollector(const ProgramPtr& program, std::string caller)
+          : program_(program), caller_(std::move(caller)) {}
+
+      void VisitExpr_(const CallPtr& call) override {
+        if (call) {
+          if (auto gv = As<GlobalVar>(call->op_)) {
+            auto callee = program_->GetFunction(gv->name_);
+            if (callee && callee->func_type_ == FunctionType::Orchestration &&
+                callee->level_.has_value() && *callee->level_ == Level::CHIP) {
+              nested_.push_back(caller_ + " -> " + callee->name_);
+            }
+          }
+        }
+        IRVisitor::VisitExpr_(call);
+      }
+
+      void VisitExpr_(const SubmitPtr& submit) override {
+        if (submit) {
+          if (auto gv = As<GlobalVar>(submit->op_)) {
+            auto callee = program_->GetFunction(gv->name_);
+            if (callee && callee->func_type_ == FunctionType::Orchestration &&
+                callee->level_.has_value() && *callee->level_ == Level::CHIP) {
+              nested_.push_back(caller_ + " -submit-> " + callee->name_);
+            }
+          }
+        }
+        IRVisitor::VisitExpr_(submit);
+      }
+
+      std::vector<std::string> nested_;
+
+     private:
+      ProgramPtr program_;
+      std::string caller_;
+    };
+
+    std::vector<FunctionPtr> kept;
+    kept.reserve(current.size() - helpers.size());
+    for (const auto& [gvar, original] : program->functions_) {
+      if (helpers.count(original->name_) > 0) continue;
+      kept.push_back(current.at(original->name_));
+    }
+    auto result = std::make_shared<Program>(kept, program->name_, program->span_);
+
+    std::vector<std::string> nested;
+    std::unordered_set<std::string> host_targets;
+    for (const auto& [gvar, fn] : result->functions_) {
+      if (!fn || !fn->body_) {
+        continue;
+      }
+      if (fn->func_type_ == FunctionType::Orchestration &&
+          fn->level_.has_value() && *fn->level_ == Level::CHIP) {
+        NestedChipOrchestrationCollector collector(result, fn->name_);
+        collector.VisitStmt(fn->body_);
+        nested.insert(nested.end(), collector.nested_.begin(), collector.nested_.end());
+      }
+      if (fn->level_.has_value() && *fn->level_ == Level::HOST) {
+        class HostChipTargetCollector : public IRVisitor {
+         public:
+          explicit HostChipTargetCollector(const ProgramPtr& program) : program_(program) {}
+
+          void VisitExpr_(const CallPtr& call) override {
+            if (call) {
+              if (auto gv = As<GlobalVar>(call->op_)) {
+                auto callee = program_->GetFunction(gv->name_);
+                if (callee && callee->func_type_ == FunctionType::Orchestration &&
+                    callee->level_.has_value() && *callee->level_ == Level::CHIP) {
+                  targets_.insert(callee->name_);
+                }
+              }
+            }
+            IRVisitor::VisitExpr_(call);
+          }
+
+         private:
+          ProgramPtr program_;
+
+         public:
+          std::unordered_set<std::string> targets_;
+        };
+        HostChipTargetCollector collector(result);
+        collector.VisitStmt(fn->body_);
+        host_targets.insert(collector.targets_.begin(), collector.targets_.end());
+      }
+    }
+    INTERNAL_CHECK_SPAN(nested.empty(), program->span_)
+        << "InlineOrchestrationHelpers: residual CHIP Orchestration -> CHIP "
+           "Orchestration edge(s) remain after expansion: "
+        << [&]() {
+             std::string edges;
+             for (const auto& edge : nested) {
+               if (!edges.empty()) edges += ", ";
+               edges += edge;
+             }
+             return edges;
+           }();
+    INTERNAL_CHECK_SPAN(host_targets.size() == 1, program->span_)
+        << "InlineOrchestrationHelpers: opt-in program must have exactly one "
+           "HOST -> CHIP root target after helper expansion, got "
+        << host_targets.size();
+    return result;
+  };
+
+  return CreateProgramPass(pass_func, "InlineOrchestrationHelpers", kInlineOrchestrationHelpersProperties);
 }
 
 }  // namespace pass

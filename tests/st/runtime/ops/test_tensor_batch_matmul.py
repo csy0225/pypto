@@ -51,6 +51,14 @@ class TestTensorMatmul2dBy3d(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Observed CI flake
+        # (3d_btrans_4x64x128x512, a2a3): 1/131072 elems, diff ~1.685e-5; 1e-4 clears
+        # it with margin. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.M = m
         self.K = k
         self.N = n
@@ -124,6 +132,14 @@ class TestTensorMatmulAcc2dBy3d(PTOTestCase):
         config=None,
     ):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Observed CI flake
+        # (3d_btrans_4x64x128x512, a2a3): 1/131072 elems, diff ~1.685e-5; 1e-4 clears
+        # it with margin. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
         self.M = m
         self.K = k
         self.N = n
@@ -180,11 +196,301 @@ class TestTensorMatmulAcc2dBy3d(PTOTestCase):
         tensors["c"][:] = torch.matmul(a.unsqueeze(0), b.transpose(-2, -1))
 
 
+class TestTensorBatchMatmulMixedAddBTrans(PTOTestCase):
+    """Mixed-kernel probe: a Vec compute result feeds a ``b_trans=True`` ND matmul.
+
+    ``bt = b0 + b1`` is a vector (Vec/UB) op result over 3D operands;
+    ``c[i] = a[i] @ bt[i]^T``. The transposed operand of the resulting
+    ``tile.batch_matmul`` originates from a compute op, NOT a load — so the
+    legacy transpose-at-load path has no transposed load to ride on. This
+    probes the CURRENT (pre-migration) ND behavior for a compute-sourced
+    transposed batch_matmul operand: silently dropped transpose, wrong
+    numerics, or a compile-time failure.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        b: int = 2,
+        m: int = 16,
+        k: int = 64,
+        n: int = 64,
+        *,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Observed CI flake
+        # (3d_btrans_4x64x128x512, a2a3): 1/131072 elems, diff ~1.685e-5; 1e-4 clears
+        # it with margin. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
+        self.B = b
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"tensor_batch_matmul_mixed_add_btrans_{self.B}x{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        B, M, K, N = self.B, self.M, self.K, self.N
+        return [
+            TensorSpec("a", [B, M, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b0", [B, N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b1", [B, N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("c", [B, M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        B, M, K, N = self.B, self.M, self.K, self.N
+
+        @pl.program
+        class TensorBatchMatmulMixedAddBTransProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def mixed_add_btrans_nd(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                b0: pl.Tensor[[B, N, K], pl.FP32],
+                b1: pl.Tensor[[B, N, K], pl.FP32],
+                c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                bt = pl.add(b0, b1)  # Vec compute -> [B, N, K]
+                # rank-3 operands -> tile.batch_matmul; bt is the b_trans operand.
+                cm = pl.matmul(a, bt, b_trans=True, out_dtype=pl.FP32)  # batch a @ bt^T -> [B, M, N]
+                out_c = pl.assemble(c, cm, offset=[0, 0, 0])
+                return out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                b0: pl.Tensor[[B, N, K], pl.FP32],
+                b1: pl.Tensor[[B, N, K], pl.FP32],
+                out_c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                out_c = self.mixed_add_btrans_nd(a, b0, b1, out_c)
+                return out_c
+
+        return TensorBatchMatmulMixedAddBTransProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        bt = tensors["b0"].to(torch.float32) + tensors["b1"].to(torch.float32)
+        tensors["c"][:] = torch.matmul(a, bt.transpose(-2, -1))
+
+
+class TestTensorBatchMatmul3dBy3dBTrans(PTOTestCase):
+    """``pl.matmul(3D, 3D, b_trans=True)`` — true multi-batch GM b_trans.
+
+    Both operands are per-batch rank-3 (``a`` = ``[B, M, K]``, ``b`` =
+    ``[B, N, K]``); ``c[i] = a[i] @ b[i]^T``. This exercises the unified
+    transpose_view path: ``b`` is loaded whole to Mat, reinterpreted by a
+    single ``tile.transpose_view`` into ``[K, B*N]`` (batch concatenated on
+    the column axis), then column-sliced per batch at offset ``i*N``. Run
+    with non-32-aligned N/K to stress per-batch slice fractal alignment.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        b: int = 2,
+        m: int = 16,
+        k: int = 80,
+        n: int = 48,
+        *,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Observed CI flake
+        # (3d_btrans_4x64x128x512, a2a3): 1/131072 elems, diff ~1.685e-5; 1e-4 clears
+        # it with margin. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
+        self.B = b
+        self.M = m
+        self.K = k
+        self.N = n
+
+    def get_name(self) -> str:
+        return f"tensor_batch_matmul_3d_by_3d_btrans_{self.B}x{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        B, M, K, N = self.B, self.M, self.K, self.N
+        return [
+            TensorSpec("a", [B, M, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("b", [B, N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("c", [B, M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        B, M, K, N = self.B, self.M, self.K, self.N
+
+        @pl.program
+        class TensorBatchMatmul3dBy3dBTransProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def batch_matmul_3d_btrans(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                b: pl.Tensor[[B, N, K], pl.FP32],
+                c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                cm = pl.matmul(a, b, b_trans=True, out_dtype=pl.FP32)  # batch a @ b^T -> [B, M, N]
+                out_c = pl.assemble(c, cm, offset=[0, 0, 0])
+                return out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                b: pl.Tensor[[B, N, K], pl.FP32],
+                out_c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                out_c = self.batch_matmul_3d_btrans(a, b, out_c)
+                return out_c
+
+        return TensorBatchMatmul3dBy3dBTransProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        b = tensors["b"].to(torch.float32)
+        tensors["c"][:] = torch.matmul(a, b.transpose(-2, -1))
+
+
+class TestTensorBatchMatmulSlicedBTrans(PTOTestCase):
+    """``pl.matmul(3D, slice(3D), b_trans=True)`` — dsv4 proj_a grouped-slice pattern.
+
+    The b_trans operand is a SLICE of a larger per-group weight ``wfull[G, N, K]``
+    (sliced to ``[B, N, K]`` at group offset ``G0``). The slice offset folds into
+    the natural whole-load's 2D-collapsed row offset, then the unified
+    ``tile.transpose_view`` + per-batch column-slice path runs (#1776). Exercised
+    end-to-end (the convert UT only checks IR shape) with non-aligned N/K.
+    """
+
+    __test__ = False
+
+    def __init__(
+        self,
+        g: int = 4,
+        g0: int = 1,
+        b: int = 2,
+        m: int = 16,
+        k: int = 80,
+        n: int = 48,
+        *,
+        platform: str | None = None,
+        config=None,
+    ):
+        super().__init__(config, platform=platform)
+        # fp32 K-split matmul: the device reduces K in a different order than the
+        # single-pass torch golden -> ~K*eps_fp32 drift (~1.5e-5 at K=128), above the
+        # 1e-5 default for near-zero (cancellation) elements. Observed CI flake
+        # (3d_btrans_4x64x128x512, a2a3): 1/131072 elems, diff ~1.685e-5; 1e-4 clears
+        # it with margin. Same class as AutoL0.
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
+        self.G, self.G0, self.B, self.M, self.K, self.N = g, g0, b, m, k, n
+
+    def get_name(self) -> str:
+        return f"tensor_batch_matmul_sliced_btrans_{self.G}g{self.G0}_{self.B}x{self.M}x{self.K}x{self.N}"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        G, B, M, K, N = self.G, self.B, self.M, self.K, self.N
+        return [
+            TensorSpec("a", [B, M, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("wfull", [G, N, K], DataType.FP32, init_value=torch.randn),
+            TensorSpec("c", [B, M, N], DataType.FP32, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        G, G0, B, M, K, N = self.G, self.G0, self.B, self.M, self.K, self.N
+
+        @pl.program
+        class TensorBatchMatmulSlicedBTransProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def sliced_btrans(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                wfull: pl.Tensor[[G, N, K], pl.FP32],
+                c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                w = pl.slice(wfull, [B, N, K], [G0, 0, 0])  # grouped slice -> [B, N, K]
+                cm = pl.matmul(a, w, b_trans=True, out_dtype=pl.FP32)
+                out_c = pl.assemble(c, cm, offset=[0, 0, 0])
+                return out_c
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[B, M, K], pl.FP32],
+                wfull: pl.Tensor[[G, N, K], pl.FP32],
+                out_c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
+            ) -> pl.Tensor[[B, M, N], pl.FP32]:
+                out_c = self.sliced_btrans(a, wfull, out_c)
+                return out_c
+
+        return TensorBatchMatmulSlicedBTransProgram
+
+    def compute_expected(self, tensors, params=None):
+        a = tensors["a"].to(torch.float32)
+        w = tensors["wfull"].to(torch.float32)[self.G0 : self.G0 + self.B]
+        tensors["c"][:] = torch.matmul(a, w.transpose(-2, -1))
+
+
 _ND_SHAPES = [(16, 64, 64), (16, 128, 64)]
 
 
 class TestTensorBatchMatmulOperations:
     """Test suite for ND ``pl.matmul`` / ``pl.matmul_acc`` lowering."""
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("b,m,k,n", [(2, 16, 80, 48)])
+    def test_tensor_batch_matmul_mixed_add_btrans(self, test_runner, platform, b, m, k, n):
+        """Mixed-kernel: a Vec compute (add) result feeds a b_trans=True ND matmul.
+
+        The transposed operand originates from a Vec compute (not a load), so it is
+        moved WHOLE to Mat and reinterpreted via a zero-copy ``tile.transpose_view``,
+        then per-batch column-sliced. A small (non-aligned) shape is used so the
+        whole-tile V2C move fits the fixed 8-deep cross-core ring (``8 * slot_size
+        <= L1``); larger shapes need a per-batch V2C move (separate follow-up).
+        """
+        result = test_runner.run(TestTensorBatchMatmulMixedAddBTrans(b=b, m=m, k=k, n=n, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("b,m,k,n", [(2, 16, 80, 48), (3, 16, 64, 64)])
+    def test_tensor_batch_matmul_3d_by_3d_btrans(self, test_runner, platform, b, m, k, n):
+        """Multi-batch ``pl.matmul(3D, 3D, b_trans=True)``: whole transpose_view + per-batch column slice."""
+        result = test_runner.run(TestTensorBatchMatmul3dBy3dBTrans(b=b, m=m, k=k, n=n, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("g,g0,b,m,k,n", [(4, 1, 2, 16, 80, 48)])
+    def test_tensor_batch_matmul_sliced_btrans(self, test_runner, platform, g, g0, b, m, k, n):
+        """b_trans operand is a grouped SLICE of a 3D weight (dsv4 proj_a) — end-to-end."""
+        result = test_runner.run(
+            TestTensorBatchMatmulSlicedBTrans(g=g, g0=g0, b=b, m=m, k=k, n=n, platform=platform)
+        )
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    @pytest.mark.parametrize("b,m,k,n", [(4, 64, 128, 512)])
+    def test_tensor_batch_matmul_3d_btrans_not_fit(self, test_runner, platform, b, m, k, n):
+        """Large b_trans batch_matmul whose whole lhs+rhs exceed L1 -> the capacity gate
+        falls back to a PER-BATCH load of each operand (+ per-batch transpose_view),
+        instead of the whole-load + slice path. Verifies the !fit path end-to-end."""
+        result = test_runner.run(TestTensorBatchMatmul3dBy3dBTrans(b=b, m=m, k=k, n=n, platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.parametrize("platform", PLATFORMS)
     @pytest.mark.parametrize("m,k,n", _ND_SHAPES)

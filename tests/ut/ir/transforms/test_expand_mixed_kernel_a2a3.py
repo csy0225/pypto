@@ -715,5 +715,339 @@ def test_split_slot_num_override_sizes_c2v_ring_on_a2a3():
     ir.assert_structural_equal(After, Expected)
 
 
+def _run_to_expand_with_flatten(program: ir.Program) -> ir.Program:
+    """Run the tile-pipeline prefix needed for a tile.transpose to reach
+    ExpandMixedKernel: FlattenTileNdTo2D adds the transpose scratch arg that the
+    TileOps2D verifier (an ExpandMixedKernel prerequisite) requires.
+    """
+    p = passes.convert_to_ssa()(program)
+    p = passes.lower_composite_ops()(p)
+    p = passes.flatten_tile_nd_to_2d()(p)
+    p = passes.infer_tile_memory_space()(p)
+    return passes.expand_mixed_kernel()(p)
+
+
+def _assert_actionable_split_error(excinfo, mode_name: str) -> None:
+    """The error must name the split mode and surface both fix directions so the
+    user can act without reading the source: drop the split, or remove the
+    transpose."""
+    msg = str(excinfo.value)
+    assert "swaps the split axis" in msg, msg
+    assert mode_name in msg, msg
+    assert "pl.SplitMode.NONE" in msg, msg  # direction 1: drop the split
+    assert "column slice" in msg, msg  # direction 2: remove the transpose
+
+
+def test_unsplittable_transpose_raises_actionable_error():
+    """A requested UP_DOWN split is rejected with a ValueError when the kernel
+    contains a tile.transpose that swaps the split axis.
+
+    tile.transpose swaps axes, so the per-lane split data migrates to the other
+    dim while SplitVectorKernel still halves the original split axis — it cannot
+    type such a transpose correctly. The split is a perf decision the user owns,
+    so the pass fails loud instead of silently compiling it un-split. Here the
+    [16, 8] matmul result is transposed under UP_DOWN (split dim 0, non-singleton).
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def t_hazard(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 8], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+        ) -> pl.Tensor[[8, 16], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 8], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(x_left, y_right)  # [16, 8] (cube result)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            zt = pl.transpose(z_vec, axis1=0, axis2=1)  # source dim0=16 non-singleton -> error
+            out_0 = pl.store(zt, [0, 0], out_0)
+            return out_0
+
+    with pytest.raises(ValueError) as excinfo:
+        _run_to_expand_with_flatten(Before)
+    _assert_actionable_split_error(excinfo, "UP_DOWN")
+
+
+def test_left_right_transpose_also_raises():
+    """The error is mode-independent: a LEFT_RIGHT split whose transpose source is
+    non-singleton on the split axis (dim 1) is also rejected, because the
+    transpose migrates the column split axis just as UP_DOWN migrates rows."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.LEFT_RIGHT})
+        def t_lr(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 16], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 16], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(x_left, y_right)  # [16, 16] (cube result)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            zt = pl.transpose(z_vec, axis1=0, axis2=1)  # source dim1=16 non-singleton -> error
+            out_0 = pl.store(zt, [0, 0], out_0)
+            return out_0
+
+    with pytest.raises(ValueError) as excinfo:
+        _run_to_expand_with_flatten(Before)
+    _assert_actionable_split_error(excinfo, "LEFT_RIGHT")
+
+
+def test_singleton_split_axis_transpose_keeps_split():
+    """A transpose whose source is singleton on the split axis carries no split
+    data (the no-op broadcast case), so the split is preserved. Here a [1, 16]
+    source is transposed under UP_DOWN (split dim 0 == 1), so it is NOT rejected
+    and the AIV keeps its split attr with no dual-AIV dispatch."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def t_singleton(
+            self,
+            x: pl.Tensor[[1, 128], pl.BF16],
+            y: pl.Tensor[[128, 16], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 16], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(x_left, y_right)  # [1, 16] (cube result)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            zt = pl.transpose(z_vec, axis1=0, axis2=1)  # source dim0=1 singleton -> kept split
+            out_0 = pl.store(zt, [0, 0], out_0)
+            return out_0
+
+    After = _run_to_expand_with_flatten(Before)
+    aiv = next(f for f in After.functions.values() if f.func_type == ir.FunctionType.AIV)
+    assert aiv.attrs.get("dual_aiv_dispatch") is not True, (
+        f"a singleton-split-axis transpose must not be rejected, got attrs={dict(aiv.attrs)}"
+    )
+    assert "split" in aiv.attrs, (
+        f"the requested split must be preserved when the transpose is a no-op on the split axis, "
+        f"got attrs={dict(aiv.attrs)}"
+    )
+
+
+def test_unsplittable_int8_transpose_raises_actionable_error():
+    """The error is dtype-independent: an int8 transpose that swaps a
+    non-singleton split axis is rejected just like the fp/bf16 cases.
+
+    A bf16 matmul (cube) keeps the kernel mixed; separately, an int8 [16, 32]
+    tensor is loaded into Vec and transposed under UP_DOWN (source dim0=16
+    non-singleton), so ExpandMixedKernel rejects the split.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+        def t_hazard_i8(
+            self,
+            x: pl.Tensor[[16, 128], pl.BF16],
+            y: pl.Tensor[[128, 8], pl.BF16],
+            q: pl.Tensor[[16, 32], pl.INT8],
+            out_0: pl.Out[pl.Tensor[[16, 8], pl.FP32]],
+            out_1: pl.Out[pl.Tensor[[32, 16], pl.INT8]],
+        ) -> pl.Tensor[[16, 8], pl.FP32]:
+            x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
+            y_mat = pl.load(y, [0, 0], [128, 8], target_memory=pl.MemorySpace.Mat)
+            y_right = pl.move(y_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(x_left, y_right)  # [16, 8] (cube result, keeps the kernel mixed)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            q_vec = pl.load(q, [0, 0], [16, 32], target_memory=pl.MemorySpace.Vec)
+            qt = pl.transpose(q_vec, axis1=0, axis2=1)  # int8 source dim0=16 non-singleton -> error
+            out_1 = pl.store(qt, [0, 0], out_1)
+            return out_0
+
+    with pytest.raises(ValueError) as excinfo:
+        _run_to_expand_with_flatten(Before)
+    _assert_actionable_split_error(excinfo, "UP_DOWN")
+
+
+# ---------------------------------------------------------------------------
+# Regression: GM tensor written on the AIV lane, consumed by the AIC matmul.
+#
+# Mirror of the GM-mediated cross-lane store/load handshake test in the OPPOSITE
+# direction. The vector lane stores into a GM tensor (producing a fresh SSA
+# version); the cube lane loads that version back as the matmul left operand.
+# ExpandMixedKernel builds the AIC body's param/clone map from func->params_
+# only, so the AIV-defined GM version is a dangling free var on the AIC lane ->
+# the printer marks it __FREE_VAR and PTO codegen's GetOrCreateTensorView
+# crashes. The fix repoints the cross-half GM use onto the shared base parameter
+# (straight-line tile.store result, IfStmt phi, and ForStmt return_var forms).
+# ---------------------------------------------------------------------------
+
+
+def _expand_no_verify(program: ir.Program) -> ir.Program:
+    """SSA -> infer-memory -> expand-mixed-kernel, expanding with verification off.
+
+    Verification is disabled (empty PassContext) so a mis-routed free Var is
+    observable as a returned-IR property instead of a verifier crash -- matching
+    the __FREE_VAR check below.
+    """
+    p = passes.infer_tile_memory_space()(passes.convert_to_ssa()(program))
+    with passes.PassContext([]):
+        return passes.expand_mixed_kernel()(p)
+
+
+def _assert_no_free_var(program: ir.Program) -> None:
+    """A dangling/free Var prints with a ``__FREE_VAR`` suffix and later crashes
+    PTO codegen's GetOrCreateTensorView; assert none survive the split."""
+    assert "__FREE_VAR" not in ir.python_print(program)
+
+
+def _assert_aic_loads_reference_params(after: ir.Program) -> None:
+    """Every cube-lane ``tile.load`` source must resolve to an AIC parameter.
+
+    The AIV lane writes a GM tensor (a fresh SSA version) that the AIC lane loads
+    back for the matmul. ExpandMixedKernel must thread that cross-half reference
+    onto the AIC function's shared GM parameter; otherwise the AIC body loads
+    from a Var defined only on the AIV lane -- a dangling reference codegen
+    cannot resolve. ``unique_id`` (not ``id(...)``) is the reliable identity key
+    across binding-layer Var wrappers.
+    """
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    param_ids = {p.unique_id for p in aic.params}
+    dangling = []
+    for s in ir.flatten_to_stmts(aic.body):
+        if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call) and _op_name(s) == "tile.load":
+            src = s.value.args[0]  # tile.load arg0 is the source tensor
+            if isinstance(src, ir.Var) and src.unique_id not in param_ids:
+                dangling.append(src.name_hint)
+    assert not dangling, (
+        f"AIC tile.load reads non-parameter Var(s) {dangling}: a cross-half GM "
+        f"SSA version was not threaded into the AIC parameter map"
+    )
+
+
+def test_aiv_gm_write_consumed_by_cube_straightline_resolves_to_param():
+    """Straight-line ``tile.store`` result (``scratch__ssa_v1``).
+
+    AIV: load -> add -> store into GM ``scratch``. AIC: load that scratch back ->
+    move Left -> matmul(scratch, b) -> move Vec. Before the fix the AIC load
+    reads the AIV-defined store-result version as a free var.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_aiv_to_aic(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: produce a GM scratch tensor (vector store).
+            a_tile = pl.load(a, [0, 0], [16, 128])
+            s = pl.add(a_tile, a_tile)
+            scratch = pl.store(s, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the AIV-written scratch.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
+def test_aiv_gm_write_in_if_consumed_by_cube_resolves_to_param():
+    """Conditional write -> IfStmt phi return_var (``scratch__phi_v*``).
+
+    Both branches store into GM ``scratch`` (so its post-if value is a phi whose
+    yields resolve to the same ``scratch`` origin); the AIC matmul loads that
+    phi. Exercises the IfStmt return_var origin propagation.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_phi(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            flag: pl.Scalar[pl.INT32],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: both branches write GM scratch -> post-if phi version.
+            if flag == 0:
+                a0 = pl.load(a, [0, 0], [16, 128])
+                s0 = pl.add(a0, a0)
+                scratch = pl.store(s0, [0, 0], scratch)
+            else:
+                a1 = pl.load(a, [0, 0], [16, 128])
+                s1 = pl.mul(a1, a1)
+                scratch = pl.store(s1, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the phi-versioned scratch.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
+def test_aiv_gm_write_in_loop_consumed_by_cube_resolves_to_param():
+    """Loop write -> ForStmt return_var (``scratch__rv_v*``).
+
+    The loop carries GM ``scratch`` as an iter_arg (init = the ``scratch`` param)
+    and stores into it each iteration; its post-loop value is the return_var that
+    the AIC matmul loads. Covered by origin_map (return_var -> iter_arg -> init).
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gm_loop(
+            self,
+            a: pl.Tensor[[16, 128], pl.BF16],
+            b: pl.Tensor[[128, 128], pl.BF16],
+            scratch: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
+            out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+        ) -> pl.Tensor[[16, 128], pl.FP32]:
+            # AIV lane: store GM scratch each iteration -> post-loop return_var.
+            for i in pl.range(2):  # noqa: B007 - loop index unused by design
+                a_tile = pl.load(a, [0, 0], [16, 128])
+                s = pl.add(a_tile, a_tile)
+                scratch = pl.store(s, [0, 0], scratch)
+            # AIC lane: cube matmul consumes the loop-carried scratch version.
+            s_mat = pl.load(scratch, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
+            s_left = pl.move(s_mat, target_memory=pl.MemorySpace.Left)
+            b_mat = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+            b_right = pl.move(b_mat, target_memory=pl.MemorySpace.Right)
+            z = pl.matmul(s_left, b_right)
+            z_vec = pl.move(z, target_memory=pl.MemorySpace.Vec)
+            out_0 = pl.store(z_vec, [0, 0], out_0)
+            return out_0
+
+    After = _expand_no_verify(Before)
+    _assert_no_free_var(After)
+    _assert_aic_loads_reference_params(After)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

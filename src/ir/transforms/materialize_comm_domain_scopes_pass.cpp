@@ -27,15 +27,16 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
-#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
-#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -43,6 +44,10 @@ namespace pypto {
 namespace ir {
 
 namespace {
+
+[[nodiscard]] bool IsTensorAllReduce(const CallPtr& call) {
+  return call && call->op_ && IsOp(call, "pld.tensor.allreduce");
+}
 
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
 struct DeviceDescriptor {
@@ -97,8 +102,8 @@ struct WindowRecord {
   AllocRecord* alloc;
 };
 
-struct AllReduceConsumer {
-  AllocRecord* data_alloc;
+struct CollectiveConsumer {
+  AllocRecord* data_alloc;  ///< nullptr for barrier-only consumers
   AllocRecord* signal_alloc;
   Span span;
 };
@@ -111,8 +116,7 @@ class AllocAndWindowCollector : public IRVisitor {
     auto var = As<Var>(op->var_);
     auto call = As<Call>(op->value_);
     if (var && call && call->op_) {
-      const auto& op_name = call->op_->name_;
-      if (op_name == "pld.tensor.alloc_window_buffer") {
+      if (IsOp(call, "pld.tensor.alloc_window_buffer")) {
         INTERNAL_CHECK_SPAN(call->args_.size() == 1, call->span_)
             << "MaterializeCommDomainScopes: pld.tensor.alloc_window_buffer expects exactly one arg (size)";
         // The parser injects ``name`` as a kwarg derived from the assignment
@@ -123,7 +127,7 @@ class AllocAndWindowCollector : public IRVisitor {
         auto rec = std::make_unique<AllocRecord>(call, var, call->args_[0], name, call->span_);
         ptr_to_alloc[var.get()] = rec.get();
         allocs.push_back(std::move(rec));
-      } else if (op_name == "pld.tensor.window" && !call->args_.empty()) {
+      } else if (IsOp(call, "pld.tensor.window") && !call->args_.empty()) {
         auto ptr_arg_var = As<Var>(call->args_[0]);
         if (ptr_arg_var) {
           auto it = ptr_to_alloc.find(ptr_arg_var.get());
@@ -203,7 +207,7 @@ DeviceDescriptor ResolveDeviceDescriptor(const ExprPtr& device, const std::vecto
         // as the direct ``pl.range(pld.system.world_size())`` form.
         ExprPtr stop = UnwrapStopExpr(fs->stop_, var_defs);
         if (auto stop_call = As<Call>(stop)) {
-          if (stop_call->op_ && stop_call->op_->name_ == "pld.system.world_size") {
+          if (stop_call->op_ && IsOp(stop_call, "pld.system.world_size")) {
             desc.is_all = true;
             return desc;
           }
@@ -271,36 +275,64 @@ class DispatchAnalyzer : public IRVisitor {
     for (const auto& arg : op->args_) {
       auto arg_var = As<Var>(arg);
       if (!arg_var) continue;
-      auto it = view_to_window_.find(arg_var.get());
-      if (it != view_to_window_.end()) {
-        it->second.alloc->seen.push_back(desc);
+      auto window = ResolveWindowRecord(arg_var);
+      if (window) {
+        window->alloc->seen.push_back(desc);
       }
     }
   }
 
-  void AnalyzeAllReduce(const CallPtr& op) {
-    if (!op || !op->op_ || op->op_->name_ != "pld.tensor.allreduce") return;
-    INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce expects exactly two args";
-    auto data_var = As<Var>(op->args_[0]);
-    auto signal_var = As<Var>(op->args_[1]);
-    CHECK(data_var && signal_var)
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce arguments must be window view Vars at "
-        << op->span_.to_string();
-    auto data_it = view_to_window_.find(data_var.get());
-    auto signal_it = view_to_window_.find(signal_var.get());
-    CHECK(data_it != view_to_window_.end())
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce data must be produced by pld.tensor.window at "
-        << op->span_.to_string();
-    CHECK(signal_it != view_to_window_.end()) << "MaterializeCommDomainScopes: pld.tensor.allreduce signal "
-                                                 "must be produced by pld.tensor.window at "
-                                              << op->span_.to_string();
-    allreduce_consumers.push_back({data_it->second.alloc, signal_it->second.alloc, op->span_});
+  [[nodiscard]] AllocRecord* ResolveWindowAlloc(const ExprPtr& expr, const std::string& op_name,
+                                                const char* role) {
+    auto view_var = As<Var>(expr);
+    INTERNAL_CHECK_SPAN(view_var, expr->span_)
+        << "MaterializeCommDomainScopes: " << op_name << " " << role << " must be a window view Var";
+    auto window = ResolveWindowRecord(view_var);
+    INTERNAL_CHECK_SPAN(window, expr->span_) << "MaterializeCommDomainScopes: " << op_name << " " << role
+                                             << " must be produced by pld.tensor.window";
+    return window->alloc;
+  }
+
+  void AnalyzeCollective(const CallPtr& op) {
+    if (!op || !op->op_) return;
+
+    if (IsOp(op, "pld.tensor.allreduce") || IsOp(op, "pld.tensor.broadcast") ||
+        IsOp(op, "pld.tensor.reduce_scatter")) {
+      const auto& op_name = op->op_->name_;
+      INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+          << "MaterializeCommDomainScopes: " << op_name << " expects exactly two args";
+      collective_consumers.push_back({ResolveWindowAlloc(op->args_[0], op_name, "data/target"),
+                                      ResolveWindowAlloc(op->args_[1], op_name, "signal"), op->span_});
+      return;
+    }
+
+    if (IsOp(op, "pld.tensor.barrier")) {
+      INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.barrier expects exactly one arg";
+      collective_consumers.push_back(
+          {nullptr, ResolveWindowAlloc(op->args_[0], "pld.tensor.barrier", "signal"), op->span_});
+      return;
+    }
+
+    if (IsOp(op, "pld.tensor.allgather")) {
+      if (op->args_.size() == 2) {
+        collective_consumers.push_back({ResolveWindowAlloc(op->args_[0], "pld.tensor.allgather", "target"),
+                                        ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "signal"),
+                                        op->span_});
+        return;
+      }
+      INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.allgather expects 2 args (host builtin) or "
+             "4 args (InCore composite)";
+      collective_consumers.push_back({ResolveWindowAlloc(op->args_[1], "pld.tensor.allgather", "target"),
+                                      ResolveWindowAlloc(op->args_[2], "pld.tensor.allgather", "signal"),
+                                      op->span_});
+    }
   }
 
   void VisitExpr_(const CallPtr& op) override {
     AnalyzeDispatch(op);
-    AnalyzeAllReduce(op);
+    AnalyzeCollective(op);
     IRVisitor::VisitExpr_(op);
   }
 
@@ -311,9 +343,30 @@ class DispatchAnalyzer : public IRVisitor {
     IRVisitor::VisitExpr_(op);
   }
 
-  std::vector<AllReduceConsumer> allreduce_consumers;
+  std::vector<CollectiveConsumer> collective_consumers;
 
  private:
+  [[nodiscard]] const WindowRecord* ResolveWindowRecord(const VarPtr& var) const {
+    std::unordered_set<const Var*> visited;
+    return ResolveWindowRecord(var, &visited);
+  }
+
+  [[nodiscard]] const WindowRecord* ResolveWindowRecord(const VarPtr& var,
+                                                        std::unordered_set<const Var*>* visited) const {
+    if (!var || !visited->insert(var.get()).second) return nullptr;
+    auto direct = view_to_window_.find(var.get());
+    if (direct != view_to_window_.end()) return &direct->second;
+
+    auto def_it = var_defs_.find(var.get());
+    if (def_it == var_defs_.end() || !def_it->second) return nullptr;
+    if (auto alias = As<Var>(def_it->second)) {
+      return ResolveWindowRecord(alias, visited);
+    }
+    auto call = As<Call>(def_it->second);
+    if (!IsTensorAllReduce(call) || call->args_.empty()) return nullptr;
+    return ResolveWindowRecord(As<Var>(call->args_[0]), visited);
+  }
+
   const std::unordered_map<const Var*, WindowRecord>& view_to_window_;
   const std::map<std::string, FunctionPtr>& chip_orchs_;
   const std::unordered_map<const Var*, ExprPtr>& var_defs_;
@@ -353,6 +406,40 @@ class DispatchAnalyzer : public IRVisitor {
   return std::make_shared<Var>(old_var->name_hint_, new_type, old_var->span_);
 }
 
+/// Substitute every window-view Var with its type-updated copy and keep the
+/// defining ``pld.tensor.window`` Call type in lockstep with the assignment
+/// LHS.
+///
+/// A plain Var substitution is insufficient here: IRMutator rewrites the LHS
+/// and downstream uses, but a Call's result type is not re-deduced from its
+/// arguments. The old Call would therefore remain a DistributedTensorType
+/// without ``window_buffer_`` while its new LHS carries the materialized
+/// WindowBuffer. Besides violating AssignTypeSymmetry, that splits the
+/// communication-domain ownership evidence across two incompatible types.
+class WindowViewSubstituter : public IRMutator {
+ public:
+  explicit WindowViewSubstituter(const std::unordered_map<const Var*, VarPtr>& view_subst) {
+    for (const auto& [old_var, new_var] : view_subst) {
+      var_remap_[old_var] = new_var;
+    }
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto base = IRMutator::VisitStmt_(op);
+    auto assign = As<AssignStmt>(base);
+    if (!assign || !assign->var_) return base;
+
+    auto call = As<Call>(assign->value_);
+    if (!call || !call->op_ || !IsOp(call, "pld.tensor.window")) return base;
+    if (structural_equal(assign->var_->GetType(), call->GetType())) return base;
+
+    auto new_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_,
+                                           assign->var_->GetType(), call->span_);
+    return std::make_shared<AssignStmt>(assign->var_, std::move(new_call), assign->span_);
+  }
+};
+
 /// Process one host_orch function: identify allocs/windows/dispatches,
 /// construct WindowBuffer instances, rewrite the body to substitute view Vars
 /// with type-updated copies, and wrap the body in a chain of
@@ -367,8 +454,10 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     return func;
   }
 
+  StmtPtr materialization_body = func->body_;
+
   AllocAndWindowCollector collector;
-  collector.VisitStmt(func->body_);
+  collector.VisitStmt(materialization_body);
 
   if (collector.allocs.empty()) {
     // No window-buffer allocations in this host_orch — nothing to do.
@@ -377,20 +466,31 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
 
   // Phase 2: record device-descriptor evidence from dispatch sites.
   DispatchAnalyzer analyzer(collector.view_to_window, chip_orchs, collector.var_defs);
-  analyzer.VisitStmt(func->body_);
+  analyzer.VisitStmt(materialization_body);
 
   // Host-level collectives do not carry their own device= selector. Their
-  // signal buffer is a user-visible window slot, so inherit the data buffer's
-  // inferred comm-domain coverage before the dead-allocation check.
-  for (const auto& consumer : analyzer.allreduce_consumers) {
-    INTERNAL_CHECK_SPAN(consumer.data_alloc && consumer.signal_alloc, consumer.span)
-        << "MaterializeCommDomainScopes: invalid pld.tensor.allreduce consumer bookkeeping";
-    CHECK(!consumer.data_alloc->seen.empty())
-        << "MaterializeCommDomainScopes: pld.tensor.allreduce data buffer has no inferred comm-domain "
-           "coverage to share with its signal buffer at "
-        << consumer.span.to_string();
-    consumer.signal_alloc->seen.insert(consumer.signal_alloc->seen.end(), consumer.data_alloc->seen.begin(),
-                                       consumer.data_alloc->seen.end());
+  // signal buffer is a user-visible window slot, so inherit paired data/target
+  // coverage when present. Barrier-only consumers keep signal coverage from
+  // dispatch sites, or fall back to the full comm-domain device set.
+  for (const auto& consumer : analyzer.collective_consumers) {
+    INTERNAL_CHECK_SPAN(consumer.signal_alloc, consumer.span)
+        << "MaterializeCommDomainScopes: invalid collective consumer bookkeeping";
+    if (consumer.data_alloc) {
+      INTERNAL_CHECK_SPAN(!consumer.data_alloc->seen.empty(), consumer.span)
+          << "MaterializeCommDomainScopes: collective data/target buffer has no inferred comm-domain "
+             "coverage to share with its signal buffer";
+      consumer.signal_alloc->seen.insert(consumer.signal_alloc->seen.end(), consumer.data_alloc->seen.begin(),
+                                         consumer.data_alloc->seen.end());
+      continue;
+    }
+    // Barrier-only consumer: if no dispatch sites registered coverage for the
+    // signal window, surface the missing coverage as a user-facing diagnostic
+    // rather than silently widening to the full comm domain (which would cause
+    // a cross-rank hang for device-subset barriers).
+    CHECK_SPAN(!consumer.signal_alloc->seen.empty(), consumer.span)
+        << "MaterializeCommDomainScopes: pld.tensor.barrier signal buffer has no inferred "
+           "comm-domain coverage — add a device= annotation or ensure the signal window "
+           "is consumed by a device-tagged chip dispatch";
   }
 
   // Phase 3: each alloc must have at least one window AND at least one
@@ -455,9 +555,14 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   }
 
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
-  // Var picks up the type-updated copy. The base IRMutator handles all uses;
-  // Substitute is the wrapper that does exactly this transformation.
-  StmtPtr new_body = view_subst.empty() ? func->body_ : transform_utils::Substitute(func->body_, view_subst);
+  // Var picks up the type-updated copy. Also rewrite each defining window
+  // Call's result type so the assignment remains type-symmetric and both sides
+  // carry the exact same WindowBuffer identity.
+  StmtPtr new_body = materialization_body;
+  if (!view_subst.empty()) {
+    WindowViewSubstituter substituter(view_subst);
+    new_body = substituter.VisitStmt(materialization_body);
+  }
 
   // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
   // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so

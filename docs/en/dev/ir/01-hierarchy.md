@@ -32,7 +32,7 @@ This document provides a complete reference of all IR node types, organized by c
 <return_stmt> ::= "return" [ <var_list> ]
 <eval_stmt>  ::= <expr>
 <seq_stmts>  ::= <stmt> { ";" <stmt> }
-<scope_stmt> ::= "with" "pl.incore" "(" ")" ":" <stmt_list>
+<scope_stmt> ::= "with" "pl.at" "(" "level" "=" "pl.Level.CORE_GROUP" ")" ":" <stmt_list>
 <break_stmt> ::= "break"
 <continue_stmt> ::= "continue"
 
@@ -167,7 +167,7 @@ for the dispatch rule.
 | Where it appears | Anywhere | Inside `manual_scope` bodies (parser-produced) and as the outlined dispatch of a `pl.at(..., deps=[...])` scope (a missing `as tid` binding gets a synthetic unused TaskId Var); preserved through the whole pipeline |
 | Return type | Callee's declared return | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
 | Has `deps` | No — a plain `Call` never carries dep edges (`attrs["manual_dep_edges"]` appears only on `ScopeStmt` from `pl.at`, consumed at scope outlining; ManualDepsOnSubmitOnly verifies this) | First-class `deps_` field — `Scalar[TASK_ID]` Vars / `Array[N, TASK_ID]` Vars |
-| SPMD launch spec | none | `core_num_` (`optional<ExprPtr>` block count) + `sync_start_` (bool), set only by `pl.spmd_submit`; `nullopt` ⇒ plain single-block submit |
+| SPMD launch spec | none | `core_num_` (`optional<ExprPtr>` block count) + `sync_start_` (bool), set only by `pl.spmd_submit`; `sync_start_` is meaningful only when `core_num_` is present (the constructor enforces `sync_start ⇒ core_num`); `nullopt` ⇒ plain single-block submit |
 | Use-def chain | `args_` only | `args_`, `deps_`, **and** `core_num_` |
 | Python syntax | `out = self.foo(...)` | `out, tid = pl.submit(self.foo, ...)` (or `pl.spmd_submit(self.foo, ..., core_num=N)`) |
 
@@ -204,10 +204,10 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **ForStmt** | `loop_var_` (DefField), `start_`, `stop_`, `step_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField), `kind_` | For loop with optional iteration args |
 | **WhileStmt** | `condition_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField) | While loop with condition and iteration args |
 | **InCoreScopeStmt** | `name_hint_`, `body_`, `split_` (optional) | InCore region; outlined to `Function(InCore)` |
-| **AutoInCoreScopeStmt** | `name_hint_`, `body_`, `split_` (optional) | Auto-InCore region; consumed by `InterchangeChunkLoops` |
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster region; outlined to `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_` (optional) | Pipeline-stage region for a given Level/Role |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_` (integer-typed `Expr`), `sync_start_` | SPMD launch region; outlined to `Function(Spmd)` |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 21) |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`PTO2_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
 | **EvalStmt** | `expr_` | Evaluate expression for side effects |
@@ -304,24 +304,21 @@ while_stmt = ir.WhileStmt(condition, [x_iter], body, [x_final], span)
 ### ScopeStmt Details
 
 `ScopeStmt` is an **abstract base class** that marks a region with a specific
-execution context. The six concrete subclasses below each carry only the
+execution context. The five concrete subclasses below each carry only the
 fields valid for their kind — invalid combinations are unrepresentable at
 construction. Use `s.scope_kind` (or `s.GetScopeKind()` in C++) to recover the
 kind from a `ScopeStmt`-typed reference, or `isinstance(s, InCoreScopeStmt)`
 to dispatch on the concrete type.
 
-All six share the common base fields `name_hint_: str` and `body_: StmtPtr`.
-Note that `pl.at(level=Level.CORE_GROUP)` lowers to `InCoreScopeStmt` /
-`AutoInCoreScopeStmt`, not `HierarchyScopeStmt` — the parser rejects `role=`
+All five share the common base fields `name_hint_: str` and `body_: StmtPtr`.
+Note that `pl.at(level=Level.CORE_GROUP)` lowers to `InCoreScopeStmt`, not
+`HierarchyScopeStmt` — the parser rejects `role=`
 at `CORE_GROUP`. `HierarchyScopeStmt` is reserved for non-`CORE_GROUP` levels
 (host, cluster, global) and is not a general replacement for in-core scopes.
 
 ```python
-# with pl.incore(): y = pl.add(x, x)
+# with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x)
 in_core = ir.InCoreScopeStmt(name_hint="", body=body, span=span)
-
-# with pl.auto_incore():       (split is optional)
-auto = ir.AutoInCoreScopeStmt(name_hint="", body=body, span=span)
 
 # with pl.cluster():
 cluster = ir.ClusterScopeStmt(name_hint="", body=body, span=span)
@@ -333,6 +330,10 @@ hier = ir.HierarchyScopeStmt(level=ir.Level.HOST, role=ir.Role.SubWorker,
 # with pl.spmd(8):
 spmd = ir.SpmdScopeStmt(core_num=ir.ConstInt(8, DataType.INDEX, span),
                         sync_start=False, name_hint="", body=body, span=span)
+
+# for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):  (explicit AIV-split region)
+split_aiv = ir.SplitAivScopeStmt(split=ir.SplitMode.UP_DOWN, count=2,
+                                 name_hint="", body=body, span=span)
 
 # with pl.manual_scope(): (orchestrator runtime region with manual dep mode)
 runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
@@ -358,14 +359,28 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   expression can be any integer-typed IR value — `Simplify` folds closure
   arithmetic to `ConstInt`, and codegen resolves `Var` references against
   the enclosing function scope.
-- `InCoreScopeStmt` / `AutoInCoreScopeStmt` are scheduled for deprecation;
-  prefer `HierarchyScopeStmt` or other surviving kinds in new code.
+- `InCoreScopeStmt` is the lowering target of
+  `pl.at(level=Level.CORE_GROUP)`; the parser rejects `role=` at
+  `CORE_GROUP`, so `HierarchyScopeStmt` is reserved for the other levels.
 - Pass behavior:
-  - `InterchangeChunkLoops` consumes `AutoInCoreScopeStmt`
   - `OutlineIncoreScopes` extracts `InCoreScopeStmt` into `Function(InCore)`
   - `OutlineClusterScopes` extracts `ClusterScopeStmt` into `Function(Group)`
     and standalone `SpmdScopeStmt` into `Function(Spmd)`
   - `OutlineHierarchyScopes` extracts `HierarchyScopeStmt`
+  - `SplitAivScopeStmt` is **non-outlined**: it is transparent to SSA and to the
+    outliners (it survives inside an outlined `Function(InCore)` body), then is
+    consumed and **erased** by `LowerAutoVectorSplit` (pass 21). It never reaches
+    `ExpandMixedKernel` (pass 22) or codegen — those see only the per-op
+    `aiv_shard` / `aic_gather` / `tpush` / `tpop` markers. A PTO codegen guard
+    fails loudly if a `SplitAivScopeStmt` ever survives that far.
+  - `SplitAivScopeStmt` is **nestable**: built via the generic
+    `BeginScope`/`EndScope`, it emits into any parent context (a `pl.range` /
+    `pl.pipeline` loop or an `if`). Sibling regions may carry **different**
+    `split_` modes (multi-mode); pass-21 halving is region-scoped, so each region
+    halves independently and out-of-region vector compute stays full-width. A
+    top-level `for aiv_id in pl.split_aiv(...)` is wrapped by the parser in an
+    enclosing `InCoreScopeStmt` (so `OutlineIncoreScopes` can outline it), i.e.
+    `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`.
   - Inside `RuntimeScopeStmt(manual=true)` blocks, the parser emits a
     `Submit` node for each `pl.submit(kernel, ..., deps=[tid1, tid2])`
     call and populates its first-class `deps_` field directly from the
@@ -388,7 +403,7 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
 **Transformation:**
 
 ```python
-# Before: with pl.incore(): y = pl.add(x, x); return y
+# Before: with pl.at(level=Level.CORE_GROUP): y = pl.add(x, x); return y
 # After: main_incore_0(x) -> y; main(x): y = main_incore_0(x); return y
 ```
 
@@ -585,7 +600,7 @@ Functions stored in sorted map for deterministic ordering. GlobalVar names must 
 | **Unary Ops** | 5 | Abs, Neg, Not, BitNot, Cast |
 | **Call/Access** | 2 | Call, TupleGetItemExpr |
 | **Operations** | 2 | Op, GlobalVar |
-| **Statements** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, AutoInCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
+| **Statements** | 16 | AssignStmt, IfStmt, ForStmt, WhileStmt, ReturnStmt, InCoreScopeStmt, ClusterScopeStmt, HierarchyScopeStmt, SpmdScopeStmt, SplitAivScopeStmt, YieldStmt, EvalStmt, SeqStmts, BreakStmt, ContinueStmt, InlineStmt |
 | **Types** | 6 | ScalarType, TensorType, TileType, TupleType, PipeType, UnknownType |
 | **Functions** | 2 | Function, Program |
 

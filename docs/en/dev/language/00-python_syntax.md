@@ -278,22 +278,6 @@ for i in pl.parallel(start, stop, step):
 
 **Key points:** Loop-carried values use `pl.range()` or `pl.parallel()` with `init_values`, tuple unpacking `(sum,)` declares iter_args, `pl.yield_()` updates values for next iteration, after loop iter_args contain final values. `pl.parallel()` produces a `ForKind.Parallel` loop while `pl.range()` produces `ForKind.Sequential` (default).
 
-#### Chunked Loops
-
-```python
-# Split loop into chunks of C iterations (nested outer/inner loops)
-for i in pl.range(10, chunk=5):
-    body_statements
-
-for i in pl.parallel(8, chunk=4):
-    body_statements
-
-for i in pl.unroll(12, chunk=4):
-    body_statements
-```
-
-**Key points:** `chunk=C` splits the loop into an outer sequential loop and an inner loop of `C` iterations. The inner loop preserves the original kind (Sequential/Parallel/Unroll). `init_values` is supported with chunked loops (iter_args thread through the generated outer/inner/remainder loops). `chunk=` loops are only valid inside a `with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):` — outside that scope the parser rejects them with an error. See [SplitChunkedLoops Pass](../passes/07-split_chunked_loops.md).
-
 ### While Loop (SSA-style with iter_args)
 
 ```python
@@ -329,18 +313,12 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | ---- | ---------- | ----- |
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | Fixed-boundary outline at CORE_GROUP |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + cross-core split hint |
-| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk])` | `AutoInCore` | Compiler-driven chunked loop split |
-| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(MODE)])` | `AutoInCore` | AutoInCore + split hint (independent entries) |
 | `pl.at(level=pl.Level.HOST)` *(or any non-`CORE_GROUP` level)* | `Hierarchy` | Distributed hierarchy scope |
 | `pl.cluster()` | `Cluster` | Co-scheduled AIC+AIV group |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd` (for-form wraps inner `InCore`) | SPMD multi-block dispatch — see [pl.spmd](#plspmd-multi-block-dispatch) |
 | `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | Split hint applies to the inner InCore (both forms) |
 | `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | Orchestrator MANUAL scope — user manages task ordering. Allowed in either `auto_scope` mode (it is a dependency-semantics choice). See [Manual dependency primitives](#manual-dependency-primitives) |
-| `pl.scope()` | `Runtime(manual=false)` | Orchestrator AUTO scope (`PTO2_SCOPE()`). Hand-placing one requires `@pl.function(auto_scope=False)` (in the default `auto_scope=True` the compiler owns AUTO placement). See [MaterializeRuntimeScopes](../passes/39-materialize_runtime_scopes.md) |
-| `pl.incore()` *(deprecated)* | `InCore` | Use `pl.at(level=pl.Level.CORE_GROUP)` instead |
-| `pl.auto_incore(split=...)` *(deprecated)* | `AutoInCore` | Use `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk, pl.split(...)])` |
-| `pl.at(..., optimization=pl.chunked_loop_optimizer[(split=...)])` *(deprecated)* | `AutoInCore` | Use `pl.at(..., optimizations=[pl.auto_chunk, pl.split(...)])` |
-| `pl.at(..., split=...)` *(deprecated)* | `InCore` | Use `pl.at(..., optimizations=[pl.split(...)])` |
+| `pl.scope()` | `Runtime(manual=false)` | Orchestrator AUTO scope (`PTO2_SCOPE()`). Hand-placing one requires `@pl.function(auto_scope=False)` (in the default `auto_scope=True` the compiler owns AUTO placement). See [MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) |
 
 See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples.
 
@@ -348,12 +326,14 @@ See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples
 
 `pl.spmd(N)` dispatches a kernel across `N` blocks. Forms:
 
-- `with pl.spmd(N): kernel(...)` — body must be a single call to a pre-defined InCore kernel.
+- `with pl.spmd(N): ...` — body is **either** a single call to a pre-defined InCore kernel (direct dispatch, `SpmdScopeStmt(body=Call)`, no inner InCore wrapper) **or** an inline multi-statement block that is auto-outlined into a synthetic InCore region (like the for-form, minus the auto-bound index). An inline body must read the per-block index via `pl.tile.get_block_idx()` — without it every block runs identical work, so the parser rejects it. Captures no producer TaskId.
 - `for i in pl.spmd(N): ...` — loop variable binds the per-block index (`pl.tile.get_block_idx()`); the body is auto-outlined into a synthetic InCore region.
-- `with pl.spmd(N, deps=[...]) as tid: ...` — **capture form**: mirrors `with pl.at(...) as tid:`. Captures the dispatch's grid-wide producer `pl.Scalar[pl.TASK_ID]` in `tid` (usable as a `deps=` edge, stored into a `pl.array.create(N, pl.TASK_ID)`, or crossed into `pl.manual_scope`), and accepts an inline multi-statement body like the for-form (read the per-block index via `pl.tile.get_block_idx()`). Lowers to an `ir.Submit` whose trailing tuple element is the grid TaskId; `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs. See [Manual dependency primitives](#manual-dependency-primitives).
+- `with pl.spmd(N, deps=[...]) as tid: ...` — **capture form**: mirrors `with pl.at(...) as tid:`. Same body shapes as the plain form above, and additionally captures the dispatch's grid-wide producer `pl.Scalar[pl.TASK_ID]` in `tid` (usable as a `deps=` edge, stored into a `pl.array.create(N, pl.TASK_ID)`, or crossed into `pl.manual_scope`). TaskId capture is orthogonal to the inline body — it is the only thing this form adds over the plain form. Lowers to an `ir.Submit` whose trailing tuple element is the grid TaskId; `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs. See [Manual dependency primitives](#manual-dependency-primitives).
 - `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` — **submit form**: dispatches the kernel across `N` blocks *and* captures the dispatch's producer `pl.Scalar[pl.TASK_ID]` (the `pl.submit` sibling for a pre-defined kernel). See [Manual dependency primitives](#manual-dependency-primitives).
 
-Optional `optimizations=[pl.split(MODE)]` only (**not** `pl.auto_chunk`; use `pl.at(..., optimizations=[pl.auto_chunk])` inside the body for chunked loops):
+All three `pl.spmd(...)` scope forms also accept `allow_early_resolve=True` (a boolean literal; same early-dispatch opt-in as `pl.submit` / `pl.at`). It forces the dispatch to lower to an `ir.Submit` even without `as tid` and lowers to `Arg::set_allow_early_resolve(true)`. Rejected on a `pl.cluster()`-nested `pl.spmd` (such a scope is unwrapped into the Group function and never produces a Submit, so the hint would be lost).
+
+Optional `optimizations=[pl.split(MODE)]`:
 
 | Entry | Form | Effect |
 | ----- | ---- | ------ |
@@ -393,7 +373,7 @@ shape (single kernel call, outlined `pl.at` region, or dependency-only fan-in).
 | `result, tid = pl.submit(kernel, *args, deps=[...], allow_early_resolve=False)` | single kernel call | The trailing `tid` is the producer `pl.Scalar[pl.TASK_ID]`. A parser construct (like `pl.range`), not a runtime function. `allow_early_resolve=True` opts this task in as a speculative early-dispatch producer (lets the scheduler pre-stage its consumers; lowers to `Arg::set_allow_early_resolve(true)`). |
 | `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | single SPMD task launch | The SPMD sibling of `pl.submit`: dispatches the kernel across `N` blocks (one orchestration task → one `tid`). `core_num` is a required keyword (positive int expr); `sync_start=True` forces atomic launch of all blocks. Callee may be InCore / AIC / AIV / Group. Records the launch spec on `Submit.core_num` / `Submit.sync_start`. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit`). |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-block | The whole block is outlined into an `InCore` kernel + `Submit`; `tid` captures the synthesized Submit's TaskId, usable as a dep for later `pl.submit` / `pl.at` sites. Without `as tid` the outliner synthesizes an unused TaskId Var — deps always travel on `Submit::deps_`. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit`); it forces the `Submit` shape even without `as tid` and lowers to `Arg::set_allow_early_resolve(true)`. |
-| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD dispatch | The SPMD sibling of the `pl.at ... as tid` form. The inline body is auto-outlined into an `InCore` kernel and dispatched across `N` blocks; `tid` captures the grid-wide producer TaskId. `deps=` accepted only with `as tid`. `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs (the lowered `Submit.core_num` is `None`); codegen reads them via the launch-function fallback. Cannot nest inside `pl.cluster()`. |
+| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD dispatch | The SPMD sibling of the `pl.at ... as tid` form. The inline body is auto-outlined into an `InCore` kernel and dispatched across `N` blocks; `tid` captures the grid-wide producer TaskId. `deps=` accepted only with `as tid`. `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs (the lowered `Submit.core_num` is `None`); codegen reads them via the launch-function fallback. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit` / `pl.at`; valid on all three `pl.spmd` forms, forcing the `Submit` shape even without `as tid`). Cannot nest inside `pl.cluster()`. |
 | `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | Submits no kernel. The returned TaskId is a compact fan-in point for later `deps=[barrier]`. |
 | `None` (Python literal) | seed / dep entry | The "no producer yet" sentinel. `prev_tid = None` seeds a TaskId loop iter_arg; `None` in `deps=[None]` is dropped (contributes no edge). Lowers to `system.task_invalid` → `PTO2TaskId::invalid()`. |
 

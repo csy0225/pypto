@@ -42,7 +42,6 @@ from .diagnostics import (
 )
 from .enum_utils import (
     LEVEL_MAP,
-    LOOP_ORIGIN_MAP,
     ROLE_MAP,
     SCOPE_MODE_MAP,
     SPLIT_MODE_MAP,
@@ -65,6 +64,35 @@ if TYPE_CHECKING:
 # submodules exposed by pypto.language.distributed.op (system_ops / tensor_ops
 # / tile_ops); also surfaced as the hint in _parse_pld_category_op.
 _PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile"})
+
+
+def _is_empty_body(body: list[ast.stmt]) -> bool:
+    """True if a function body carries no statements beyond a signature marker.
+
+    Accepts a bare ``...`` (the documented spelling), a bare ``pass`` (what the
+    IR printer emits for an empty body — required so external-kernel functions
+    survive print -> reparse round-trips), and an optional leading docstring.
+
+    Used to validate external-kernel declarations, whose implementation lives in
+    a hand-written C++ source rather than a parsed DSL body.
+    """
+    non_doc = [
+        stmt
+        for stmt in body
+        if not (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
+    ]
+    if not non_doc:
+        return True
+    if len(non_doc) != 1:
+        return False
+    only = non_doc[0]
+    if isinstance(only, ast.Pass):
+        return True
+    return isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant) and only.value.value is ...
 
 
 def _is_pld_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
@@ -152,7 +180,7 @@ def _is_per_element_task_id_read(expr: ir.Expr) -> bool:
     """
     if not isinstance(expr, ir.Call):
         return False
-    if expr.op.name != "array.get_element":
+    if expr.op.name != ir.get_op("array.get_element").name:
         return False
     if not isinstance(expr.type, ir.ScalarType) or expr.type.dtype != DataType.TASK_ID:
         return False
@@ -330,7 +358,7 @@ def _normalize_inferred_type_for_annotation(
         isinstance(annotation_type, ir.TileType)
         and isinstance(inferred_type, ir.TileType)
         and isinstance(value_expr, ir.Call)
-        and value_expr.op.name in {"tile.load", "tile.create"}
+        and value_expr.op.name in {ir.get_op("tile.load").name, ir.get_op("tile.create").name}
         and len(annotation_type.shape) <= 2
         and len(inferred_type.shape) > 2
     ):
@@ -393,17 +421,13 @@ class _AtKwargState:
     # the scope's ``allow_early_resolve`` attr and threaded onto the synthesised
     # ``Submit`` by the outliner (mirrors ``pl.submit(..., allow_early_resolve=)``).
     allow_early_resolve: bool = False
-    requests_auto_chunk: bool = False
     split_mode: "ir.SplitMode | None" = None
     # Optional cross-core ring-buffer depth from ``pl.split(mode, slot_num=N)``.
     # Stored on the scope attrs and propagated to the outlined function attr.
     split_slot_num: "int | None" = None
-    # Tracks which kwarg produced the AutoChunk / split state so the validation
-    # step can reject mixing the new `optimizations=` list with the deprecated
-    # `optimization=`/`split=` kwargs and emit DeprecationWarning at the end.
+    # Tracks the ``optimizations=`` kwarg AST so a duplicate ``optimizations=``
+    # can be rejected in ``_handle_at_optimizations_kw``.
     new_optimizations_kw: "ast.keyword | None" = field(default=None)
-    legacy_optimization_kw: "ast.keyword | None" = field(default=None)
-    legacy_split_kw: "ast.keyword | None" = field(default=None)
     # ``deps=[tid1, tid2]`` AST kept verbatim; resolved into Var refs by the
     # caller once it has decided this scope opts into the manual_dep_edges path.
     deps_kw: "ast.keyword | None" = field(default=None)
@@ -420,6 +444,7 @@ class _AtKwargState:
     # ``dump_vars`` transfer), and the outliner translates it into the
     # synthesised dispatch's ``kAttrDumpVars``.
     dumps_kw: "ast.keyword | None" = field(default=None)
+    windowize: bool = False
 
 
 _SPMD_SCOPE_NAME_SUFFIX = "_spmd"
@@ -527,6 +552,10 @@ class ASTParser:
         # Track loop kinds for break/continue validation
         self._loop_kind_stack: list[str] = []
         self._scope_kind_stack: list[ir.ScopeKind] = []
+        # Active ``pl.split_aiv(mode=...)`` modes (innermost last). ``pl.aiv_shard`` /
+        # ``pl.aic_gather`` inherit the split mode from this stack rather than
+        # taking it as an argument.
+        self._split_aiv_mode_stack: list[ir.SplitMode] = []
         # Depth of nested ``with pl.manual_scope():`` blocks. Used to gate the
         # ``deps=[var]`` kwarg recognition on kernel calls.
         self._manual_scope_depth: int = 0
@@ -632,6 +661,28 @@ class ASTParser:
         """Return whether parsing is currently nested inside the given scope kind."""
         return scope_kind in self._scope_kind_stack
 
+    @contextmanager
+    def _split_aiv_mode_context(self, mode: ir.SplitMode) -> Iterator[None]:
+        """Track the active ``pl.split_aiv`` split mode during body parsing.
+
+        ``pl.aiv_shard`` / ``pl.aic_gather`` read the innermost entry to inherit
+        the split mode from the enclosing ``for ... in pl.split_aiv(mode=...)``
+        scope instead of taking it as an explicit argument.
+
+        Also pushes a ``"split_aiv"`` sentinel onto :attr:`_loop_kind_stack` for
+        the duration of the body parse. A ``pl.split_aiv`` loop lowers to a scope,
+        not a ``ForStmt``, so ``break`` / ``continue`` inside it have no loop to
+        target; the sentinel makes :meth:`_validate_loop_control` reject them
+        instead of letting them silently bind to an enclosing Python loop.
+        """
+        self._split_aiv_mode_stack.append(mode)
+        self._loop_kind_stack.append("split_aiv")
+        try:
+            yield
+        finally:
+            self._loop_kind_stack.pop()
+            self._split_aiv_mode_stack.pop()
+
     def parse_function(
         self,
         func_def: ast.FunctionDef,
@@ -730,7 +781,28 @@ class ASTParser:
 
             # Parse function body. HOST SubWorkers carry pure-Python source
             # via ``inline_body`` and are not parsed as DSL.
-            if inline_body is not None:
+            external_source = (func_attrs or {}).get("external_source")
+            if external_source is not None:
+                # Header-only external C++ kernel: no DSL body to parse. The
+                # signature (params + directions + return types) is the contract
+                # the orchestration submits against; the backend compiles the
+                # referenced ``.cpp`` as the InCore kernel by func_id.
+                if func_type not in (ir.FunctionType.AIC, ir.FunctionType.AIV):
+                    raise ParserTypeError(
+                        f"external_source is only valid on FunctionType.AIC or "
+                        f"FunctionType.AIV, got {func_type!r} for function '{func_name}'",
+                        span=func_span,
+                        hint="Declare the external kernel as pl.FunctionType.AIC or pl.FunctionType.AIV.",
+                    )
+                if not _is_empty_body(func_def.body):
+                    raise ParserSyntaxError(
+                        f"External kernel '{func_name}' must have an empty '...' body "
+                        "(signature only) — its implementation is the C++ source "
+                        "given by external_source.",
+                        span=func_span,
+                        hint="Replace the function body with a bare '...'.",
+                    )
+            elif inline_body is not None:
                 self.builder.inline_stmt(inline_body, ir.InlineLanguage.Python, func_span)
             else:
                 self._parse_body_siblings(func_def.body)
@@ -1238,7 +1310,11 @@ class ASTParser:
                 (
                     isinstance(override_type, ir.TileType)
                     and isinstance(value_expr.type, ir.UnknownType)
-                    and value_expr.op.name in ("tile.tpop_from_aiv", "tile.tpop_from_aic")
+                    and value_expr.op.name
+                    in {
+                        ir.get_op("tile.tpop_from_aiv").name,
+                        ir.get_op("tile.tpop_from_aic").name,
+                    }
                 )
                 or not _types_match(value_expr.type, override_type)
             )
@@ -1972,12 +2048,14 @@ class ASTParser:
                     # Will be resolved from loop outputs
                     self.scope_manager.define_var(var_name, f"loop_yield_{i}")
 
-    _VALID_ITERATORS = {"range", "parallel", "unroll", "pipeline", "while_", "spmd"}
+    _VALID_ITERATORS = {"range", "parallel", "unroll", "pipeline", "while_", "spmd", "split_aiv"}
     _ITERATOR_ERROR = (
-        "For loop must use pl.range(), pl.parallel(), pl.unroll(), pl.pipeline(), pl.while_(), or pl.spmd()"
+        "For loop must use pl.range(), pl.parallel(), pl.unroll(), pl.pipeline(), pl.while_(), "
+        "pl.spmd(), or pl.split_aiv()"
     )
     _ITERATOR_HINT = (
-        "Use pl.range(), pl.parallel(), pl.unroll(), pl.pipeline(), pl.while_(), or pl.spmd() as the iterator"
+        "Use pl.range(), pl.parallel(), pl.unroll(), pl.pipeline(), pl.while_(), pl.spmd(), "
+        "or pl.split_aiv() as the iterator"
     )
 
     def _validate_for_loop_iterator(self, stmt: ast.For) -> tuple[ast.Call, str]:
@@ -2082,6 +2160,11 @@ class ASTParser:
             self._parse_spmd_for_loop(stmt, iter_call)
             return
 
+        # Handle pl.split_aiv() loop form — opens a single explicit-split InCore scope.
+        if iterator_type == "split_aiv":
+            self._parse_split_aiv_for_loop(stmt, iter_call)
+            return
+
         loop_var_name, iter_args_node, is_simple_for = self._parse_for_loop_target(stmt)
         range_args = self._parse_range_call(iter_call, iterator_type)
 
@@ -2121,12 +2204,6 @@ class ASTParser:
                     hint="Use a non-zero step in pl.unroll(start, stop, step).",
                 )
 
-        # Validate chunk arguments
-        chunk_expr = range_args.get("chunk")
-        chunk_policy_str = range_args.get("chunk_policy", "guarded")
-        if chunk_expr is not None:
-            self._validate_chunk_args(chunk_expr, range_args["init_values"], iter_call)
-
         # Validate stage= on pl.pipeline() and merge into attrs as "pipeline_stages".
         # stage= is required on pl.pipeline() and forbidden everywhere else.
         pipeline_stages: int | None = None
@@ -2137,12 +2214,6 @@ class ASTParser:
                     "pl.pipeline() requires stage= (positive integer)",
                     span=self.span_tracker.get_span(iter_call),
                     hint="Use pl.pipeline(stop, stage=F).",
-                )
-            if chunk_expr is not None:
-                raise ParserSyntaxError(
-                    "stage= and chunk= are mutually exclusive on pl.pipeline()",
-                    span=self.span_tracker.get_span(iter_call),
-                    hint="Drop chunk= when pipelining — pl.pipeline replicates the body at tile level.",
                 )
             if not _is_const_int(stage_expr):
                 raise ParserSyntaxError(
@@ -2201,8 +2272,6 @@ class ASTParser:
             range_args["step"],
             span,
             kind,
-            chunk_size=chunk_expr,
-            chunk_policy=chunk_policy_str,
             attrs=attrs_dict,
         ) as loop:
             self.current_loop_builder = loop
@@ -2247,33 +2316,9 @@ class ASTParser:
                     if i < len(loop_result.return_vars):
                         self.scope_manager.define_var(var_name, loop_result.return_vars[i])
 
-    def _validate_chunk_args(self, chunk_expr: Any, init_values: list[Any], iter_call: ast.Call) -> None:
-        """Validate chunk arguments for range/parallel/unroll loops."""
-        if not self._is_inside_scope(ir.ScopeKind.AutoInCore):
-            raise ParserSyntaxError(
-                "chunk=... loops are only valid inside "
-                "with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):",
-                span=self.span_tracker.get_span(iter_call),
-                hint="Wrap the loop in 'with pl.at(level=pl.Level.CORE_GROUP, "
-                "optimizations=[pl.auto_chunk]):' or remove the chunk= argument.",
-            )
-        if not _is_const_int(chunk_expr):
-            raise ParserSyntaxError(
-                "chunk must be a compile-time constant positive integer",
-                span=self.span_tracker.get_span(iter_call),
-                hint="Use an integer literal for chunk: chunk=5",
-            )
-        chunk_val = _const_int_value(chunk_expr)
-        if chunk_val is not None and chunk_val <= 0:
-            raise ParserSyntaxError(
-                f"chunk must be a positive integer, got {chunk_val}",
-                span=self.span_tracker.get_span(iter_call),
-                hint="Use a positive integer for chunk: chunk=5",
-            )
-
     _ITERATOR_KEYWORDS = {
-        "range": ("init_values", "chunk", "chunk_policy", "attrs"),
-        "parallel": ("init_values", "chunk", "chunk_policy", "attrs"),
+        "range": ("init_values", "attrs"),
+        "parallel": ("init_values", "attrs"),
         "unroll": ("init_values", "attrs"),
         "pipeline": ("init_values", "stage", "attrs"),
     }
@@ -2289,32 +2334,14 @@ class ASTParser:
                     span=self.span_tracker.get_span(keyword.value),
                     hint="Use a tuple for init_values: init_values=(var1, var2)",
                 )
-        elif keyword.arg == "chunk":
-            result["chunk"] = self.parse_expression(keyword.value)
         elif keyword.arg == "stage":
             result["stage"] = self.parse_expression(keyword.value)
-        elif keyword.arg == "chunk_policy":
-            if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
-                _VALID_CHUNK_POLICIES = {"leading_full", "guarded"}
-                if keyword.value.value not in _VALID_CHUNK_POLICIES:
-                    raise ParserSyntaxError(
-                        f"Unsupported chunk_policy: {keyword.value.value!r}",
-                        span=self.span_tracker.get_span(keyword.value),
-                        hint=f"Supported values: {', '.join(sorted(_VALID_CHUNK_POLICIES))}",
-                    )
-                result["chunk_policy"] = keyword.value.value
-            else:
-                raise ParserSyntaxError(
-                    "chunk_policy must be a string literal",
-                    span=self.span_tracker.get_span(keyword.value),
-                    hint='Use a string like chunk_policy="leading_full"',
-                )
         elif keyword.arg == "attrs":
             if not isinstance(keyword.value, ast.Dict):
                 raise ParserSyntaxError(
                     "attrs must be a dict literal",
                     span=self.span_tracker.get_span(keyword.value),
-                    hint='Use a dict like attrs={"loop_origin": pl.LoopOrigin.ChunkOuter}',
+                    hint='Use a dict like attrs={"my_attr": 1}',
                 )
             result["attrs"] = self._parse_attrs_dict(keyword.value)
         else:
@@ -2357,8 +2384,6 @@ class ASTParser:
 
         result: dict[str, Any] = {
             "init_values": [],
-            "chunk": None,
-            "chunk_policy": "guarded",
             "unroll": None,
             "attrs": {},
         }
@@ -2375,12 +2400,9 @@ class ASTParser:
 
         Supports string keys with values that are:
         - Integer/float/bool/string constants
-        - pl.LoopOrigin.<name> enum references
         """
         # Map of known enum attr keys to their (enum_map, enum_name, qualified) configs
-        _ENUM_ATTRS: dict[str, tuple[dict[str, object], str, str]] = {
-            "loop_origin": (LOOP_ORIGIN_MAP, "LoopOrigin", "pl.LoopOrigin"),
-        }
+        _ENUM_ATTRS: dict[str, tuple[dict[str, object], str, str]] = {}
 
         result: dict[str, object] = {}
         for key_node, value_node in zip(node.keys, node.values):
@@ -2400,8 +2422,7 @@ class ASTParser:
                 raise ParserSyntaxError(
                     f"Unsupported value type for attrs key '{key}'",
                     span=self.span_tracker.get_span(value_node),
-                    hint="Supported values: integer, float, bool, string,"
-                    " or enum (e.g., pl.LoopOrigin.ChunkOuter)",
+                    hint="Supported values: integer, float, bool, or string",
                 )
         return result
 
@@ -2999,19 +3020,15 @@ class ASTParser:
         self.current_if_builder = None
 
     def _parse_at_kwargs(self, call: ast.Call) -> "_AtKwargState":
-        """Extract level, role, AutoChunk request, split mode, deps, and name from pl.at(...).
+        """Extract level, role, split mode, deps, and name from pl.at(...).
 
-        Supports both positional and keyword forms. Preferred new API uses the
-        ``optimizations=[...]`` list with ``pl.split(...)`` and ``pl.auto_chunk``
-        entries. The legacy ``optimization=`` and top-level ``split=`` kwargs
-        are still accepted but emit a DeprecationWarning. Mixing the new
-        ``optimizations=`` list with either deprecated kwarg is a hard error.
+        Supports both positional and keyword forms. The split mode is configured
+        through the ``optimizations=[...]`` list with ``pl.split(...)`` entries.
 
-        Returns the populated :class:`_AtKwargState`. ``requests_auto_chunk`` is
-        True when the resulting scope must be ``AutoInCore`` rather than
-        ``InCore``. ``deps_kw`` carries the verbatim ``deps=`` keyword AST when
-        present, so the caller can resolve it into ``Var`` refs once it has
-        decided this scope opts into the ``manual_dep_edges`` path.
+        Returns the populated :class:`_AtKwargState`. ``deps_kw`` carries the
+        verbatim ``deps=`` keyword AST when present, so the caller can resolve it
+        into ``Var`` refs once it has decided this scope opts into the
+        ``manual_dep_edges`` path.
         """
         if len(call.args) > 2:
             raise ParserSyntaxError(
@@ -3036,7 +3053,6 @@ class ASTParser:
                 hint="Use pl.at(pl.Level.HOST) or pl.at(level=pl.Level.HOST)",
             )
 
-        self._validate_at_kwarg_combinations(state)
         return state
 
     def _dispatch_at_keyword(self, kw: ast.keyword, state: "_AtKwargState") -> None:
@@ -3057,10 +3073,6 @@ class ASTParser:
             state.role = extract_enum_value(kw.value, ROLE_MAP, "Role", "pl.Role")
         elif kw.arg == "optimizations":
             self._handle_at_optimizations_kw(kw, state)
-        elif kw.arg == "optimization":
-            self._handle_at_legacy_optimization_kw(kw, state)
-        elif kw.arg == "split":
-            self._handle_at_legacy_split_kw(kw, state)
         elif kw.arg == "name_hint":
             state.name_hint = self._parse_scope_name_hint(kw.value, "pl.at()")
         elif kw.arg == "allow_early_resolve":
@@ -3071,6 +3083,14 @@ class ASTParser:
                     hint="Write allow_early_resolve=True to opt this scope into early-dispatch.",
                 )
             state.allow_early_resolve = kw.value.value
+        elif kw.arg == "windowize":
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+                raise ParserSyntaxError(
+                    "pl.at() windowize must be a boolean literal (True/False)",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint="Write windowize=True to allow local windowization for this InCore scope.",
+                )
+            state.windowize = kw.value.value
         elif kw.arg in _AT_STASH_KWARGS:
             self._stash_at_kwarg(kw, state)
         elif kw.arg is None:
@@ -3085,7 +3105,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(kw),
                 hint=(
                     "Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, "
-                    "allow_early_resolve, name_hint"
+                    "allow_early_resolve, name_hint, windowize"
                 ),
             )
 
@@ -3109,72 +3129,9 @@ class ASTParser:
             )
         state.new_optimizations_kw = kw
         (
-            state.requests_auto_chunk,
             state.split_mode,
             state.split_slot_num,
         ) = self._parse_optimizations_list(kw.value)
-
-    def _handle_at_legacy_optimization_kw(self, kw: ast.keyword, state: "_AtKwargState") -> None:
-        if state.legacy_optimization_kw is not None:
-            raise ParserSyntaxError(
-                "pl.at() got multiple values for argument 'optimization'",
-                span=self.span_tracker.get_span(kw),
-            )
-        state.legacy_optimization_kw = kw
-        # Bare or called legacy optimizer always implies AutoChunk.
-        state.requests_auto_chunk = True
-        state.split_mode = self._parse_chunked_loop_optimizer(kw.value)
-
-    def _handle_at_legacy_split_kw(self, kw: ast.keyword, state: "_AtKwargState") -> None:
-        if state.legacy_split_kw is not None:
-            raise ParserSyntaxError(
-                "pl.at() got multiple values for argument 'split'",
-                span=self.span_tracker.get_span(kw),
-            )
-        state.legacy_split_kw = kw
-        state.split_mode = self._eval_split_mode(kw.value)
-
-    def _validate_at_kwarg_combinations(self, state: "_AtKwargState") -> None:
-        """Reject illegal kwarg combinations and emit DeprecationWarnings."""
-        # Hard error when mixing new optimizations= with deprecated kwargs.
-        if state.new_optimizations_kw is not None and (
-            state.legacy_optimization_kw is not None or state.legacy_split_kw is not None
-        ):
-            offending = state.legacy_optimization_kw or state.legacy_split_kw
-            assert offending is not None
-            raise ParserSyntaxError(
-                "Cannot mix 'optimizations=' with deprecated 'optimization=' or 'split=' kwargs in pl.at()",
-                span=self.span_tracker.get_span(offending),
-                hint="Use only optimizations=[pl.split(...), pl.auto_chunk] — drop the deprecated kwargs.",
-            )
-
-        # Preserve the pre-existing rule that the two deprecated kwargs cannot be
-        # combined: legacy `optimization=` always implied AutoInCore + a baked-in
-        # split, so combining it with legacy top-level `split=` was ambiguous.
-        if state.legacy_optimization_kw is not None and state.legacy_split_kw is not None:
-            raise ParserSyntaxError(
-                "Cannot use both 'optimization' and 'split' in pl.at()",
-                span=self.span_tracker.get_span(state.legacy_split_kw),
-                hint="Use optimizations=[pl.auto_chunk, pl.split(...)] for AutoInCore + "
-                "split, or optimizations=[pl.split(...)] for plain InCore + split.",
-            )
-
-        # Emit deprecation warnings for legacy kwargs (after mixing checks, so the
-        # user sees the structural error first if both apply).
-        if state.legacy_optimization_kw is not None:
-            warnings.warn(
-                "pl.at(optimization=pl.chunked_loop_optimizer[(...)]) is deprecated; "
-                "use pl.at(optimizations=[pl.auto_chunk]) — combine with pl.split(...) "
-                "if a split mode is needed.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        if state.legacy_split_kw is not None:
-            warnings.warn(
-                "pl.at(split=...) is deprecated; use pl.at(optimizations=[pl.split(...)]).",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
     def _parse_optimizations_list(
         self,
@@ -3183,16 +3140,12 @@ class ASTParser:
         owner: str = "pl.at",
         list_hint: str | None = None,
         entry_hint: str | None = None,
-    ) -> tuple[bool, "ir.SplitMode | None", "int | None"]:
+    ) -> tuple["ir.SplitMode | None", "int | None"]:
         """Parse ``optimizations=[...]`` for ``pl.at`` or ``pl.spmd``.
 
-        Each entry must be one of:
-
-        - ``pl.auto_chunk`` — request AutoInCore semantics.
-        - ``pl.split(MODE)`` — set the cross-core split mode.
-
-        Both fully qualified forms (``pl.optimizations.auto_chunk``,
-        ``pl.optimizations.split(MODE)``) are also accepted.
+        Each entry must be ``pl.split(MODE)`` — set the cross-core split mode.
+        The fully qualified form (``pl.optimizations.split(MODE)``) is also
+        accepted.
 
         Args:
             owner: API name used in error messages (e.g. ``"pl.at"``, ``"pl.spmd"``).
@@ -3200,20 +3153,12 @@ class ASTParser:
             entry_hint: Override hint for unsupported list entries.
 
         Returns:
-            Tuple ``(requests_auto_chunk, split_mode, split_slot_num)``.
+            Tuple ``(split_mode, split_slot_num)``.
         """
         if list_hint is None:
-            list_hint = (
-                "Use optimizations=[pl.split(pl.SplitMode.NONE)]."
-                if owner == "pl.spmd"
-                else "Use optimizations=[pl.split(pl.SplitMode.NONE)] or optimizations=[pl.auto_chunk]."
-            )
+            list_hint = "Use optimizations=[pl.split(pl.SplitMode.NONE)]."
         if entry_hint is None:
-            entry_hint = (
-                "Each entry must be pl.split(pl.SplitMode.X)."
-                if owner == "pl.spmd"
-                else "Each entry must be pl.auto_chunk or pl.split(pl.SplitMode.X)."
-            )
+            entry_hint = "Each entry must be pl.split(pl.SplitMode.X)."
         if not isinstance(value, ast.List):
             raise ParserSyntaxError(
                 f"{owner}(optimizations=...) must be a list literal",
@@ -3221,22 +3166,12 @@ class ASTParser:
                 hint=list_hint,
             )
 
-        requests_auto_chunk = False
         split_mode: ir.SplitMode | None = None
         split_slot_num: int | None = None
-        seen_auto_chunk = False
         seen_split = False
 
         for entry in value.elts:
-            if self._is_pl_auto_chunk(entry):
-                if seen_auto_chunk:
-                    raise ParserSyntaxError(
-                        "Duplicate 'pl.auto_chunk' in optimizations=[...]",
-                        span=self.span_tracker.get_span(entry),
-                    )
-                seen_auto_chunk = True
-                requests_auto_chunk = True
-            elif (parsed := self._try_parse_pl_split(entry)) is not None:
+            if (parsed := self._try_parse_pl_split(entry)) is not None:
                 if seen_split:
                     raise ParserSyntaxError(
                         "Duplicate 'pl.split(...)' in optimizations=[...]",
@@ -3256,52 +3191,19 @@ class ASTParser:
                     hint=entry_hint,
                 )
 
-        return requests_auto_chunk, split_mode, split_slot_num
+        return split_mode, split_slot_num
 
-    def _parse_spmd_optimizations_list(
-        self, value: ast.expr, *, span_anchor: ast.AST
-    ) -> "tuple[ir.SplitMode | None, int | None]":
+    def _parse_spmd_optimizations_list(self, value: ast.expr) -> "tuple[ir.SplitMode | None, int | None]":
         """Parse ``pl.spmd(..., optimizations=[...])`` — ``pl.split`` only.
-
-        ``pl.auto_chunk`` is not supported on ``pl.spmd``; use
-        ``pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk])`` inside
-        the scope body instead.
 
         Returns ``(split_mode, split_slot_num)``.
         """
-        requests_auto_chunk, split_mode, split_slot_num = self._parse_optimizations_list(
+        return self._parse_optimizations_list(
             value,
             owner="pl.spmd",
             list_hint="Use optimizations=[pl.split(pl.SplitMode.NONE)].",
             entry_hint="Each entry must be pl.split(pl.SplitMode.X).",
         )
-        if requests_auto_chunk:
-            raise ParserSyntaxError(
-                "pl.auto_chunk is not supported in pl.spmd(optimizations=[...])",
-                span=self.span_tracker.get_span(span_anchor),
-                hint="Use optimizations=[pl.split(pl.SplitMode.X)] on pl.spmd(), "
-                "or move pl.auto_chunk into an inner "
-                "pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]).",
-            )
-        return split_mode, split_slot_num
-
-    @staticmethod
-    def _is_pl_auto_chunk(node: ast.expr) -> bool:
-        """Return True if the AST node is ``pl.auto_chunk`` or ``pl.optimizations.auto_chunk``."""
-        if not isinstance(node, ast.Attribute) or node.attr != "auto_chunk":
-            return False
-        # pl.auto_chunk
-        if isinstance(node.value, ast.Name) and node.value.id == "pl":
-            return True
-        # pl.optimizations.auto_chunk
-        if (
-            isinstance(node.value, ast.Attribute)
-            and node.value.attr == "optimizations"
-            and isinstance(node.value.value, ast.Name)
-            and node.value.value.id == "pl"
-        ):
-            return True
-        return False
 
     def _try_parse_pl_split(self, node: ast.expr) -> "tuple[ir.SplitMode, int | None] | None":
         """Return ``(SplitMode, slot_num)`` if the AST node is ``pl.split(MODE)``; else None.
@@ -3367,59 +3269,6 @@ class ASTParser:
                 span=self.span_tracker.get_span(value),
             )
         return value.value
-
-    def _parse_chunked_loop_optimizer(self, value: ast.expr) -> "ir.SplitMode | None":
-        """Parse pl.chunked_loop_optimizer or pl.chunked_loop_optimizer(split=...) AST node.
-
-        Returns the split mode to use for the AutoInCore scope.
-        """
-        # Bare: pl.chunked_loop_optimizer
-        if (
-            isinstance(value, ast.Attribute)
-            and value.attr == "chunked_loop_optimizer"
-            and isinstance(value.value, ast.Name)
-            and value.value.id == "pl"
-        ):
-            return None
-
-        # Called: pl.chunked_loop_optimizer(split=pl.SplitMode.<MODE>)
-        if (
-            isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Attribute)
-            and value.func.attr == "chunked_loop_optimizer"
-            and isinstance(value.func.value, ast.Name)
-            and value.func.value.id == "pl"
-        ):
-            if value.args:
-                raise ParserSyntaxError(
-                    "pl.chunked_loop_optimizer() does not accept positional arguments",
-                    span=self.span_tracker.get_span(value),
-                    hint="Use: pl.chunked_loop_optimizer(split=pl.SplitMode.<MODE>)",
-                )
-            split: ir.SplitMode | None = None
-            for opt_kw in value.keywords:
-                if opt_kw.arg == "split":
-                    split = extract_enum_value(opt_kw.value, SPLIT_MODE_MAP, "SplitMode", "pl.SplitMode")
-                else:
-                    raise ParserSyntaxError(
-                        f"pl.chunked_loop_optimizer() got unexpected keyword '{opt_kw.arg}'",
-                        span=self.span_tracker.get_span(opt_kw),
-                        hint="Only 'split' is supported: "
-                        "pl.chunked_loop_optimizer(split=pl.SplitMode.<MODE>)",
-                    )
-            return split
-
-        raise ParserSyntaxError(
-            "optimization= only accepts pl.chunked_loop_optimizer or "
-            "pl.chunked_loop_optimizer(split=pl.SplitMode.<MODE>)",
-            span=self.span_tracker.get_span(value),
-            hint="Use optimization=pl.chunked_loop_optimizer or "
-            "optimization=pl.chunked_loop_optimizer(split=pl.SplitMode.<MODE>)",
-        )
-
-    def _eval_split_mode(self, value: ast.expr) -> "ir.SplitMode":
-        """Extract SplitMode enum value from AST expression."""
-        return extract_enum_value(value, SPLIT_MODE_MAP, "SplitMode", "pl.SplitMode")
 
     def _parse_scope_name_hint(self, value: ast.expr, func_name: str) -> str:
         """Extract and validate a scope name hint from an AST expression.
@@ -3531,48 +3380,14 @@ class ASTParser:
         scope_kind_map: dict[str, "ir.ScopeKind"],
         optional_vars: "ast.expr | None" = None,
     ) -> None:
-        """Parse legacy scope context managers (pl.incore, pl.auto_incore, pl.cluster, pl.spmd).
+        """Parse pl.cluster / pl.spmd scope context managers.
 
         ``optional_vars`` (the ``as <target>`` clause) is only meaningful for
         ``pl.spmd`` (``with pl.spmd(...) as tid:``); the caller rejects it on the
         other kinds before dispatching here.
         """
-        split_mode = None
         name_hint = ""
-        if func_attr in ("auto_incore", "incore"):
-            if context_expr.args:
-                raise ParserSyntaxError(
-                    f"pl.{func_attr}() does not accept positional arguments",
-                    span=self.span_tracker.get_span(stmt),
-                    hint=f"Use 'with pl.{func_attr}(split=pl.SplitMode.UP_DOWN):'",
-                )
-            for kw in context_expr.keywords:
-                if kw.arg == "split":
-                    split_mode = self._eval_split_mode(kw.value)
-                elif kw.arg == "name_hint":
-                    name_hint = self._parse_scope_name_hint(kw.value, f"pl.{func_attr}()")
-                else:
-                    raise ParserSyntaxError(
-                        f"pl.{func_attr}() got unexpected keyword argument '{kw.arg}'",
-                        span=self.span_tracker.get_span(stmt),
-                        hint="Supported keywords: 'split', 'name_hint'",
-                    )
-            if func_attr == "incore":
-                warnings.warn(
-                    "pl.incore() is deprecated; use 'with pl.at(level=pl.Level.CORE_GROUP):' "
-                    "(optionally with optimizations=[pl.split(pl.SplitMode.X)]) instead",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            else:
-                warnings.warn(
-                    "pl.auto_incore() is deprecated; use "
-                    "'with pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]):' "
-                    "(combine with pl.split(pl.SplitMode.X) if a split mode is needed) instead",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-        elif func_attr == "cluster":
+        if func_attr == "cluster":
             if context_expr.args:
                 raise ParserSyntaxError(
                     f"pl.{func_attr}() does not accept positional arguments",
@@ -3592,18 +3407,7 @@ class ASTParser:
             span = self.span_tracker.get_span(stmt)
             self._parse_scope_body(stmt, scope_kind, span, name_hint=name_hint)
             return
-        elif func_attr == "spmd":
-            self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
-            return
-        elif context_expr.args or context_expr.keywords:
-            raise ParserSyntaxError(
-                f"pl.{func_attr}() does not accept arguments",
-                span=self.span_tracker.get_span(stmt),
-                hint=f"Use 'with pl.{func_attr}():' without arguments",
-            )
-        scope_kind = scope_kind_map[func_attr]
-        span = self.span_tracker.get_span(stmt)
-        self._parse_scope_body(stmt, scope_kind, span, split=split_mode, name_hint=name_hint)
+        self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
 
     # Integer dtypes accepted for an SPMD ``core_num`` (block count). Shared by
     # the ``pl.spmd`` scope path and the ``pl.spmd_submit`` task-launch path.
@@ -3692,6 +3496,22 @@ class ASTParser:
             )
         return core_num, sync_start
 
+    def _parse_spmd_bool_literal_kwarg(self, kw: ast.keyword, usage_hint: str) -> bool:
+        """Validate and return a boolean-literal ``pl.spmd()`` kwarg value.
+
+        Shared by ``sync_start=`` and ``allow_early_resolve=`` (both require a
+        plain ``True`` / ``False`` literal so the parser can record the flag
+        without evaluating an expression). The error message names ``kw.arg`` so
+        each kwarg reports its own diagnostic.
+        """
+        if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
+            raise ParserSyntaxError(
+                f"{kw.arg} must be a boolean literal (True/False)",
+                span=self.span_tracker.get_span(kw.value),
+                hint=usage_hint,
+            )
+        return kw.value.value
+
     def _parse_spmd_kwargs(
         self,
         anchor: ast.AST,
@@ -3699,13 +3519,15 @@ class ASTParser:
         *,
         usage_hint: str,
         allow_deps: bool = False,
-    ) -> tuple["ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]"]:
-        """Parse ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=)`` arguments.
+    ) -> tuple["ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool]:
+        """Parse the ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=, ...)`` arguments.
 
-        The first positional argument is ``core_num`` (range-like). Returns
-        ``(core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars)``
-        with ``sync_start`` defaulting to ``False``, ``split_mode`` /
-        ``split_slot_num`` to ``None``, and ``dep_vars`` to ``[]``.
+        Also accepts ``allow_early_resolve=`` (the speculative early-dispatch
+        hint). The first positional argument is ``core_num`` (range-like). Returns
+        ``(core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars,
+        allow_early_resolve)`` with ``sync_start`` / ``allow_early_resolve``
+        defaulting to ``False``, ``split_mode`` / ``split_slot_num`` to ``None``,
+        and ``dep_vars`` to ``[]``.
 
         ``optimizations=[...]`` accepts only ``pl.split(MODE)`` — see
         :meth:`_parse_spmd_optimizations_list`.
@@ -3715,6 +3537,11 @@ class ASTParser:
         ``pl.submit(..., deps=)`` / ``pl.at(..., deps=)`` — producer TaskId
         ``Scalar[TASK_ID]`` Vars, an ``Array[N, TASK_ID]`` carry, or the ``None``
         sentinel — resolved via :meth:`_parse_submit_deps_kwarg`.
+
+        ``allow_early_resolve=True/False`` is a speculative early-dispatch hint
+        (same as ``pl.submit`` / ``pl.at``); it is always accepted here (it needs
+        no ``as tid``), and a cluster-nesting guard at the call site rejects it
+        when the dispatch would be unwrapped into a Group function.
         """
         if len(call.args) > 1:
             raise ParserSyntaxError(
@@ -3730,6 +3557,7 @@ class ASTParser:
         split_mode: ir.SplitMode | None = None
         split_slot_num: int | None = None
         deps_kw: ast.keyword | None = None
+        allow_early_resolve: bool = False
         for kw in call.keywords:
             if kw.arg is None:
                 # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
@@ -3750,15 +3578,9 @@ class ASTParser:
                     )
                 core_num = self._parse_and_validate_core_num(kw.value, kw.value, usage_hint)
             elif kw.arg == "sync_start":
-                if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, bool):
-                    raise ParserSyntaxError(
-                        "sync_start must be a boolean literal (True/False)",
-                        span=self.span_tracker.get_span(anchor),
-                        hint=usage_hint,
-                    )
-                sync_start = kw.value.value
+                sync_start = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
             elif kw.arg == "optimizations":
-                split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value, span_anchor=anchor)
+                split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value)
             elif kw.arg == "deps":
                 if not allow_deps:
                     raise ParserSyntaxError(
@@ -3769,11 +3591,15 @@ class ASTParser:
                         "deps=[...])` for the single-call form.",
                     )
                 deps_kw = kw
+            elif kw.arg == "allow_early_resolve":
+                allow_early_resolve = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
             else:
                 supported = (
-                    "Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps'"
+                    "Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps', "
+                    "'allow_early_resolve'"
                     if allow_deps
-                    else "Supported keywords: 'sync_start', 'name_hint', 'optimizations'"
+                    else "Supported keywords: 'sync_start', 'name_hint', 'optimizations', "
+                    "'allow_early_resolve'"
                 )
                 raise ParserSyntaxError(
                     f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
@@ -3790,7 +3616,148 @@ class ASTParser:
         if deps_kw is not None:
             anchor_span = self.span_tracker.get_span(anchor)
             dep_vars = self._parse_submit_deps_kwarg("pl.spmd()", [deps_kw], anchor_span)
-        return core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars
+        return core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars, allow_early_resolve
+
+    def _reject_spmd_early_resolve_in_cluster(self, allow_early_resolve: bool, span: "ir.Span") -> None:
+        """Reject ``allow_early_resolve=True`` on a ``pl.cluster()``-nested ``pl.spmd``.
+
+        A cluster-nested Spmd scope is unwrapped into the Group function by
+        ``OutlineClusterScopes`` (``UnwrapNestedSpmd``) and never lowers to a
+        ``Submit``, so the early-dispatch hint would be silently dropped. Raise a
+        clear parse-time error instead, mirroring the ``as tid`` cluster rejection
+        in :meth:`_parse_spmd_scope_with_tid`.
+        """
+        if allow_early_resolve and self._is_inside_scope(ir.ScopeKind.Cluster):
+            raise ParserSyntaxError(
+                "`pl.spmd(..., allow_early_resolve=True)` cannot be nested inside `pl.cluster()` — "
+                "a cluster-nested pl.spmd is unwrapped into the Group function and never produces a "
+                "Submit, so the early-dispatch hint would be lost.",
+                span=span,
+                hint="Use a standalone `with pl.spmd(..., allow_early_resolve=True):` (implicit "
+                "cluster) to keep the hint.",
+            )
+
+    @staticmethod
+    def _spmd_body_reads_block_idx(body: "list[ast.stmt]") -> bool:
+        """True if any statement in an inline SPMD body calls ``get_block_idx()``.
+
+        An inline (auto-outlined) ``pl.spmd`` body distinguishes blocks solely via
+        the per-block index; without it every block executes identical work — almost
+        always a bug, and the reason the body is being outlined into a per-block
+        kernel at all. The single-call direct-dispatch shape is exempt (the callee
+        reads the index internally), so this is only consulted for inline bodies.
+
+        Matched at the AST layer (no IR ``Op`` exists yet) by the trailing call name,
+        so every valid spelling of the API counts regardless of receiver:
+        ``pl.get_block_idx()`` (the top-level alias real models use), the qualified
+        ``pl.tile.get_block_idx()`` / ``tile.get_block_idx()``, and a bare
+        ``get_block_idx()`` imported directly. Matching by name only is deliberately
+        lenient: ``get_block_idx`` is unique to this API (no other DSL object exposes
+        it), and being lenient here is far safer than rejecting a real body that
+        distinguishes blocks. ``ast.walk`` recurses the whole body subtree, so a
+        nested use (inside a ``pl.range`` loop or an expression argument) is found.
+        """
+        for body_stmt in body:
+            for node in ast.walk(body_stmt):
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    if (isinstance(func, ast.Attribute) and func.attr == "get_block_idx") or (
+                        isinstance(func, ast.Name) and func.id == "get_block_idx"
+                    ):
+                        return True
+        return False
+
+    def _emit_spmd_body(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt fields
+        self,
+        stmt: ast.With,
+        span: "ir.Span",
+        scope_kind: "ir.ScopeKind",
+        core_num: "ir.Expr",
+        sync_start: bool,
+        name_hint: str,
+        split_mode: "ir.SplitMode | None",
+        split_slot_num: "int | None",
+        scope_attrs: "list[tuple[str, Any]]",
+    ) -> None:
+        """Emit the ``SpmdScopeStmt`` body shared by the plain and ``as tid`` with-forms.
+
+        The two forms differ only in ``scope_attrs`` (the ``as tid`` form adds
+        ``task_id_var`` / ``manual_dep_edges``); the body dispatch is identical:
+
+        * single call + no split → ``SpmdScopeStmt(body=Call)`` with no inner InCore
+          wrapper — the historical direct-dispatch shape (the callee is a pre-defined
+          kernel that reads the block index internally). This is also the shape
+          ``OutlineIncoreScopes`` leaves behind once an inline body is outlined, so
+          the IR round-trips identically across passes.
+        * inline multi-statement body, or single-call + split → wrap in
+          ``InCoreScopeStmt(split, <body>)`` for ``OutlineIncoreScopes`` to outline
+          into a synthetic per-block kernel, exactly like ``for i in pl.spmd(n):``.
+          Such an inline body must read the per-block index (see below).
+        """
+        # A single body statement whose value is a Call — Assign/AnnAssign/Expr all
+        # expose a `.value`, so one membership test covers the three call-carrying
+        # statement kinds (`x = f()`, `x: T = f()`, and a bare `f()`).
+        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
+        is_single_call = isinstance(body_stmt, (ast.Assign, ast.AnnAssign, ast.Expr)) and isinstance(
+            body_stmt.value, ast.Call
+        )
+        # An inline (auto-outlined) body must read the per-block index — the
+        # single-call dispatch is exempt (its callee reads it internally). Unlike
+        # the for-form, the with-forms do not bind the index for you, so require an
+        # explicit ``pl.tile.get_block_idx()`` somewhere in the body.
+        if not is_single_call and not self._spmd_body_reads_block_idx(stmt.body):
+            raise ParserSyntaxError(
+                "inline `with pl.spmd(...)` body must read the per-block index via "
+                "`pl.tile.get_block_idx()`; without it every block runs identical work.",
+                span=span,
+                hint="Add `i = pl.tile.get_block_idx()` inside the scope, or use "
+                "`for i in pl.spmd(n):` to bind the block index automatically.",
+            )
+        if is_single_call and split_mode is None:
+            # Historical no-InCore-wrapper shape. Any ``scope_attrs``
+            # (allow_early_resolve, and for the ``as tid`` form task_id_var /
+            # manual_dep_edges) ride on the SpmdScopeStmt.
+            self._parse_scope_body(
+                stmt,
+                scope_kind,
+                span,
+                name_hint=name_hint,
+                core_num=core_num,
+                sync_start=sync_start,
+                attrs=scope_attrs or None,
+            )
+            return
+        # split= hint or an inline multi-statement body requires an inner
+        # InCoreScopeStmt to carry split_ / be outlined. Build the scope directly
+        # instead of routing through _parse_scope_body, so merge any forward-sticky
+        # pl.dump_tag tensors onto it here (see _parse_spmd_for_loop for the full
+        # rationale).
+        spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
+        incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
+        with self.builder.scope(
+            scope_kind,
+            span,
+            name_hint=spmd_name_hint,
+            core_num=core_num,
+            sync_start=sync_start,
+            attrs=scope_attrs or None,
+        ):
+            with self._scope_kind_context(scope_kind):
+                self.scope_manager.enter_scope("spmd_with")
+                with self.builder.scope(
+                    ir.ScopeKind.InCore,
+                    span,
+                    split=split_mode,
+                    name_hint=incore_name_hint,
+                    attrs=incore_attrs,
+                ):
+                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                        self.scope_manager.enter_scope("spmd_with_incore")
+                        self._parse_body_siblings(stmt.body)
+                        self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
+                        self.scope_manager.exit_scope(leak_vars=True)
+                self.scope_manager.exit_scope(leak_vars=True)
 
     def _parse_spmd_scope(
         self,
@@ -3801,19 +3768,26 @@ class ASTParser:
     ) -> None:
         """Parse ``with pl.spmd(...):`` / ``with pl.spmd(...) as tid:`` into a ScopeStmt(Spmd).
 
-        Two forms:
+        Two forms, differing only in whether the grid dispatch's producer TaskId is
+        captured — the body shape is identical (see :meth:`_emit_spmd_body`):
 
-        * ``with pl.spmd(n): self.kernel(...)`` — wraps a single kernel call
-          (historical shape; no producer TaskId captured, no ``deps=``).
-        * ``with pl.spmd(n, deps=[...]) as tid:`` — captures the grid dispatch's
-          producer ``Scalar[TASK_ID]`` (mirrors ``with pl.at(...) as tid:``) and
-          accepts an inline multi-statement body that is auto-outlined into an
-          InCore kernel, exactly like ``for i in pl.spmd(n):``. The per-block
-          index is read inside the body via ``pl.tile.get_block_idx()``.
+        * ``with pl.spmd(n):`` — no captured TaskId, no ``deps=``. Accepts either a
+          single kernel call (historical direct-dispatch shape) or an inline
+          multi-statement body auto-outlined into an InCore kernel (like
+          ``for i in pl.spmd(n):``, minus the auto-bound loop var — read the
+          per-block index inside via ``pl.tile.get_block_idx()``).
+        * ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes, and
+          additionally captures the producer ``Scalar[TASK_ID]`` (mirrors
+          ``with pl.at(...) as tid:``) so it can feed a ``deps=`` edge.
+
+        TaskId capture and inline bodies are orthogonal: the inline body is outlined
+        the same way with or without ``as tid``; ``as tid`` only adds the
+        ``task_id_var`` attr that makes the dispatch lower to an ``ir.Submit``.
         """
         with_hint = (
-            "Use 'with pl.spmd(4):' with a single function call inside, or "
-            "'with pl.spmd(4) as tid:' to capture the dispatch TaskId."
+            "Use 'with pl.spmd(4):' with a single call or an inline block that reads "
+            "'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also capture "
+            "the dispatch TaskId."
         )
         # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
         # not by the resolved list being non-empty. _parse_submit_deps_kwarg
@@ -3822,7 +3796,15 @@ class ASTParser:
         # Passing allow_deps=(optional_vars is not None) makes _parse_spmd_kwargs
         # reject any ``deps=`` on the non-capturing form (and keeps its "supported
         # keywords" hint accurate).
-        core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars = self._parse_spmd_kwargs(
+        (
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            dep_vars,
+            allow_early_resolve,
+        ) = self._parse_spmd_kwargs(
             stmt, context_expr, usage_hint=with_hint, allow_deps=optional_vars is not None
         )
         scope_kind = scope_kind_map["spmd"]
@@ -3839,81 +3821,36 @@ class ASTParser:
                 split_mode,
                 split_slot_num,
                 dep_vars,
+                allow_early_resolve,
                 optional_vars,
             )
             return
 
-        # No ``as tid``: the historical single-kernel-call with-form. ``deps=`` was
-        # already rejected above (allow_deps=False), so dep_vars is empty here.
-        # Validate body is exactly one statement that is a function call.
-        # The loop form (for i in pl.spmd(n):) and the `as tid` with-form are
-        # what accept inline multi-statement bodies.
-        spmd_hint = (
-            "The 'with pl.spmd()' form (without 'as tid') wraps a single kernel call. "
-            "Use 'with pl.spmd(4) as tid:' to write inline tile/tensor ops and capture the "
-            "dispatch TaskId, or 'for i in pl.spmd(4):' for an inline loop body."
+        # ``allow_early_resolve`` opts the grid dispatch into speculative
+        # early-dispatch (mirrors pl.submit / pl.at). A cluster-nested pl.spmd is
+        # unwrapped into the Group function by OutlineClusterScopes and never
+        # lowers to a Submit, so the hint would be silently dropped — reject it
+        # here (mirrors the ``as tid`` cluster rejection in
+        # _parse_spmd_scope_with_tid).
+        self._reject_spmd_early_resolve_in_cluster(allow_early_resolve, span)
+        spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
+
+        # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
+        # (allow_deps=False), so dep_vars is empty here. The shared helper keeps the
+        # historical single-call direct-dispatch shape and outlines an inline
+        # multi-statement body into a synthetic InCore kernel — identical to the
+        # ``as tid`` form, minus the captured TaskId.
+        self._emit_spmd_body(
+            stmt,
+            span,
+            scope_kind,
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            spmd_attrs,
         )
-        if len(stmt.body) != 1:
-            raise ParserSyntaxError(
-                f"pl.spmd() body must contain exactly one statement, got {len(stmt.body)}",
-                span=self.span_tracker.get_span(stmt),
-                hint=spmd_hint,
-            )
-        body_stmt = stmt.body[0]
-        is_call = (
-            (isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.AnnAssign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call))
-        )
-        if not is_call:
-            raise ParserSyntaxError(
-                "pl.spmd() body statement must be a function call",
-                span=self.span_tracker.get_span(stmt),
-                hint=spmd_hint,
-            )
-        if split_mode is None:
-            # No optimizations — preserve the historical IR shape:
-            # SpmdScopeStmt(<call>) with no inner InCore wrapper.
-            self._parse_scope_body(
-                stmt,
-                scope_kind,
-                span,
-                name_hint=name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-            )
-        else:
-            # split= hint requires an inner InCoreScopeStmt to carry the
-            # split_ field. Build SpmdScopeStmt(InCoreScopeStmt(split_=mode, <call>)).
-            spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
-            # Like the for-form, this path builds the InCore scope directly
-            # instead of routing through _parse_scope_body, so merge any
-            # forward-sticky pl.dump_tag tensors onto it here (see
-            # _parse_spmd_for_loop for the full rationale).
-            incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
-            incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
-            with self.builder.scope(
-                scope_kind,
-                span,
-                name_hint=spmd_name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-            ):
-                with self._scope_kind_context(scope_kind):
-                    self.scope_manager.enter_scope("spmd_with")
-                    with self.builder.scope(
-                        ir.ScopeKind.InCore,
-                        span,
-                        split=split_mode,
-                        name_hint=incore_name_hint,
-                        attrs=incore_attrs,
-                    ):
-                        with self._scope_kind_context(ir.ScopeKind.InCore):
-                            self.scope_manager.enter_scope("spmd_with_incore")
-                            self._parse_body_siblings(stmt.body)
-                            self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-                            self.scope_manager.exit_scope(leak_vars=True)
-                    self.scope_manager.exit_scope(leak_vars=True)
 
     def _parse_spmd_scope_with_tid(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt + capture
         self,
@@ -3926,6 +3863,7 @@ class ASTParser:
         split_mode: "ir.SplitMode | None",
         split_slot_num: "int | None",
         dep_vars: "list[ir.Var]",
+        allow_early_resolve: bool,
         optional_vars: "ast.expr",
     ) -> None:
         """Parse ``with pl.spmd(n, deps=[...]) as tid:`` capturing the dispatch TaskId.
@@ -3963,15 +3901,20 @@ class ASTParser:
                 hint="Use `with pl.spmd(...) as tid:` (single name; nested tuples are not allowed).",
             )
 
-        # Canonical attr order (deps before tid) mirrors _parse_at_meta so a
-        # print -> reparse cycle compares equal under structural_equal's
-        # positional attr check.
+        # Canonical attr order (deps, task_id_var, allow_early_resolve) mirrors
+        # _parse_at_meta so a print -> reparse cycle compares equal under
+        # structural_equal's positional attr check.
         scope_attrs: list[tuple[str, Any]] = []
         if dep_vars:
             scope_attrs.append(("manual_dep_edges", dep_vars))
         tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
         self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
         scope_attrs.append(("task_id_var", tid_var))
+        # ``allow_early_resolve`` last (canonical order) — the Spmd outliner reads
+        # it off the scope and threads it onto the synthesised Submit, exactly as
+        # _parse_at_meta does for pl.at scopes.
+        if allow_early_resolve:
+            scope_attrs.append(("allow_early_resolve", True))
 
         # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
         # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
@@ -3984,55 +3927,22 @@ class ASTParser:
         self.builder.assign(tid_var, placeholder_rhs, span=span)
         self.builder.push_pending_leading_comments(leading)
 
-        # A lone kernel call (no split) keeps the no-InCore-wrapper shape — the
-        # same SpmdScopeStmt(body=Call) that OutlineIncoreScopes leaves behind once
-        # an inline body is outlined — so the IR round-trips identically across
-        # passes. Anything else (inline multi-statement body, or single-call with a
-        # split hint) wraps in an InCoreScopeStmt, exactly like the for-form.
-        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
-        is_single_call = body_stmt is not None and (
-            (isinstance(body_stmt, ast.Assign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.AnnAssign) and isinstance(body_stmt.value, ast.Call))
-            or (isinstance(body_stmt, ast.Expr) and isinstance(body_stmt.value, ast.Call))
-        )
-        if is_single_call and split_mode is None:
-            self._parse_scope_body(
-                stmt,
-                scope_kind,
-                span,
-                name_hint=name_hint,
-                core_num=core_num,
-                sync_start=sync_start,
-                attrs=scope_attrs,
-            )
-            return
-
-        spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
-        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
-        incore_attrs = self._append_split_slot_num_attr(incore_attrs, split_slot_num)
-        with self.builder.scope(
-            scope_kind,
+        # Emit the body via the shared helper — identical shape to the plain
+        # with-form, plus the task_id_var / manual_dep_edges built into scope_attrs
+        # above: a lone call (no split) keeps the no-InCore-wrapper direct-dispatch
+        # shape; an inline multi-statement body (or single call + split) wraps in an
+        # InCoreScopeStmt for outlining and must read the per-block index.
+        self._emit_spmd_body(
+            stmt,
             span,
-            name_hint=spmd_name_hint,
-            core_num=core_num,
-            sync_start=sync_start,
-            attrs=scope_attrs,
-        ):
-            with self._scope_kind_context(scope_kind):
-                self.scope_manager.enter_scope("spmd_with")
-                with self.builder.scope(
-                    ir.ScopeKind.InCore,
-                    span,
-                    split=split_mode,
-                    name_hint=incore_name_hint,
-                    attrs=incore_attrs,
-                ):
-                    with self._scope_kind_context(ir.ScopeKind.InCore):
-                        self.scope_manager.enter_scope("spmd_with_incore")
-                        self._parse_body_siblings(stmt.body)
-                        self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
-                        self.scope_manager.exit_scope(leak_vars=True)
-                self.scope_manager.exit_scope(leak_vars=True)
+            scope_kind,
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            scope_attrs,
+        )
 
     def _parse_spmd_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
         """Parse ``for i in pl.spmd(N, ...): body`` into
@@ -4068,15 +3978,27 @@ class ASTParser:
         # The for-form does not capture a TaskId, so it rejects deps= (allow_deps
         # defaults False): use the with-form `with pl.spmd(n, deps=[...]) as tid:`
         # to wire explicit deps. dep_vars is therefore always empty here.
-        core_num, sync_start, name_hint, split_mode, split_slot_num, _ = self._parse_spmd_kwargs(
-            stmt, iter_call, usage_hint=spmd_hint
-        )
+        (
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            _,
+            allow_early_resolve,
+        ) = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
 
         span = self.span_tracker.get_span(stmt)
+        # ``allow_early_resolve`` rides on the SpmdScopeStmt (read by the Spmd
+        # outliner onto the synthesised Submit). A cluster-nested pl.spmd is
+        # unwrapped into the Group and never produces a Submit, so reject the hint
+        # there (mirrors the with-form / as-tid guards).
+        self._reject_spmd_early_resolve_in_cluster(allow_early_resolve, span)
+        spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
         # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
         # scope — the kernel the loop body lowers to. The with-form (pl.at /
-        # pl.spmd / pl.incore) routes through _parse_scope_body for this; the
+        # pl.spmd / pl.cluster) routes through _parse_scope_body for this; the
         # for-form builds its scope directly, so attach here to keep the two
         # paths symmetric. OutlineIncoreScopes then carries the dump_vars onto
         # the synthesised inner-kernel Call; the wrapper-dispatch codegen
@@ -4089,6 +4011,7 @@ class ASTParser:
             name_hint=spmd_name_hint,
             core_num=core_num,
             sync_start=sync_start,
+            attrs=spmd_attrs or None,
         ):
             with self._scope_kind_context(ir.ScopeKind.Spmd):
                 self.scope_manager.enter_scope("spmd_for")
@@ -4113,6 +4036,160 @@ class ASTParser:
                 # own for-loop variable-leaking semantics.
                 self.scope_manager.exit_scope(leak_vars=True)
 
+    # AIV sub-core count is hardware-fixed at 2 (the two AIV lanes of one AICore).
+    _SPLIT_AIV_SUBCORE_NUM = 2
+
+    def _parse_split_aiv_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
+        """Parse ``for aiv_id in pl.split_aiv(2, mode=...): body`` into a
+        first-class ``SplitAivScopeStmt`` region.
+
+        The region is a structural node that may appear anywhere in an InCore
+        body — including inside a ``pl.range`` / ``pl.pipeline`` loop or an
+        ``if`` — and carries the requested ``SplitMode`` on
+        ``SplitAivScopeStmt::split_``. The loop variable is bound to
+        ``pl.tile.get_subblock_idx()`` (the AIV lane / sub-core index) as the
+        first statement of the region body. ``LowerAutoVectorSplit`` (pass 20)
+        consumes and erases the node; it never reaches codegen.
+        """
+        split_aiv_hint = (
+            "Use 'for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):' — n is the AIV "
+            "sub-core count (hardware-fixed at 2); 'mode' is required (NONE = task-parallel, "
+            "no halving; UP_DOWN / LEFT_RIGHT = data-parallel halving); and the loop variable "
+            "binds the AIV lane index (equivalent to pl.tile.get_subblock_idx())."
+        )
+        # A pl.split_aiv loop must not be nested inside another pl.split_aiv body:
+        # one split_aiv body already represents the two AIV lanes, so re-partitioning
+        # them is not a meaningful (or lowerable) pattern. _split_aiv_mode_stack is
+        # non-empty exactly while parsing inside an enclosing split_aiv body.
+        if self._split_aiv_mode_stack:
+            raise ParserSyntaxError(
+                "nested 'for ... in pl.split_aiv(...)' is not allowed: a split_aiv body already "
+                "represents the two AIV lanes, so it cannot contain another split_aiv loop",
+                span=self.span_tracker.get_span(stmt),
+                hint=split_aiv_hint,
+            )
+        if not isinstance(stmt.target, ast.Name):
+            raise ParserSyntaxError(
+                "for ... in pl.split_aiv(...) must use a single loop variable",
+                span=self.span_tracker.get_span(stmt.target),
+                hint=split_aiv_hint,
+            )
+        loop_var_name = stmt.target.id
+
+        # ``pl.split_aiv`` IS the split declaration, so a co-present
+        # ``optimizations=[pl.split(...)]`` would be a second, conflicting split
+        # spec. Loop-carried / chunking kwargs make no sense for an SPMD-style
+        # split body either. Reject both with targeted diagnostics.
+        disallowed_loop_kwargs = {"init_values", "chunk", "chunk_policy", "attrs", "step", "stage"}
+        for kw in iter_call.keywords:
+            if kw.arg in disallowed_loop_kwargs:
+                raise ParserSyntaxError(
+                    f"pl.split_aiv() loop form does not accept '{kw.arg}='",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint=split_aiv_hint,
+                )
+            if kw.arg == "optimizations":
+                raise ParserSyntaxError(
+                    "pl.split_aiv() does not accept 'optimizations=' — pl.split_aiv() IS the "
+                    "split declaration; a co-present pl.split(...) is a conflicting split spec",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint=split_aiv_hint,
+                )
+
+        # ``n`` (the AIV sub-core count) is positional and hardware-fixed at 2.
+        if len(iter_call.args) != 1:
+            raise ParserSyntaxError(
+                "pl.split_aiv() takes exactly one positional argument (n, the AIV sub-core count)",
+                span=self.span_tracker.get_span(iter_call),
+                hint=split_aiv_hint,
+            )
+        n_expr = self.parse_expression(cast("ast.expr", iter_call.args[0]))
+        if not (isinstance(n_expr, ir.ConstInt) and n_expr.value == self._SPLIT_AIV_SUBCORE_NUM):
+            got = n_expr.value if isinstance(n_expr, ir.ConstInt) else python_print(n_expr, format=False)
+            raise ParserSyntaxError(
+                f"pl.split_aiv(n) requires n == {self._SPLIT_AIV_SUBCORE_NUM} "
+                f"(AIV sub-core count is hardware-fixed at {self._SPLIT_AIV_SUBCORE_NUM}), got {got}",
+                span=self.span_tracker.get_span(iter_call.args[0]),
+                hint=split_aiv_hint,
+            )
+
+        # ``mode`` is a required keyword — no silent default.
+        split_mode: ir.SplitMode | None = None
+        for kw in iter_call.keywords:
+            if kw.arg is None:
+                raise ParserSyntaxError(
+                    "pl.split_aiv() does not accept **kwargs; pass n (positional) and mode= explicitly",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint=split_aiv_hint,
+                )
+            if kw.arg == "mode":
+                split_mode = extract_enum_value(kw.value, SPLIT_MODE_MAP, "SplitMode", "pl.SplitMode")
+            elif kw.arg not in disallowed_loop_kwargs and kw.arg != "optimizations":
+                raise ParserSyntaxError(
+                    f"pl.split_aiv() got unexpected keyword argument '{kw.arg}'",
+                    span=self.span_tracker.get_span(kw.value),
+                    hint=split_aiv_hint,
+                )
+        if split_mode is None:
+            raise ParserSyntaxError(
+                "pl.split_aiv() requires mode= (e.g. mode=pl.SplitMode.NONE for task-parallel, "
+                "or pl.SplitMode.UP_DOWN / pl.SplitMode.LEFT_RIGHT for data-parallel halving)",
+                span=self.span_tracker.get_span(iter_call),
+                hint=split_aiv_hint,
+            )
+
+        # Build a first-class SplitAivScopeStmt region. The region body begins
+        # with ``aiv_id = pl.tile.get_subblock_idx()`` and carries the requested
+        # SplitMode on the node; LowerAutoVectorSplit (pass 18) consumes it.
+        #
+        # FLATTEN: when already inside a CORE_GROUP InCore scope — directly or
+        # through an intervening pl.range/pl.pipeline/if — emit the region in
+        # place; it nests inside the open context. OutlineIncoreScopes outlines the
+        # enclosing core function and the nested region survives.
+        if self._is_inside_scope(ir.ScopeKind.InCore):
+            self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
+            return
+
+        # Bare top-level form (no enclosing InCore): a top-level split_aiv must
+        # live inside a core function, so synthesize an InCore wrapper first and
+        # nest the region inside it (keeps it eligible for OutlineIncoreScopes —
+        # else the region would have no enclosing InCore to outline). Merge any
+        # forward-sticky pl.dump_tag tensors onto the wrapper (mirrors the other
+        # InCore-creating paths); the split mode + split_aiv marker ride the
+        # nested SplitAivScopeStmt region node, not the InCore wrapper.
+        span = self.span_tracker.get_span(stmt)
+        incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
+        with self.builder.scope(ir.ScopeKind.InCore, span, attrs=incore_attrs):
+            with self._scope_kind_context(ir.ScopeKind.InCore):
+                self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
+
+    def _emit_split_aiv_region(self, stmt: ast.For, loop_var_name: str, split_mode: ir.SplitMode) -> None:
+        """Emit a first-class ``SplitAivScopeStmt`` region at the current point.
+
+        Opens a ``ScopeKind.SplitAiv`` scope carrying ``split_mode`` and binds
+        ``aiv_id = pl.tile.get_subblock_idx()`` as its first statement, then
+        parses the loop body inside it. Used by both arms of
+        :meth:`_parse_split_aiv_for_loop` (inside-InCore and the bare,
+        InCore-wrapped form).
+        """
+        span = self.span_tracker.get_span(stmt)
+        with self.builder.scope(ir.ScopeKind.SplitAiv, span, split=split_mode):
+            with self._scope_kind_context(ir.ScopeKind.SplitAiv):
+                # A fresh var scope keeps the loop var / body bindings tidy;
+                # leak_vars pushes them up so subsequent statements stay visible.
+                self.scope_manager.enter_scope("split_aiv_for")
+                # Bind `aiv_id = pl.tile.get_subblock_idx()` as the first
+                # statement of the region body.
+                loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX), span=span)
+                self.scope_manager.define_var(loop_var_name, loop_var)
+                self.builder.assign(loop_var, ir_op.tile.get_subblock_idx(span=span), span=span)
+                # Expose the split mode to ``pl.aiv_shard`` / ``pl.aic_gather``
+                # calls in the body, which inherit it from this region.
+                with self._split_aiv_mode_context(split_mode):
+                    self._parse_body_siblings(stmt.body)
+                self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
+                self.scope_manager.exit_scope(leak_vars=True)
+
     def _merge_forward_sticky_dump(
         self,
         attrs: "list[tuple[str, Any]] | None",
@@ -4122,8 +4199,8 @@ class ASTParser:
 
         The single injection point for the scope-level selective-dump carrier on
         first parse — the explicit / round-trip ``dumps=`` surface is handled
-        separately by :meth:`_parse_at_meta`. Both the ``pl.at`` and the legacy
-        ``pl.incore`` / ``pl.cluster`` paths route through
+        separately by :meth:`_parse_at_meta`. Both the ``pl.at`` and the
+        ``pl.cluster`` paths route through
         :meth:`_parse_scope_body`, so attaching here covers every scope kind that
         becomes a kernel dispatch. Runtime scopes (``pl.manual_scope`` /
         ``pl.auto_scope``) are skipped: they are not outlined into a dispatch, and
@@ -4207,7 +4284,6 @@ class ASTParser:
         state = self._parse_at_kwargs(context_expr)
         level = state.level
         role = state.role
-        requests_auto_chunk = state.requests_auto_chunk
         split_mode = state.split_mode
         name_hint = state.name_hint
         deps_kw = state.deps_kw
@@ -4218,20 +4294,10 @@ class ASTParser:
 
         is_core_group = level == ir.Level.CORE_GROUP
 
-        if requests_auto_chunk and not is_core_group:
-            raise ParserSyntaxError(
-                "auto-chunk optimization is only supported with level=pl.Level.CORE_GROUP "
-                "(via optimizations=[pl.auto_chunk] or the deprecated "
-                "optimization=pl.chunked_loop_optimizer)",
-                span=span,
-                hint="Use pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.auto_chunk]) "
-                "for an AutoInCore scope.",
-            )
-
         if split_mode is not None and not is_core_group:
             raise ParserSyntaxError(
                 "split mode is only supported with level=pl.Level.CORE_GROUP "
-                "(via optimizations=[pl.split(...)] or the deprecated split= kwarg)",
+                "(via optimizations=[pl.split(...)])",
                 span=span,
                 hint="Use pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]).",
             )
@@ -4240,8 +4306,7 @@ class ASTParser:
             raise ParserSyntaxError(
                 "role= is not supported with level=pl.Level.CORE_GROUP",
                 span=span,
-                hint="Drop role= for InCore/AutoInCore scopes, "
-                "or use a non-CORE_GROUP level for Hierarchy scope",
+                hint="Drop role= for InCore scopes, or use a non-CORE_GROUP level for Hierarchy scope",
             )
 
         # Build the optional ``manual_dep_edges`` / ``task_id_var`` attrs for the
@@ -4254,6 +4319,9 @@ class ASTParser:
             deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, span
         )
         scope_attrs = self._append_split_slot_num_attr(scope_attrs, state.split_slot_num)
+        if state.windowize:
+            scope_attrs = list(scope_attrs or [])
+            scope_attrs.append(("windowize", True))
 
         # ``with pl.at(...) as tid:`` allocates ``tid`` as an outer-scope Var
         # whose real definition is synthesised later by ``OutlineIncoreScopes``
@@ -4296,15 +4364,6 @@ class ASTParser:
                 span,
                 level=level,
                 role=role,
-                name_hint=name_hint,
-                attrs=scope_attrs,
-            )
-        elif requests_auto_chunk:
-            self._parse_scope_body(
-                stmt,
-                ir.ScopeKind.AutoInCore,
-                span,
-                split=split_mode,
                 name_hint=name_hint,
                 attrs=scope_attrs,
             )
@@ -4377,7 +4436,7 @@ class ASTParser:
         # ``deps=``) and also the print/reparse round-trip surface. The
         # forward-sticky ``pl.dump_tag`` seed is merged in later by
         # :meth:`_parse_scope_body` (the single injection point shared by the
-        # ``pl.at`` and legacy ``pl.incore`` / ``pl.cluster`` paths), so it is
+        # ``pl.at`` and ``pl.cluster`` paths), so it is
         # not consulted here.
         dump_vars: list[ir.Var] = self._parse_at_dumps_kwarg(dumps_kw) if dumps_kw else []
 
@@ -4549,16 +4608,11 @@ class ASTParser:
         """Parse with statement for scope contexts.
 
         Currently supports:
-        - with pl.incore(): ... (deprecated; creates ScopeStmt with InCore scope)
-        - with pl.incore(split=pl.SplitMode.UP_DOWN): ... (deprecated; InCore with split)
-        - with pl.auto_incore(): ... (deprecated; creates ScopeStmt with AutoInCore scope)
-        - with pl.auto_incore(split=pl.SplitMode.UP_DOWN): ... (deprecated; with split mode)
         - with pl.cluster(): ... (creates ScopeStmt with Cluster scope)
         - with pl.at(level=..., role=...): ... (creates ScopeStmt with InCore/Hierarchy scope)
         - with pl.at(level=CORE_GROUP): ... (creates ScopeStmt with InCore scope)
-        - with pl.at(level=CORE_GROUP, split=pl.SplitMode.UP_DOWN): ... (InCore with split)
-        - with pl.at(level=CORE_GROUP, optimization=pl.chunked_loop_optimizer): ...
-          (creates ScopeStmt with AutoInCore scope)
+        - with pl.at(level=CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]): ...
+          (InCore with split)
 
         Args:
             stmt: With AST node
@@ -4568,8 +4622,9 @@ class ASTParser:
             raise ParserSyntaxError(
                 "Only single context manager supported in with statement",
                 span=self.span_tracker.get_span(stmt),
-                hint="Use 'with pl.incore():', 'with pl.auto_incore():',"
-                " 'with pl.cluster():', or 'with pl.at(level=...):'"
+                hint="Use 'with pl.cluster():', 'with pl.spmd(...):',"
+                " 'with pl.at(level=...):', 'with pl.scope():', or"
+                " 'with pl.manual_scope():'"
                 " without multiple context managers",
             )
 
@@ -4579,8 +4634,6 @@ class ASTParser:
 
         # Map DSL function names to ScopeKind values
         _SCOPE_KIND_MAP = {
-            "incore": ir.ScopeKind.InCore,
-            "auto_incore": ir.ScopeKind.AutoInCore,
             "cluster": ir.ScopeKind.Cluster,
             "spmd": ir.ScopeKind.Spmd,
         }
@@ -4614,7 +4667,7 @@ class ASTParser:
                     self._parse_manual_scope(stmt, context_expr)
                     return
 
-                # Existing scope kinds: pl.incore(), pl.auto_incore(), pl.cluster(), pl.spmd()
+                # Existing scope kinds: pl.cluster(), pl.spmd()
                 if func.attr in _SCOPE_KIND_MAP:
                     self._parse_legacy_scope(
                         stmt, context_expr, func.attr, _SCOPE_KIND_MAP, optional_vars=optional_vars
@@ -4630,8 +4683,9 @@ class ASTParser:
         raise UnsupportedFeatureError(
             "Unsupported context manager in with statement",
             span=self.span_tracker.get_span(stmt),
-            hint="Supported: 'with pl.incore():', 'with pl.auto_incore():',"
-            " 'with pl.cluster():', 'with pl.at(level=..., optimization=...):'",
+            hint="Supported: 'with pl.cluster():', 'with pl.spmd(...):',"
+            " 'with pl.at(level=..., optimizations=[...]):', 'with pl.scope():',"
+            " or 'with pl.manual_scope():'",
         )
 
     def parse_return(self, stmt: ast.Return) -> None:
@@ -4763,6 +4817,13 @@ class ASTParser:
                 f"'{keyword}' not supported in unrolled loops",
                 span=span,
                 hint=f"'{keyword}' can only be used in sequential (pl.range) or while loops",
+            )
+        if current_kind == "split_aiv":
+            raise InvalidOperationError(
+                f"'{keyword}' not supported inside a 'for ... in pl.split_aiv(...)' body",
+                span=span,
+                hint=f"'{keyword}' can only be used in sequential (pl.range) or while loops; a "
+                "pl.split_aiv body is a scope over the two AIV lanes, not a loop",
             )
 
     def parse_expression(self, expr: ast.expr) -> ir.Expr:
@@ -5177,6 +5238,22 @@ class ASTParser:
         if isinstance(node, ast.Name):
             attrs.insert(0, node.id)
 
+        # pl.aiv_shard / pl.aic_gather (also pl.tile.aiv_shard / pl.tile.aic_gather
+        # and the printed pl.tensor.aiv_shard / pl.tensor.aic_gather high-level
+        # form): the split mode is inherited from the enclosing ``pl.split_aiv``
+        # scope, so intercept before the generic dispatch (the DSL wrapper raises
+        # since it cannot resolve the scope mode). The emitted op namespace is
+        # type-dispatched inside ``_parse_split_transfer_op`` (tensor.* for a
+        # high-level Tensor operand, tile.* otherwise), so a printed
+        # ``pl.tensor.aiv_shard(...)`` must also route here for print -> parse.
+        if (
+            attrs
+            and attrs[0] == "pl"
+            and attrs[-1] in ("aiv_shard", "aic_gather")
+            and (len(attrs) == 2 or (len(attrs) == 3 and attrs[1] in ("tile", "tensor")))
+        ):
+            return self._parse_split_transfer_op(attrs[-1], call)
+
         # pld.<op> (2-segment unified short form)
         if len(attrs) == 2 and attrs[0] == "pld":
             return self._parse_pld_op(attrs[1], call)
@@ -5219,6 +5296,148 @@ class ASTParser:
             span=self.span_tracker.get_span(call),
             hint="Use pl.*, pl.tensor.*, pl.tile.*, or pl.system.* operations",
         )
+
+    def _parse_split_transfer_op(self, op_name: str, call: ast.Call) -> ir.Expr:
+        """Parse ``pl.aiv_shard(x)`` / ``pl.aic_gather(x)``.
+
+        The emitted op namespace is **type-dispatched** on the operand:
+
+        - A high-level **Tensor** operand (``@pl.jit`` / ``pl.spmd`` author-facing
+          form, e.g. a ``pl.matmul`` result or a GM tensor param) lowers to
+          ``tensor.aiv_shard`` / ``tensor.aic_gather``. This form is
+          **region-only** — it is reachable solely through the high-level scoped
+          path below (which requires an enclosing ``pl.split_aiv`` region). A
+          ``tensor.*`` op is lowered 1:1 to the matching ``tile.*`` op at
+          ``ConvertTensorToTileOps``.
+        - A **Tile** (or not-yet-typed) operand keeps the ``tile.aiv_shard`` /
+          ``tile.aic_gather`` form, preserving the legacy ``@pl.program`` path.
+        - A **distributed** tensor operand is rejected (AIV/AIC split only).
+
+        Two surface forms reach this method:
+
+        - **High-level scoped form** ``pl.aiv_shard(x)`` inside a
+          ``for aiv_id in pl.split_aiv(mode=...)`` loop. The op inherits the
+          split mode from the enclosing scope — the user does not (and must not)
+          pass a ``split=`` / ``mode=`` kwarg. The mode is read off
+          :attr:`_split_aiv_mode_stack` and stamped as the ``split`` attr. Both
+          the tile and tensor forms are valid here.
+        - **Outlined low-level form** ``pl.tile.aiv_shard(tile, split=N)`` with an
+          explicit ``split=`` kwarg and NO enclosing ``pl.split_aiv`` loop. This
+          is what the python printer emits for a function already lowered into
+          the explicit ``split_aiv`` form (e.g. after ``LowerAutoVectorSplit`` /
+          ``OutlineIncoreScopes``, or a hand-written ``split_aiv`` kernel). The
+          split is carried on the op itself, so the form must round-trip without
+          re-synthesising the loop wrapper. The explicit ``split`` is taken
+          verbatim and stamped as the ``split`` attr. This form is **tile-only**:
+          a high-level Tensor operand is rejected (wrap it in a
+          ``pl.split_aiv`` region instead).
+        """
+        span = self.span_tracker.get_span(call)
+        hint = (
+            f"Write 'x = pl.{op_name}(tile)' inside a "
+            "'for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):' loop; "
+            "the split mode is taken from that scope."
+        )
+
+        # Detect the outlined low-level form: an explicit ``split=`` kwarg. A
+        # ``mode=`` kwarg is never accepted (the mode is an integer ``split``
+        # attr on the lowered op, never a SplitMode literal); any other kwarg is
+        # rejected as well.
+        explicit_split: ast.expr | None = None
+        for kw in call.keywords:
+            if kw.arg == "split":
+                explicit_split = cast("ast.expr", kw.value)
+                continue
+            if kw.arg == "mode":
+                raise ParserSyntaxError(
+                    f"pl.{op_name}() does not take a mode= argument — pass the lowered "
+                    "integer 'split=' (outlined form) or rely on the enclosing "
+                    "pl.split_aiv(mode=...) scope (high-level form)",
+                    span=span,
+                    hint=hint,
+                )
+            raise ParserSyntaxError(
+                f"pl.{op_name}() does not accept keyword argument '{kw.arg}'",
+                span=span,
+                hint=hint,
+            )
+
+        if len(call.args) != 1:
+            raise ParserSyntaxError(
+                f"pl.{op_name}() takes exactly one positional argument (the tile to "
+                f"{'shard' if op_name == 'aiv_shard' else 'gather'}), got {len(call.args)}",
+                span=span,
+                hint=hint,
+            )
+        operand_expr = self.parse_expression(cast("ast.expr", call.args[0]))
+
+        # Reject distributed tensors outright — AIV/AIC split only. This must
+        # come BEFORE the TensorType dispatch: ``DistributedTensorType`` is a
+        # subclass of ``TensorType`` and would otherwise route to the tensor op.
+        if isinstance(operand_expr.type, ir.DistributedTensorType):
+            raise ParserSyntaxError(
+                f"pl.{op_name} does not support distributed tensors (AIV/AIC split only)",
+                span=span,
+                hint=hint,
+            )
+        # Type-dispatch the emitted op namespace: a high-level Tensor operand
+        # lowers to ``tensor.{op}`` (region-only, converted to the tile op at
+        # ConvertTensorToTileOps); a Tile / not-yet-typed operand keeps the
+        # legacy ``tile.{op}`` form.
+        is_tensor_operand = isinstance(operand_expr.type, ir.TensorType)
+        op_ns = "tensor" if is_tensor_operand else "tile"
+
+        if explicit_split is not None:
+            # Outlined form — bypass the scope-stack requirement; the split is
+            # carried on the op. The printer emits a plain integer literal.
+            # An explicit ``split=`` is ONLY valid in the outlined form (no
+            # enclosing ``pl.split_aiv`` loop); inside such a loop the mode is
+            # inherited from the scope and passing ``split=`` would silently
+            # override it, so reject it there.
+            if self._split_aiv_mode_stack:
+                raise ParserSyntaxError(
+                    f"pl.{op_name}() does not take a split= argument inside a "
+                    "'for ... in pl.split_aiv(...)' loop — the split mode is inherited "
+                    "from that scope",
+                    span=span,
+                    hint=hint,
+                )
+            # The outlined form is tile-only: a high-level Tensor operand is not
+            # valid here. The tensor form is reachable solely through the
+            # region-scoped path (which carries the split mode on the region).
+            if is_tensor_operand:
+                raise ParserSyntaxError(
+                    f"pl.{op_name}(..., split=N) does not accept a high-level Tensor "
+                    "operand — the outlined split= form is tile-only. Wrap the Tensor "
+                    "in a 'for aiv_id in pl.split_aiv(...)' region instead, which supplies "
+                    "the split mode and lowers to the tile op.",
+                    span=span,
+                    hint=hint,
+                )
+            if not (isinstance(explicit_split, ast.Constant) and isinstance(explicit_split.value, int)):
+                raise ParserSyntaxError(
+                    f"pl.{op_name}(..., split=N) requires an integer split (the lowered "
+                    "SplitMode value), got "
+                    f"'{ast.unparse(explicit_split)}'",
+                    span=span,
+                    hint=hint,
+                )
+            return ir.create_op_call(
+                f"{op_ns}.{op_name}", [operand_expr], {"split": int(explicit_split.value)}, span
+            )
+
+        # High-level scoped form — inherit the mode from the enclosing scope.
+        # This is the only path that emits the tensor form (region-only).
+        if not self._split_aiv_mode_stack:
+            raise ParserSyntaxError(
+                f"pl.{op_name}() must be used inside a 'for ... in pl.split_aiv(...)' loop "
+                "(or pass an explicit integer 'split=' in the outlined form); it otherwise "
+                "inherits the split mode from that scope",
+                span=span,
+                hint=hint,
+            )
+        mode = self._split_aiv_mode_stack[-1]
+        return ir.create_op_call(f"{op_ns}.{op_name}", [operand_expr], {"split": int(mode.value)}, span)
 
     @staticmethod
     def _validate_kernel_call_kwargs(
@@ -5275,6 +5494,34 @@ class ASTParser:
                 hint=hint,
             )
 
+    @staticmethod
+    def _call_args_for_return_deduction(
+        func_obj: ir.Function,
+        args: list[ir.Expr],
+        *,
+        as_submit: bool,
+    ) -> tuple[list[ir.Var], list[ir.Expr]]:
+        """Pair callee params with actual args for return-type substitution."""
+        if not as_submit or len(args) == len(func_obj.params):
+            return list(func_obj.params), args
+
+        callee_params: list[ir.Var] = []
+        paired_args: list[ir.Expr] = []
+        arg_idx = 0
+        for param_idx, (param, direction) in enumerate(zip(func_obj.params, func_obj.param_directions)):
+            if direction in (ir.ParamDirection.Out, ir.ParamDirection.InOut):
+                remaining_required = sum(
+                    1
+                    for d in func_obj.param_directions[param_idx + 1 :]
+                    if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+                )
+                if len(args) - arg_idx <= remaining_required:
+                    continue
+            callee_params.append(param)
+            paired_args.append(args[arg_idx])
+            arg_idx += 1
+        return callee_params, paired_args
+
     def _parse_kernel_call(
         self,
         method_attr: ast.Attribute,
@@ -5327,7 +5574,38 @@ class ASTParser:
 
         # Validate argument count before parsing args to fail fast.
         if func_obj is not None:
-            self._validate_call_arg_count(method_name, func_obj, len(arg_nodes), span)
+            if as_submit:
+                # For submit (pl.submit / pl.spmd_submit), Out- and InOut-
+                # directed parameters are runtime-allocated outputs that
+                # MAY be omitted at the call site. The lower bound is the
+                # count of non-Out/InOut params; the upper bound is all
+                # params (when Out params are passed explicitly).
+                expected_lo = sum(
+                    1
+                    for d in func_obj.param_directions
+                    if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+                )
+                expected_hi = len(func_obj.params)
+                ok = expected_lo <= len(arg_nodes) <= expected_hi
+            else:
+                expected_hi = len(func_obj.params)
+                ok = len(arg_nodes) == len(func_obj.params)
+            if not ok:
+                param_info = [
+                    f"{p.name_hint}: {d.name}" for p, d in zip(func_obj.params, func_obj.param_directions)
+                ]
+                hint = (
+                    f"Parameters: {param_info}. Out/InOut params may be omitted in submit calls."
+                    if as_submit
+                    else f"Parameters: {param_info}"
+                )
+                raise ParserTypeError(
+                    f"Function '{method_name}' expects "
+                    + (f"{expected_lo}..{expected_hi}" if as_submit else f"{expected_hi}")
+                    + f" argument(s), got {len(arg_nodes)}",
+                    span=span,
+                    hint=hint,
+                )
 
         arg_directions = self._extract_arg_directions_from_attrs(method_name, keywords, len(arg_nodes), span)
         if arg_directions is None:
@@ -5397,9 +5675,14 @@ class ASTParser:
         if func_obj is not None and not return_types and not as_submit:
             return_types = self._effective_return_types(func_obj)
         if func_obj is not None and return_types:
-            return_types = ir.deduce_call_return_type(
-                list(func_obj.params),
+            callee_params_for_return, args_for_return = self._call_args_for_return_deduction(
+                func_obj,
                 args,
+                as_submit=as_submit,
+            )
+            return_types = ir.deduce_call_return_type(
+                callee_params_for_return,
+                args_for_return,
                 return_types,
             )
         return self._make_call_with_return_type(
@@ -6521,6 +6804,13 @@ class ASTParser:
             key = keyword.arg
             value = keyword.value
 
+            # ``attrs={...}`` is a generic compiler-internal attr dict (e.g.
+            # ``pipeline_membership``), NOT an op kwarg. The dispatch helpers
+            # extract it via ``_parse_op_attrs`` and re-attach it to the built
+            # Call, so skip it here.
+            if key == "attrs":
+                continue
+
             # Handle dtype specially
             if key == "dtype":
                 kwargs[key] = self.type_resolver.resolve_dtype(value)
@@ -6537,6 +6827,33 @@ class ASTParser:
             else:
                 kwargs[key] = self.parse_expression(value)
         return kwargs
+
+    def _parse_op_attrs(self, call: ast.Call) -> dict[str, object] | None:
+        """Extract a generic ``attrs={...}`` kwarg from an op call, if present.
+
+        The python printer surfaces compiler-internal op-call attrs (e.g.
+        ``pipeline_membership``) as a trailing ``attrs={...}`` dict. The op DSL
+        wrappers / IR builders take no attrs parameter, so the dispatch helpers
+        parse it here and re-attach it via ``ir.set_call_attrs`` after building
+        the call. Returns ``None`` when no ``attrs=`` kwarg is present.
+        """
+        for keyword in call.keywords:
+            if keyword.arg != "attrs":
+                continue
+            if not isinstance(keyword.value, ast.Dict):
+                raise ParserSyntaxError(
+                    "op attrs must be a dict literal",
+                    span=self.span_tracker.get_span(keyword.value),
+                )
+            return self._parse_attrs_dict(keyword.value)
+        return None
+
+    @staticmethod
+    def _attach_op_attrs(result: ir.Expr, attrs: dict[str, object] | None) -> ir.Expr:
+        """Re-attach parsed generic attrs to a freshly built op Call."""
+        if attrs and isinstance(result, ir.Call):
+            return ir.set_call_attrs(result, attrs)
+        return result
 
     def _resolve_unary_kwarg(self, value: ast.UnaryOp) -> Any:
         """Resolve a unary op kwarg value (e.g., -1)."""
@@ -6648,10 +6965,11 @@ class ASTParser:
             )
         args = [self._parse_op_positional_arg(arg) for arg in call.args]
         kwargs = self._parse_op_kwargs(call)
+        attrs = self._parse_op_attrs(call)
         op_func = getattr(module, op_name)
         span = self.span_tracker.get_span(call)
         try:
-            return invoke_dsl(op_func, args, kwargs, span)
+            return self._attach_op_attrs(invoke_dsl(op_func, args, kwargs, span), attrs)
         except ParserError:
             raise
         except (TypeError, ValueError) as e:
@@ -6723,10 +7041,11 @@ class ASTParser:
             )
         args = [self._parse_op_positional_arg(arg) for arg in call.args]
         kwargs = self._parse_op_kwargs(call)
+        attrs = self._parse_op_attrs(call)
         op_func = getattr(module, op_name)
         span = self.span_tracker.get_span(call)
         try:
-            return op_func(*args, **kwargs, span=span)
+            return self._attach_op_attrs(op_func(*args, **kwargs, span=span), attrs)
         except ParserError:
             raise
         except Exception as e:
@@ -6828,13 +7147,12 @@ class ASTParser:
 
         if op_name == "world_size":
             in_device_scope = any(
-                self._is_inside_scope(kind)
-                for kind in (ir.ScopeKind.InCore, ir.ScopeKind.AutoInCore, ir.ScopeKind.Spmd)
+                self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
             )
             if self._func_level != ir.Level.HOST or in_device_scope:
                 raise ParserSyntaxError(
                     "pld.system.world_size() can only be called in HOST orchestration context "
-                    "(not inside InCore / AutoInCore / SPMD scopes); "
+                    "(not inside InCore / SPMD scopes); "
                     f"current function level: {self._func_level}",
                     span=span,
                     hint="Use '@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)' "

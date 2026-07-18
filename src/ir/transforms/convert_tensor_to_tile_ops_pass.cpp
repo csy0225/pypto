@@ -208,13 +208,9 @@ std::vector<TypePtr> FindYieldTypes(const std::vector<StmtPtr>& stmts) {
  * @brief Resolved consumer memory space requirement for a variable.
  */
 struct ConsumerSpaceReq {
-  MemorySpace space;       ///< Required memory space
-  bool transpose = false;  ///< Bake transpose into the consumer-driven load.
-                           ///< Only set for ND (batch_matmul) b_trans operands: those
-                           ///< take the legacy transpose-at-load path. A 2D tile.matmul
-                           ///< b_trans operand keeps transpose=false here and is
-                           ///< reinterpreted by a zero-copy tile.transpose_view view in
-                           ///< BridgeInputSpaces instead (issue #1776).
+  MemorySpace space;  ///< Required memory space. The consumer-driven load is always
+                      ///< natural; a transposed (b_trans/a_trans) operand is realised
+                      ///< by a zero-copy tile.transpose_view in BridgeInputSpaces.
 };
 
 /**
@@ -297,30 +293,19 @@ class ConsumerSpaceCollector : public IRVisitor {
       return;
     }
 
-    // An operand of rank > 2 makes this matmul lower to tile.batch_matmul (ND),
-    // which keeps the legacy transpose-at-load path; a 2D tile.matmul instead
-    // uses a zero-copy tile.transpose_view view added in BridgeInputSpaces (#1776).
-    // So a consumer-driven load bakes the transpose ONLY for the ND case.
-    bool consumer_is_nd = false;
-    for (const auto& a : call->args_) {
-      if (auto tt = As<TensorType>(a->GetType()); tt && tt->shape_.size() > 2) {
-        consumer_is_nd = true;
-        break;
-      }
-    }
+    // Both 2D tile.matmul and ND tile.batch_matmul realise a transposed operand
+    // as a zero-copy tile.transpose_view added in BridgeInputSpaces (issues #1776
+    // / ND extension): the consumer-driven load is ALWAYS natural, and the view
+    // supplies the transpose. (No more transpose-at-load baking.)
     for (const auto& [idx, req] : entry->input_reqs) {
       if (idx >= call->args_.size()) continue;
       if (auto var = As<Var>(call->args_[idx])) {
-        const bool want_transpose = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
-        // 2D matmul: natural load (transpose=false), transpose_view compensates later.
-        // ND batch_matmul: bake the transpose into the load (legacy), no view.
-        const bool transpose = want_transpose && consumer_is_nd;
         // Prioritize non-Vec spaces: if an existing requirement is the default Vec but this
         // consumer needs a specialized space (Mat/Left/Right/Acc/Bias), override it so the
         // load-like producer can emit the specialized space directly.
-        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space, transpose});
+        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space});
         if (!inserted && it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-          it->second = ConsumerSpaceReq{req.space, transpose};
+          it->second = ConsumerSpaceReq{req.space};
         }
       }
     }
@@ -561,7 +546,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
     // Consumer-driven space override for load-like ops (e.g. tensor.slice
     // feeding into tensor.matmul → load to Mat instead of default Vec).
-    if (call->op_->name_ == "tensor.slice") {
+    if (IsOp(call, "tensor.slice")) {
       auto consumer_req = consumer_collector_.GetConsumerReq(op->var_.get());
       if (consumer_req) {
         auto override_load = HandleConsumerDrivenLoad(op, call, *consumer_req);
@@ -641,11 +626,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
     const auto& offset_arg = call->args_[2];
     ExprPtr valid_shapes = (call->args_.size() == 4) ? call->args_[3] : shape_arg;
 
-    // req.transpose is set only for ND (batch_matmul) b_trans operands (legacy
-    // transpose-at-load); 2D matmul operands load natural here and get a
-    // zero-copy tile.transpose_view view at the matmul site instead (issue #1776).
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space},
-                                                                 {"transpose", req.transpose}};
+    // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
+    // operand gets a zero-copy tile.transpose_view at the matmul site instead.
+    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
     auto load_call = op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
                                          load_kwargs, call->span_);
 
@@ -668,27 +651,21 @@ class TensorToTileMutator : public TypePropagatingMutator {
     std::vector<StmtPtr> stmts;
 
     // An operand of rank > 2 means this matmul lowers to tile.batch_matmul, not
-    // tile.matmul (see the rank dispatch in op_conversion_registry.cpp). The
-    // zero-copy transpose_view rework targets 2D tile.matmul only (issue #1776);
-    // batch_matmul keeps the legacy transpose-at-load path.
-    bool is_nd = false;
-    for (const auto& a : args) {
-      if (auto tt = As<TensorType>(a->GetType())) {
-        if (tt->shape_.size() > 2) is_nd = true;
-      } else if (auto tl = As<TileType>(a->GetType())) {
-        if (tl->shape_.size() > 2) is_nd = true;
-      }
-      if (is_nd) break;
-    }
+    // tile.matmul (see the rank dispatch in op_conversion_registry.cpp).
+    //
+    // Both 2D tile.matmul AND ND tile.batch_matmul realise a transposed operand
+    // as a zero-copy tile.transpose_view over ONE natural load/move (issues #1776
+    // / ND extension). FlattenTileNdTo2D slices the whole transposed view per
+    // batch; the tile-level (batch_)matmul carries no transpose semantic.
 
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
-    // and return the bound load Var.
+    // and return the bound load Var. The load is always natural; a transposed
+    // operand is realised by a zero-copy tile.transpose_view on the result.
     auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space,
-                         bool transpose, size_t idx) -> VarPtr {
+                         size_t idx) -> VarPtr {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
       auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
-      std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space},
-                                                               {"transpose", transpose}};
+      std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
       auto load = op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
@@ -710,43 +687,54 @@ class TensorToTileMutator : public TypePropagatingMutator {
     for (const auto& [idx, _] : input_reqs) sorted_indices.push_back(idx);
     std::sort(sorted_indices.begin(), sorted_indices.end());
 
+    // Zero-copy reinterpret a Mat-resident tile as its transpose (NZ<->ZN),
+    // aliasing the SAME L1 buffer (issue #1776). Valid only for Mat tiles.
+    auto emit_view = [&](const VarPtr& v) -> VarPtr {
+      auto view = op_registry_.Create("tile.transpose_view", {v}, {}, call->span_);
+      auto view_var = std::make_shared<Var>(v->name_hint_ + "_t", view->GetType(), call->span_);
+      stmts.push_back(std::make_shared<AssignStmt>(view_var, view, call->span_));
+      return view_var;
+    };
+
+    // Bridge a non-Mat (e.g. Vec) tile to Mat in its NATURAL orientation via a
+    // V2C move. transpose_view needs a Mat-resident tile (a col_major Vec tile
+    // cannot be pushed V2C — a2a3 TPUSH transfers only ND/NZ tiles), so a Vec
+    // compute result feeding a b_trans matmul (mixed kernel) is moved to Mat with
+    // its original shape first, then reinterpreted as its transpose on the Mat side.
+    auto emit_move_to_mat = [&](const VarPtr& v) -> VarPtr {
+      std::vector<std::pair<std::string, std::any>> move_kw = {{"target_memory", MemorySpace::Mat}};
+      auto mv = op_registry_.Create("tile.move", {v}, move_kw, call->span_);
+      auto mv_var = std::make_shared<Var>(v->name_hint_ + "_mat", mv->GetType(), call->span_);
+      stmts.push_back(std::make_shared<AssignStmt>(mv_var, mv, call->span_));
+      return mv_var;
+    };
+
     for (size_t idx : sorted_indices) {
       const auto& req = input_reqs.at(idx);
       if (idx >= args.size()) continue;
-      const bool want_transpose = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
+      const bool use_view = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
       auto tensor_type = As<TensorType>(args[idx]->GetType());
 
-      // 2D tile.matmul realises a transposed operand as a zero-copy tile.transpose_view
-      // view over ONE natural load, aliasing the same L1 buffer (issue #1776) — so
-      // a tensor consumed by both a b_trans=True and a b_trans=False matmul loads
-      // once. ND (batch_matmul) keeps the legacy transpose-at-load path: the
-      // transpose is baked into the load and no view is emitted.
-      const bool use_view = want_transpose && !is_nd;
-
-      VarPtr space_var;
       if (tensor_type) {
-        // Bake the transpose into the load only on the legacy ND path; the 2D
-        // path always loads naturally and lets the view supply the transpose.
-        space_var = emit_load(args[idx], tensor_type, req.space, /*transpose=*/want_transpose && is_nd, idx);
-      } else if (use_view) {
-        // Already a tile (e.g. a consumer-driven Mat load) that we reinterpret
-        // below; aliasing its buffer requires a Var.
-        space_var = As<Var>(args[idx]);
-        if (!space_var) continue;  // non-Var tile expr: leave as-is
-      } else {
-        continue;  // already a tile in the right orientation — pass through
+        // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
+        // transpose with a zero-copy view when b_trans/a_trans.
+        auto loaded = emit_load(args[idx], tensor_type, req.space, idx);
+        args[idx] = use_view ? emit_view(loaded) : loaded;
+        continue;
       }
 
-      if (use_view) {
-        // Zero-copy reinterpret the natural Mat tile as its transpose (NZ<->ZN),
-        // aliasing the SAME L1 buffer.
-        auto view = op_registry_.Create("tile.transpose_view", {space_var}, {}, call->span_);
-        auto view_var = std::make_shared<Var>(space_var->name_hint_ + "_t", view->GetType(), call->span_);
-        stmts.push_back(std::make_shared<AssignStmt>(view_var, view, call->span_));
-        args[idx] = view_var;
-      } else {
-        args[idx] = space_var;
-      }
+      // Tile operand. Only a transposed operand needs rewriting; a non-transposed
+      // tile passes through.
+      if (!use_view) continue;
+      auto var = As<Var>(args[idx]);
+      if (!var) continue;  // non-Var tile expr: leave as-is
+      auto tile_ty = As<TileType>(var->GetType());
+      const bool mat_resident =
+          tile_ty && tile_ty->memory_space_.value_or(MemorySpace::Vec) == MemorySpace::Mat;
+      // Mat-resident operand (e.g. a consumer-driven Mat load): zero-copy view.
+      // Non-Mat operand (Vec compute result, mixed kernel): move to Mat in its
+      // natural shape first, then view the Mat tile.
+      args[idx] = mat_resident ? emit_view(var) : emit_view(emit_move_to_mat(var));
     }
 
     return {std::move(args), std::move(stmts)};
@@ -825,23 +813,22 @@ ExprPtr GetCallKwargExpr(const CallPtr& call, const std::string& key) {
 ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (!call) return nullptr;
 
-  const std::string& op_name = call->op_->name_;
-  if (op_name == "tensor.write" && !call->args_.empty()) {
+  if (IsOp(call, "tensor.write") && !call->args_.empty()) {
     return call->args_[0];
   }
-  if (op_name == "tile.store") {
+  if (IsOp(call, "tile.store")) {
     if (call->args_.size() >= 3) {
       return call->args_[2];
     }
     return GetCallKwargExpr(call, "output_tensor");
   }
-  if (op_name == "tensor.assemble" && !call->args_.empty()) {
+  if (IsOp(call, "tensor.assemble") && !call->args_.empty()) {
     return call->args_[0];
   }
   // pld.tile.remote_store(src_tile, target, peer, offsets): the cross-rank write
   // lands in `target` (args_[1]). Recognising it here lets the enclosing window
   // param be upgraded from In to Out/InOut so a later reader gets a RAW edge.
-  if (op_name == "pld.tile.remote_store" && call->args_.size() >= 2) {
+  if (IsOp(call, "pld.tile.remote_store") && call->args_.size() >= 2) {
     return call->args_[1];
   }
   // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
@@ -850,7 +837,7 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   //   the HCCL TGET writes the pulled bytes into local `dst` (args_[0]).
   // Both mirror the remote_store handling above so the enclosing window
   // param is upgraded from In to Out/InOut and a later reader gets a RAW edge.
-  if ((op_name == "pld.tile.put" || op_name == "pld.tile.get") && !call->args_.empty()) {
+  if ((IsOp(call, "pld.tile.put") || IsOp(call, "pld.tile.get")) && !call->args_.empty()) {
     return call->args_[0];
   }
   // pld.tensor.allreduce(target, signal, *, op): the composite collective
@@ -860,7 +847,32 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   // ``pld.tensor.allreduce`` already records both args as InOut; this
   // entry just identifies the primary data target for any downstream
   // consumer that walks GetWriteTargetExpr.
-  if (op_name == "pld.tensor.allreduce" && !call->args_.empty()) {
+  if (IsOp(call, "pld.tensor.allreduce") && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  // pld.tensor.allgather(local_data, target, signal, out): writes gathered
+  // chunks into out on every rank (Phase 3 per-peer pld.tile.get).  out (args_[3])
+  // is the primary write target; target (args_[1]) is used for staging only.
+  if (IsOp(call, "pld.tensor.allgather") && call->args_.size() >= 4) {
+    return call->args_[3];
+  }
+  // pld.tensor.reduce_scatter(target, signal, *, op): writes the reduced
+  // chunk back into target (Phase 4 store).  target (args_[0]) is the
+  // primary write target — same as allreduce.
+  if (IsOp(call, "pld.tensor.reduce_scatter") && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  // pld.tensor.barrier(signal): returns a rebind of signal — the result
+  // aliases signal so that ``sig2 = barrier(sig1)`` propagates origins
+  // through GetAliasOrigins().  The AnalyzeCallAccess handler separately
+  // marks signal read+write for param-direction inference.
+  if (IsOp(call, "pld.tensor.barrier") && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  // pld.tensor.broadcast(target, signal, *, root): writes root's data into
+  // target on every rank via pld.tile.get.  target (args_[0]) is
+  // the primary write target.
+  if (IsOp(call, "pld.tensor.broadcast") && !call->args_.empty()) {
     return call->args_[0];
   }
   return nullptr;
@@ -893,11 +905,10 @@ ParamOrigins GetAliasOrigins(const ExprPtr& expr, const AliasOriginMap& origin_m
   auto call = As<Call>(expr);
   if (!call) return {};
 
-  const std::string& op_name = call->op_->name_;
   if (auto write_target = GetWriteTargetExpr(call)) {
     return GetAliasOrigins(write_target, origin_map);
   }
-  if (op_name == "tensor.slice" && !call->args_.empty()) {
+  if (IsOp(call, "tensor.slice") && !call->args_.empty()) {
     return GetAliasOrigins(call->args_[0], origin_map);
   }
   return {};
@@ -941,8 +952,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
                        std::vector<bool>& has_write) {
   if (!call) return;
 
-  const std::string& op_name = call->op_->name_;
-  if (op_name == "tile.load" || op_name == "tensor.read") {
+  if (IsOp(call, "tile.load") || IsOp(call, "tensor.read")) {
     if (!call->args_.empty()) {
       MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
     }
@@ -952,7 +962,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "tile.store") {
+  if (IsOp(call, "tile.store")) {
     if (!call->args_.empty()) {
       MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
     }
@@ -968,7 +978,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "pld.tile.remote_store") {
+  if (IsOp(call, "pld.tile.remote_store")) {
     // remote_store(src_tile, target, peer, offsets): src_tile/peer/offsets read,
     // target (args_[1]) written. Mirrors the tile.store handling above.
     if (!call->args_.empty()) {
@@ -983,7 +993,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "pld.tile.put" || op_name == "pld.tile.get") {
+  if (IsOp(call, "pld.tile.put") || IsOp(call, "pld.tile.get")) {
     // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
     //   dst (args_[0]) is the cross-rank write target; peer/src/stage and any
     //   subregion offsets are all read.
@@ -1001,7 +1011,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "pld.tensor.allreduce") {
+  if (IsOp(call, "pld.tensor.allreduce")) {
     // pld.tensor.allreduce(target, signal, *, op): both target (args_[0])
     // and signal (args_[1]) are InOut — read AND written across the
     // 4-phase decomposition (target read in Phase 3, written in Phase 4;
@@ -1017,7 +1027,65 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "tensor.write") {
+  if (IsOp(call, "pld.tensor.allgather")) {
+    // pld.tensor.allgather(local_data, target, signal, out):
+    //   local_data (args_[0]) is In (read-only — staged into target).
+    //   target (args_[1]) is read (Phase 3 pld.tile.get from peers)
+    //     and written (Phase 1 store into own window).  InOut.
+    //   signal (args_[2]) is written (notify) and read (wait).  InOut.
+    //   out (args_[3]) is write-only — the intrinsic writes directly into it.
+    if (call->args_.size() >= 1) {
+      // local_data: read only
+      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
+    }
+    for (size_t i = 1; i < std::min<size_t>(3, call->args_.size()); ++i) {
+      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
+      MarkAccess(origins, has_read);
+      MarkAccess(origins, has_write);
+    }
+    if (call->args_.size() >= 4) {
+      // out: write only
+      MarkAccess(CollectReferencedOrigins(call->args_[3], origin_map), has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "pld.tensor.reduce_scatter")) {
+    // pld.tensor.reduce_scatter(target, signal, *, op): same 5-phase
+    // pattern as allreduce — both target and signal are InOut.
+    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
+      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
+      MarkAccess(origins, has_read);
+      MarkAccess(origins, has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "pld.tensor.barrier")) {
+    // pld.tensor.barrier(signal): signal (args_[0]) is InOut.
+    // Written in Phase 1 (notify), read in Phase 2 (wait).
+    if (!call->args_.empty()) {
+      auto origins = CollectReferencedOrigins(call->args_[0], origin_map);
+      MarkAccess(origins, has_read);
+      MarkAccess(origins, has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "pld.tensor.broadcast")) {
+    // pld.tensor.broadcast(target, signal, *, root): target (args_[0]) and
+    // signal (args_[1]) are both InOut.  Target is read via pld.tile.get
+    // (non-root reads root's slice), written via pld.tile.get into local
+    // slot.  Signal is written (Phase 2a notify) and read (Phase 2b wait).
+    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
+      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
+      MarkAccess(origins, has_read);
+      MarkAccess(origins, has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "tensor.write")) {
     for (size_t i = 1; i < call->args_.size(); ++i) {
       MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
     }
@@ -1027,7 +1095,7 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "tensor.assemble") {
+  if (IsOp(call, "tensor.assemble")) {
     for (size_t i = 1; i < call->args_.size(); ++i) {
       MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
     }
@@ -1037,7 +1105,21 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
     return;
   }
 
-  if (op_name == "tensor.slice" || op_name == "tensor.create" || op_name == "tensor.full") {
+  if (IsOp(call, "tensor.slice") || IsOp(call, "tensor.create") || IsOp(call, "tensor.full")) {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    return;
+  }
+
+  if (IsOp(call, "system.syncall") && call->args_.size() >= 3) {
+    // Soft form: each core writes its arrival counter into gm_workspace
+    // (args_[0]) and polls the others, so the workspace is read AND written.
+    // The scratch tile(s) and used_cores (args_[1:]) are reads. Marking the
+    // write lets dependency analysis order barriers that reuse one workspace.
+    // args_.size() is 3 for aiv_only/aic_only and 4 for mix (extra L1 scratch).
+    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
+    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_write);
     for (size_t i = 1; i < call->args_.size(); ++i) {
       MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
     }
@@ -1143,11 +1225,6 @@ YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_ma
     }
     if (auto step_call = As<Call>(for_stmt->step_)) {
       AnalyzeCallAccess(step_call, origin_map, has_read, has_write);
-    }
-    if (for_stmt->chunk_config_.has_value()) {
-      if (auto chunk_call = As<Call>(for_stmt->chunk_config_->size)) {
-        AnalyzeCallAccess(chunk_call, origin_map, has_read, has_write);
-      }
     }
 
     auto body_map = origin_map;
@@ -1279,7 +1356,7 @@ std::optional<ReturnedAssembleLoopRewrite> RewriteReturnedAssembleLoopToStore(
       if (assign) {
         auto call = As<Call>(assign->value_);
         bool is_target_assemble = false;
-        if (call && call->op_->name_ == "tile.assemble" && call->args_.size() == 3) {
+        if (call && IsOp(call, "tile.assemble") && call->args_.size() == 3) {
           if (auto iter = As<IterArg>(call->args_[0])) {
             is_target_assemble = iter.get() == old_iter_arg.get();
           } else if (auto var = As<Var>(call->args_[0])) {
@@ -1434,8 +1511,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
 
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
     auto shapes = MakeShapeTuple(tensor_type->shape_, span);
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                 {"transpose", false}};
+    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
     auto load_call = op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, span);
 
     std::string tile_name = MakeTileValueName(var->name_hint_);
@@ -2107,7 +2183,7 @@ class IncoreTileOpsVerifier : public IRVisitor {
       // ``AsTensorTypeLike`` also whitelists ``DistributedTensorType``, which the
       // conversion registry above keeps as ``tensor.read`` / ``tensor.write`` so the
       // PTO codegen can lower it as a local-rank ``pto.load_scalar`` / ``pto.store_scalar``.
-      if ((call->op_->name_ == "tensor.read" || call->op_->name_ == "tensor.write") && !call->args_.empty() &&
+      if ((IsOp(call, "tensor.read") || IsOp(call, "tensor.write")) && !call->args_.empty() &&
           AsTensorTypeLike(call->args_[0]->GetType())) {
         return;
       }

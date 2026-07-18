@@ -114,9 +114,9 @@ At the tile layer, `tile.batch_matmul` provides batched semantics for
 `TileType` operands. It accepts rank >= 2 tiles, broadcasts the leading batch
 dimensions, and keeps the same operand-only interface style as `tile.matmul`.
 If batch operands need transpose semantics, that can be expressed either with
-an explicit `tile.transpose(...)` on the inputs or by feeding a tile produced
-by `tile.load(..., transpose=True)`. During later lowering to 2D
-`tile.matmul`, both forms are normalized to the same operand-transpose
+an explicit `tile.transpose(...)` on the inputs or by a zero-copy
+`tile.transpose_view(...)` over a natural `tile.load`. During later lowering to
+2D `tile.matmul`, both forms are normalized to the same operand-transpose
 semantics.
 
 `tile.batch_matmul_acc(acc, lhs, rhs)` is the accumulating counterpart for
@@ -230,7 +230,7 @@ UINT32 + INT32 → INT32 (signed precedence)
 **Location**: `src/ir/op/tensor_ops/`
 **Python API**: `from pypto.ir.op import tensor`
 
-**Operations:** `tensor.add/sub/mul/div` (element-wise with full N-D broadcasting), `tensor.maximum/minimum` (element-wise max/min; rhs may be tensor or scalar — `ConvertTensorToTileOps` dispatches to `tile.maximum/minimum` or `tile.maximums/minimums` based on the rhs operand type), `tensor.set_validshape` (internal, update valid-shape metadata without data movement — compiler-generated only), `tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2` (sorting; tensor-level counterparts of `tile.sort32` / `tile.mrgsort` — converted to tile ops by `ConvertTensorToTileOps`), `tensor.gather` (per-dim indexing; MVP supports rank-2 inputs with `dim=-1` and lowers to a per-row `tile.gather` loop via `ConvertTensorToTileOps`), `tensor.gather_mask` (mask-pattern gather; tensor-level counterpart of `tile.gather_mask`, with optional same-bit-width `output_dtype`), `tensor.scatter` (column scatter; the column-wise inverse of `tensor.gather`, MVP supports rank-2 inputs with `dim=-1` — `out[b, index[b, k]] = src[b, k]`, `index` same shape as `src` — and lowers to `tile.scatter` via `ConvertTensorToTileOps`), `tensor.scatter_mask` (mask-pattern row-scatter; tensor-level counterpart of `tile.scatter_mask`, expands a compact `input` tensor into the mask-marked columns of `dst`; A3 / CPU-sim style backends only — A5 rejects this form), `tensor.ci` / `tensor.arange` (contiguous integer sequence generation; lowers to `tile.ci`; also exposed at top level as `pl.arange`)
+**Operations:** `tensor.add/sub/mul/div` (element-wise with full N-D broadcasting), `tensor.maximum/minimum` (element-wise max/min; rhs may be tensor or scalar — `ConvertTensorToTileOps` dispatches to `tile.maximum/minimum` or `tile.maximums/minimums` based on the rhs operand type), `tensor.set_validshape` (internal, update valid-shape metadata without data movement — compiler-generated only), `tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2` (sorting; tensor-level counterparts of `tile.sort32` / `tile.mrgsort` — converted to tile ops by `ConvertTensorToTileOps`), `tensor.gather` (per-dim indexing; MVP supports rank-2 inputs with `dim=-1` and lowers to a per-row `tile.gather` loop via `ConvertTensorToTileOps`), `tensor.gather_mask` (mask-pattern gather; tensor-level counterpart of `tile.gather_mask`, with optional same-bit-width `output_dtype` — see [Mask patterns](#mask-patterns)), `tensor.scatter` (column scatter; the column-wise inverse of `tensor.gather`, MVP supports rank-2 inputs with `dim=-1` — `out[b, index[b, k]] = src[b, k]`, `index` same shape as `src` — and lowers to `tile.scatter` via `ConvertTensorToTileOps`), `tensor.scatter_mask` (mask-pattern row-scatter; tensor-level counterpart of `tile.scatter_mask`, expands a compact `input` tensor into the mask-marked columns of `dst` — see [Mask patterns](#mask-patterns)), `tensor.ci` / `tensor.arange` (contiguous integer sequence generation; lowers to `tile.ci`; also exposed at top level as `pl.arange`)
 
 **Example:**
 
@@ -273,9 +273,25 @@ with ib.function("tensor_example") as f:
 | - | `tile.ci` | Generate contiguous integer sequence (start + k / start - k); dtype ∈ {INT16, INT32}; innermost dim != 1 |
 | **Reduction** | `tile.sum` | Reduction along axis (axis, keepdim) |
 | **Scatter** | `tile.scatter` | Row-scatter `src` into `dst` at per-row indices (`pto.tscatter` index form; DPS — `dst` is in/out, the result aliases `dst`). `src`/`dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}; `indexes` dtype ∈ {I16, I32}; element-size matching rule: 4-byte dst ↔ INT32, 2-byte dst ↔ INT16, 1-byte dst ↔ INT16. |
-| - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (`pto.tscatter` mask form; DPS). Mask pattern selects positions: P0101 (1) / P1010 (2) — stride 2; P0001 (3) / P0010 (4) / P0100 (5) / P1000 (6) — stride 4; P1111 (7) — no expansion. Targeted at A3 / CPU-sim style backends — A5 rejects this form. |
+| - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (DPS — `dst` is in/out). A PyPTO codegen form lowered to a `pto.tscatter` mask emission — **not** a distinct pto-isa instruction (unlike `tile.gather_mask`). See [Mask patterns](#mask-patterns). |
 
 **Data Flow:** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
+
+### Mask patterns
+
+`*.gather_mask` / `*.scatter_mask` use a compile-time `MaskPattern` (`pl.tile.MaskPattern`, integer values 1–7, matching the hardware `VREDUCEv2` pattern modes) to mark a per-row subset of columns (names read **right-to-left**, rightmost bit = column 0). The same mark set drives the two ops in opposite directions. **`gather_mask`** *selects & compacts*: it reads the marked columns of a wide input into the leading columns of a narrower output (`out_cols = cols / stride`); this is a real pto-isa instruction (`pto.tgather` mask form), supported on A2/A3 **and A5**. **`scatter_mask`** *places & expands*: it writes a compact input into the marked columns of a wider `dst` (`dst_cols = cols * stride`), leaving unmarked columns at their prior `dst` value (DPS); this is a **PyPTO codegen-level form, not a distinct pto-isa instruction** — there is no `pto.tscatter` mask instruction (unlike gather) — and PyPTO emits it for A2/A3 / CPU-sim style lowering paths. E.g. for `[a0 a1 a2 a3 a4 a5 a6 a7]`: gather `P0101 → [a0 a2 a4 a6]`; scatter of `[s0 s1 s2 s3]` `P0101 → [s0 · s1 · s2 · s3 ·]` (`·` = preserved `dst`).
+
+| Pattern | int | Marks column `c` when | Marked columns | Stride |
+| ------- | --- | --------------------- | -------------- | ------ |
+| `P0101` | 1 | `c % 2 == 0` | 0, 2, 4, … | 2 |
+| `P1010` | 2 | `c % 2 == 1` | 1, 3, 5, … | 2 |
+| `P0001` | 3 | `c % 4 == 0` | 0, 4, 8, … | 4 |
+| `P0010` | 4 | `c % 4 == 1` | 1, 5, 9, … | 4 |
+| `P0100` | 5 | `c % 4 == 2` | 2, 6, 10, … | 4 |
+| `P1000` | 6 | `c % 4 == 3` | 3, 7, 11, … | 4 |
+| `P1111` | 7 | always | all | 1 |
+
+The last dim must be divisible by the stride. `gather_mask` also accepts an optional same-bit-width `output_dtype` (bit-reinterpret, not a value cast). Reference: gather selection is `MaskSelect` in `pto-isa` `include/pto/cpu/TGather.hpp`; pypto type deduction in `src/ir/op/tile_ops/gather.cpp` (gather) / `src/ir/op/tile_ops/scatter.cpp` (scatter).
 
 ### Example Usage
 
@@ -311,10 +327,21 @@ with ib.function("tile_computation") as f:
 | `system.bar_all` | Global barrier | None |
 | `system.bar_v` | Vector barrier | None |
 | `system.bar_m` | Matrix barrier | None |
+| `system.syncall` | Cross-core all-participant barrier (`pto::SYNCALL`). `mode="hard"` (FFTS, no operands) or `mode="soft"` (GM-polling, operands) | `core_type` (`"aiv_only"` \| `"aic_only"` \| `"mix"`), `mode` (`"hard"` \| `"soft"`) |
 | `system.sync_src` | Set sync flag | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | Wait sync flag | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.task_invalid` | Sentinel `PTO2TaskId::invalid()` — "no producer" seed for a TaskId carry | None |
 | `system.task_is_valid` | Test whether a `TASK_ID` value is a valid (non-sentinel) handle | None; sole positional arg is the TaskId Var |
+
+`system.syncall` has two modes. The **hard** form (`mode="hard"`, default) emits an FFTS barrier that waits for **all** physical cores of the selected `core_type`; the kernel must be launched at full occupancy (one block per physical core), or the barrier deadlocks (AICore error 507018). The **soft** form (`mode="soft"`) polls a shared GM workspace and so works at **partial** occupancy. `gm_workspace` is a shared, zero-initialized GM `INT32` tensor with `used_cores * 8` slots (pass it as a kernel parameter so all blocks share one buffer); the scratch tile(s) are compiler-synthesized local staging buffers; `used_cores` is the participant count. Soft mode is supported for every `core_type`, with operands that vary by participant set:
+
+- `aiv_only`: `[gm_workspace, ub_scratch, used_cores]` — one UB (Vec) staging tile.
+- `aic_only`: `[gm_workspace, l1_scratch, used_cores]` — one flat L1 (Mat, `slayout=none_box`) staging tile.
+- `mix`: `[gm_workspace, ub_scratch, l1_scratch, used_cores]` — both a UB and a flat L1 tile. The barrier rendezvouses AIC + AIV cores, so `used_cores` is the *total* participant count (AIC blocks + AIV subblocks). The op is duplicated onto both the cube and vector lanes; each lane uses its own tile (the other is dead), matching pto-isa's soft-mix lowering.
+
+The flat L1 staging tile is created via `pl.tile.create(..., target_memory=pl.Mem.Mat, flat_layout=True)`, which keeps the contiguous `slayout=none_box` layout (a normal boxed NZ Mat tile would mis-place the 8-int32 counter slots).
+
+The unified `mode=` keyword API (`mode="hard"` / `mode="soft"`) is the **DSL** surface (`pl.system.syncall`). The Python IR helpers under `pypto.ir.op.system` are split instead: `syncall(core_type=...)` builds the hard form and `syncall_soft(core_type, args)` builds the soft form.
 
 `system.task_invalid` returns [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype). It is the lowering target of the Python literal `None` when `None` appears in a TaskId position (a `deps=[None]` entry or a TaskId loop iter_arg seed) inside `with pl.manual_scope():` regions. There is no `system.task_id_of` op — producer task ids are obtained from the second tuple element returned by the `pl.submit(...)` parser construct, not from a builtin. Source: `src/ir/op/sync_ops/task.cpp`.
 

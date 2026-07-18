@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 
 #include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
@@ -42,8 +43,7 @@ std::optional<MemorySpace> GetFirstTileArgMemory(const CallPtr& call) {
 CVDirection ClassifyMoveDirection(const CallPtr& call) {
   if (!call || !call->op_) return CVDirection::NONE;
 
-  auto op = std::dynamic_pointer_cast<const Op>(call->op_);
-  if (!op || op->name_ != "tile.move") return CVDirection::NONE;
+  if (!IsOp(call, "tile.move")) return CVDirection::NONE;
 
   auto src_memory = GetFirstTileArgMemory(call);
   if (!src_memory.has_value()) return CVDirection::NONE;
@@ -86,10 +86,46 @@ CoreAffinity ClassifyCallAffinity(const CallPtr& call) {
   // the src memory. The per-stmt "is this a boundary" decision lives in
   // boundary_moves; MIXED here is just the affinity label so CombineAffinity
   // rolls up correctly through compound stmts.
-  if (op->name_ == "tile.move") {
+  if (IsOp(op, "tile.move")) {
     if (ClassifyMoveDirection(call) != CVDirection::NONE) return CoreAffinity::MIXED;
     auto ms = GetFirstTileArgMemory(call);
     return (ms && IsCubeMemorySpace(*ms)) ? CoreAffinity::CUBE : CoreAffinity::VECTOR;
+  }
+
+  // 2a. system.syncall is dynamically classified by its `core_type` (for both
+  // the hard and soft forms): a "mix" barrier rendezvouses both cube and vector
+  // cores, so it is SHARED (duplicated onto both lanes by ExpandMixedKernel);
+  // "aic_only" runs on cube, "aiv_only" on vector. Without this, the soft form's
+  // first tile arg (a Vec UB scratch) would mis-classify a mix barrier as VECTOR
+  // via the first-tile-input rule below and drop it from the AIC lane; the hard
+  // form (no operands) would otherwise fall through to SHARED for every
+  // core_type. Classifying by core_type keeps aiv_only/aic_only on their own
+  // lane in a mixed kernel.
+  if (IsOp(op, "system.syncall")) {
+    std::string core_type = "mix";
+    for (const auto& [key, value] : call->kwargs_) {
+      if (key == "core_type") {
+        core_type = AnyCast<std::string>(value, "core_type");
+        break;
+      }
+    }
+    if (core_type == "aic_only") return CoreAffinity::CUBE;
+    if (core_type == "aiv_only") return CoreAffinity::VECTOR;
+    return CoreAffinity::SHARED;  // mix
+  }
+
+  // 2b. Explicit split-reshape ops are cross-C/V boundaries (the data crosses
+  // the cube/vector divide as a tpush on the producer plus a tpop on the
+  // consumer), so they roll up as MIXED exactly like a boundary tile.move.
+  // ExpandMixedKernel's boundary arm folds them into tpush/tpop with the
+  // op-driven fractal/post-move rules. aiv_shard = C->V, aic_gather = V->C.
+  // The author-facing tensor.aiv_shard / tensor.aic_gather (pl.aiv_shard(tensor)
+  // inside a pl.split_aiv region) are still tensor.* in the OutlineIncoreScopes
+  // .. ConvertTensorToTileOps window, so recognize them here too — they mark the
+  // same C/V boundary and must roll up as MIXED for cube/vector outlining.
+  if (IsOp(op, "tile.aiv_shard") || IsOp(op, "tile.aic_gather") || IsOp(op, "tensor.aiv_shard") ||
+      IsOp(op, "tensor.aic_gather")) {
+    return CoreAffinity::MIXED;
   }
 
   // 3. Output memory — set_output_memory(...) / set_output_memory_from_kwarg(...).

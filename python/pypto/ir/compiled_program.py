@@ -38,14 +38,15 @@ from pypto.pypto_core.ir import (
     ScalarType,
     ShapedType,
 )
-from pypto.runtime.device_tensor import DeviceTensor
+from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
 # Type alias for arguments accepted by CompiledProgram.__call__().
-# Tensor params accept ``torch.Tensor`` (host) or :class:`DeviceTensor`
-# (worker-resident — skips H2D/D2H, see ``pypto.runtime.DeviceTensor``).
+# Tensor params accept ``torch.Tensor`` (host), :class:`DeviceTensor`
+# (worker-resident — skips H2D/D2H, see ``pypto.runtime.DeviceTensor``), or, for
+# distributed programs, a :class:`StackedDeviceTensor` (per-card resident shards).
 # Scalar params accept Python primitives or ctypes scalars (which are
 # coerced to the correct ctypes type internally).
-CallArg = torch.Tensor | DeviceTensor | int | float | bool | ctypes._SimpleCData
+CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData
 
 # IR DataType -> torch.dtype mapping.
 # Keyed by string because nanobind DataType instances are not singletons,
@@ -249,6 +250,38 @@ def _validate_device_tensor(arg: DeviceTensor, info: _ParamInfo) -> None:
         )
 
 
+def _validate_stacked_tensor(arg: StackedDeviceTensor, info: _ParamInfo) -> None:
+    """Check a ``StackedDeviceTensor`` arg against IR parameter metadata.
+
+    The stacked tensor stands in for a ``[B, *tail]`` parameter the orchestrator
+    slices along its leading dimension, so its ``full_shape`` is validated the
+    same way as a :class:`DeviceTensor`'s shape: rank and every static dim must
+    agree; dynamic dims (``-1``) are skipped. Per-shard shapes and dtype
+    consistency are already enforced by ``StackedDeviceTensor.__init__``.
+
+    Raises:
+        TypeError: when ``full_shape`` rank/dims or dtype disagree with ``info``.
+    """
+    if info.shape is not None:
+        if len(info.shape) != len(arg.full_shape):
+            raise TypeError(
+                f"Parameter {info.name!r} expects rank {len(info.shape)} "
+                f"(shape {tuple(info.shape)}); got StackedDeviceTensor full_shape {arg.full_shape}"
+            )
+        for expected_dim, actual_dim in zip(info.shape, arg.full_shape, strict=True):
+            if expected_dim >= 0 and expected_dim != actual_dim:
+                raise TypeError(
+                    f"Parameter {info.name!r} expects shape {tuple(info.shape)}; "
+                    f"got StackedDeviceTensor full_shape {arg.full_shape}"
+                )
+    expected_dtype = _to_torch_dtype(info.dtype)
+    if expected_dtype is not None and arg.dtype != expected_dtype:
+        raise TypeError(
+            f"Parameter {info.name!r} expects dtype {expected_dtype}; "
+            f"got StackedDeviceTensor dtype {arg.dtype}"
+        )
+
+
 def _build_full_args(
     input_args: tuple["CallArg", ...],
     param_infos: list[_ParamInfo],
@@ -356,7 +389,7 @@ def _invoke_compiled(
     args: tuple["CallArg", ...],
     config: Any,
     caller_name: str,
-) -> "tuple[torch.Tensor | tuple[torch.Tensor, ...] | None, Any]":
+) -> "torch.Tensor | tuple[torch.Tensor, ...] | None":
     """Shared dispatch: coerce args, call the runtime, pack outputs.
 
     Used by both :meth:`CompiledProgram.__call__` (single-orch case) and
@@ -364,13 +397,9 @@ def _invoke_compiled(
     differ only in *where* the artifacts live and *whose* metadata they
     apply — everything from argument coercion onward is identical.
 
-    Returns a ``(outputs, timing)`` pair: *outputs* is ``None`` for in-place
-    calls or the packed return tensors otherwise; *timing* is the simpler
-    ``RunTiming`` from :func:`pypto.runtime.execute_compiled` (``host_wall_us``
-    / ``device_wall_us``) — always a ``RunTiming``, never ``None``, since the
-    dispatch always produces one. Callers surface *timing* via
-    ``last_run_timing`` and return *outputs* unchanged so the public call
-    signature stays backward compatible.
+    Returns *outputs*: ``None`` for in-place calls or the packed return
+    tensors otherwise. Per-run timing is no longer returned — read it from
+    the runtime's ``[STRACE]`` log markers (simpler PR #1177).
     """
     coerced, return_style = _coerce_args(
         args, param_infos, output_indices, return_types, caller_name=caller_name
@@ -381,7 +410,7 @@ def _invoke_compiled(
     if config is None:
         config = RunConfig()
 
-    timing = execute_compiled(
+    execute_compiled(
         output_dir,
         coerced,
         platform=platform,
@@ -393,11 +422,10 @@ def _invoke_compiled(
     )
 
     if not return_style:
-        return None, timing
+        return None
     outputs = [coerced[i] for i in output_indices]
     assert all(isinstance(o, torch.Tensor) for o in outputs)
-    packed = outputs[0] if len(outputs) == 1 else tuple(outputs)
-    return packed, timing  # type: ignore[return-value]
+    return outputs[0] if len(outputs) == 1 else tuple(outputs)  # type: ignore[return-value]
 
 
 def _default_platform(backend_type: BackendType) -> str:
@@ -462,11 +490,6 @@ class CompiledProgram:
         self._chip_callable: Any = None
         self._runtime_name: str | None = None
         self._runtime_config: dict[str, Any] | None = None
-
-        # RunTiming from the most recent __call__ (host_wall_us /
-        # device_wall_us), or None before the first on-device run. Surfaced as
-        # a side channel so the call return value stays outputs/None.
-        self.last_run_timing: Any = None
 
         # Multi-orch (L2-only) programs emit each Orchestration as a
         # self-contained sub-build under ``next_levels/<name>/``. Detect
@@ -648,7 +671,7 @@ class CompiledProgram:
 
     @property
     def runtime_name(self) -> str:
-        """Runtime ABI name baked into ``kernel_config.py`` (e.g. ``"host_build_graph"``)."""
+        """Runtime ABI name baked into ``kernel_config.py`` (e.g. ``"tensormap_and_ringbuffer"``)."""
         self._ensure_runtime_loaded()
         assert self._runtime_name is not None
         return self._runtime_name
@@ -839,9 +862,9 @@ class CompiledProgram:
 
         Returns:
             ``None`` for in-place calls, a single ``torch.Tensor`` or a
-            ``tuple`` for return-style calls. The on-device timing for this
-            call is stored on :attr:`last_run_timing` (a simpler ``RunTiming``
-            with ``host_wall_us`` / ``device_wall_us``).
+            ``tuple`` for return-style calls. Per-run on-device timing is no
+            longer surfaced as an attribute — read it from the runtime's
+            ``[STRACE]`` log markers (simpler PR #1177).
 
         Raises:
             TypeError: If the program has multiple L2 orchestrations (use
@@ -855,7 +878,7 @@ class CompiledProgram:
                 f"compiled['<name>'](...) or compiled.<name>(...)."
             )
         param_infos, output_indices, return_types = self._get_metadata()
-        outputs, self.last_run_timing = _invoke_compiled(
+        return _invoke_compiled(
             output_dir=self._output_dir,
             platform=self._platform,
             param_infos=param_infos,
@@ -865,7 +888,6 @@ class CompiledProgram:
             config=config,
             caller_name="CompiledProgram",
         )
-        return outputs
 
 
 class _SubChipCallable:
@@ -888,8 +910,6 @@ class _SubChipCallable:
         self._chip_callable: Any = None
         self._runtime_name: str | None = None
         self._runtime_config: dict[str, Any] | None = None
-        # RunTiming from the most recent __call__ — see CompiledProgram.
-        self.last_run_timing: Any = None
 
     @property
     def name(self) -> str:
@@ -995,7 +1015,7 @@ class _SubChipCallable:
         *args: CallArg,
         config: Any = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
-        outputs, self.last_run_timing = _invoke_compiled(
+        return _invoke_compiled(
             output_dir=self._output_dir,
             platform=self._platform,
             param_infos=self._param_infos,
@@ -1005,7 +1025,6 @@ class _SubChipCallable:
             config=config,
             caller_name=f"orchestration {self._name!r}",
         )
-        return outputs
 
 
 # Public re-exports for callers (e.g. ir.compile()) that need orchestration

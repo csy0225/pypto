@@ -92,10 +92,10 @@ enum class ObjectKind {
   WhileStmt,
   // Scope statement kinds (split from former ScopeStmt — see issue #1047)
   InCoreScopeStmt,
-  AutoInCoreScopeStmt,
   ClusterScopeStmt,
   HierarchyScopeStmt,
   SpmdScopeStmt,
+  SplitAivScopeStmt,
   RuntimeScopeStmt,
   CommDomainScopeStmt,
   SeqStmts,

@@ -84,7 +84,9 @@ class TestBatchMatmulTile(PTOTestCase):
 class TestBatchMatmulBTranspose(PTOTestCase):
     """Tile-level batch matmul with B transposed: C = A @ B^T.
 
-    B is stored as [batch, N, K] and transposed inline before batch_matmul.
+    B is loaded natural ([batch, N, K]) and reinterpreted by a zero-copy
+    ``pl.tile.transpose_view`` before ``pl.batch_matmul``; FlattenTileNdTo2D
+    per-batch column-slices the whole view (issue #1776 / ND extension).
     """
 
     __test__ = False
@@ -119,10 +121,9 @@ class TestBatchMatmulBTranspose(PTOTestCase):
                 c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
             ) -> pl.Tensor[[B, M, N], pl.FP32]:
                 tile_a = pl.load(a, offsets=[0, 0, 0], shapes=[B, M, K], target_memory=pl.MemorySpace.Mat)
-                tile_b = pl.load(
-                    b, offsets=[0, 0, 0], shapes=[B, N, K], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
-                tile_c = pl.batch_matmul(tile_a, tile_b)
+                tile_b = pl.load(b, offsets=[0, 0, 0], shapes=[B, N, K], target_memory=pl.MemorySpace.Mat)
+                tile_b_t = pl.tile.transpose_view(tile_b)
+                tile_c = pl.batch_matmul(tile_a, tile_b_t)
                 out_c = pl.store(tile_c, offsets=[0, 0, 0], output_tensor=c)
                 return out_c
 
@@ -146,7 +147,9 @@ class TestBatchMatmulBTranspose(PTOTestCase):
 class TestBatchMatmulATranspose(PTOTestCase):
     """Tile-level batch matmul with A transposed: C = A^T @ B.
 
-    A is stored as [batch, K, M] and transposed inline before batch_matmul.
+    A is loaded natural ([batch, K, M]) and reinterpreted by a zero-copy
+    ``pl.tile.transpose_view`` before ``pl.batch_matmul``; FlattenTileNdTo2D
+    per-batch column-slices the whole view (issue #1776 / ND extension).
     """
 
     __test__ = False
@@ -180,11 +183,10 @@ class TestBatchMatmulATranspose(PTOTestCase):
                 b: pl.Tensor[[B, K, N], pl.FP32],
                 c: pl.Out[pl.Tensor[[B, M, N], pl.FP32]],
             ) -> pl.Tensor[[B, M, N], pl.FP32]:
-                tile_a = pl.load(
-                    a, offsets=[0, 0, 0], shapes=[B, K, M], target_memory=pl.MemorySpace.Mat, transpose=True
-                )
+                tile_a = pl.load(a, offsets=[0, 0, 0], shapes=[B, K, M], target_memory=pl.MemorySpace.Mat)
+                tile_a_t = pl.tile.transpose_view(tile_a)
                 tile_b = pl.load(b, offsets=[0, 0, 0], shapes=[B, K, N], target_memory=pl.MemorySpace.Mat)
-                tile_c = pl.batch_matmul(tile_a, tile_b)
+                tile_c = pl.batch_matmul(tile_a_t, tile_b)
                 out_c = pl.store(tile_c, offsets=[0, 0, 0], output_tensor=c)
                 return out_c
 

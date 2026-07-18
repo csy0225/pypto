@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <vector>
 
@@ -39,83 +40,120 @@ constexpr int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
 // Candidate scoring
 // ===========================================================================
 
+// One enumerated design-space combination (the axes beyond the tile shape).
+// dbA / dbB are derived from `stat`; dbc is the L0C double-buffer choice.
+struct Regime {
+  Stationarity stat = Stationarity::kOutputStationary;
+  bool dbc = false;  // true => dbC = 2 (drain hidden)
+};
+
+// Per-operand double-buffer depth derived from stationarity: the stationary
+// operand is single-buffered (false), the moving operand(s) double-buffered.
+struct OperandDB {
+  bool a = true;
+  bool b = true;
+};
+OperandDB DeriveOperandDB(Stationarity stat) {
+  switch (stat) {
+    case Stationarity::kAStationary:
+      return {/*a=*/false, /*b=*/true};  // A pinned
+    case Stationarity::kBStationary:
+      return {/*a=*/true, /*b=*/false};  // B pinned
+    case Stationarity::kOutputStationary:
+      break;
+  }
+  return {/*a=*/true, /*b=*/true};  // both stream
+}
+
 struct Candidate {
   int m = 0;
   int n = 0;
   int k = 0;
   int64_t traffic = 0;
+  int64_t cost_cycles = 0;
   int64_t padded_compute = 0;
+  double load_cycles = 0;  // C_load — a wall-tie-break (hidden under max() when MAD-bound)
+  Regime regime;           // the (stationarity, dbC) this tile was scored under
 };
 
-// Largest legal aligned k for a given (m, n). Returns 0 if no legal k exists.
-// Callers must pass m, n >= min_m, min_n (positive).
+// All legal k values for a fixed (m, n), ascending. k is a REAL search axis:
+// the MAD term ceil(K/k)*ceil(k/kt) is NOT monotonic in k when kt != align_k
+// (e.g. bytes_a=1 -> kt=32 > align_k=16), so the largest legal k is not always
+// wall-optimal. The caller must score every returned k, not just the largest.
 //
-// When `allow_padding` is false, the returned k must additionally divide K:
-// the downstream `AutoTileMatmulL0` pass has no K-boundary handling yet (see
-// `auto_tile_matmul_l0_pass.cpp` PH-AT-007) and will skip the matmul if
-// `K % k != 0`, leaving the caller-supplied Mat tile to overflow L0.  Walking
-// k_max down to the largest aligned divisor of K avoids that silent skip and
-// keeps the chooser-pass contract intact.
-int LargestLegalK(int m, int n, const L0TileConfig& cfg, int64_t A0, int64_t B0) {
+// Legality mirrors the three regimes:
+//   * legacy (no relaxation): aligned k that DIVIDE K -- the pass has no
+//     K-boundary handling, so a non-divisor k would be skipped (PH-AT-007).
+//   * allow_k_boundary: any aligned k <= capacity, PLUS k == K when the full K
+//     reduction fits one L0 block (a single block; K is 16-aligned, so k == K is
+//     too -- ptoas requires 16-aligned tile cols).
+//   * allow_padding: aligned k bounded by the aligned-up problem size.
+std::vector<int> EnumerateLegalKs(int m, int n, const L0TileConfig& cfg, int64_t A0, int64_t B0) {
+  std::vector<int> ks;
   const int64_t k_from_a = A0 / m;
   const int64_t k_from_b = B0 / n;
-  // Padded callers want k bounded by the *aligned-up* problem size — without
-  // AlignUp, K=17 with align_k=16 would cap at max(17, 16)=17 then align-down
-  // to 16, so the natural padded k=32 would never be considered.
-  const int64_t k_from_problem =
+  const int64_t cap = std::min(k_from_a, k_from_b);  // max k that fits L0a and L0b
+  const int64_t k_problem =
       cfg.allow_padding ? std::max<int64_t>(AlignUp(static_cast<int64_t>(cfg.K), cfg.align_k), cfg.min_k)
-                        : cfg.K;
-  int64_t k_max = std::min({k_from_a, k_from_b, static_cast<int64_t>(k_from_problem)});
-  k_max = AlignDown(k_max, cfg.align_k);
-  if (k_max < cfg.min_k) return 0;
-  if (!cfg.allow_padding) {
-    // O(K / align_k) per call; constant in IR size.
-    while (k_max >= cfg.min_k && cfg.K % k_max != 0) {
-      k_max -= cfg.align_k;
-    }
-    if (k_max < cfg.min_k) return 0;
+                        : static_cast<int64_t>(cfg.K);
+  const int64_t k_hi = AlignDown(std::min(cap, k_problem), cfg.align_k);
+  // allow_k_boundary admits a NON-DIVISOR k (the K-peel) ONLY when K is itself
+  // align_k-aligned: then every full block AND the peeled tail (K - floor(K/k)*k)
+  // are 16-aligned, which ptoas requires for tile cols. A non-16-aligned K has no
+  // valid k-tiling (a non-fractal tail or whole-K block), so it yields no candidate
+  // here and the pass skips the matmul (PH-AT-007) rather than emit invalid extracts.
+  const bool peel_ok = cfg.allow_k_boundary && (cfg.K % cfg.align_k == 0);
+  for (int64_t k = cfg.min_k; k <= k_hi; k += cfg.align_k) {
+    if (!cfg.allow_padding && !peel_ok && cfg.K % k != 0) continue;  // divisors only
+    ks.push_back(static_cast<int>(k));
   }
-  return static_cast<int>(k_max);
+  return ks;
 }
 
-// Largest legal aligned n for a given m. n is bounded by C0 / m (since m*n <=
-// C0) and by allowing at least min_k to fit in B0 (so n <= B0 / min_k).
-int LargestLegalN(int m, const L0TileConfig& cfg, int64_t B0, int64_t C0) {
-  const int64_t n_from_c = C0 / m;
-  const int64_t n_from_b = B0 / cfg.min_k;
-  const int64_t n_from_problem = cfg.allow_padding ? std::max(cfg.N, cfg.min_n) : cfg.N;
-  int64_t n_max = std::min({n_from_c, n_from_b, static_cast<int64_t>(n_from_problem)});
-  n_max = AlignDown(n_max, cfg.align_n);
-  if (n_max < cfg.min_n) return 0;
-  return static_cast<int>(n_max);
-}
+// Which operand a full-K output-stationary tile hoists (defined with LoadCycles
+// below; forward-declared so EstimateTraffic mirrors the same min-hoist route).
+bool OSHoldsHoldA(int m, int n, const L0TileConfig& cfg);
 
-// Largest legal aligned m for a given n (symmetric to LargestLegalN).
-int LargestLegalM(int n, const L0TileConfig& cfg, int64_t A0, int64_t C0) {
-  const int64_t m_from_c = C0 / n;
-  const int64_t m_from_a = A0 / cfg.min_k;
-  const int64_t m_from_problem = cfg.allow_padding ? std::max(cfg.M, cfg.min_m) : cfg.M;
-  int64_t m_max = std::min({m_from_c, m_from_a, static_cast<int64_t>(m_from_problem)});
-  m_max = AlignDown(m_max, cfg.align_m);
-  if (m_max < cfg.min_m) return 0;
-  return static_cast<int>(m_max);
-}
-
-// Cost model from L0_TILING.md §5.
-//
-//   A traffic ≈ bytes_a * M * K * ceil(N / n)
-//   B traffic ≈ bytes_b * K * N * ceil(M / m)
-//   C traffic ≈ gamma_c * bytes_c * M * N
-//
-// gamma_c is 2 when the matmul reads its accumulator (C = beta*C + A@B),
-// else 1.
-int64_t EstimateTraffic(int m, int n, int k, const L0TileConfig& cfg) {
-  (void)k;  // k does not appear in the traffic model under C-stationary scheduling.
+// L1<->L0 operand + drain traffic in BYTES for the chosen tile under its regime.
+// Inspection-only (the chooser ranks by the roofline wall, not this value); the
+// reload counts follow the regime's stationarity, mirroring LoadCycles so the
+// reported traffic is honest for every regime (A/B-stationary AND the full-K
+// output-stationary min-hoist, not just split-K OS):
+//   A traffic ≈ bytes_a * M * K * (ceil(N/n), or 1 when A is held)
+//   B traffic ≈ bytes_b * K * N * (ceil(M/m), or 1 when B is held)
+//   C traffic ≈ gamma_c * bytes_c * M * N   (gamma_c = 2 when the accumulator is read)
+int64_t EstimateTraffic(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
   const int64_t M = cfg.M;
   const int64_t N = cfg.N;
   const int64_t K = cfg.K;
-  const int64_t a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K * CeilDiv(N, n);
-  const int64_t b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N * CeilDiv(M, m);
+  const int64_t ceil_n = CeilDiv(N, n);
+  const int64_t ceil_m = CeilDiv(M, m);
+  int64_t a_traffic = 0;
+  int64_t b_traffic = 0;
+  switch (r.stat) {
+    case Stationarity::kAStationary:
+      a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K;  // A loaded once (k == K)
+      b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N * ceil_m;
+      break;
+    case Stationarity::kBStationary:
+      a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K * ceil_n;
+      b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N;  // B loaded once (k == K)
+      break;
+    case Stationarity::kOutputStationary:
+      // Full-K OS hoists one operand (mirror LoadCycles' min-hoist via OSHoldsHoldA so
+      // this metric matches the wall the tile was scored under); split-K re-streams both.
+      if (static_cast<int64_t>(k) >= K && OSHoldsHoldA(m, n, cfg)) {
+        a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K;           // A held once
+        b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N * ceil_m;  // B streamed
+      } else if (static_cast<int64_t>(k) >= K) {
+        a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K * ceil_n;  // A streamed
+        b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N;           // B held once
+      } else {
+        a_traffic = static_cast<int64_t>(cfg.bytes_a) * M * K * ceil_n;  // split-K: both re-streamed
+        b_traffic = static_cast<int64_t>(cfg.bytes_b) * K * N * ceil_m;
+      }
+      break;
+  }
   const int64_t gamma_c = cfg.c_read ? 2 : 1;
   const int64_t c_traffic = gamma_c * static_cast<int64_t>(cfg.bytes_c) * M * N;
   return a_traffic + b_traffic + c_traffic;
@@ -125,44 +163,220 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
   return CeilDiv(cfg.M, m) * m * CeilDiv(cfg.N, n) * n * CeilDiv(cfg.K, k) * k;
 }
 
-// Lexicographic ordering: lower is better.
-//   (traffic, padded_compute, ceil(K/k), -m*n, -k)
+// Roofline cost model (output-stationary, single L0C -- the algorithm
+// the pass realizes today). See l0_tile_chooser.h and the pto-isa cost-model
+// study (DESIGN_SPACE.md). All costs are in core cycles.
+
+// Cube MAD cost over the full padded grid. Per-TMATMUL cost is
+//   mad_head + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16),
+// with kt = mad_k_fractal_bytes/bytes_a and cpr = bytes_a/2 (1 BF16 / 2 FP32).
+// The K-fractal count is summed over the K-blocks the emit ACTUALLY runs:
+// floor(K/k) full k-wide blocks plus, when k does not divide K (the K-peel), one
+// narrower tail block of width K - floor(K/k)*k scored at ITS width -- not rounded
+// up to k. MAD is the primary ranking key, so charging the peel tail as a full
+// k-block would over-price non-divisor candidates and mis-rank them. For a divisor
+// k this reduces exactly to (K/k)*ceil(k/kt) -- unchanged.
+int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
+  const int64_t kt = std::max<int64_t>(1, cfg.mad_k_fractal_bytes / static_cast<int64_t>(cfg.bytes_a));
+  const int64_t cpr = std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
+  const int64_t num_full = cfg.K / k;                        // full k-wide K-blocks
+  const int64_t k_tail = cfg.K - num_full * k;               // peel tail width (0 if k | K)
+  const int64_t k_blocks = num_full + (k_tail > 0 ? 1 : 0);  // == CeilDiv(K, k)
+  const int64_t k_fractals = num_full * CeilDiv(k, kt) + (k_tail > 0 ? CeilDiv(k_tail, kt) : 0);
+  const int64_t per_mn =
+      k_blocks * cfg.mad_head + cpr * CeilDiv(m, cfg.align_m) * k_fractals * CeilDiv(n, cfg.align_n);
+  return CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n) * per_mn;
+}
+
+// Bandwidth-weighted held-A vs held-B interior load cycles for a full-K OS tile
+// (see LoadCycles below for the two expressions). Returns true when hoisting A
+// (rows outer) is at least as cheap as hoisting B. This is the SINGLE definition
+// of the OS hoist: LoadCycles routes its k==K cost through it, and ChooseL0Tile
+// records the result into L0TileResult::os_holds_a so BuildFullKPipelined emits
+// the SAME hoist the wall was scored under. (Previously the emit re-derived the
+// hoist from raw byte traffic, which disagrees with this cycle-weighted min under
+// the ~200:132 L0A:L0B bandwidth ratio -- latent because the final tile pick was
+// unaffected, but it made estimated_cost_cycles wrong and the emitted loop order
+// diverge from the scored one on asymmetric shapes.) Tie -> hold A (rows outer),
+// matching the Stationarity enum / ascending-aspect order.
+bool OSHoldsHoldA(int m, int n, const L0TileConfig& cfg) {
+  const double M = cfg.M, N = cfg.N, K = cfg.K;
+  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
+  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
+  const double ba = static_cast<double>(cfg.bytes_a);
+  const double bb = static_cast<double>(cfg.bytes_b);
+  const double held_a = (ba * M * K) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;  // hold A, stream B
+  const double held_b = (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N) / cfg.bw_b;  // hold B, stream A
+  return held_a <= held_b;
+}
+
+// L1->L0 load cost (cycles). The MTE1 pipe is shared, so A and B loads serialize;
+// each is weighted by its port bandwidth (the 2:1 L0A/L0B asymmetry). The reload
+// counts depend on the stationarity / reuse route. The full-K emitter
+// (BuildFullKPipelined) ALWAYS hoists one operand to the outer loop -- it is
+// loaded once per outer step and reused across the inner sweep, the other
+// streamed -- so "output-stationary" at k == K is NOT "both re-streamed"; it
+// picks the cheaper hoist. Only the split-K emitter (BuildSplitKGrid, k < K)
+// genuinely re-streams both, because partial sums pin the L0C accumulator and no
+// operand panel stays resident across the K blocks.  (op-sim work-calibrated:
+// the old OS "M*K*ceil_n" charged the hoisted operand as re-extracted per inner
+// tile -- a phantom saving that made A/B-stationary look cheaper than OS.)
+//   held A (k==K) : A once (M*K)      ; B streamed (K*N*ceil_m)
+//   held B (k==K) : A streamed (M*K*ceil_n) ; B once (K*N)
+//   OS, k==K      : min(held-A, held-B) route (the emit hoists the cheaper)
+//   OS, k<K       : both re-streamed (A M*K*ceil_n, B K*N*ceil_m)
+double LoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
+  const double M = cfg.M, N = cfg.N, K = cfg.K;
+  const double ceil_n = static_cast<double>(CeilDiv(cfg.N, n));
+  const double ceil_m = static_cast<double>(CeilDiv(cfg.M, m));
+  const double ba = static_cast<double>(cfg.bytes_a);
+  const double bb = static_cast<double>(cfg.bytes_b);
+  const double held_a = (ba * M * K) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;  // hold A, stream B
+  const double held_b = (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N) / cfg.bw_b;  // hold B, stream A
+  switch (r.stat) {
+    case Stationarity::kAStationary:
+      return held_a;  // A held (requires k == K)
+    case Stationarity::kBStationary:
+      return held_b;  // B held (requires k == K)
+    case Stationarity::kOutputStationary:
+      if (k >= static_cast<int>(K)) {
+        // Route through the shared hoist decision so the scored cost matches the
+        // operand BuildFullKPipelined actually hoists (recorded in os_holds_a).
+        return OSHoldsHoldA(m, n, cfg) ? held_a : held_b;
+      }
+      // split-K: BuildSplitKGrid re-streams both operands across the K blocks.
+      return (ba * M * K * ceil_n) / cfg.bw_a + (bb * K * N * ceil_m) / cfg.bw_b;
+  }
+  return std::min(held_a, held_b);
+}
+
+// L0C drain cost over the full problem. FIXPIPE drains one output tile at a time:
+// each drain pays a fixed issue overhead plus its bytes at the drain bandwidth,
+// and there are ceil(M/m)*ceil(N/n) output tiles. So drain is TILE-DEPENDENT --
+// splitting the OUTPUT (M/N) raises the drain count, while splitting K does NOT
+// (partial sums accumulate in the single L0C, one drain per (m,n) block). This
+// is the term that stops the chooser from over-splitting M/N on shallow-K shapes
+// (op-sim device-validated: per-drain work = drain_fixed_cycles + bytes/bw_drain;
+// omitting it under-priced M/N-split tiles and cost 2-13% on small shallow-K).
+// NOTE: bw_drain is the 32-aligned-N slope; N % 32 != 0 drains slower (a separate
+// fixpipe fractal cliff) -- not modelled, ~ranking-neutral within a problem.
+double DrainCycles(int m, int n, const L0TileConfig& cfg) {
+  const double gamma_c = cfg.c_read ? 2.0 : 1.0;
+  const double num_drains = static_cast<double>(CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n));
+  const double bytes = gamma_c * static_cast<double>(cfg.bytes_c) * m * n;
+  return num_drains * (cfg.drain_fixed_cycles + bytes / cfg.bw_drain);
+}
+
+// Roofline wall in cycles. With a single L0C (drain_hidden=false) the FIXPIPE
+// drain is exposed -- the cube stalls on each tile's store -- so it ADDS to the
+// pipe maximum. With L0C double-buffered (drain_hidden=true) the drain overlaps
+// the next tile's compute, so it JOINS the maximum instead of adding.
+int64_t WallCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
+  const double compute = std::max(LoadCycles(m, n, k, cfg, r), static_cast<double>(MadCycles(m, n, k, cfg)));
+  const double drain = DrainCycles(m, n, cfg);
+  const double wall = r.dbc ? std::max(compute, drain) : compute + drain;
+  // Guard the float->int cast: a non-finite or out-of-exact-range wall would be UB.
+  // Given the validated positive bandwidths and aligned-bounded dims this never fires.
+  INTERNAL_CHECK(std::isfinite(wall) && wall <= 9007199254740992.0)  // 2^53
+      << "Internal error: ChooseL0Tile wall cycles " << wall << " is non-finite or out of range";
+  return static_cast<int64_t>(std::llround(wall));
+}
+
+// Ordering: lower is better. Primary key is the roofline wall (cycles); ties
+// (equal cycles) break by lex (padded_compute, ceil(K/k), C_load, -m*n, -k).
 bool Better(const Candidate& a, const Candidate& b, const L0TileConfig& cfg) {
-  if (a.traffic != b.traffic) return a.traffic < b.traffic;
+  if (a.cost_cycles != b.cost_cycles) return a.cost_cycles < b.cost_cycles;
   if (a.padded_compute != b.padded_compute) return a.padded_compute < b.padded_compute;
   const int64_t a_kblocks = CeilDiv(cfg.K, a.k);
   const int64_t b_kblocks = CeilDiv(cfg.K, b.k);
   if (a_kblocks != b_kblocks) return a_kblocks < b_kblocks;
+  // Among wall-ties (MAD-bound: the load is hidden under max(C_load, C_mad)),
+  // prefer the lower HIDDEN load. The L0A/L0B bandwidth asymmetry (2:1) favours
+  // one aspect, and that aspect wins the moment the real shape leaves the perfect
+  // MAD-bound knee. This disambiguates aspect-swapped (m,n)<->(n,m) tiles that the
+  // symmetric area/k keys below cannot -- otherwise the ascending-m scan would
+  // pick the load-suboptimal small-m aspect.
+  if (a.load_cycles != b.load_cycles) return a.load_cycles < b.load_cycles;
   const int64_t a_area = static_cast<int64_t>(a.m) * a.n;
   const int64_t b_area = static_cast<int64_t>(b.m) * b.n;
   if (a_area != b_area) return a_area > b_area;  // larger area preferred
   return a.k > b.k;                              // larger k preferred
 }
 
-// Try a candidate (m, n) by picking the largest legal k and recording the
-// scored result. No-op if the candidate is illegal.
-void TryCandidate(int m, int n, const L0TileConfig& cfg, int64_t A0, int64_t B0, int64_t C0,
-                  std::vector<Candidate>& out) {
-  if (m < cfg.min_m || n < cfg.min_n) return;
+// Build the scored candidate for an explicit (m, n, k). nullopt if illegal
+// (below min, or the output overflows L0C, or m/n exceed the problem dims
+// without padding). The operand-capacity legality of k is the caller's job
+// (EnumerateLegalKs only returns k that fit L0a/L0b).
+std::optional<Candidate> MakeCandidate(int m, int n, int k, const L0TileConfig& cfg, int64_t C0,
+                                       const Regime& regime) {
+  if (m < cfg.min_m || n < cfg.min_n || k < cfg.min_k) return std::nullopt;
   // Without padding, the chosen tile must not exceed the problem dimensions.
   // Aligned-down boundary tiles (m <= M but M % m != 0) are still permitted —
-  // those are handled by the outer loop, not by chooser-introduced padding.
-  if (!cfg.allow_padding) {
-    if (m > cfg.M || n > cfg.N) return;
-  }
-  m = static_cast<int>(AlignDown(m, cfg.align_m));
-  n = static_cast<int>(AlignDown(n, cfg.align_n));
-  if (m < cfg.min_m || n < cfg.min_n) return;
-  if (static_cast<int64_t>(m) * n > C0) return;
-  const int k = LargestLegalK(m, n, cfg, A0, B0);
-  if (k == 0) return;
+  // the full-K emitter peels the partial boundary into a straight-line tail.
+  if (!cfg.allow_padding && (m > cfg.M || n > cfg.N)) return std::nullopt;
+  if (static_cast<int64_t>(m) * n > C0) return std::nullopt;
   Candidate c;
   c.m = m;
   c.n = n;
   c.k = k;
-  c.traffic = EstimateTraffic(m, n, k, cfg);
+  c.traffic = EstimateTraffic(m, n, k, cfg, regime);
+  c.cost_cycles = WallCycles(m, n, k, cfg, regime);
   c.padded_compute = PaddedComputeVolume(m, n, k, cfg);
-  out.push_back(c);
+  c.load_cycles = LoadCycles(m, n, k, cfg, regime);
+  c.regime = regime;
+  return c;
+}
+
+// Enumerate the legal aligned (m, n, k) grid under capacity C0 for one
+// design-space regime and return its minimum-wall tile. EVERY legal k per
+// (m, n) is scored (k is not monotone in wall -- see EnumerateLegalKs), so this
+// is a true exhaustive search over the regime's tile shapes, not (m, n) with a
+// largest-k shortcut.
+//
+// require_2d: only tiles forming a >= 2x2 output grid are considered -- L0C
+//   double-buffering overlaps drains in the inner pipelined loop, which needs
+//   >= 2 tiles on each axis.
+// require_full_k: only tiles that reduce K in a single pass (k == K) are
+//   considered -- needed for the operand-stationary routes (A/B held across K)
+//   and for the dbC=2 ping-pong (realized only by the full-K pipelined emitter).
+//
+// Complexity: O((C0 / align^2) * (K / align_k)) per matmul -- the (m, n) grid is
+// bounded by m*n <= C0 and the L0A/L0B capacities, k by K/align_k. A hardware
+// constant per op, independent of IR size. The chooser runs once per matmul op
+// (matmul ops are O(N)), so the pass stays linear in the IR.
+std::optional<Candidate> EnumerateBest(const L0TileConfig& cfg, const Regime& regime, int64_t A0, int64_t B0,
+                                       int64_t C0, bool require_2d, bool require_full_k) {
+  const int64_t m_hi = cfg.allow_padding ? AlignUp(static_cast<int64_t>(cfg.M), cfg.align_m) : cfg.M;
+  const int64_t n_hi = cfg.allow_padding ? AlignUp(static_cast<int64_t>(cfg.N), cfg.align_n) : cfg.N;
+  std::optional<Candidate> best;
+  for (int64_t m = cfg.min_m; m <= m_hi; m += cfg.align_m) {
+    // n >= min_n must fit m*n <= C0; once it cannot, no larger m can either.
+    if (m * static_cast<int64_t>(cfg.min_n) > C0) break;
+    if (require_2d && CeilDiv(static_cast<int64_t>(cfg.M), m) < 2) continue;
+    const int64_t n_max = std::min<int64_t>(n_hi, C0 / m);
+    for (int64_t n = cfg.min_n; n <= n_max; n += cfg.align_n) {
+      if (require_2d && CeilDiv(static_cast<int64_t>(cfg.N), n) < 2) continue;
+      for (const int k : EnumerateLegalKs(static_cast<int>(m), static_cast<int>(n), cfg, A0, B0)) {
+        if (require_full_k && k != cfg.K) continue;
+        auto c = MakeCandidate(static_cast<int>(m), static_cast<int>(n), k, cfg, C0, regime);
+        if (c && (!best || Better(*c, *best, cfg))) best = c;
+      }
+    }
+  }
+  return best;
+}
+
+// Operand (L0A/L0B) element budgets for a regime: stationary operand uses the
+// full buffer (depth 1), the moving operand is halved (depth 2).
+int64_t L0aBudget(const L0TileConfig& cfg, const OperandDB& db) {
+  return static_cast<int64_t>(cfg.l0a_bytes) / (static_cast<int64_t>(cfg.bytes_a) * (db.a ? 2 : 1));
+}
+int64_t L0bBudget(const L0TileConfig& cfg, const OperandDB& db) {
+  return static_cast<int64_t>(cfg.l0b_bytes) / (static_cast<int64_t>(cfg.bytes_b) * (db.b ? 2 : 1));
+}
+// L0C element budget per accumulator: halved for dbC=2 (m * n * bytes_c <= L0C / dbC).
+int64_t L0cBudget(const L0TileConfig& cfg, const Regime& r) {
+  return static_cast<int64_t>(cfg.l0c_bytes) / (static_cast<int64_t>(cfg.bytes_c) * (r.dbc ? 2 : 1));
 }
 
 }  // namespace
@@ -179,6 +393,9 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
       << "ChooseL0Tile: minimum tile dimensions must be positive";
   CHECK(cfg.align_m > 0 && cfg.align_n > 0 && cfg.align_k > 0)
       << "ChooseL0Tile: tile alignments must be positive";
+  CHECK(cfg.bw_a > 0.0 && cfg.bw_b > 0.0 && cfg.bw_drain > 0.0)
+      << "ChooseL0Tile: roofline bandwidths must be strictly positive (got bw_a=" << cfg.bw_a
+      << ", bw_b=" << cfg.bw_b << ", bw_drain=" << cfg.bw_drain << ") -- they divide the load/drain cost.";
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a
@@ -193,13 +410,14 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
                               << " is below the cube minimum tile dimension " << cfg.min_k;
   }
 
-  // 2. Effective capacity (in elements). Halve for double-buffered operands.
-  const int64_t A0 = static_cast<int64_t>(cfg.l0a_bytes) /
-                     (static_cast<int64_t>(cfg.bytes_a) * (cfg.double_buffer_a ? 2 : 1));
-  const int64_t B0 = static_cast<int64_t>(cfg.l0b_bytes) /
-                     (static_cast<int64_t>(cfg.bytes_b) * (cfg.double_buffer_b ? 2 : 1));
-  const int64_t C0 = static_cast<int64_t>(cfg.l0c_bytes) /
-                     (static_cast<int64_t>(cfg.bytes_c) * (cfg.double_buffer_c ? 2 : 1));
+  // 2. Baseline budgets for the always-present output-stationary / dbC=1 regime
+  //    (both operands double-buffered, one full L0C accumulator). The capacity
+  //    sanity checks use this most-constrained operand budget.
+  const OperandDB os_db = DeriveOperandDB(Stationarity::kOutputStationary);
+  const int64_t A0 = L0aBudget(cfg, os_db);
+  const int64_t B0 = L0bBudget(cfg, os_db);
+  const Regime base_regime;  // OS, dbC=1
+  const int64_t C0_base = L0cBudget(cfg, base_regime);
 
   CHECK(A0 >= static_cast<int64_t>(cfg.min_m) * cfg.min_k)
       << "ChooseL0Tile: L0a capacity " << A0 << " elements is too small to fit the minimum tile ("
@@ -207,63 +425,56 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   CHECK(B0 >= static_cast<int64_t>(cfg.min_n) * cfg.min_k)
       << "ChooseL0Tile: L0b capacity " << B0 << " elements is too small to fit the minimum tile ("
       << cfg.min_k << " x " << cfg.min_n << ")";
-  CHECK(C0 >= static_cast<int64_t>(cfg.min_m) * cfg.min_n)
-      << "ChooseL0Tile: L0c capacity " << C0 << " elements is too small to fit the minimum tile ("
+  CHECK(C0_base >= static_cast<int64_t>(cfg.min_m) * cfg.min_n)
+      << "ChooseL0Tile: L0c capacity " << C0_base << " elements is too small to fit the minimum tile ("
       << cfg.min_m << " x " << cfg.min_n << ")";
 
-  // 3. Continuous optimum (L0_TILING.md §6).
-  //    Minimises bytes_a * M / n + bytes_b * N / m subject to m*n <= C0.
-  const double m_star_raw =
-      std::sqrt(static_cast<double>(cfg.bytes_b) * static_cast<double>(cfg.N) * static_cast<double>(C0) /
-                (static_cast<double>(cfg.bytes_a) * static_cast<double>(cfg.M)));
+  // 3. Score the design space. The baseline (output-stationary, dbC=1) is today's
+  //    realizable algorithm and is always scored. Within a regime the wall
+  //    objective couples m, n, k non-separably (the BW-weighted load-optimal
+  //    aspect m:n = bytes_b*BW_A : bytes_a*BW_B = 2:1 for BF16 trades against the
+  //    per-tile MAD head and ceil waste), so we score every legal tile.
+  std::optional<Candidate> best =
+      EnumerateBest(cfg, base_regime, A0, B0, C0_base, /*require_2d=*/false, /*require_full_k=*/false);
+  CHECK(best) << "ChooseL0Tile: no legal (m, n, k) tile found for M=" << cfg.M << ", N=" << cfg.N
+              << ", K=" << cfg.K << ". This indicates the hardware capacity is below the configured "
+              << "minimum tile shape; check L0a/L0b/L0c bytes and min_m/min_n/min_k.";
 
-  // 4. Generate candidates. We accumulate then deduplicate before scoring.
-  std::vector<Candidate> candidates;
-
-  // Continuous-optimum candidates around m_star: floor and ceil aligned.
-  const int64_t m_floor =
-      std::max<int64_t>(cfg.min_m, AlignDown(static_cast<int64_t>(m_star_raw), cfg.align_m));
-  const int64_t m_ceil = std::max<int64_t>(cfg.min_m, AlignUp(static_cast<int64_t>(m_star_raw), cfg.align_m));
-  for (int64_t m_cand : {m_floor, m_ceil}) {
-    const int n_legal = LargestLegalN(static_cast<int>(m_cand), cfg, B0, C0);
-    TryCandidate(static_cast<int>(m_cand), n_legal, cfg, A0, B0, C0, candidates);
-  }
-
-  // Symmetric: candidates around n_star = C0 / m_star.
-  const double n_star_raw = (m_star_raw > 0.0) ? static_cast<double>(C0) / m_star_raw : 0.0;
-  const int64_t n_floor =
-      std::max<int64_t>(cfg.min_n, AlignDown(static_cast<int64_t>(n_star_raw), cfg.align_n));
-  const int64_t n_ceil = std::max<int64_t>(cfg.min_n, AlignUp(static_cast<int64_t>(n_star_raw), cfg.align_n));
-  for (int64_t n_cand : {n_floor, n_ceil}) {
-    const int m_legal = LargestLegalM(static_cast<int>(n_cand), cfg, A0, C0);
-    TryCandidate(m_legal, static_cast<int>(n_cand), cfg, A0, B0, C0, candidates);
-  }
-
-  // Full-C candidate: pad/align M and N, take if it fits.
-  {
-    const int m_full =
-        static_cast<int>(std::max<int64_t>(cfg.min_m, AlignUp(static_cast<int64_t>(cfg.M), cfg.align_m)));
-    const int n_full =
-        static_cast<int>(std::max<int64_t>(cfg.min_n, AlignUp(static_cast<int64_t>(cfg.N), cfg.align_n)));
-    if (cfg.allow_padding ||
-        (m_full <= AlignUp(static_cast<int64_t>(cfg.M), cfg.align_m) && m_full <= cfg.M && n_full <= cfg.N)) {
-      TryCandidate(m_full, n_full, cfg, A0, B0, C0, candidates);
+  // Explore the rest of the design space only when the baseline actually tiles
+  // the output. A full [M, N, K] tile that fits one L0C is "already L0-sized":
+  // the caller skips tiling, so no richer algorithm (operand-stationary, dbC=2)
+  // should turn it into a multi-tile grid for a marginal modelled gain the
+  // lowering's loop/extract overhead would erase. Each enumerated regime is gated
+  // by the realizable mask and adopted only on a STRICTLY lower wall (ties keep
+  // the simpler, earlier regime -- the baseline first).
+  const bool is_tiled = !(best->m == cfg.M && best->n == cfg.N && best->k == cfg.K);
+  if (is_tiled) {
+    std::vector<Stationarity> stats = {Stationarity::kOutputStationary};
+    if (cfg.allow_a_stationary) stats.push_back(Stationarity::kAStationary);
+    if (cfg.allow_b_stationary) stats.push_back(Stationarity::kBStationary);
+    for (const Stationarity stat : stats) {
+      const OperandDB db = DeriveOperandDB(stat);
+      const int64_t a0 = L0aBudget(cfg, db);
+      const int64_t b0 = L0bBudget(cfg, db);
+      const bool is_os = stat == Stationarity::kOutputStationary;
+      for (int dbc = 0; dbc <= (cfg.allow_double_buffer_c ? 1 : 0); ++dbc) {
+        const Regime r{stat, /*dbc=*/dbc == 1};
+        if (is_os && !r.dbc) continue;  // baseline, already scored
+        const int64_t c0 = L0cBudget(cfg, r);
+        if (c0 < static_cast<int64_t>(cfg.min_m) * cfg.min_n) continue;  // can't fit min tile
+        // Operand-stationary pins an operand across K (k == K); dbC=2 needs the
+        // full-K emitter (k == K) and a >= 2x2 grid for the ping-pong.
+        const bool require_full_k = !is_os || r.dbc;
+        const bool require_2d = r.dbc;
+        auto cand = EnumerateBest(cfg, r, a0, b0, c0, require_2d, require_full_k);
+        // Cross-regime tie policy: a non-baseline regime is adopted only on a
+        // STRICTLY lower wall, so an equal-wall A/B-stationary or dbC=2 candidate
+        // never displaces the already-scored output-stationary baseline. This is
+        // a deterministic "prefer the simpler lowering" rule, not enumeration
+        // order. (Within a regime, Better() applies the full lexicographic key.)
+        if (cand && cand->cost_cycles < best->cost_cycles) best = cand;
+      }
     }
-  }
-
-  // Defensive bottom-floor candidate at the minimum tile shape, in case the
-  // continuous optimum and full-C all fall outside the legal region.
-  TryCandidate(cfg.min_m, cfg.min_n, cfg, A0, B0, C0, candidates);
-
-  CHECK(!candidates.empty()) << "ChooseL0Tile: no legal (m, n, k) tile found for M=" << cfg.M
-                             << ", N=" << cfg.N << ", K=" << cfg.K
-                             << ". This indicates the hardware capacity is below the configured "
-                             << "minimum tile shape; check L0a/L0b/L0c bytes and min_m/min_n/min_k.";
-
-  // 5. Pick best by lex (traffic, padded_compute, k_blocks, -area, -k).
-  const Candidate* best = &candidates.front();
-  for (const auto& c : candidates) {
-    if (Better(c, *best, cfg)) best = &c;
   }
 
   L0TileResult result;
@@ -271,7 +482,15 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   result.n = best->n;
   result.k = best->k;
   result.estimated_traffic_bytes = best->traffic;
+  result.estimated_cost_cycles = best->cost_cycles;
   result.padded_compute_volume = best->padded_compute;
+  result.stationarity = best->regime.stat;
+  result.double_buffer_c = best->regime.dbc;
+  // Record the full-K OS hoist (bandwidth-weighted held-A vs held-B) so
+  // BuildFullKPipelined emits the same operand the wall was scored under. Only
+  // consulted for output-stationary k == K; A/B-stationary force the loop order
+  // from `stationarity` and split-K uses a different emitter.
+  result.os_holds_a = OSHoldsHoldA(best->m, best->n, cfg);
 
   // 6. Perf-hint diagnostics for borderline cases (callers may forward via
   //    EmitDiagnostics with severity PerfHint).

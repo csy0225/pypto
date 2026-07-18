@@ -15,7 +15,7 @@
 - 生命周期通过 def-use 分析确定
 - 共享完成后，已无引用的 MemRef 及其 alloc 语句会被清理
 
-**使用时机**：在 InitMemRef 之后、AllocateMemoryAddr 之前运行。可减少内存分配开销。
+**使用时机**：在 [`MaterializeSemanticAliases`](29-materialize_semantic_aliases.md) 之后、AllocateMemoryAddr 之前运行。可减少内存分配开销。本 pass 只做**机会性**的生命周期合并；**语义强制**的 must-alias 重定向（循环 carry / 原地 —— 本 pass 原来的 "Step 0"）现在在 `MaterializeSemanticAliases` 里运行,因此 `MemoryReuse` 可以被独立跳过（例如 `memory_planner=PTOAS`,由 ptoas 接管生命周期复用）。
 
 ## API
 
@@ -42,18 +42,20 @@ program_optimized = reuse_pass(program)
 
 1. **生命周期分析**：遍历完整 IR 树（包括嵌套控制流体内的语句）通过 def-use 分析计算变量生命周期。在循环外定义但在循环内使用的变量，其生命周期会延展到循环结束（循环感知延展）
 2. **干涉检查**：识别生命周期重叠的变量
-3. **MemRef 共享**：为同一内存空间中不干涉的变量分配相同的 MemRef 指针
+3. **MemRef 共享**（全局「最大优先 + first-fit」装箱，`IdentifyReuseOpportunities`）：在每个内存空间内，按 **大小从大到小** 装箱；后续每个区间加入第一个其全部成员都能与之共享的缓冲区（生命周期不重叠 + hazard / no-alias 安全，见 `can_share`）。缓冲区的分配大小由其首个（最大）成员固定，因此之后纳入更小的成员是「免费」的 —— 且 *后定义的较大区间* 现在可以承载 *先定义的较小区间*。（此前的定义序贪心带有单向的大小门槛 `source.size >= target.size`，因此两个生命周期不相交、但较小者先定义的 tile 永远无法合并。）每个成员被重定位到的「代表」是该缓冲区的最大成员；由于 InitMemRef 会把所有 `tile.alloc` 提升到函数体头部，代表的 alloc 支配整个函数，因此代表即使定义在其部分成员之后也是安全的。由于装箱器不再按程序序处理，每个成对门槛（hazard、no-alias）都会在两个方向上检查。
 4. **循环携带变量重对齐**（`AlignLoopCarriesToInitMutator`）：共享（步骤 3）只会重写由 `AssignStmt` 定义的变量（producer/init），而循环携带的 `iter_arg`/`return_var` 节点被排除在生命周期/共享映射之外、仍保留原始 MemRef。本步骤**自外向内**遍历 `ForStmt`，将每个循环的 `iter_arg`/`return_var` 重对齐到其（已复用的）`initValue` 的 MemRef，并在递归前写入 `var_remap_`，使嵌套循环能观察到已修正的外层 `iter_arg` 作为其 init。若缺少本步骤，被复用的**嵌套流水化 `matmul_acc`** 累加器会分裂到两个 Acc 缓冲区，导致步骤 5 插入非法的 `acc→acc tile.move`，被 Ascend 910B 的 ptoas 拒绝（[#1352](https://github.com/hw-native-sys/pypto/issues/1352)）
-5. **Yield 修复**：修复控制流返回变量的 MemRef 不一致：
+5. **累加器 if-phi 合并**（`TopDownRetargeter::CoalesceAccumulatorIfPhis`）：`LowerPipelineLoops` 会把 stage-2 的 K 循环剥离成 `if`-phi，其活跃分支是就地累加的 `matmul_acc`（位于累加器缓冲区），而失效的 `if k==0` 分支是位于*不同* Acc 缓冲区上的全新 `matmul` seed。若不处理，步骤 6 会用 `acc→acc tile.move` 协调二者 —— 产生第二个同时存活的 L0C 缓冲区（溢出），且 ptoas 也会拒绝（不存在合法的 Acc→Acc `tmov`）。本步骤通过 `reuses_input` 的 producer 识别就地累加分支，并把*另一*分支的 seed 重定向到累加器缓冲区，使两个分支共享同一缓冲区、不再产生 move（符合 `mad_acc` 共享 `%dst` 的语义）。仅作用于 `Acc`；重定向是**强制的**（被拒绝的重定向会触发 `INTERNAL_CHECK`，绝不退化为 move —— 因为不存在合法的 Acc→Acc move）。它会跳过*全局* dead-at-assign 活跃性检查（否则会因 if 之后合法的 phi 消费者而误判拒绝），但仅在验证分支互斥真正所需的两个前提之后：(a) seed 的 producer 是词法上位于该分支**内部**的 `Call`（经由分支透传的 if 前值会无条件执行，从而破坏 sibling 就地分支所读取的累加器），以及 (b) **限定分支范围** 的 `IsTargetDeadAtAssign`（在所属 `if` 处停止）确认分支内 seed 之后没有对累加器缓冲区的尾部读取。任一前提不满足时，该 phi 交由步骤 6 处理而不做合并
+6. **Yield 修复**：修复控制流返回变量的 MemRef 不一致：
    - **ForStmt**：确保 4 个循环携带变量（initValue、iter_arg、yield value、return_var）共享同一个 MemRef。若 MemRef 不同则在 yield 前插入 `tile.move`
    - **IfStmt**：修补 return_vars 使其 MemRef 与 yield value 一致
-6. **移除冗余 alloc**：收集仍被 TileType 变量引用的所有 MemRef，然后移除不再使用的 `tile.alloc` 语句
+7. **恒等拷贝缓冲区归一化**（`NormalizeIdentityCopyBuffersMutator`）：在步骤 5 重定向累加器 if-phi 后，对（已被移动的）return_var 的下游裸 `Var` SSA 恒等拷贝可能仍携带合并前的缓冲区（例如 `c_phi` 移到 `mem_acc_5` 后，`c: …mem_acc_17 = c_phi`）。`x = y` 拷贝（值为裸 `Var` 而非 `Call`）是纯重命名、必须与 `y` 共用缓冲区，因此本次单向前向遍历把这类拷贝的 LHS 重定型到 RHS 的 MemRef，并替换 LHS 的下游使用。无不一致时为空操作
+8. **移除冗余 alloc**：收集仍被 TileType 变量引用的所有 MemRef，然后移除不再使用的 `tile.alloc` 语句
 
 **复用条件**：
 
 - 生命周期不重叠（无干涉）。当 `prev.last_use <= curr.def` 时，两个变量不重叠（即源的最后使用可以和目标的定义在同一语句，因为在同一语句内输入先于输出被消费）
 - 相同内存空间
-- **字节**大小兼容（复用目标必须足够大）
+- 缓冲区大小取其**最大**成员；由于按最大优先装箱，后纳入的成员都不大于代表，故无需显式字节大小检查（复用方向也不再被限制为「先定义且更大」）
 - **No-alias 守护**（算子语义）：定义复用变量的算子可以禁止其输出与某些输入操作数共享缓冲区——因为硬件在**写输出的同时读取**这些输入,原地写会中途破坏该算子。三个来源汇入同一个"每个输出禁止 alias 的输入集合"（`ForbidAliasCollector`）：
   - `not_inplace_safe()` —— 该算子无法以 `src == dst` 运行，因此其输出不得 alias **任何**输入操作数。
   - `forbid_output_alias(i)` —— 该算子对其值操作数 in-place-safe，但在写输出时读取**某个特定**操作数，因此输出不得 alias 该操作数的缓冲区。
@@ -68,9 +70,13 @@ program_optimized = reuse_pass(program)
   | `tile.recip`、`tile.rsqrt` | `not_inplace_safe` | 高精度路径在写输出时读取输入**和** tmp scratch |
   | `tile.row_sum` / `row_max` / `row_min` | `not_inplace_safe` | `TROW*` 在写规约输出 `[M, 1]` 时读取整行输入 + tmp scratch |
   | `tile.mrgsort_format1` | `not_inplace_safe` | 归并排序 intrinsic 要求 `src != dst` |
+  | `tile.fmod`、`tile.fmods` | `not_inplace_safe` | `TFMOD`/`TFMODS` 按 `a - trunc(a/b)*b` 计算，先用 `dst = a/b` 覆盖输出，再重新读取原始 `src0`（`a`）做最后的减法；当 `dst == src0` 时该减法读到的是已被覆盖的商，导致每个元素都算成 `0` |
+  | `tile.transpose` | `not_inplace_safe` | `pto.ttrans` 非 in-place 安全：a2a3 非对齐标量路径直接从 `src` 写 `dst`（不经 tmp 暂存），`dst == src` 会边写边读损坏数据。输出始终分配新 buffer（InitMemRef 也不会为其继承输入的 buffer）。 |
   | `tile.sel` | `forbid_output_alias(0)`（mask）、`(3)`（tmp） | `TSEL` 在写 `dst` 时读取 mask + tmp scratch |
   | `tile.{row,col}_expand{,_mul,_add,_sub,_div}` | `forbid_output_alias(1)`（广播向量） | 行/列向量（arg 1）会被**每个**输出行/列重读,输出若 alias 它则在第一行/列后被覆盖 |
   | `tile.cast`（仅升精度） | 输出 ≠ 输入缓冲区（条件式,在 `ForbidAliasCollector`） | 更宽的输出写指针超前于读指针（见上） |
+
+- **流水线 stage 守卫**（容量门控）：`pl.pipeline(stage=F)` 将循环体复制 `F` 份以实现 ping-pong，`LowerPipelineLoops` 给每个副本产生 tile 的 `Call` 打上 `pipeline_membership` `(group, stage)`（见 [25-lower_pipeline_loops.md](25-lower_pipeline_loops.md)）。`F` 份副本在调度器下并发执行，因此它们程序序不相交的生命周期**不是**安全的复用信号——把并发副本合并到同一块缓冲会注入一条虚假的写后读（write-after-read），使各 stage 串行化（即 #1475 的 cube matmul 操作数坍缩）。MemoryReuse 因此在**每个内存空间**（包括 L0 matmul 空间 Left/Right/Acc/Bias，且无论 tile 是 load 还是 `tile.move` 的结果）都把并发副本保持在**不同的缓冲**中，最多到**可负担的双缓冲深度** `F_g = min(depth_g, ⌊C_s / slot_g⌋)`：stage `k` 的副本落在残数 `ordinal(k) mod F_g`（**稠密**的 stage 序号，因此稀疏 stage ID 如 `{0, 2}` 不会因 `2 mod 2 == 0 mod 2` 而错误合并），因此并发副本永不共享（放得下时是完整 ping-pong，空间紧张时尽量分散）。分离是否放得下由**精确的按空间分配器足迹**（`SpaceFootprint`，与 `AllocateMemoryAddr` 共享——按构造保证一致）决定，而非估算。当某空间在所有 group 的可负担深度下仍然溢出时，采用**优雅的跨 group 削减**：将某个 group 的深度降低一个残数并重新打包（按 `MaxRelief` 启发式选择 group——优先释放最多字节，平局取最小 group id）；若削减耗尽，则整体回退到 **legacy 重新打包**（`force_legacy`），从而绝不会在 legacy 打包本可放下的情况下溢出。容量未知的空间（未配置 backend）使用 legacy 判据，因此容量门控路径绝不比 legacy 更差。当门控把某个 group 的深度降到其请求的 `stage=` 之下（或某空间触发 legacy 回退）时，MemoryReuse 通过统一诊断通道发出诊断——一条 `PH-MR-001` **性能提示**（回退情形则为 **warning**），指出请求深度与实际深度以及修复方式（把每 stage 的 tile 缩小到 `≤ C_s / stage`，或把 `stage=` 降到能放下的值）——因此容量导致的串行化绝不会静默发生。复用决策完成后，MemoryReuse 会剥离已消费的 `pipeline_membership` attr，使其不会带到下游 pass 或 codegen。
 
 **不再有 shape / dtype / TileView 兼容性门槛**：共享同一物理 MemRef 的 tile 可以携带**不同**的 shape、dtype 或 `TileView` 属性。PTO codegen 为每个 tile 绑定一条 per-variable 的 `alloc_tile`，因此每个别名都以各自的静态 shape / dtype / layout / `valid_shape` 声明共享基址。这允许例如：
 
@@ -157,7 +163,9 @@ Pass MemoryReuse();
 - `ComputeLifetimes` 构建 MemRef 共享组和生命周期区间
 - `IdentifyReuseOpportunities` 查找复用候选
 - `ApplyMemRefSharing` 通过 `MemRefSharingMutator` 更新 MemRef 指针
+- `TopDownRetargeter::CoalesceAccumulatorIfPhis` 通过把失效分支的 seed 重定向到就地累加器缓冲区，合并被剥离的循环携带累加器 `if`-phi，使 `YieldFixupMutator` 不再产生非法的 `acc→acc tile.move`（见算法步骤 5）
 - `YieldFixupMutator` 修复 ForStmt/IfStmt 在复用后的 yield/return_var MemRef 不一致（必要时插入 `tile.move`）
+- `NormalizeIdentityCopyBuffersMutator` 协调累加器 if-phi 合并后 LHS/RHS 缓冲区不一致的裸 `Var` SSA 恒等拷贝（见算法步骤 7）
 - `UsedMemRefCollector` 收集共享后仍被引用的 MemRef 指针
 - `RemoveUnusedAllocStatements` 从 `SeqStmts` 中过滤掉冗余的 `tile.alloc` 语句
 

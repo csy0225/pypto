@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -25,7 +26,9 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/codegen/codegen_preconditions.h"
 #include "pypto/codegen/distributed/distributed_op_registry.h"
+#include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/comm.h"
@@ -71,6 +74,7 @@ std::string BuiltinEntrySymbol(const std::string& variant) {
 
 std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
   CHECK(program != nullptr) << "Cannot generate code for null program";
+  VerifyDistributedCodegenPreconditions(program);
 
   program_ = program;
   emitter_.Clear();
@@ -245,16 +249,19 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 
 void DistributedCodegen::EmitImports() {
   emitter_.EmitLine("import torch");
-  // ``ContinuousTensor`` + ``DataType`` are used by DistributedTensor
+  // The unified strided ``Tensor`` + ``DataType`` are used by DistributedTensor
   // formal emission (host_orch wraps per-rank window-bound regions via
-  // ``ContinuousTensor.make(..., child_memory=True)``).
+  // ``Tensor.make(..., child_memory=True)``).
   // ``CommBufferSpec`` is the spec list passed to ``orch.allocate_domain``
   // inside host_orch when the program declares at least one comm domain;
   // harmless to import for comm-less L3 programs.
   emitter_.EmitLine(
       "from simpler.task_interface import "
-      "CallConfig, CommBufferSpec, ContinuousTensor, DataType, TaskArgs, TensorArgType");
+      "CallConfig, CommBufferSpec, DataType, TaskArgs, Tensor, TensorArgType");
   emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
+  // ``_submit_chip`` wraps ``orch.submit_next_level`` to namespace per-rank DFX
+  // ``output_prefix`` (``<base>/rank{worker}``); a no-op when DFX is off.
+  emitter_.EmitLine("from pypto.runtime.distributed_runner import _submit_chip");
 }
 
 void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
@@ -281,7 +288,7 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   emitter_.EmitLine(sig.str());
   emitter_.IncreaseIndent();
 
-  // Register parameter names and emit local bindings for scalar params.
+  // Register parameter names and emit local bindings for scalar-like params.
   // All orchestrator parameters live in the tensors dict; tensor params are
   // referenced via tensors["name"] at call sites, but scalar params (e.g.
   // pl.Scalar[pl.BOOL]) may appear in bare-name contexts such as ``if``
@@ -298,6 +305,13 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   // don't own comm allocations and skip this step.
   if (func->level_.has_value() && ir::LevelToLinquLevel(*func->level_) >= 3) {
     CollectHostOrchVarDefs(func);
+    // Recover pl.dynamic() shape dims into local bindings before the body walk
+    // so per-rank host slices that reference a dynamic dim resolve at runtime
+    // instead of raising NameError (#1873). Bindings are emitted at the top of
+    // the function body (ahead of the comm-domain ``with`` / for-loop), so they
+    // are visible everywhere below — Python ``with`` / ``for`` do not open a
+    // new scope.
+    EmitHostOrchDynamicDimBindings(func);
   }
 
   // Emit body. The host_orch body is wrapped by MaterializeCommDomainScopes
@@ -339,6 +353,153 @@ void DistributedCodegen::CollectHostOrchVarDefs(const ir::FunctionPtr& func) {
   if (!func->body_) return;
   HostOrchVarDefCollector collector(host_orch_var_defs_);
   collector.VisitStmt(func->body_);
+}
+
+namespace {
+
+// Extract a constant int from a tensor-shape sub-expression, or nullopt.
+std::optional<int64_t> ConstIntFromShapeExpr(const ir::ExprPtr& expr) {
+  if (auto ci = ir::As<ir::ConstInt>(expr)) return ci->value_;
+  return std::nullopt;
+}
+
+// True iff ``v`` is the Var ``target``. Raw pointer identity is sound: the IR
+// holds the canonical shared_ptr graph, so each Var has exactly one address
+// (matching ``CollectVarsFromShapeExpr``'s own ``Var*`` dedup).
+bool IsTargetVar(const ir::ExprPtr& v, const ir::VarPtr& target) {
+  auto var = ir::As<ir::Var>(v);
+  return var && var.get() == target.get();
+}
+
+}  // namespace
+
+std::string DistributedCodegen::InvertShapeDimForVar(const ir::ExprPtr& dim_expr,
+                                                     const ir::VarPtr& target_var,
+                                                     const std::string& shape_access) const {
+  // Bare var: shape == var  ->  var = shape_access.
+  if (IsTargetVar(dim_expr, target_var)) return shape_access;
+
+  // Add: shape == var + c (either operand order)  ->  var = (shape - c).
+  if (auto add = ir::As<ir::Add>(dim_expr)) {
+    if (IsTargetVar(add->left_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(add->right_)) {
+        return "(" + shape_access + " - " + std::to_string(*c) + ")";
+      }
+    }
+    if (IsTargetVar(add->right_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(add->left_)) {
+        return "(" + shape_access + " - " + std::to_string(*c) + ")";
+      }
+    }
+    return "";
+  }
+
+  // Sub: shape == var - c  ->  var = (shape + c);
+  //      shape == c - var  ->  var = (c - shape).
+  if (auto sub = ir::As<ir::Sub>(dim_expr)) {
+    if (IsTargetVar(sub->left_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(sub->right_)) {
+        return "(" + shape_access + " + " + std::to_string(*c) + ")";
+      }
+    }
+    if (IsTargetVar(sub->right_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(sub->left_)) {
+        return "(" + std::to_string(*c) + " - " + shape_access + ")";
+      }
+    }
+    return "";
+  }
+
+  // Mul is commutative: shape == var * c (either order)  ->  var = (shape // c).
+  // Integer ``//`` (not ``/``) keeps the recovered dim int-typed for slice
+  // bounds. ``c == 0`` is rejected (non-invertible).
+  if (auto mul = ir::As<ir::Mul>(dim_expr)) {
+    if (IsTargetVar(mul->left_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(mul->right_); c && *c != 0) {
+        return "(" + shape_access + " // " + std::to_string(*c) + ")";
+      }
+    }
+    if (IsTargetVar(mul->right_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(mul->left_); c && *c != 0) {
+        return "(" + shape_access + " // " + std::to_string(*c) + ")";
+      }
+    }
+    return "";
+  }
+
+  // FloorDiv is non-commutative: only shape == var // c inverts (to
+  // var = shape * c). ``c // var`` is not uniquely invertible against a runtime
+  // shape, so ``(c, var)`` is rejected.
+  if (auto fdiv = ir::As<ir::FloorDiv>(dim_expr)) {
+    if (IsTargetVar(fdiv->left_, target_var)) {
+      if (auto c = ConstIntFromShapeExpr(fdiv->right_); c && *c != 0) {
+        return "(" + shape_access + " * " + std::to_string(*c) + ")";
+      }
+    }
+    return "";
+  }
+
+  return "";
+}
+
+void DistributedCodegen::EmitHostOrchDynamicDimBindings(const ir::FunctionPtr& func) {
+  // Per-param/dim walk delegates to ``CollectVarsFromShapeExpr`` -- the same C++
+  // helper that drives the trailing ``%argN: index`` params on the device
+  // ``func.func`` signature -- so host-side dim recovery stays in lockstep with
+  // the compiled kernel by construction.
+  struct DimSource {
+    ir::VarPtr var;
+    std::string param_name;  // already SanitizeName-d
+    int dim_idx;
+    ir::ExprPtr expr;
+  };
+
+  // First-seen order + best (invertible-preferred) source per canonical Var*.
+  std::vector<const ir::Var*> dyn_var_order;
+  std::unordered_map<const ir::Var*, DimSource> dyn_var_best;
+
+  for (const auto& param : func->params_) {
+    auto tensor_type = ir::AsTensorTypeLike(param->GetType());
+    if (!tensor_type) continue;
+    const std::string param_name = SanitizeName(param->name_hint_);
+    for (size_t dim_idx = 0; dim_idx < tensor_type->shape_.size(); ++dim_idx) {
+      const auto& dim = tensor_type->shape_[dim_idx];
+      for (const auto& dyn_var : CollectVarsFromShapeExpr(dim)) {
+        const ir::Var* key = dyn_var.get();
+        auto it = dyn_var_best.find(key);
+        if (it == dyn_var_best.end()) {
+          dyn_var_order.push_back(key);
+          dyn_var_best.emplace(key, DimSource{dyn_var, param_name, static_cast<int>(dim_idx), dim});
+          continue;
+        }
+        // Upgrade source if the previously-seen dim is non-invertible and this
+        // one is, so a symbol first seen in a non-invertible form still gets
+        // pinned to a recoverable shape.
+        const bool prev_invertible = !InvertShapeDimForVar(it->second.expr, it->second.var, "S").empty();
+        const bool cur_invertible = !InvertShapeDimForVar(dim, dyn_var, "S").empty();
+        if (!prev_invertible && cur_invertible) {
+          it->second = DimSource{dyn_var, param_name, static_cast<int>(dim_idx), dim};
+        }
+      }
+    }
+  }
+
+  for (const ir::Var* key : dyn_var_order) {
+    const DimSource& src = dyn_var_best.at(key);
+    const std::string shape_access =
+        "tensors[\"" + src.param_name + "\"].shape[" + std::to_string(src.dim_idx) + "]";
+    const std::string value_expr = InvertShapeDimForVar(src.expr, src.var, shape_access);
+    // Surface a non-invertible dynamic dim as a documented user-facing
+    // limitation (mirrors the device-side ValueError), rather than silently
+    // leaving the symbol unbound. ``src.var`` is guaranteed non-null here.
+    CHECK_SPAN(!value_expr.empty(), src.var->span_)
+        << "Cannot recover dynamic dimension '" << src.var->name_hint_
+        << "' for host-orchestration codegen: it only appears inside non-invertible tensor-shape "
+        << "expressions. Host-slice dynamic dims must be recoverable from a runtime tensor shape via "
+        << "'var' or a single-var affine form (var +/-/*// const_int); at least one tensor parameter "
+        << "must expose the variable in one of these forms.";
+    emitter_.EmitLine(SanitizeName(src.var->name_hint_) + " = " + value_expr);
+  }
 }
 
 std::string DistributedCodegen::GetCommSlotSizeAsCode(const ir::ExprPtr& size_expr) {
@@ -443,7 +604,7 @@ void DistributedCodegen::EmitEntryFunction() {
   emitter_.EmitLine("def entry(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size):");
   emitter_.IncreaseIndent();
 
-  // Register parameter names and emit local bindings for scalar params.
+  // Register parameter names and emit local bindings for scalar-like params.
   RegisterParamsAndEmitScalarBindings(entry_func_);
 
   // Emit body
@@ -470,7 +631,7 @@ void DistributedCodegen::RegisterParamsAndEmitScalarBindings(const ir::FunctionP
   for (const auto& param : func->params_) {
     std::string name = SanitizeName(param->name_hint_);
     declared_vars_.insert(name);
-    if (ir::As<ir::ScalarType>(param->GetType())) {
+    if (ir::As<ir::ScalarType>(param->GetType()) || ir::IsA<ir::CommCtxType>(param->GetType())) {
       emitter_.EmitLine(name + " = tensors[\"" + name + "\"]");
     }
   }
@@ -548,11 +709,16 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
   }
 
   const auto value_call = ir::As<ir::Call>(op->value_);
-  const bool distributed_tensor_alias =
-      ir::As<ir::DistributedTensorType>(op->var_->GetType()) &&
-      ir::As<ir::DistributedTensorType>(op->value_->GetType()) &&
-      (!value_call || (value_call->op_ && value_call->op_->name_ == "pld.tensor.window"));
+  const bool distributed_tensor_alias = ir::As<ir::DistributedTensorType>(op->var_->GetType()) &&
+                                        ir::As<ir::DistributedTensorType>(op->value_->GetType()) &&
+                                        (!value_call || ir::IsOp(value_call, "pld.tensor.window"));
   if (distributed_tensor_alias) {
+    declared_vars_.insert(var_name);
+    current_target_var_ = "";
+    current_expr_value_ = "";
+    return;
+  }
+  if (value_call && ir::IsOp(value_call, "pld.system.get_comm_ctx")) {
     declared_vars_.insert(var_name);
     current_target_var_ = "";
     current_expr_value_ = "";
@@ -706,7 +872,7 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
   }
 
   // tensor.create → orch.alloc() for HOST-level orchestrators
-  if (op->op_->name_ == "tensor.create") {
+  if (ir::IsOp(op, "tensor.create")) {
     EmitTensorCreate(op);
     return;
   }
@@ -715,7 +881,7 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
   // every emitted orchestrator's signature (see EmitFunction / EmitEntryFunction).
   // The runner fills it with len(DistributedConfig.device_ids) — present for
   // comm-less programs too, so this lowering is uniform.
-  if (op->op_->name_ == "pld.system.world_size") {
+  if (ir::IsOp(op, "pld.system.world_size")) {
     current_expr_value_ = "world_size";
     return;
   }
@@ -792,11 +958,17 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   emitter_.EmitLine(ta_var + " = TaskArgs()");
 
   for (size_t i = 0; i < call->args_.size(); ++i) {
+    if (ir::IsA<ir::CommCtxType>(call->args_[i]->GetType())) {
+      emitter_.EmitLine(ta_var + ".add_scalar(" + ResolveCommCtxArg(call->args_[i], rank_expr, call->span_) +
+                        ")");
+      continue;
+    }
+
     VisitExpr(call->args_[i]);
     std::string arg_str = current_expr_value_;
     current_expr_value_ = "";
 
-    // N7: DistributedTensorType formals route through ContinuousTensor.make
+    // N7: DistributedTensorType formals route through Tensor.make
     // with ``child_memory=True``. ``As<DistributedTensorType>`` is strict
     // ObjectKind match, so this branch fires only for DistributedTensor —
     // plain TensorType falls through to the existing make_tensor_arg path.
@@ -815,7 +987,7 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
         tag = ParamDirectionToTensorArgType(callee->param_directions_[i]);
       }
       const std::string handle_var = HandleVarForScope(ScopeForWindowBuffer(window_buffer));
-      emitter_.EmitLine(ta_var + ".add_tensor(ContinuousTensor.make(data=" + handle_var + "[" + rank_expr +
+      emitter_.EmitLine(ta_var + ".add_tensor(Tensor.make(data=" + handle_var + "[" + rank_expr +
                         "].buffer_ptrs[\"" + name + "\"], shapes=" + shape + ", dtype=" + dtype_enum +
                         ", child_memory=True), " + tag + ")");
       continue;
@@ -831,12 +1003,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       continue;
     }
 
-    // ScalarType formal — pass-through via ``add_scalar``. Emitted in the
-    // call's IR-argument position so the runtime TaskArgs layout matches
-    // the callee's parameter list one-for-one (the trailing CommContext
-    // pointers appended below for each DistributedTensor formal are
-    // synthetic — added by the N7 kernel-signature transform and do not
-    // appear in the user-visible signature).
+    // ScalarType formal: pass through via ``add_scalar`` in IR-argument order
+    // so the runtime TaskArgs layout matches the callee parameter list.
     if (ir::As<ir::ScalarType>(call->args_[i]->GetType())) {
       emitter_.EmitLine(ta_var + ".add_scalar(" + arg_str + ")");
       continue;
@@ -844,22 +1012,6 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
 
     INTERNAL_CHECK_SPAN(false, call->span_) << "EmitCallToWorker: unsupported call arg type at index " << i
                                             << ": " << call->args_[i]->GetType()->TypeName();
-  }
-
-  // After all add_tensor lines, append one
-  // ``add_scalar(__comm_d<group_idx>[<r>].device_ctx)`` per DistributedTensor
-  // arg, in IR-arg order — matches the N6 incore PTO signature's trailing
-  // ctx-ptr segment. The group lookup uses the same WindowBuffer-identity
-  // map as the add_tensor branch above so two DistributedTensors from
-  // different CommGroups route to their respective handles.
-  for (const auto& arg : call->args_) {
-    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
-    if (!dist_type) continue;
-    INTERNAL_CHECK_SPAN(dist_type->window_buffer_.has_value(), call->span_)
-        << "DistributedTensorType arg must have window_buffer_ populated by N4 pass";
-    const std::string device_ctx_handle =
-        HandleVarForScope(ScopeForWindowBuffer(dist_type->window_buffer_.value()));
-    emitter_.EmitLine(ta_var + ".add_scalar(" + device_ctx_handle + "[" + rank_expr + "].device_ctx)");
   }
 
   // If this call has an assignment target (return value) but the callee already
@@ -914,10 +1066,17 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     // simpler runtime's ``worker=`` kwarg (see simpler/python/simpler/
     // orchestrator.py — ``-1`` = unconstrained). Empty rank_expr ⇔ no
     // ``device=`` attr → omit the kwarg, byte-compatible with comm-less L3.
-    const std::string worker_kwarg = rank_expr.empty() ? "" : (", worker=" + rank_expr);
     emitter_.EmitLine("_keep.append(" + ta_var + ")");
-    emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var + ", config" +
-                      worker_kwarg + ")");
+    if (rank_expr.empty()) {
+      emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var +
+                        ", config)");
+    } else {
+      // Rank-pinned dispatch routes through ``_submit_chip`` so DFX artifacts
+      // land in a per-rank subdir (``<output_prefix>/rank{r}``); a no-op
+      // forward to ``submit_next_level`` when DFX is off.
+      emitter_.EmitLine("_submit_chip(orch, callables[\"" + callee->name_ + "\"], " + ta_var + ", config, " +
+                        rank_expr + ")");
+    }
   }
 
   // If this call has an assignment target (return value), alias it to the OUT
@@ -966,7 +1125,7 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
 void DistributedCodegen::EmitDistIntrinsic(const ir::CallPtr& call) {
   const auto& op_name = call->op_->name_;
 
-  if (op_name == "dist.tree_reduce") {
+  if (ir::IsOp(call, "dist.tree_reduce")) {
     EmitTreeReduce(call);
     return;
   }
@@ -1039,7 +1198,7 @@ bool IsTensorCreateAssign(const ir::StmtPtr& stmt) {
   if (!assign) return false;
   auto call = std::dynamic_pointer_cast<const ir::Call>(assign->value_);
   if (!call || !call->op_) return false;
-  return call->op_->name_ == "tensor.create";
+  return ir::IsOp(call, "tensor.create");
 }
 
 // Recursively reject any `tensor.create` reachable through @p stmt — pre-init
@@ -1146,7 +1305,7 @@ std::string DistributedCodegen::DataTypeToPythonDType(const DataType& dtype) {
 std::string DistributedCodegen::DataTypeToSimplerEnum(const DataType& dtype) {
   // ``simpler.task_interface.DataType`` exposes the C-style enum names
   // (FLOAT16 / FLOAT32 / BFLOAT16 / INT* / UINT* / BOOL). Map PyPTO's
-  // dtype tags to those names so emitted ``ContinuousTensor.make(..., dtype=DataType.<X>)``
+  // dtype tags to those names so emitted ``Tensor.make(..., dtype=DataType.<X>)``
   // matches at runtime.
   if (dtype == DataType::FP16) return "FLOAT16";
   if (dtype == DataType::FP32) return "FLOAT32";
@@ -1178,6 +1337,37 @@ std::string DistributedCodegen::ResolveRankExpr(const ir::CallPtr& call) const {
   INTERNAL_CHECK_SPAN(false, call->span_)
       << "device= attr must be ConstInt or Var (N3 parser invariant), got " << dev->TypeName();
   return "";
+}
+
+std::string DistributedCodegen::ResolveCommCtxArg(const ir::ExprPtr& arg, const std::string& rank_expr,
+                                                  const ir::Span& span) const {
+  ir::ExprPtr cur = arg;
+  std::unordered_set<const ir::Var*> visited;
+  while (auto var = ir::As<ir::Var>(cur)) {
+    if (!visited.insert(var.get()).second) break;
+    auto it = host_orch_var_defs_.find(var.get());
+    if (it == host_orch_var_defs_.end() || !it->second) break;
+    cur = it->second;
+  }
+
+  auto get_ctx = ir::As<ir::Call>(cur);
+  if (!get_ctx && ir::IsA<ir::CommCtxType>(cur->GetType())) {
+    if (auto var = ir::As<ir::Var>(cur)) {
+      return SanitizeName(var->name_hint_);
+    }
+  }
+  INTERNAL_CHECK_SPAN(get_ctx && ir::IsOp(get_ctx, "pld.system.get_comm_ctx"), span)
+      << "CommCtx call arg must be produced by pld.system.get_comm_ctx or be an explicit CommCtx Var";
+  INTERNAL_CHECK_SPAN(!rank_expr.empty(), span)
+      << "Call passing a get_comm_ctx-derived CommCtx arg must carry "
+         "device= attr so host codegen can select the per-rank device_ctx";
+  INTERNAL_CHECK_SPAN(get_ctx->args_.size() == 1, get_ctx->span_)
+      << "pld.system.get_comm_ctx expects exactly one DistributedTensor arg";
+  auto dist_type = ir::As<ir::DistributedTensorType>(get_ctx->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(dist_type && dist_type->window_buffer_.has_value(), get_ctx->span_)
+      << "pld.system.get_comm_ctx host lowering requires a window-bound DistributedTensor";
+  const std::string handle_var = HandleVarForScope(ScopeForWindowBuffer(dist_type->window_buffer_.value()));
+  return handle_var + "[" + rank_expr + "].device_ctx";
 }
 
 std::string DistributedCodegen::FormatShapeTuple(const std::vector<ir::ExprPtr>& shape) {

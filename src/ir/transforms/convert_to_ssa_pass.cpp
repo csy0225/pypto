@@ -153,7 +153,6 @@ static std::unordered_set<const Var*> ComputeStmtLiveIn(const StmtPtr& stmt) {
     uc.CollectExpr(op->stop_);
     uc.CollectExpr(op->step_);
     for (const auto& ia : op->iter_args_) uc.CollectExpr(ia->initValue_);
-    if (op->chunk_config_.has_value()) uc.CollectExpr(op->chunk_config_->size);
     auto body_li = ComputeStmtLiveIn(op->body_);
     body_li.erase(op->loop_var_.get());
     for (const auto& ia : op->iter_args_) body_li.erase(ia.get());
@@ -473,9 +472,9 @@ class SSAConverter {
     if (kind == ObjectKind::ReturnStmt) return ConvertReturn(As<ReturnStmt>(s));
     if (kind == ObjectKind::YieldStmt) return ConvertYield(As<YieldStmt>(s));
     if (kind == ObjectKind::EvalStmt) return ConvertEval(As<EvalStmt>(s));
-    if (kind == ObjectKind::InCoreScopeStmt || kind == ObjectKind::AutoInCoreScopeStmt ||
-        kind == ObjectKind::ClusterScopeStmt || kind == ObjectKind::HierarchyScopeStmt ||
-        kind == ObjectKind::SpmdScopeStmt || kind == ObjectKind::RuntimeScopeStmt ||
+    if (kind == ObjectKind::InCoreScopeStmt || kind == ObjectKind::ClusterScopeStmt ||
+        kind == ObjectKind::HierarchyScopeStmt || kind == ObjectKind::SpmdScopeStmt ||
+        kind == ObjectKind::RuntimeScopeStmt || kind == ObjectKind::SplitAivScopeStmt ||
         kind == ObjectKind::CommDomainScopeStmt) {
       return ConvertScope(As<ScopeStmt>(s));
     }
@@ -487,7 +486,20 @@ class SSAConverter {
   StmtPtr ConvertAssign(const AssignStmtPtr& op) {
     auto val = SubstExpr(op->value_);
     auto key = op->var_.get();
-    auto var = AllocVersion(key, op->var_->GetType(), op->var_->span_);
+    // For shaped values the RHS is the authoritative post-substitution type.
+    // Its TensorView/TileView and dynamic shape expressions have already gone
+    // through SubstExpr; rebuilding the LHS from the pre-SSA annotation can
+    // otherwise retain stale Var identities in valid_shape/stride fields.
+    //
+    // Do not apply this rule to scalars. A scalar assignment may carry an
+    // explicit declaration dtype that is intentionally wider than the
+    // literal/expression dtype (for example ``INT64 x = 0``). Replacing that
+    // declaration with the RHS type breaks loop-carried dtype consistency.
+    TypePtr definition_type = op->var_->GetType();
+    if (val && (AsTensorTypeLike(definition_type) || As<TileType>(definition_type))) {
+      definition_type = val->GetType();
+    }
+    auto var = AllocVersion(key, definition_type, op->var_->span_);
     auto result = MutableCopy(op);
     result->var_ = var;
     result->value_ = val;
@@ -1050,8 +1062,8 @@ class SSAConverter {
 
     // Block escaping-var promotion across non-Runtime scope boundaries (#1351).
     //
-    // ``HierarchyScopeStmt`` / ``InCoreScopeStmt`` / ``AutoInCoreScopeStmt`` /
-    // ``ClusterScopeStmt`` / ``SpmdScopeStmt`` separate the loops *inside*
+    // ``HierarchyScopeStmt`` / ``InCoreScopeStmt`` / ``ClusterScopeStmt`` /
+    // ``SpmdScopeStmt`` separate the loops *inside*
     // their body from the use-site of any variable defined further down the
     // *outer* sequence. The inner loops cannot manufacture a working init
     // value for such a use (FindInitValue typically falls back to an
@@ -1064,14 +1076,16 @@ class SSAConverter {
     // ``cur_`` is intentionally NOT restored after the body — variables
     // first-defined inside the body and referenced after the scope must
     // still substitute to their in-body SSA version (relied on by passes
-    // like InterchangeChunkLoops that emit ``out = pl.assemble(...)`` inside
-    // ``pl.at`` and return ``out`` outside). Whether such a leak is
-    // user-legal is enforced by other property verifiers, not by SSA.
+    // that emit ``out = pl.assemble(...)`` inside ``pl.at`` and return
+    // ``out`` outside). Whether such a leak is user-legal is enforced by
+    // other property verifiers, not by SSA.
     //
     // ``RuntimeScopeStmt`` is a thin ``pl.scope()`` codegen wrapper, not a
     // boundary — its body shares SSA state with the enclosing function and
-    // stays fully transparent.
-    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op);
+    // stays fully transparent. ``SplitAivScopeStmt`` is likewise transparent:
+    // it is never outlined and is lowered in place by LowerAutoVectorSplit
+    // (pass 21), so its body shares SSA state with the enclosing function.
+    const bool is_outline_boundary = !As<RuntimeScopeStmt>(op) && !As<SplitAivScopeStmt>(op);
     std::unordered_set<const Var*> saved_future_needs;
     if (is_outline_boundary) {
       saved_future_needs = future_needs_;
@@ -1102,7 +1116,6 @@ class SSAConverter {
       return result;
     };
     if (auto in_core = As<InCoreScopeStmt>(op)) return rewrite(in_core);
-    if (auto auto_in_core = As<AutoInCoreScopeStmt>(op)) return rewrite(auto_in_core);
     if (auto cluster = As<ClusterScopeStmt>(op)) return rewrite(cluster);
     if (auto hier = As<HierarchyScopeStmt>(op)) return rewrite(hier);
     if (auto spmd = As<SpmdScopeStmt>(op)) {
@@ -1113,6 +1126,7 @@ class SSAConverter {
       return result;
     }
     if (auto runtime_scope = As<RuntimeScopeStmt>(op)) return rewrite(runtime_scope);
+    if (auto split_aiv = As<SplitAivScopeStmt>(op)) return rewrite(split_aiv);
     if (auto comm_domain = As<CommDomainScopeStmt>(op)) return rewrite(comm_domain);
     INTERNAL_UNREACHABLE_SPAN(op->span_) << "Unknown ScopeStmt subclass: " << op->TypeName();
     return op;
@@ -1172,6 +1186,13 @@ class SSAConverter {
     if (auto scope = As<RuntimeScopeStmt>(s)) {
       return ExtractYield(scope->body_);
     }
+    // SplitAivScopeStmt is likewise transparent: lowered in place by
+    // LowerAutoVectorSplit (pass 21), its body shares SSA state with the
+    // enclosing function, so a for/if body whose trailing stmt is a region must
+    // tunnel its carry-yield through the wrapper.
+    if (auto scope = As<SplitAivScopeStmt>(s)) {
+      return ExtractYield(scope->body_);
+    }
     if (auto seq = As<SeqStmts>(s)) {
       if (!seq->stmts_.empty()) {
         return ExtractYield(seq->stmts_.back());
@@ -1186,6 +1207,14 @@ class SSAConverter {
     // Transparent through a RuntimeScopeStmt: replace the carry-yield *inside*
     // the scope body and keep the scope wrapper (codegen still needs it).
     if (auto scope = As<RuntimeScopeStmt>(s)) {
+      auto copy = MutableCopy(scope);
+      copy->body_ = ReplaceOrAppendYield(scope->body_, vals, span);
+      return copy;
+    }
+    // Transparent through a SplitAivScopeStmt for the same reason (see
+    // ExtractYield): replace the carry-yield inside the region body and keep the
+    // wrapper for LowerAutoVectorSplit to consume.
+    if (auto scope = As<SplitAivScopeStmt>(s)) {
       auto copy = MutableCopy(scope);
       copy->body_ = ReplaceOrAppendYield(scope->body_, vals, span);
       return copy;

@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np  # pyright: ignore[reportMissingImports]
 import torch
 
-from .device_tensor import DeviceTensor
+from .device_tensor import DeviceTensor, StackedDeviceTensor
 from .runtime_base import Worker
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# ContinuousTensor → torch.Tensor conversion
+# simpler Tensor → torch.Tensor conversion
 # ---------------------------------------------------------------------------
 
 _DTYPE_MAP: dict[str, tuple[type, torch.dtype]] = {
@@ -53,9 +53,9 @@ _DTYPE_MAP: dict[str, tuple[type, torch.dtype]] = {
 
 
 def _tensor_from_continuous(ct) -> torch.Tensor:
-    """Convert a simpler ContinuousTensor to a torch.Tensor (zero-copy).
+    """Convert a simpler ``Tensor`` to a torch.Tensor (zero-copy).
 
-    The returned tensor shares the same memory as the ContinuousTensor
+    The returned tensor shares the same memory as the simpler ``Tensor``
     (via shared memory), so modifications are visible across processes.
 
     For dtypes that ``torch.from_numpy`` cannot accept directly (FP16/BF16),
@@ -71,7 +71,7 @@ def _tensor_from_continuous(ct) -> torch.Tensor:
         c_type, torch_dtype = _DTYPE_MAP[dtype_key]
     except KeyError as exc:
         raise TypeError(
-            f"Unsupported ContinuousTensor dtype: {dtype_str!r}. "
+            f"Unsupported simpler Tensor dtype: {dtype_str!r}. "
             f"Add an explicit mapping in _DTYPE_MAP. "
             f"Known dtypes: {sorted(_DTYPE_MAP)}"
         ) from exc
@@ -361,24 +361,45 @@ def _bind_sub_workers(
     return {**loaded, **callbacks}
 
 
-def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None) -> Any:
+def _make_call_config(
+    dc: DistributedConfig,
+    run_config: RunConfig | None = None,
+    *,
+    dfx_base: Path | None = None,
+    co_enable_swimlane_dep_gen: bool = True,
+) -> Any:
     """Build a simpler ``CallConfig`` from the distributed config.
 
     The ``block_dim`` / ``aicpu_thread_num`` baseline always comes from the
     program's :class:`DistributedConfig`. When *run_config* is given, its
     per-task ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-    ``ring_dep_pool``) are overlaid on top, so a single L3 dispatch can size the
+    ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) are overlaid
+    on top, so a single L3 dispatch can size the
     runtime's ring buffers without mutating the prepared program's shared
     config. ``None`` (the default) leaves the baseline untouched and the runtime
     applies its own ``PTO2_RING_*`` env var / compile-time fallback.
 
+    DFX diagnostics (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen``
+    / ``enable_scope_stats`` / ``enable_l2_swimlane``) are likewise read from
+    *run_config* and written to the shared ``config`` the host_orch chip dispatch
+    forwards to every ``orch.submit_next_level``; their artifacts land under
+    *dfx_base* (``<output_dir>/dfx_outputs``). ``enable_l2_swimlane`` co-enables
+    dep_gen so the converter can resolve task arrows / kernel names (see the
+    inline note on the single-pass timing trade-off vs the L2 two-pass).
+
     Args:
         dc: The program's distributed configuration (baseline).
-        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*``
-            overrides are applied. ``None`` means no ring override.
+        run_config: Optional per-dispatch :class:`RunConfig` whose ``ring_*`` and
+            DFX overrides are applied. ``None`` means no override.
+        dfx_base: Directory under which DFX artifacts are written
+            (``<output_dir>/dfx_outputs``). Required whenever *run_config*
+            enables a DFX flag; created if missing.
 
     Returns:
         A fresh simpler ``CallConfig``.
+
+    Raises:
+        ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
     from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         CallConfig,
@@ -389,36 +410,218 @@ def _make_call_config(dc: DistributedConfig, run_config: RunConfig | None = None
         call_config.block_dim = dc.block_dim
     call_config.aicpu_thread_num = dc.aicpu_thread_num
     if run_config is not None:
-        from .runner import _apply_ring_overrides  # noqa: PLC0415
+        from .runner import _apply_ring_overrides, _DfxOpts  # noqa: PLC0415
 
         _apply_ring_overrides(call_config, run_config)
 
-    import os
-    dfx_prefix = os.environ.get("PYPTO_DISTRIBUTED_DFX_PREFIX")
-    if dfx_prefix:
-        call_config.output_prefix = dfx_prefix
-        call_config.enable_dep_gen = os.environ.get("PYPTO_DISTRIBUTED_DEP_GEN", "0") == "1"
-        l2 = os.environ.get("PYPTO_DISTRIBUTED_L2_SWIMLANE", "0")
-        try:
-            call_config.enable_l2_swimlane = int(l2)
-        except ValueError:
-            call_config.enable_l2_swimlane = l2.lower() in ("1", "true", "yes")
+        dfx = _DfxOpts.from_run_config(run_config)
+        if dfx.any():
+            if dfx_base is None:
+                raise ValueError("_make_call_config: dfx_base is required when a DFX flag is enabled on L3")
+            dfx_base.mkdir(parents=True, exist_ok=True)
+            call_config.enable_dump_tensor = dfx.enable_dump_tensor
+            call_config.enable_pmu = dfx.enable_pmu
+            # Swimlane needs ``deps.json`` so the converter can resolve task
+            # arrows / kernel names. The one-shot path runs a clean two-pass
+            # (pass 1 dep_gen → deps.json, pass 2 swimlane → clean records) and
+            # sets ``co_enable_swimlane_dep_gen=False`` on the timing pass so
+            # dep_gen does not perturb it. Everywhere else (the timing-pass-less
+            # single-pass: prepared worker, or sim where conversion is skipped)
+            # co-enable dep_gen so swimlane still has a graph in one dispatch.
+            # ``enable_l2_swimlane`` is an int (0/1/2), so the ``or``/``and`` chain
+            # can yield an int; the ``CallConfig.enable_dep_gen`` pybind setter
+            # only accepts ``bool``. Wrap in ``bool(...)`` to avoid a TypeError.
+            call_config.enable_dep_gen = bool(
+                dfx.enable_dep_gen or (co_enable_swimlane_dep_gen and dfx.enable_l2_swimlane)
+            )
+            call_config.enable_scope_stats = dfx.enable_scope_stats
+            call_config.enable_l2_swimlane = dfx.enable_l2_swimlane
+            # Base dir shared by every chip; ``_submit_chip`` namespaces it per
+            # dispatch (``<dfx_base>/rank{worker}/d{k}``) so per-dispatch
+            # artifacts (pmu.csv, deps.json, l2_swimlane_records.json, ...) don't
+            # overwrite each other — even when one card runs multiple dispatches.
+            call_config.output_prefix = str(dfx_base)
+
+    # Backward-compatible stepfun/develop DFX knobs. These are intentionally a
+    # fallback: explicit RunConfig DFX fields take precedence and keep the newer
+    # N1 per-dispatch namespacing path intact.
+    import os  # noqa: PLC0415
+
+    if not call_config.output_prefix:
+        dfx_prefix = os.environ.get("PYPTO_DISTRIBUTED_DFX_PREFIX")
+        if dfx_prefix:
+            call_config.output_prefix = dfx_prefix
+            call_config.enable_dep_gen = os.environ.get("PYPTO_DISTRIBUTED_DEP_GEN", "0") == "1"
+            l2 = os.environ.get("PYPTO_DISTRIBUTED_L2_SWIMLANE", "0")
+            try:
+                call_config.enable_l2_swimlane = int(l2)
+            except ValueError:
+                call_config.enable_l2_swimlane = l2.lower() in ("1", "true", "yes")
     return call_config
 
 
-def _is_continuous_tensor(arg: Any) -> bool:
-    """True if *arg* is a simpler ``ContinuousTensor``.
+def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int) -> Any:
+    """``orch.submit_next_level`` with per-dispatch DFX ``output_prefix`` isolation.
+
+    The runtime path helpers root every diagnostic artifact at a fixed filename
+    under ``output_prefix`` (``<prefix>/pmu.csv`` etc.), so any two dispatches
+    sharing one prefix clobber each other. Namespacing by card alone is not
+    enough: one card may receive several dispatches in a single host_orch run
+    (pipeline stages, expert kernels, or genuinely different chip programs all
+    pinned to the same ``device``), and each re-init+finalize of the runtime's
+    per-run collector rewrites the fixed-name file. So this wrapper appends
+    ``/rank{worker}/d{k}`` — card *and* the card's k-th dispatch — for the
+    duration of the submit, then restores the shared ``config``. The restore is
+    safe because ``submit_next_level`` copies the ``CallConfig`` into the task
+    slot synchronously (orchestrator ``s.config = config``) before it returns,
+    so it never races the already-queued task.
+
+    ``k`` comes from a per-card counter on ``orch`` reset at the top of every
+    run (see ``_dispatch.orch_fn``), so the numbering is deterministic and
+    matches across the swimlane two-pass.
+
+    When DFX is off (``output_prefix`` unset) or the dispatch is unconstrained
+    (``worker < 0``) the call is forwarded unchanged.
+
+    The codegen emits this for every rank-pinned chip dispatch; the comm-less
+    single-dispatch path keeps the bare ``orch.submit_next_level(...)`` call.
+    """
+    base = config.output_prefix
+    if not base or worker < 0:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    idx_map = getattr(orch, "_dfx_dispatch_idx", None)
+    if idx_map is None:
+        # Defensive: a caller that bypassed ``orch_fn`` (no reset) still gets
+        # per-card isolation, just without a guaranteed two-pass match.
+        idx_map = orch._dfx_dispatch_idx = {}
+    k = idx_map.get(worker, 0)
+    idx_map[worker] = k + 1
+    config.output_prefix = f"{base}/rank{worker}/d{k}"
+    try:
+        return orch.submit_next_level(callable_id, task_args, config, worker=worker)
+    finally:
+        config.output_prefix = base
+
+
+def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
+    """Remove stale ``rank*/d{k}`` dispatch dirs before a fresh DFX run.
+
+    The per-card dispatch counter resets to ``d0`` at the start of every run, so
+    a prepared :class:`DistributedWorker` reusing one ``output_dir`` across
+    dispatches would otherwise leave higher-numbered ``d{k}`` dirs from an
+    earlier, larger run on disk. ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
+    those stale dirs would be re-converted as if they belonged to the current
+    run. Clearing them once, before the first dispatch of a DFX run, scopes the
+    artifacts (and their post-processing) to exactly this run. Called only when
+    DFX is enabled; best-effort (a removal failure must not abort the dispatch).
+    """
+    if not dfx_base.is_dir():
+        return
+    import shutil  # noqa: PLC0415
+
+    for rank_dir in dfx_base.glob("rank*"):
+        if not rank_dir.is_dir():
+            continue
+        for disp_dir in rank_dir.glob("d[0-9]*"):
+            if disp_dir.is_dir():
+                shutil.rmtree(disp_dir, ignore_errors=True)
+
+
+def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
+    """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
+
+    The runtime writes ``rank{r}/d{k}/l2_swimlane_records.json`` +
+    ``rank{r}/d{k}/deps.json`` per dispatch (``_submit_chip`` namespaced the dir
+    by card *and* the card's k-th dispatch; dep_gen is co-enabled with
+    swimlane). This best-effort post-pass runs the offline ``swimlane_converter``
+    once per dispatch dir, resolving kernel names from a merged map of every
+    chip callable's ``kernel_config.py`` (``next_levels/*/``). Each dispatch's
+    records are single-chip, so the L2 converter applies unchanged — and a card
+    that ran several (possibly different) programs keeps one swimlane per
+    dispatch instead of overwriting down to the last.
+
+    Onboard-only: the simulator emits records but not the task metadata the
+    converter joins against, so conversion is skipped there (mirrors the L2
+    ``_collect_dfx_artifacts`` swimlane branch). Any failure is logged, never
+    raised — the raw records remain for manual conversion.
+    """
+    if platform.endswith("sim"):
+        print(
+            "Skipping L3 swimlane conversion on simulator: merged_swimlane_*.json "
+            "is only generated for onboard runs (raw l2_swimlane_records.json kept)."
+        )
+        return
+
+    from .runner import _generate_swimlane  # noqa: PLC0415
+
+    # ``glob("*/")`` directory filtering is only reliable on 3.11+; filter
+    # explicitly so this works on the 3.10 baseline too.
+    chip_dirs = sorted(d for d in (output_dir / "next_levels").glob("*") if d.is_dir())
+    merged: dict = {}
+    try:
+        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+            load_kernel_config,
+        )
+
+        for chip_dir in chip_dirs:
+            kc = chip_dir / "kernel_config.py"
+            if kc.exists():
+                merged.update(load_kernel_config(str(kc)))
+    except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
+        print(f"Skipping L3 swimlane name_map ({type(e).__name__}: {e}); labels fall back to defaults")
+
+    dfx_base = output_dir / "dfx_outputs"
+    for r in range(n_ranks):
+        rank_dir = dfx_base / f"rank{r}"
+        if not rank_dir.is_dir():
+            continue
+        # One card may have run several dispatches: ``rank{r}/d0``, ``d1``, ...
+        # Match only ``d`` + digits (the names ``_submit_chip`` emits) so an
+        # unrelated diagnostic dir under rank_dir is never picked up. 3.10-safe
+        # dir filter (``glob`` directory filtering is only reliable on 3.11+).
+        dispatch_dirs = sorted(d for d in rank_dir.glob("d[0-9]*") if d.is_dir())
+        for disp_dir in dispatch_dirs:
+            records = disp_dir / "l2_swimlane_records.json"
+            if not records.exists():
+                continue
+            # Best-effort, as documented: a write/convert failure for one
+            # dispatch must not turn a successful run into a post-processing
+            # crash. The raw records remain on disk for manual conversion.
+            try:
+                name_map_path: Path | None = None
+                if merged:
+                    name_map_path = disp_dir / "name_map.json"
+                    name_map_path.write_text(
+                        json.dumps(
+                            {"level": 2, "orchestrator_name": None, "callable_id_to_name": merged},
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+                # ``work_dir`` only feeds the converter's ``-k`` fallback; the
+                # merged ``name_map`` passed as ``func_names`` takes precedence.
+                work_dir = chip_dirs[0] if chip_dirs else output_dir
+                _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path)
+            except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
+                print(
+                    f"Skipping L3 swimlane conversion for {disp_dir.name} of rank {r} "
+                    f"({type(e).__name__}: {e}); raw records kept"
+                )
+
+
+def _is_simpler_tensor(arg: Any) -> bool:
+    """True if *arg* is a simpler ``Tensor``.
 
     Returns ``False`` (rather than raising) when simpler is unavailable, so the
     DeviceTensor-only path stays importable without the runtime package.
     """
     try:
         from .task_interface import (  # noqa: PLC0415
-            ContinuousTensor,  # pyright: ignore[reportAttributeAccessIssue]
+            Tensor,  # pyright: ignore[reportAttributeAccessIssue]
         )
     except ImportError:
         return False
-    return isinstance(arg, ContinuousTensor)
+    return isinstance(arg, Tensor)
 
 
 def _dispatch(
@@ -429,12 +632,11 @@ def _dispatch(
     sub_ids: dict[str, Any],
     call_config: Any,
     device_nums: int,
-) -> Any:
+) -> None:
     """Build the orchestration closure and run it once on ``w``.
 
-    Returns the simpler ``RunTiming`` from ``w.run`` (``host_wall_us`` /
-    ``device_wall_us``). For an L3 DAG ``device_wall_us`` is ``0`` — only the
-    host wall around the dispatch is meaningful here.
+    The simpler ``Worker.run`` returns ``None`` (per-run timing is read from
+    the runtime's ``[STRACE]`` log markers, simpler PR #1177).
     """
     # Fresh _keep per dispatch: it pins per-call TaskArgs alive for the run.
     _keep: list[Any] = []
@@ -444,6 +646,12 @@ def _dispatch(
     # and comm-less paths.
 
     def orch_fn(orch, _unused_args, _unused_cfg):
+        # Reset the per-card DFX dispatch counter at the start of every run so
+        # ``_submit_chip`` numbers a card's dispatches ``d0, d1, ...`` fresh each
+        # pass. Two-pass swimlane reissues the same dispatch order, so pass 1
+        # (deps.json) and pass 2 (records) land the same dispatch in the same
+        # ``rank{w}/d{k}`` dir — letting the converter join them.
+        orch._dfx_dispatch_idx = {}
         entry_fn(
             orch,
             _unused_args,
@@ -455,14 +663,14 @@ def _dispatch(
             world_size=device_nums,
         )
 
-    return w.run(orch_fn)
+    w.run(orch_fn)
 
 
 def execute_distributed(
     compiled: DistributedCompiledProgram,
-    coerced_args: list[torch.Tensor | DeviceTensor],
+    coerced_args: list[torch.Tensor | DeviceTensor | StackedDeviceTensor],
     config: RunConfig | None = None,
-) -> Any:
+) -> None:
     """Execute a distributed compiled program once via simpler Worker(level=3).
 
     One-shot path: runs the full setup, dispatches once, then tears the Worker
@@ -476,14 +684,24 @@ def execute_distributed(
             worker-resident :class:`~pypto.runtime.DeviceTensor`.
         config: Optional per-dispatch :class:`RunConfig`. Its per-task
             ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-            ``ring_dep_pool``) size this dispatch's runtime ring buffers; the
-            remaining (compile-side / DFX) fields are not consumed on the L3
-            dispatch path. ``None`` defers every ring field to the runtime.
+            ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) size
+            this dispatch's runtime ring buffers, and its
+            runtime-diagnostic DFX flags (``enable_dump_tensor`` / ``enable_pmu``
+            / ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``)
+            are written per dispatch under
+            ``<output_dir>/dfx_outputs/rank{r}/d{k}/`` (``d{k}`` is the card's
+            k-th dispatch, so multiple — even different — chip programs on one
+            card keep separate artifacts). Onboard, ``enable_l2_swimlane`` runs a
+            clean two-pass dispatch (pass 1 dep_gen → ``deps.json``, pass 2
+            swimlane → records with unperturbed timing) and additionally produces
+            ``merged_swimlane_*.json`` per dispatch. The remaining compile-side
+            fields are not consumed on the dispatch path. ``None`` defers every
+            ring field to the runtime and leaves DFX off.
 
     Returns:
-        The simpler ``RunTiming`` from the dispatch (``host_wall_us`` /
-        ``device_wall_us``; ``device_wall_us`` is ``0`` for the L3 DAG), or
-        ``None`` if dispatch produced no timing.
+        ``None``. Device results are written back into the host tensors in
+        place; per-run timing is read from the runtime's ``[STRACE]`` log
+        markers (simpler PR #1177), not returned here.
     """
     dc = compiled._distributed_config
     output_dir = compiled.output_dir
@@ -495,9 +713,12 @@ def execute_distributed(
     # be in shared memory before the fork; DeviceTensor inputs are device
     # pointers forwarded at submit time and need no pre-fork shared memory.
     param_infos, _, _ = compiled._get_metadata()
-    tensors: dict[str, torch.Tensor | DeviceTensor] = {}
+    tensors: dict[str, torch.Tensor | DeviceTensor | StackedDeviceTensor] = {}
     for info, arg in zip(param_infos, coerced_args, strict=True):
-        if isinstance(arg, DeviceTensor):
+        # Worker-resident inputs (a DeviceTensor, or a StackedDeviceTensor whose
+        # per-rank shards are each DeviceTensors) are device pointers forwarded
+        # at submit time — no pre-fork shared memory needed.
+        if isinstance(arg, (DeviceTensor, StackedDeviceTensor)):
             tensors[info.name] = arg
             continue
         if not arg.is_shared():
@@ -517,29 +738,87 @@ def execute_distributed(
 
     num_sub = max(dc.num_sub_workers, len(sub_worker_fns))
 
-    # Construct/register/init inside the try so a failure in any setup step still
-    # closes the worker and unlinks the rootinfo temp file — none of these leak.
-    w = None
-    try:
-        w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
-        sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
-        w.init()
-        return _dispatch(
-            w, entry_fn, tensors, chip_cids, sub_ids, _make_call_config(dc, config), len(dc.device_ids)
+    def _run_once(call_config: Any) -> None:
+        """One full worker lifecycle (construct → register → init → dispatch → close).
+
+        Each call forks fresh chip workers and closes them, so the per-pass DFX
+        collectors — which live in the forked children, not this host process —
+        get clean SVM state every pass. That is why the L3 two-pass below does
+        not need the subprocess the in-process L2 path uses to dodge the
+        ``halHostRegister`` cap (rc 8).
+
+        Construct/register/init run inside the try so a failure in any setup step
+        still closes the worker and unlinks the rootinfo temp file.
+        """
+        w = None
+        try:
+            w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
+            sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
+            w.init()
+            _dispatch(w, entry_fn, tensors, chip_cids, sub_ids, call_config, len(dc.device_ids))
+        finally:
+            if w is not None:
+                w.close()
+
+    dfx_base = output_dir / "dfx_outputs"
+    swimlane = config is not None and config.enable_l2_swimlane
+
+    # Scope DFX artifacts to this run: drop any stale ``rank*/d{k}`` dirs from an
+    # earlier (possibly larger) run before the first dispatch writes new ones.
+    if config is not None:
+        from .runner import _DfxOpts  # noqa: PLC0415
+
+        if _DfxOpts.from_run_config(config).any():
+            _clear_dfx_dispatch_dirs(dfx_base)
+
+    if config is not None and config.enable_l2_swimlane and not compiled.platform.endswith("sim"):
+        # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
+        # collection perturbs timing, so the per-dispatch task graph and the kept
+        # timing come from separate dispatches.
+        import dataclasses  # noqa: PLC0415
+
+        print(
+            "[swimlane] L3 swimlane enabled -> running the dispatch twice "
+            "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
         )
-    finally:
-        if w is not None:
-            w.close()
+        print(
+            "[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded."
+        )
+        deps_cfg = dataclasses.replace(
+            config,
+            enable_l2_swimlane=False,
+            enable_dep_gen=True,
+            enable_pmu=0,
+            enable_scope_stats=False,
+            enable_dump_tensor=0,
+        )
+        _run_once(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
+
+        print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
+        timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
+        _run_once(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
+    else:
+        _run_once(_make_call_config(dc, config, dfx_base=dfx_base))
+
+    # Offline post-pass (reads the per-dispatch deps.json + records on disk).
+    if swimlane:
+        _collect_l3_swimlane(output_dir, len(dc.device_ids), compiled.platform)
 
 
 def execute_distributed_compiled(
     output_dir: str | Path,
-    args: Sequence[torch.Tensor | DeviceTensor | ctypes._SimpleCData],
+    args: Sequence[torch.Tensor | DeviceTensor | StackedDeviceTensor | ctypes._SimpleCData],
     config: RunConfig | None = None,
     *,
     platform: str | None = None,
     distributed_config: DistributedConfig | None = None,
-) -> torch.Tensor | DeviceTensor | tuple[torch.Tensor | DeviceTensor, ...] | None:
+) -> (
+    torch.Tensor
+    | DeviceTensor
+    | StackedDeviceTensor
+    | tuple[torch.Tensor | DeviceTensor | StackedDeviceTensor, ...]
+    | None
+):
     """Reconstruct a distributed program from ``output_dir`` and run it once.
 
     The distributed counterpart of :func:`pypto.runtime.execute_compiled`: it
@@ -558,8 +837,11 @@ def execute_distributed_compiled(
             parameter order (in-place, or input-only for a return-style program).
         config: Optional per-dispatch :class:`RunConfig`, forwarded to
             ``__call__``. Its per-task ring-sizing overrides size this dispatch's
-            runtime ring buffers; other (compile-side / DFX) fields are not
-            consumed on the L3 dispatch path.
+            runtime ring buffers, and its runtime-diagnostic DFX flags
+            (``enable_dump_tensor`` / ``enable_pmu`` / ``enable_dep_gen`` /
+            ``enable_scope_stats`` / ``enable_l2_swimlane``) are written per
+            dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``. Other
+            compile-side fields are not consumed on the dispatch path.
         platform: Override the persisted platform (e.g. ``a2a3sim`` → ``a2a3``).
         distributed_config: Override the persisted run config (e.g. a different
             set of ``device_ids``).
@@ -751,9 +1033,6 @@ class DistributedWorker(Worker):
         # Live RegistrationHandles so close() can mark them closed. WeakSet
         # so handles that drop out of scope first don't pin DistributedWorker.
         self._handles: weakref.WeakSet[Any] = weakref.WeakSet()
-        # RunTiming from the most recent dispatch (host_wall_us; device_wall_us
-        # is 0 for the L3 DAG), or None before the first run.
-        self.last_run_timing: Any = None
 
     @staticmethod
     def _check_compatible(prog: DistributedCompiledProgram, primary: DistributedCompiledProgram) -> None:
@@ -807,6 +1086,30 @@ class DistributedWorker(Worker):
         self._require_open("malloc")
         return int(self._orch().malloc(worker_id, nbytes))
 
+    def import_ipc(self, key: bytes, *, worker_id: int = 0) -> int:
+        """Import an ACL device-IPC *key* on chip *worker_id*; returns a device pointer.
+
+        The key is produced by ``aclrtIpcMemGetExportKey`` on the exporting process
+        (e.g. vLLM's KV-cache buffer). The import runs inside the forked chip
+        child's own ACL context, so the returned pointer is valid for kernels and
+        can back a :class:`~pypto.runtime.DeviceTensor` (``child_memory``) argument
+        with no H2D/D2H copy — the device-shared / zero-copy path. Pair the
+        returned pointer with the matching shape/dtype to build the kernel arg.
+        """
+        self._require_open("import_ipc")
+        return int(self._orch().import_ipc(worker_id, bytes(key)))
+
+    def import_ipc_all(self, device_key_map: dict[int, bytes]) -> dict[int, int]:
+        """Import one external ACL IPC allocation in each chip child.
+
+        ``device_key_map`` is keyed by physical device id and each value is the
+        256-byte key returned by ``aclrtIpcMemGetExportKey``.  Simpler performs
+        the imports inside the matching forked chip ACL contexts and returns
+        child-valid peer VAs.
+        """
+        self._require_open("import_ipc_all")
+        return self._w.import_ipc_all(device_key_map)
+
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_open("free")
@@ -827,27 +1130,174 @@ class DistributedWorker(Worker):
     # the readiness guard (open vs. closed) and the host-init upload policy (the
     # upload runs in a forked chip worker, so no defensive copy is possible).
 
-    _WORKER_KIND = "chip worker"
-
     def _require_ready(self, op: str) -> None:
         # Worker ABC hook: device-memory ops are valid until close().
         self._require_open(op)
 
-    def _prepare_init(self, init: torch.Tensor) -> torch.Tensor:
-        # Worker ABC hook: the upload (``copy_to``) runs **inside the
-        # forked chip worker**, so ``init`` must be a CPU, contiguous,
-        # shared-memory tensor allocated **before**
-        # :meth:`DistributedCompiledProgram.prepare` (call ``.share_memory_()``).
-        # Unlike L2 we cannot make a defensive ``.cpu().contiguous()`` copy: that
-        # copy would live only in the parent and be invisible to the child.
-        if not (init.is_shared() and init.is_contiguous() and init.device.type == "cpu"):
+    @staticmethod
+    def _require_forked_host_buffer(tensor: torch.Tensor, api: str, access: str) -> None:
+        """Validate *tensor* is a host buffer the forked chip worker can ``access``.
+
+        Every H2D/D2H copy runs **inside the forked chip worker**, which can only
+        touch host memory it inherited at fork. So *tensor* must be a CPU,
+        contiguous, **shared-memory** tensor allocated **before**
+        :meth:`DistributedCompiledProgram.prepare` (call ``.share_memory_()``); a
+        buffer allocated after ``prepare()`` — or a non-shared one — is invisible
+        to the child.
+
+        Args:
+            tensor: The host buffer to validate.
+            api: The calling API signature, woven into the error message
+                (e.g. ``"copy_stacked_from(host=...)"``).
+            access: The child's access verb — ``"read"`` for uploads, ``"write"``
+                for read-backs.
+
+        Raises:
+            ValueError: If *tensor* is not CPU, contiguous, and shared-memory.
+        """
+        if not (tensor.is_shared() and tensor.is_contiguous() and tensor.device.type == "cpu"):
             raise ValueError(
-                "DistributedWorker.alloc_tensor(init=...) requires a CPU, contiguous, "
-                "shared-memory tensor allocated BEFORE prepare() (call .share_memory_()). "
-                "The upload runs in the forked chip worker, which can only read host "
-                "memory it inherited at fork."
+                f"{api} requires a CPU, contiguous, shared-memory tensor allocated "
+                f"BEFORE prepare() (call .share_memory_()). The copy runs in the forked "
+                f"chip worker, which can only {access} host memory it inherited at fork."
             )
+
+    def _prepare_init(self, init: torch.Tensor) -> torch.Tensor:
+        # Worker ABC hook: the upload (``copy_to``) runs **inside the forked chip
+        # worker**, so ``init`` must be a CPU, contiguous, shared-memory tensor
+        # allocated **before** prepare() (see _require_forked_host_buffer). Unlike
+        # L2 we cannot make a defensive ``.cpu().contiguous()`` copy: that copy
+        # would live only in the parent and be invisible to the child.
+        self._require_forked_host_buffer(init, "DistributedWorker.alloc_tensor(init=...)", "read")
         return init
+
+    def alloc_stacked_tensor(
+        self,
+        host: torch.Tensor,
+        *,
+        worker_ids: Sequence[int] | None = None,
+    ) -> StackedDeviceTensor:
+        """Upload each leading-dim shard of *host* to a worker once; reuse it.
+
+        The leading dimension of *host* is the stack/shard dimension: shard ``i``
+        (``host[i]``, shape ``host.shape[1:]``) is uploaded to worker
+        ``worker_ids[i]`` and stays resident for the worker's lifetime. Pass the
+        returned :class:`~pypto.runtime.StackedDeviceTensor` in place of *host*
+        for a leading-dim-sharded program parameter (a ``[B, *tail]`` tensor the
+        orchestrator slices per rank: ``for r in range(world_size):
+        child(x[r], device=...)``). The generated ``host_orch`` indexes ``x[i]``
+        to shard ``i``'s :class:`~pypto.runtime.DeviceTensor`, so the runtime
+        skips the per-dispatch H2D upload (``child_memory``) — the stack is
+        uploaded once here and reused across every ``rt(...)`` dispatch.
+
+        Args:
+            host: A CPU, contiguous, **shared-memory** ``[B, *tail]`` tensor
+                allocated BEFORE :meth:`~DistributedCompiledProgram.prepare`
+                (call ``.share_memory_()``); the upload runs in the forked chip
+                worker, which can only read host memory inherited at fork.
+            worker_ids: ``worker_ids[i]`` is the worker that holds shard ``i``
+                and whose task consumes ``x[i]``; it MUST equal the worker the
+                program submits ``x[i]``'s dispatch to (its ``device=``
+                expression). Entries must be distinct and within
+                ``[0, world_size)``. Defaults to ``range(B)`` — the canonical
+                ``for r in range(world_size): child(x[r], device=r)`` program. A
+                permuted/subset placement (``device=perm[r]`` / ``device=2*r``)
+                needs the matching ``worker_ids``.
+
+        Returns:
+            A :class:`~pypto.runtime.StackedDeviceTensor`; its shards are tracked
+            by this worker and auto-freed on :meth:`close` if not released earlier
+            via :meth:`free_stacked_tensor`.
+        """
+        self._require_open("alloc_stacked_tensor")
+        if not isinstance(host, torch.Tensor):
+            raise TypeError(
+                f"alloc_stacked_tensor(host=...) expects a torch.Tensor, got {type(host).__name__}"
+            )
+        if host.ndim < 2:
+            raise ValueError(
+                f"alloc_stacked_tensor needs a [B, *tail] tensor (rank >= 2), got shape {tuple(host.shape)}"
+            )
+        b = int(host.shape[0])
+        if b < 1:
+            raise ValueError(
+                f"alloc_stacked_tensor needs at least one shard in the leading dim, "
+                f"got shape {tuple(host.shape)}"
+            )
+        world = len(self.dc.device_ids)
+        ids = list(range(b)) if worker_ids is None else [int(w) for w in worker_ids]
+        if len(ids) != b:
+            raise ValueError(f"worker_ids has {len(ids)} entries; host leading dim is {b}")
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"worker_ids must be distinct (one shard per worker), got {ids}")
+        for w in ids:
+            if not 0 <= w < world:
+                raise ValueError(f"worker id {w} out of range [0, {world}) (world_size from device_ids)")
+
+        shards: list[DeviceTensor] = []
+        try:
+            for i, w in enumerate(ids):
+                shards.append(
+                    self.alloc_tensor(
+                        tuple(host.shape[1:]),
+                        host.dtype,
+                        init=host[i].contiguous(),
+                        worker_id=w,
+                    )
+                )
+        except Exception:
+            # Roll back any shards already uploaded so a mid-loop failure
+            # (e.g. a non-shared host) never leaks device memory.
+            for shard, w in zip(shards, ids, strict=False):
+                self.free_tensor(shard, worker_id=w)
+            raise
+        return StackedDeviceTensor(shards, tuple(host.shape), tuple(ids))
+
+    def free_stacked_tensor(self, stacked: StackedDeviceTensor) -> None:
+        """Release every shard of *stacked* against its owning worker. Idempotent."""
+        for shard, w in zip(stacked.shards, stacked.worker_ids, strict=True):
+            self.free_tensor(shard, worker_id=w)
+
+    def copy_stacked_from(self, stacked: StackedDeviceTensor, host: torch.Tensor) -> None:
+        """Read every shard of *stacked* back to *host* (D2H) — the read-back
+        symmetric to :meth:`alloc_stacked_tensor`.
+
+        Because a :class:`~pypto.runtime.StackedDeviceTensor` skips the
+        per-dispatch D2H copy, callers that want the shards' current device
+        contents (e.g. a resident KV cache at the end of an L3 step) must read
+        them back explicitly. Shard ``i`` is copied from its owning worker
+        ``stacked.worker_ids[i]`` into ``host[i]``.
+
+        Args:
+            stacked: The resident stacked tensor to read back.
+            host: A CPU, contiguous, **shared-memory** ``[B, *tail]`` tensor
+                allocated BEFORE :meth:`~DistributedCompiledProgram.prepare`
+                (call ``.share_memory_()``), whose shape and dtype match
+                ``stacked.full_shape`` / ``stacked.dtype``. Filled in place
+                (``host[i]`` receives shard ``i``). The D2H copy runs in the
+                forked chip worker, which can only write to host memory it
+                inherited at fork — a buffer allocated after ``prepare()`` (or a
+                non-shared one) would leave *host* untouched.
+        """
+        self._require_open("copy_stacked_from")
+        if not isinstance(stacked, StackedDeviceTensor):
+            raise TypeError(
+                f"copy_stacked_from(stacked=...) expects a StackedDeviceTensor, got {type(stacked).__name__}"
+            )
+        if not isinstance(host, torch.Tensor):
+            raise TypeError(f"copy_stacked_from(host=...) expects a torch.Tensor, got {type(host).__name__}")
+        if tuple(host.shape) != stacked.full_shape:
+            raise ValueError(
+                f"host shape {tuple(host.shape)} does not match stacked full_shape {stacked.full_shape}"
+            )
+        if host.dtype != stacked.dtype:
+            raise ValueError(f"host dtype {host.dtype} does not match stacked dtype {stacked.dtype}")
+        self._require_forked_host_buffer(host, "copy_stacked_from(host=...)", "write")
+        for i, (shard, w) in enumerate(zip(stacked.shards, stacked.worker_ids, strict=True)):
+            # host is contiguous + shared, so host[i] is a contiguous view at the
+            # right offset into the same shm segment the child inherited at fork;
+            # host[i].data_ptr() is therefore the correct cross-process D2H dst.
+            self.copy_from(host[i].data_ptr(), shard.data_ptr, shard.nbytes, worker_id=w)
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -865,7 +1315,7 @@ class DistributedWorker(Worker):
           worker reads/writes it through the inherited shared mapping; read
           outputs back directly from the tensor — no ``copy_from`` needed.
         - a worker-resident :class:`~pypto.runtime.DeviceTensor` (e.g. a static
-          weight from :meth:`alloc_tensor`) or a simpler ``ContinuousTensor``.
+          weight from :meth:`alloc_tensor`) or a simpler ``Tensor``.
 
         A non-shared ``torch.Tensor`` is rejected: a buffer allocated after the
         fork is invisible to the chip worker.
@@ -876,7 +1326,8 @@ class DistributedWorker(Worker):
 
         ``config`` is an optional per-dispatch :class:`RunConfig`: its per-task
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
-        ``ring_dep_pool``) size this dispatch's runtime ring buffers without
+        ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) size this
+        dispatch's runtime ring buffers without
         touching the prepared program's shared config, so consecutive dispatches
         can use different ring sizes. ``None`` reuses the program's baseline.
         """
@@ -900,7 +1351,10 @@ class DistributedWorker(Worker):
         ``None``, the prepared baseline is reused with zero extra allocation.
         """
         self._require_open("run")
-        from pypto.ir.compiled_program import _validate_device_tensor  # noqa: PLC0415
+        from pypto.ir.compiled_program import (  # noqa: PLC0415
+            _validate_device_tensor,
+            _validate_stacked_tensor,
+        )
 
         state = self._states.get(compiled)
         if state is None:
@@ -914,7 +1368,15 @@ class DistributedWorker(Worker):
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
         if config is not None:
-            call_config = _make_call_config(compiled._distributed_config, config)
+            dfx_base = compiled.output_dir / "dfx_outputs"
+            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
+            # This worker reuses one output_dir across dispatches, so stale
+            # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared
+            # before this run rewrites ``d0, d1, ...`` (see _clear_dfx_dispatch_dirs).
+            from .runner import _DfxOpts  # noqa: PLC0415
+
+            if _DfxOpts.from_run_config(config).any():
+                _clear_dfx_dispatch_dirs(dfx_base)
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)
@@ -930,7 +1392,9 @@ class DistributedWorker(Worker):
                 # Scalar parameter (e.g. seq_len): forwarded as-is to the entry.
                 tensors[info.name] = arg
                 continue
-            if isinstance(arg, DeviceTensor):
+            if isinstance(arg, StackedDeviceTensor):
+                _validate_stacked_tensor(arg, info)
+            elif isinstance(arg, DeviceTensor):
                 _validate_device_tensor(arg, info)
             elif isinstance(arg, torch.Tensor):
                 if not arg.is_shared():
@@ -940,14 +1404,15 @@ class DistributedWorker(Worker):
                         f"reuse the same buffer across dispatches), so the forked chip worker can see "
                         f"it. Got a non-shared tensor."
                     )
-            elif not _is_continuous_tensor(arg):
+            elif not _is_simpler_tensor(arg):
                 raise TypeError(
                     f"DistributedWorker parameter {info.name!r} got {type(arg).__name__}; expected a "
-                    f"shared-memory torch.Tensor, a worker-resident DeviceTensor, or a ContinuousTensor."
+                    f"shared-memory torch.Tensor, a worker-resident DeviceTensor, a "
+                    f"StackedDeviceTensor, or a simpler Tensor."
                 )
             tensors[info.name] = arg
 
-        self.last_run_timing = _dispatch(
+        _dispatch(
             self._w,
             state["entry_fn"],
             tensors,
@@ -956,6 +1421,17 @@ class DistributedWorker(Worker):
             call_config,
             state["device_nums"],
         )
+
+        # Offline post-pass (reads the per-dispatch records on disk; no worker needed).
+        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
+        # worker reuses its forked chip children across dispatches, so it cannot
+        # re-fork between a deps pass and a timing pass without tripping the
+        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
+        # single-pass (dep_gen co-enabled), so the on-disk records include
+        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
+        # clean two-pass swimlane timing.
+        if config is not None and config.enable_l2_swimlane:
+            _collect_l3_swimlane(compiled.output_dir, state["device_nums"], compiled.platform)
 
     # ------------------------------------------------------------------
     # Lifecycle

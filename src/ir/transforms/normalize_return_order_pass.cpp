@@ -22,11 +22,13 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/type.h"
@@ -79,7 +81,7 @@ std::vector<int> BuildReturnToParamMapping(const FunctionPtr& func) {
       if (!assign->var_) continue;
       if (auto call = As<Call>(assign->value_)) {
         // tile.store(tile, offsets, out_param, ...) → lhs tracks out_param
-        if (call->op_ && call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+        if (IsOp(call, "tile.store") && call->args_.size() >= 3) {
           if (auto out_param = As<Var>(call->args_[2])) {
             var_to_out_param[assign->var_.get()] = find_param_index(out_param.get());
           }
@@ -292,6 +294,7 @@ class TupleIndexPermutationMutator : public IRMutator {
  protected:
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto new_value = VisitExpr(op->value_);
+    VarPtr new_var = op->var_;
 
     if (op->var_) {
       // Both Call and Submit (pl.submit inside pl.manual_scope) launch a callee
@@ -313,7 +316,23 @@ class TupleIndexPermutationMutator : public IRMutator {
       if (auto global_var = std::dynamic_pointer_cast<const GlobalVar>(callee_op)) {
         auto perm_it = permutations_.find(global_var->name_);
         if (perm_it != permutations_.end() && !perm_it->second.empty()) {
-          reordered_tuple_vars_[op->var_.get()] = &perm_it->second;
+          // Reorder the call/submit result TupleType in lockstep with the
+          // callee's return types. Existing tests used homogeneous FP32
+          // outputs, which hid this requirement. With heterogeneous native
+          // W8A8 returns such as (INT8 data, FP32 scale), remapping only the
+          // TupleGetItem index makes the projection read the correct slot but
+          // retain the *old slot's type*, swapping data and scale dtypes.
+          new_value = ReorderCallLikeResultType(new_value, perm_it->second);
+
+          // The assignment LHS is the tuple definition consumed by later
+          // TupleGetItemExpr nodes. Rebuild it with the reordered TupleType and
+          // register the identity remap so every downstream tuple reference
+          // sees both the new type and the new projection order.
+          if (!structural_equal(op->var_->GetType(), new_value->GetType())) {
+            new_var = std::make_shared<Var>(op->var_->name_hint_, new_value->GetType(), op->var_->span_);
+            var_remap_[op->var_.get()] = new_var;
+          }
+          reordered_tuple_vars_[new_var.get()] = &perm_it->second;
         } else {
           // Reassigned to a non-reordered call: remove stale entry.
           reordered_tuple_vars_.erase(op->var_.get());
@@ -324,8 +343,8 @@ class TupleIndexPermutationMutator : public IRMutator {
       }
     }
 
-    if (new_value.get() != op->value_.get()) {
-      return std::make_shared<AssignStmt>(op->var_, new_value, op->span_);
+    if (new_value.get() != op->value_.get() || new_var.get() != op->var_.get()) {
+      return std::make_shared<AssignStmt>(new_var, new_value, op->span_);
     }
     return op;
   }
@@ -353,6 +372,44 @@ class TupleIndexPermutationMutator : public IRMutator {
   }
 
  private:
+  TypePtr ReorderTupleType(const TypePtr& type, const std::vector<int>& permutation,
+                           const Span& span) const {
+    auto tuple = As<TupleType>(type);
+    INTERNAL_CHECK_SPAN(tuple, span)
+        << "NormalizeReturnOrder: reordered call/submit result must have TupleType";
+    INTERNAL_CHECK_SPAN(tuple->types_.size() >= permutation.size(), span)
+        << "NormalizeReturnOrder: call/submit result tuple has " << tuple->types_.size()
+        << " element(s), fewer than return permutation size " << permutation.size();
+
+    // Submit appends Scalar[TASK_ID] after the callee returns. Reorder only the
+    // callee-return prefix and preserve every trailing runtime element.
+    std::vector<TypePtr> reordered = tuple->types_;
+    for (size_t old_index = 0; old_index < permutation.size(); ++old_index) {
+      const int new_index = permutation[old_index];
+      INTERNAL_CHECK_SPAN(new_index >= 0 && new_index < static_cast<int>(permutation.size()), span)
+          << "NormalizeReturnOrder: result-type permutation index out of range";
+      reordered[static_cast<size_t>(new_index)] = tuple->types_[old_index];
+    }
+    return std::make_shared<TupleType>(std::move(reordered));
+  }
+
+  ExprPtr ReorderCallLikeResultType(const ExprPtr& value,
+                                    const std::vector<int>& permutation) const {
+    auto new_type = ReorderTupleType(value->GetType(), permutation, value->span_);
+    if (auto call = As<Call>(value)) {
+      return std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_,
+                                    std::move(new_type), call->span_);
+    }
+    if (auto submit = As<Submit>(value)) {
+      return std::make_shared<Submit>(
+          submit->op_, submit->args_, submit->deps_, submit->kwargs_, submit->attrs_,
+          std::move(new_type), submit->span_, submit->core_num_, submit->sync_start_,
+          submit->allow_early_resolve_);
+    }
+    INTERNAL_UNREACHABLE_SPAN(value->span_)
+        << "NormalizeReturnOrder: expected Call or Submit result";
+  }
+
   const std::unordered_map<std::string, std::vector<int>>& permutations_;
   std::unordered_map<const Var*, const std::vector<int>*> reordered_tuple_vars_;
 };

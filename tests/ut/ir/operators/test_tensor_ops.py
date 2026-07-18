@@ -277,6 +277,142 @@ def test_tensor_col_sum():
     assert len(result_type.shape) == 2
 
 
+def test_tensor_row_prod():
+    """Test tensor.row_prod reduction (reduce last axis)."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.row_prod(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_prod"
+
+    # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1].
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 64
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 1
+
+
+def test_tensor_col_prod():
+    """tensor.col_prod reduces axis=-2 (the M dim of [..., M, N]) with keepdim=True."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.col_prod(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_prod"
+
+    # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128].
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 1
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 128
+
+
+def test_tensor_row_argmax():
+    """tensor.row_argmax reduces the last axis (keepdim) with an int32 index output."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.row_argmax(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_argmax"
+
+    # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1]; dtype -> int32.
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 64
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 1
+
+
+def test_tensor_row_argmin():
+    """tensor.row_argmin mirrors row_argmax: last-axis reduce, int32 index output."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.row_argmin(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_argmin"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+    # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1].
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 64
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 1
+
+
+def test_tensor_col_argmax():
+    """tensor.col_argmax reduces axis=-2 (keepdim) with an int32 index output."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.col_argmax(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_argmax"
+
+    # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128]; dtype -> int32.
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 1
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 128
+
+
+def test_tensor_col_argmin():
+    """tensor.col_argmin mirrors col_argmax: axis=-2 reduce, int32 index output."""
+    span = ir.Span.unknown()
+
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim128], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.col_argmin(tensor_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_argmin"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+    # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128].
+    assert len(result_type.shape) == 2
+    assert isinstance(result_type.shape[0], ir.ConstInt) and result_type.shape[0].value == 1
+    assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 128
+
+
 def test_tensor_col_max():
     """tensor.col_max reduces axis=-2 (the M dim of [..., M, N]) with keepdim=True."""
     span = ir.Span.unknown()
@@ -753,6 +889,86 @@ def test_tensor_row_expand_mul():
     assert len(result_type.shape) == 2
 
 
+def _row_expand_pair():
+    span = ir.Span.unknown()
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+    tensor_var = ir.Var("t", ir.TensorType([dim64, dim128], DataType.FP16), span)
+    row_var = ir.Var("rv", ir.TensorType([dim64, dim1], DataType.FP16), span)
+    return tensor_var, row_var
+
+
+def _col_expand_pair():
+    span = ir.Span.unknown()
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    dim128 = ir.ConstInt(128, DataType.INT32, span)
+    dim1 = ir.ConstInt(1, DataType.INT32, span)
+    tensor_var = ir.Var("t", ir.TensorType([dim64, dim128], DataType.FP16), span)
+    col_var = ir.Var("cv", ir.TensorType([dim1, dim128], DataType.FP16), span)
+    return tensor_var, col_var
+
+
+def test_tensor_row_expand_max():
+    """Test tensor.row_expand_max operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_max(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_max"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_row_expand_min():
+    """Test tensor.row_expand_min operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_min(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_min"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_row_expand_expdif():
+    """Test tensor.row_expand_expdif operation."""
+    tensor_var, row_var = _row_expand_pair()
+    call = ir.op.tensor.row_expand_expdif(tensor_var, row_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.row_expand_expdif"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_max():
+    """Test tensor.col_expand_max operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_max(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_max"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_min():
+    """Test tensor.col_expand_min operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_min(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_min"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
+def test_tensor_col_expand_expdif():
+    """Test tensor.col_expand_expdif operation."""
+    tensor_var, col_var = _col_expand_pair()
+    call = ir.op.tensor.col_expand_expdif(tensor_var, col_var)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.col_expand_expdif"
+    assert isinstance(call.type, ir.TensorType)
+    assert len(call.type.shape) == 2
+
+
 def test_tensor_row_expand_mul_dtype_promotion():
     """Test tensor.row_expand_mul promotes data types."""
     span = ir.Span.unknown()
@@ -1014,6 +1230,46 @@ def test_tensor_div():
 
     assert isinstance(call, ir.Call)
     assert call.op.name == "tensor.div"
+
+
+@pytest.mark.parametrize("op_name", ["part_add", "part_mul", "part_max", "part_min"])
+def test_tensor_part_ops(op_name):
+    """Test tensor.part_* partial-combine binary operations (tensor-tensor only)."""
+    span = ir.Span.unknown()
+
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim8], DataType.FP32)
+    var_a = ir.Var("a", tensor_type, span)
+    var_b = ir.Var("b", tensor_type, span)
+
+    call = getattr(ir.op.tensor, op_name)(var_a, var_b)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == f"tensor.{op_name}"
+
+
+def test_tensor_fmod():
+    """Test tensor.fmod operation (tensor-tensor) and tensor.fmods (tensor-scalar dispatch)."""
+    span = ir.Span.unknown()
+
+    dim8 = ir.ConstInt(8, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim8], DataType.FP32)
+    var_a = ir.Var("a", tensor_type, span)
+    var_b = ir.Var("b", tensor_type, span)
+
+    # tensor-tensor -> tensor.fmod
+    call = ir.op.tensor.fmod(var_a, var_b)
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.fmod"
+
+    # tensor-scalar via fmod auto-dispatch -> tensor.fmods
+    call_scalar = ir.op.tensor.fmod(var_a, 3.0)
+    assert isinstance(call_scalar, ir.Call)
+    assert call_scalar.op.name == "tensor.fmods"
+
+    # explicit fmods -> tensor.fmods
+    call_fmods = ir.op.tensor.fmods(var_a, 3.0)
+    assert isinstance(call_fmods, ir.Call)
+    assert call_fmods.op.name == "tensor.fmods"
 
 
 def test_const_float():
@@ -1682,6 +1938,50 @@ def test_tensor_fillpad_clears_valid_shape():
     assert len(result_type.tensor_view.valid_shape) == 2
     assert result_type.tensor_view.valid_shape[0] == dim8
     assert result_type.tensor_view.valid_shape[1] == dim16
+
+
+def test_tensor_fillpad_expand():
+    """tensor.fillpad_expand grows the tensor and marks it fully valid."""
+    span = ir.Span.unknown()
+    dim48 = ir.ConstInt(48, DataType.INT32, span)
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    tensor_view = ir.TensorView(
+        stride=[],
+        layout=ir.TensorLayout.ND,
+        valid_shape=[ir.ConstInt(40, DataType.INT32, span), ir.ConstInt(50, DataType.INT32, span)],
+    )
+    tensor_type = ir.TensorType([dim48, dim64], DataType.FP32, None, tensor_view)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    call = ir.op.tensor.fillpad_expand(tensor_var, [64, 128], pad_value=ir.PadValue.zero)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == "tensor.fillpad_expand"
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP32
+    # Output physical shape is the requested (larger) shape, fully valid.
+    rows, cols = result_type.shape[0], result_type.shape[1]
+    assert isinstance(rows, ir.ConstInt)
+    assert isinstance(cols, ir.ConstInt)
+    assert rows.value == 64
+    assert cols.value == 128
+    assert result_type.tensor_view is not None
+    assert result_type.tensor_view.pad == ir.PadValue.zero
+    vrows = result_type.tensor_view.valid_shape[0]
+    assert isinstance(vrows, ir.ConstInt)
+    assert vrows.value == 64
+
+
+def test_tensor_fillpad_expand_shrink_raises():
+    """tensor.fillpad_expand rejects a destination smaller than the source."""
+    span = ir.Span.unknown()
+    dim64 = ir.ConstInt(64, DataType.INT32, span)
+    tensor_type = ir.TensorType([dim64, dim64], DataType.FP32)
+    tensor_var = ir.Var("t", tensor_type, span)
+
+    with pytest.raises(ValueError, match="must be >= source dimension"):
+        ir.op.tensor.fillpad_expand(tensor_var, [32, 64], pad_value=ir.PadValue.zero)
 
 
 def test_tensor_set_validshape():
@@ -3078,6 +3378,38 @@ class TestTensorCiOp:
 
     def test_top_level_gather_is_tensor_gather(self):
         assert pl.gather is pl.tensor.gather
+
+
+class TestTensorRandomOp:
+    """Tests for tensor.random (counter-based RNG generator)."""
+
+    def test_tensor_random_default(self):
+        call = tensor.random(1, 2, 3, 4, 5, 6, [4, 256])
+        t = call.type
+        assert isinstance(t, ir.TensorType)
+        assert t.dtype == DataType.UINT32
+        assert len(t.shape) == 2
+        assert "tensor.random" in str(call)
+
+    def test_tensor_random_int32_dtype(self):
+        call = tensor.random(1, 2, 3, 4, 5, 6, [8, 128], dtype=DataType.INT32)
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.dtype == DataType.INT32
+
+    def test_tensor_random_rejects_float_dtype(self):
+        with pytest.raises(ValueError, match=r"INT32.*UINT32"):
+            tensor.random(1, 2, 3, 4, 5, 6, [4, 64], dtype=DataType.FP32)
+
+    def test_tensor_random_rejects_bad_rounds(self):
+        with pytest.raises(ValueError, match="rounds to be 7 or 10"):
+            tensor.random(1, 2, 3, 4, 5, 6, [4, 64], rounds=5)
+
+    def test_tensor_random_rejects_nd_shape(self):
+        with pytest.raises(ValueError, match="2D shape"):
+            tensor.random(1, 2, 3, 4, 5, 6, [2, 4, 64])
+
+    def test_top_level_random_is_tensor_random(self):
+        assert pl.random is pl.tensor.random
 
 
 if __name__ == "__main__":

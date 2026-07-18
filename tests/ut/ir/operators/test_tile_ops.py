@@ -712,6 +712,135 @@ class TestTileReductionOps:
         ir_str = str(Program)
         assert "tile.col_min" in ir_str
 
+    def test_tile_row_prod(self):
+        """Test tile.row_prod operation (2 args: tile + tmp_tile)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 1], pl.FP32],
+            ) -> pl.Tensor[[128, 1], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_row_prod: pl.Tile[[32, 1], pl.FP32] = pl.row_prod(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.FP32] = pl.store(tile_row_prod, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_prod" in ir_str
+
+    def test_tile_col_prod(self):
+        """Test tile.col_prod operation (1 arg)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tile_col_prod: pl.Tile[[1, 128], pl.FP32] = pl.tile.col_prod(tile_in)
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_col_prod, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_prod" in ir_str
+
+    def test_tile_row_argmax(self):
+        """Test tile.row_argmax (2 args, int32 index output)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 1], pl.INT32],
+            ) -> pl.Tensor[[128, 1], pl.INT32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_argmax: pl.Tile[[32, 1], pl.INT32] = pl.row_argmax(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.INT32] = pl.store(tile_argmax, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_argmax" in ir_str
+
+    def test_tile_row_argmin(self):
+        """Test tile.row_argmin (2 args, int32 index output)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 1], pl.INT32],
+            ) -> pl.Tensor[[128, 1], pl.INT32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_argmin: pl.Tile[[32, 1], pl.INT32] = pl.row_argmin(tile_in, tmp_tile)
+                result: pl.Tensor[[128, 1], pl.INT32] = pl.store(tile_argmin, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_argmin" in ir_str
+
+    def test_tile_col_argmax(self):
+        """Test tile.col_argmax (2 args incl. tmp, int32 index output)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.INT32],
+            ) -> pl.Tensor[[1, 128], pl.INT32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_argmax: pl.Tile[[1, 128], pl.INT32] = pl.col_argmax(tile_in, tmp_tile)
+                result: pl.Tensor[[1, 128], pl.INT32] = pl.store(tile_argmax, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_argmax" in ir_str
+
+    def test_tile_col_argmin(self):
+        """Test tile.col_argmin (2 args incl. tmp, int32 index output)."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.INT32],
+            ) -> pl.Tensor[[1, 128], pl.INT32]:
+                tile_in: pl.Tile[[32, 128], pl.FP32] = pl.load(input, [0, 0], [32, 128])
+                tmp_tile: pl.Tile[[32, 128], pl.FP32] = pl.tile.create(
+                    [32, 128], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_argmin: pl.Tile[[1, 128], pl.INT32] = pl.col_argmin(tile_in, tmp_tile)
+                result: pl.Tensor[[1, 128], pl.INT32] = pl.store(tile_argmin, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_argmin" in ir_str
+
     def test_tile_min_axis0(self):
         """Test tile.min operator - min along axis 0 (column-wise)."""
 
@@ -1048,6 +1177,132 @@ class TestTileBroadcastOps:
 
         ir_str = str(Program)
         assert "tile.row_expand_mul" in ir_str
+
+    def test_tile_row_expand_max(self):
+        """Test tile.row_expand_max operator - max of each tile row and row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_max(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_max" in ir_str
+
+    def test_tile_row_expand_min(self):
+        """Test tile.row_expand_min operator - min of each tile row and row vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_min(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_min" in ir_str
+
+    def test_tile_row_expand_expdif(self):
+        """Test tile.row_expand_expdif operator - exp(tile - row vector) per row."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                row: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_row: pl.Tile[[32, 1], pl.FP32] = pl.load(row, [0, 0], [32, 1])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.row_expand_expdif(tile_a, tile_row)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.row_expand_expdif" in ir_str
+
+    def test_tile_col_expand_max(self):
+        """Test tile.col_expand_max operator - max of each tile column and col vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_max(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_max" in ir_str
+
+    def test_tile_col_expand_min(self):
+        """Test tile.col_expand_min operator - min of each tile column and col vector."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_min(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_min" in ir_str
+
+    def test_tile_col_expand_expdif(self):
+        """Test tile.col_expand_expdif operator - exp(tile - col vector) per column."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                tile: pl.Tensor[[128, 128], pl.FP32],
+                col: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(tile, [0, 0], [32, 32])
+                tile_col: pl.Tile[[1, 32], pl.FP32] = pl.load(col, [0, 0], [1, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.col_expand_expdif(tile_a, tile_col)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.col_expand_expdif" in ir_str
 
     def test_tile_row_expand(self):
         """Test tile.row_expand operator - expand row vector to target tile shape."""
@@ -1682,6 +1937,91 @@ class TestTileSliceReshapeOps:
         assert result_type3.get_effective_tile_view().blayout == ir.TileLayout.row_major
         assert call3.kwargs == {}
 
+    def test_tile_fillpad_expand(self):
+        """Test tile.fillpad_expand grows the tile and fills with pad_value."""
+        span = ir.Span.unknown()
+
+        # Source tile [48, 64], valid [40, 50].
+        dim48 = ir.ConstInt(48, DataType.INT32, span)
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+        src_type = ir.TileType([dim48, dim64], DataType.FP32)
+        src = ir.Var("src", src_type, span)
+
+        # Expand to [64, 128] with zero padding.
+        call = tile.fillpad_expand(src, [64, 128], pad_value=ir.PadValue.zero)
+
+        assert isinstance(call, ir.Call)
+        assert call.op.name == "tile.fillpad_expand"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+        # Output physical shape is the requested (larger) shape.
+        rows, cols = result_type.shape[0], result_type.shape[1]
+        assert isinstance(rows, ir.ConstInt)
+        assert isinstance(cols, ir.ConstInt)
+        assert rows.value == 64
+        assert cols.value == 128
+        view = result_type.get_effective_tile_view()
+        # After expand the whole destination is valid and carries the pad mode.
+        assert view.pad == ir.PadValue.zero
+        vrows, vcols = view.valid_shape[0], view.valid_shape[1]
+        assert isinstance(vrows, ir.ConstInt)
+        assert isinstance(vcols, ir.ConstInt)
+        assert vrows.value == 64
+        assert vcols.value == 128
+
+        # max / min pad modes round-trip onto the result view.
+        call_max = tile.fillpad_expand(src, [64, 128], pad_value=ir.PadValue.max)
+        max_type = call_max.type
+        assert isinstance(max_type, ir.TileType)
+        assert max_type.get_effective_tile_view().pad == ir.PadValue.max
+
+    def test_tile_fillpad_expand_same_shape(self):
+        """tile.fillpad_expand permits a same-shape (non-strict) expansion."""
+        span = ir.Span.unknown()
+        dim32 = ir.ConstInt(32, DataType.INT32, span)
+        src_type = ir.TileType([dim32, dim32], DataType.FP16)
+        src = ir.Var("src", src_type, span)
+
+        call = tile.fillpad_expand(src, [32, 32], pad_value=ir.PadValue.zero)
+        assert call.op.name == "tile.fillpad_expand"
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        dim0 = result_type.shape[0]
+        assert isinstance(dim0, ir.ConstInt)
+        assert dim0.value == 32
+
+    def test_tile_fillpad_expand_shrink_raises(self):
+        """tile.fillpad_expand rejects a destination smaller than the source."""
+        span = ir.Span.unknown()
+        dim64 = ir.ConstInt(64, DataType.INT32, span)
+        src_type = ir.TileType([dim64, dim64], DataType.FP32)
+        src = ir.Var("src", src_type, span)
+
+        with pytest.raises(ValueError, match="must be >= source dimension"):
+            tile.fillpad_expand(src, [32, 64], pad_value=ir.PadValue.zero)
+
+    def test_tile_fillpad_expand_program(self):
+        """tile.fillpad_expand is reachable from the DSL and prints in the IR."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[48, 64], pl.FP32],
+                output: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                src: pl.Tile[[48, 64], pl.FP32] = pl.load(a, [0, 0], [48, 64])
+                dst: pl.Tile[[64, 64], pl.FP32] = pl.tile.fillpad_expand(
+                    src, [64, 64], pad_value=pl.PadValue.zero
+                )
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(dst, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.fillpad_expand" in ir_str
+
     def test_tile_transpose(self):
         """Test tile.transpose operation."""
         span = ir.Span.unknown()
@@ -2092,7 +2432,10 @@ class TestTileBitwiseArithmeticOps:
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
                 tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rem(tile_a, tile_b)
+                tmp: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+                    [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rem(tile_a, tile_b, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
@@ -2111,12 +2454,68 @@ class TestTileBitwiseArithmeticOps:
                 output: pl.Tensor[[128, 128], pl.FP32],
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rems(tile_a, 3.0)
+                tmp: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+                    [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.rems(tile_a, 3.0, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
         ir_str = str(Program)
         assert "tile.rems" in ir_str
+
+    @pytest.mark.parametrize("op_name", ["part_add", "part_mul", "part_max", "part_min"])
+    def test_tile_part_ops(self, op_name):
+        """Test tile.part_* partial-combine binary operators (tile-tile only)."""
+        span = ir.Span.unknown()
+        dim = ir.ConstInt(16, DataType.INT32, span)
+        tile_type = ir.TileType([dim, dim], DataType.FP32)
+        var_a = ir.Var("a", tile_type, span)
+        var_b = ir.Var("b", tile_type, span)
+
+        call = getattr(tile, op_name)(var_a, var_b)
+        assert isinstance(call, ir.Call)
+        assert call.op.name == f"tile.{op_name}"
+
+    def test_tile_fmod(self):
+        """Test tile.fmod operator - element-wise floating-point remainder of two tiles."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                b: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.fmod(tile_a, tile_b)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.fmod" in ir_str
+
+    def test_tile_fmods(self):
+        """Test tile.fmods operator - element-wise floating-point remainder of tile and scalar."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                output: pl.Tensor[[128, 128], pl.FP32],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                tile_c: pl.Tile[[32, 32], pl.FP32] = pl.fmods(tile_a, 3.0)
+                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.fmods" in ir_str
 
     def test_tile_and(self):
         """Test tile.and operator - element-wise bitwise AND of two tiles."""
@@ -3499,6 +3898,57 @@ class TestTileCiOp:
 
     def test_tile_arange_alias_is_ci(self):
         assert pl.tile.arange is pl.tile.ci
+
+
+class TestTileRandomOp:
+    """tile.random (pto.trandom): counter-based RNG generator."""
+
+    def test_tile_random_default(self):
+        """tile.random returns a TileType with requested shape and UINT32 dtype."""
+        call = tile.random(1, 2, 3, 4, 5, 6, [4, 256])
+        t = call.type
+        assert isinstance(t, ir.TileType)
+        assert t.dtype == DataType.UINT32
+        assert len(t.shape) == 2
+        rows, cols = t.shape[0], t.shape[1]
+        assert isinstance(rows, ir.ConstInt) and rows.value == 4
+        assert isinstance(cols, ir.ConstInt) and cols.value == 256
+        assert "tile.random" in str(call)
+
+    def test_tile_random_int32_dtype(self):
+        call = tile.random(1, 2, 3, 4, 5, 6, [8, 128], dtype=DataType.INT32)
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == DataType.INT32
+
+    def test_tile_random_rounds7(self):
+        """rounds=7 must be preserved on the op, not silently dropped to the default 10."""
+        call = tile.random(1, 2, 3, 4, 5, 6, [4, 64], rounds=7)
+        assert "rounds=7" in str(call)
+
+    def test_tile_random_valid_shape(self):
+        """valid_shape narrows the written region; physical shape stays full."""
+        call = tile.random(1, 2, 3, 4, 5, 6, [16, 128], valid_shape=[10, 80])
+        t = call.type
+        assert isinstance(t, ir.TileType)
+        rows, cols = t.shape[0], t.shape[1]
+        assert isinstance(rows, ir.ConstInt) and rows.value == 16
+        assert isinstance(cols, ir.ConstInt) and cols.value == 128
+        view = t.get_effective_tile_view()
+        vr, vc = view.valid_shape[0], view.valid_shape[1]
+        assert isinstance(vr, ir.ConstInt) and vr.value == 10
+        assert isinstance(vc, ir.ConstInt) and vc.value == 80
+
+    def test_tile_random_rejects_valid_shape_gt_shape(self):
+        with pytest.raises(ValueError, match="valid_shape element"):
+            tile.random(1, 2, 3, 4, 5, 6, [16, 128], valid_shape=[20, 80])
+
+    def test_tile_random_rejects_float_dtype(self):
+        with pytest.raises(ValueError, match=r"INT32.*UINT32"):
+            tile.random(1, 2, 3, 4, 5, 6, [4, 64], dtype=DataType.FP32)
+
+    def test_tile_random_rejects_bad_rounds(self):
+        with pytest.raises(ValueError, match="rounds to be 7 or 10"):
+            tile.random(1, 2, 3, 4, 5, 6, [4, 64], rounds=5)
 
 
 class TestTileStoreDistributedDest:

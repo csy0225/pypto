@@ -28,6 +28,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
@@ -36,13 +37,14 @@
 
 namespace pypto {
 
-namespace codegen {
+// Forward declaration for PTOCodegen::GetBackendHandler()'s return type. The full
+// definition lives in pypto/backend/common/backend_handler.h and is included by
+// the translation units that call the handler's methods (e.g. op-emit callbacks).
+namespace backend {
+class BackendHandler;
+}  // namespace backend
 
-struct TpopResultInfo {
-  int split = 0;
-  std::string op_name;
-  std::optional<int> pipe_id;
-};
+namespace codegen {
 
 /// Order distinct DataTypes by their internal code so containers keyed on
 /// DataType (e.g. the CommRemoteOffset helper dtype set) iterate
@@ -96,12 +98,25 @@ class PTOCodegen : public CodegenBase {
   ~PTOCodegen() override = default;
 
   /**
+   * @brief Backend handler for backend-specific codegen decisions.
+   *
+   * Never null: the constructor requires a backend that exposes a handler.
+   * Used by op-emit callbacks that must gate behaviour on the target backend
+   * (e.g. rejecting a bf16 atomic-add store on Ascend950).
+   */
+  [[nodiscard]] const backend::BackendHandler* GetBackendHandler() const;
+
+  /**
    * @brief Generate PTO-ISA MLIR format code from IR Program
    *
    * @param program Input PyPTO IR Program
+   * @param emit_tile_addr When true (default), emit the physical `addr` operand
+   *        on `pto.alloc_tile` from the MemRef byte offset (ptoas
+   *        --pto-level=level3). When false, omit `addr` so the ptoas PlanMemory
+   *        pass allocates instead (--pto-level=level2).
    * @return MLIR code as string
    */
-  std::string Generate(const ir::ProgramPtr& program);
+  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true);
 
   // CodegenBase interface (unified API for operator codegen callbacks)
   [[nodiscard]] std::string GetCurrentResultTarget() const override;
@@ -362,6 +377,7 @@ class PTOCodegen : public CodegenBase {
     std::string col_off_ssa;
     std::string materialize_target_ssa;
     std::string materialize_target_type;
+    std::optional<ir::MemorySpace> source_memory_space;
     bool emitted = false;
   };
   void RegisterSubviewMaterialization(const std::string& subview_ssa, const SubviewMaterializationInfo& info);
@@ -383,34 +399,45 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetGMSlotBufferSSA() const;
 
   /**
-   * @brief SSA name of the synthetic SPMD block_idx prefix param.
+   * @brief SSA name of the synthetic SPMD block_idx param.
    *
    * When the current function uses tile.get_block_idx / tile.get_block_num,
-   * PTOCodegen prepends two i32 prefix params (%arg0, %arg1) to the emitted
-   * func.func signature. The kernel wrapper resolves the runtime values via
+   * PTOCodegen appends two i32 params to the end of the emitted func.func
+   * signature. The kernel wrapper resolves the runtime values via
    * intrinsic.h::get_block_idx(args) / get_block_num(args) and forwards them
-   * as the first two call args. Returns empty when the function does not use
+   * as trailing call args. Returns empty when the function does not use
    * SPMD block ops.
    */
   [[nodiscard]] std::string GetSpmdBlockIdxArgSSA() const { return fs_.spmd_block_idx_arg; }
 
   /**
-   * @brief SSA name of the synthetic SPMD block_num prefix param. See
+   * @brief SSA name of the synthetic SPMD block_num param. See
    * GetSpmdBlockIdxArgSSA() for the surrounding mechanism.
    */
   [[nodiscard]] std::string GetSpmdBlockNumArgSSA() const { return fs_.spmd_block_num_arg; }
 
   /**
-   * @brief SSA name of the CommContext pointer arg appended for a
-   * DistributedTensor param.
+   * @brief SSA name of the synthetic SPMD subblock_idx (AIV lane) param.
    *
-   * N6 distributed codegen appends one ``!pto.ptr<i64>`` arg per
-   * DistributedTensor parameter at the end of the func.func signature
-   * (after explicit tensor/scalar params, before dynamic-shape ``index``
-   * params). The mapping ``dist_tensor_var → ctx_ssa`` lets the
-   * pld.system.get_comm_ctx / pld.tile.remote_load / pld.tensor.put /
-   * pld.system.notify / pld.system.wait codegen
-   * recover the matching context pointer.
+   * Mirrors GetSpmdBlockIdxArgSSA(): when the function uses
+   * tile.get_subblock_idx, PTOCodegen appends one i32 param to the func.func
+   * signature and the kernel wrapper resolves it from
+   * intrinsic.h::get_sub_block_id(args) (the runtime's per-core lane id),
+   * rather than reading the ccec get_subblockid() register. Returns empty when
+   * the function does not use the op.
+   */
+  [[nodiscard]] std::string GetSpmdSubblockIdxArgSSA() const { return fs_.spmd_subblock_idx_arg; }
+
+  /**
+   * @brief SSA name of the materialized CommContext pointer arg for a
+   * DistributedTensor parameter.
+   *
+   * MaterializeDistTensorCtx adds one explicit ``CommCtxType``
+   * parameter per DistributedTensor parameter. PTOCodegen lowers those
+   * params as ``!pto.ptr<i64>`` scalar arguments and records the
+   * ``dist_tensor_var -> ctx_ssa`` mapping so pld.system.get_comm_ctx /
+   * pld.tile.remote_load / pld.tensor.put / pld.system.notify /
+   * pld.system.wait codegen can recover the matching context pointer.
    *
    * @param dist_var DistributedTensor parameter variable.
    * @return SSA name (e.g. ``%arg7``), or empty string if @p dist_var is
@@ -509,23 +536,6 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetGMSlotBufferSSAForPipe(int pipe_id, int dir_mask);
 
   /**
-   * @brief Get metadata for a tile var produced by a matching tpop operation
-   * @param var Raw pointer to the tile variable
-   * @param expected_tpop_op_name Expected originating tpop op name
-   * @param tfree_op_name Name of the consuming tfree op for diagnostics
-   * @return Metadata from the originating tpop
-   */
-  [[nodiscard]] const TpopResultInfo& GetValidatedTpopInfo(const ir::Var* var,
-                                                           const std::string& expected_tpop_op_name,
-                                                           const std::string& tfree_op_name) const;
-
-  /**
-   * @brief Get the split value for a tile var produced by a matching tpop operation
-   */
-  [[nodiscard]] int GetValidatedTpopSplit(const ir::Var* var, const std::string& expected_tpop_op_name,
-                                          const std::string& tfree_op_name) const;
-
-  /**
    * @brief Check if the current function is an AIC (Cube) function
    */
   [[nodiscard]] bool IsAICFunction() const;
@@ -548,6 +558,11 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] bool IsDualAivDispatchFunction() const;
 
  protected:
+  // Statement-entry dispatch guard: rejects any SplitAivScopeStmt that survived
+  // to PTO codegen (it must be lowered and erased by LowerAutoVectorSplit,
+  // pass 21). The base visitor would otherwise silently unwrap it.
+  void VisitStmt(const ir::StmtPtr& stmt) override;
+
   // Override visitor methods for code generation - Statements
   void VisitStmt_(const ir::AssignStmtPtr& op) override;
   void VisitStmt_(const ir::ForStmtPtr& op) override;
@@ -721,7 +736,16 @@ class PTOCodegen : public CodegenBase {
     std::map<const ir::Var*, std::string> memref_to_var_name;  ///< keyed by base_ Ptr
     std::vector<std::pair<ir::VarPtr, std::shared_ptr<const ir::TileType>>> tile_var_allocs;
     std::set<const ir::Var*> emitted_tile_alloc_vars;
-    std::map<const ir::Var*, TpopResultInfo> tpop_result_vars;
+    /// PTOAS memory-planner mode only (no addr baked): full-MemRef-identity key
+    /// (base+offset+size) -> canonical tile_buf SSA. Variables that resolve to
+    /// the same buffer (e.g. a loop-carried accumulator coalesced by
+    /// MemoryReuse) share one handle so the op writes in place and ptoas
+    /// PlanMemory keeps them one buffer. Views (same base, different
+    /// offset/size) get distinct keys and are never merged.
+    std::map<std::string, std::string> memref_identity_to_mlir;
+    /// alloc_tile SSA handles already emitted — dedups the alloc when several
+    /// vars share one handle (PTOAS in-place aliasing).
+    std::set<std::string> emitted_tile_alloc_names;
 
     ir::FunctionPtr current_function;
     ir::VarPtr current_result_var;
@@ -732,11 +756,15 @@ class PTOCodegen : public CodegenBase {
     DataType gm_slot_buffer_dtype = DataType::FP32;
     std::map<std::pair<int, int>, std::string> gm_slot_buffer_region_by_pipe;
 
-    /// SSA names of the synthetic SPMD block_idx/block_num prefix params.
-    /// Empty when the current function does not use tile.get_block_idx /
-    /// tile.get_block_num.
+    /// SSA names of the synthetic SPMD block_idx/block_num params, appended at
+    /// the func.func signature tail. Empty when the current function does not
+    /// use tile.get_block_idx / tile.get_block_num.
     std::string spmd_block_idx_arg;
     std::string spmd_block_num_arg;
+
+    /// SSA name of the synthetic SPMD subblock_idx (AIV lane) param.
+    /// Empty when the current function does not use tile.get_subblock_idx.
+    std::string spmd_subblock_idx_arg;
 
     /// Mapping from DistributedTensor parameter Var → CommContext pointer
     /// arg SSA name. Populated in GenerateFunction when appending the
@@ -776,7 +804,8 @@ class PTOCodegen : public CodegenBase {
       memref_to_var_name.clear();
       tile_var_allocs.clear();
       emitted_tile_alloc_vars.clear();
-      tpop_result_vars.clear();
+      memref_identity_to_mlir.clear();
+      emitted_tile_alloc_names.clear();
 
       current_function.reset();
       current_result_var.reset();
@@ -789,6 +818,7 @@ class PTOCodegen : public CodegenBase {
 
       spmd_block_idx_arg.clear();
       spmd_block_num_arg.clear();
+      spmd_subblock_idx_arg.clear();
       dist_tensor_to_ctx.clear();
 
       current_expr_value.clear();
@@ -814,6 +844,10 @@ class PTOCodegen : public CodegenBase {
   std::set<DataType, DtypeCodeLess> remote_offset_dtypes_;
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
+
+  /// When false, `pto.alloc_tile` omits the physical `addr` operand so the
+  /// ptoas PlanMemory pass owns allocation (--pto-level=level2). Set by Generate.
+  bool emit_tile_addr_ = true;
 
   /// Emit an arith binary op, return SSA result name
   std::string EmitArithBinaryOp(const std::string& mlir_op, const std::string& lhs, const std::string& rhs,

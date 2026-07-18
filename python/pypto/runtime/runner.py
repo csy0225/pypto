@@ -42,7 +42,7 @@ import torch
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
 from pypto.pypto_core import backend as _backend_core
-from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase
+from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
 
 from .device_tensor import DeviceTensor
 
@@ -52,11 +52,6 @@ if TYPE_CHECKING:
     # here would risk a partially-initialised ``pypto.runtime`` package at import
     # time. The field is plumbed through to ``ir.compile()`` lazily anyway.
     from pypto.ir.distributed_compiled_program import DistributedConfig
-
-    # ``RunTiming`` is a simpler nanobind type re-exported via
-    # ``task_interface``. Under TYPE_CHECKING only so importing ``runner`` does
-    # not pull in the optional ``simpler`` package at import time.
-    from .task_interface import RunTiming  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def _load_golden_from_data_dir(out_dir: Path, output_names: set[str]) -> dict[str, torch.Tensor] | None:
@@ -74,6 +69,12 @@ def _load_golden_from_data_dir(out_dir: Path, output_names: set[str]) -> dict[st
             return None
         result[name] = torch.load(pt_file, weights_only=True)
     return result
+
+
+# Number of scope-depth rings the runtime sizes independently. Mirrors
+# RUNTIME_ENV_RING_COUNT in the runtime's task_interface/call_config.h. A
+# per-ring RunConfig override (list/tuple) must supply exactly this many entries.
+_RING_DEPTH = 4
 
 
 @dataclass
@@ -114,7 +115,7 @@ class RunConfig:
             task metadata the converter needs. Mirrors runtime's
             ``--enable-l2-swimlane`` flag.
         enable_dump_tensor: Per-task tensor dump **level** written into
-            ``<work_dir>/dfx_outputs/tensor_dump/``. Inspect with
+            ``<work_dir>/dfx_outputs/args_dump/``. Inspect with
             ``python -m simpler_setup.tools.dump_viewer``. Mirrors
             ``--dump-tensor``:
 
@@ -134,8 +135,9 @@ class RunConfig:
             Output: ``<work_dir>/dfx_outputs/pmu.csv``. Mirrors
             ``--enable-pmu N``.
         enable_dep_gen: Capture PTO2 dependency edges into
-            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand
-            via ``python -m simpler_setup.tools.deps_to_graph``. Mirrors
+            ``<work_dir>/dfx_outputs/deps.json``. Render to HTML on demand via
+            ``python -m simpler_setup.tools.deps_viewer <deps.json> --format
+            html`` (the CLI defaults to text output). Mirrors
             ``--enable-dep-gen``.
         enable_scope_stats: Capture per-scope heap / task_window / tensormap
             ring-fill peaks into
@@ -171,18 +173,24 @@ class RunConfig:
             thread count. Same precedence rules as ``block_dim``.
         ring_task_window: Optional per-invocation override of the runtime
             ring's task-slot window (number of in-flight tasks). Forwarded to
-            ``CallConfig.runtime_env.ring_task_window``. Must be a power of two
-            ``>= 4``. ``None`` (default) leaves the field unset so the runtime
-            falls back to its ``PTO2_RING_TASK_WINDOW`` env var or compile-time
-            default.
+            ``CallConfig.runtime_env.ring_task_window``. A scalar (broadcast to
+            all scope-depth rings) or a list/tuple of exactly 4 ints sizing
+            rings 0..3 independently; each entry must be a power of two ``>= 4`` (a
+            ``0`` list-entry leaves that ring at its default). ``None`` (default)
+            leaves the field unset so the runtime falls back to its
+            ``PTO2_RING_TASK_WINDOW`` env var or compile-time default.
         ring_heap: Optional per-invocation override of the per-ring output-heap
             size in **bytes**. Forwarded to ``CallConfig.runtime_env.ring_heap``.
-            Must be a power of two ``>= 1024``. ``None`` defers to the runtime's
-            ``PTO2_RING_HEAP`` env var or compile-time default.
+            A scalar or a list/tuple of 4 ints (per ring 0..3); each entry must
+            be a power of two ``>= 1024`` (a ``0`` list-entry leaves that ring at its
+            default). ``None`` defers to the runtime's ``PTO2_RING_HEAP`` env var
+            or compile-time default.
         ring_dep_pool: Optional per-invocation override of the per-ring
             dependency-edge pool capacity. Forwarded to
-            ``CallConfig.runtime_env.ring_dep_pool``. Must be in
-            ``[4, INT32_MAX]``. ``None`` defers to the runtime's
+            ``CallConfig.runtime_env.ring_dep_pool``. A scalar or a list/tuple
+            of 4 ints (per ring 0..3); each entry must be in ``[4, INT32_MAX]`` (a
+            ``0`` list-entry leaves that ring at its default). ``None`` defers
+            to the runtime's
             ``PTO2_RING_DEP_POOL`` env var or compile-time default.
         distributed_config: Optional L3 distributed-execution config, consumed
             only on the ``@pl.jit`` path. When set, it is forwarded to
@@ -225,9 +233,13 @@ class RunConfig:
     golden_data_dir: str | None = None
     block_dim: int | None = None
     aicpu_thread_num: int | None = None
-    ring_task_window: int | None = None
-    ring_heap: int | None = None
-    ring_dep_pool: int | None = None
+    # Each accepts a scalar (broadcast to all scope-depth rings) or a list/tuple
+    # of exactly ``_RING_DEPTH`` ints sizing rings 0..3 independently; a 0 entry
+    # leaves that ring at its env/compile-time default. A tuple is normalized to
+    # a list during validation.
+    ring_task_window: int | list[int] | tuple[int, ...] | None = None
+    ring_heap: int | list[int] | tuple[int, ...] | None = None
+    ring_dep_pool: int | list[int] | tuple[int, ...] | None = None
     distributed_config: "DistributedConfig | None" = None
     analyze_auto_scopes_for_deps: bool = False
 
@@ -261,11 +273,17 @@ class RunConfig:
         self._validate_ring_overrides()
 
     def _validate_ring_overrides(self) -> None:
-        """Validate the per-task ring-sizing overrides.
+        """Validate the per-task ring-sizing overrides (scalar or per-ring list).
 
         Mirrors the constraints enforced by the runtime's
-        ``RuntimeEnv::validate()``. ``None`` means "unset" and is always
-        allowed (the runtime falls back to env var / compile-time default).
+        ``RuntimeEnv::validate()``. ``None`` means "unset" and is always allowed
+        (the runtime falls back to env var / compile-time default).
+
+        A scalar is broadcast to every ring. A list sizes each scope-depth ring
+        independently and must have exactly ``_RING_DEPTH`` entries; a ``0``
+        list-entry leaves that ring at its env/compile-time default — the same
+        fall-through the runtime allows. Scalars do not accept ``0`` (use
+        ``None`` to leave the whole field unset).
         """
 
         def _is_int(v: object) -> bool:
@@ -277,20 +295,38 @@ class RunConfig:
         def _is_pow2(v: int) -> bool:
             return v > 0 and (v & (v - 1)) == 0
 
-        if self.ring_task_window is not None and not (
-            _is_int(self.ring_task_window) and _is_pow2(self.ring_task_window) and self.ring_task_window >= 4
-        ):
-            raise ValueError(f"ring_task_window must be a power of 2 >= 4, got {self.ring_task_window!r}")
-        if self.ring_heap is not None and not (
-            _is_int(self.ring_heap) and _is_pow2(self.ring_heap) and self.ring_heap >= 1024
-        ):
-            raise ValueError(
-                f"ring_heap must be a power of 2 >= 1024 (bytes per ring), got {self.ring_heap!r}"
-            )
-        if self.ring_dep_pool is not None and not (
-            _is_int(self.ring_dep_pool) and 4 <= self.ring_dep_pool <= 2**31 - 1
-        ):
-            raise ValueError(f"ring_dep_pool must be in [4, INT32_MAX], got {self.ring_dep_pool!r}")
+        # (field, human-readable constraint, scalar predicate). A scalar is
+        # validated directly; a list/tuple must have exactly ``_RING_DEPTH``
+        # entries and every entry obeys the predicate (a ``0`` entry is the
+        # runtime's "leave this ring at its default" sentinel).
+        specs = (
+            ("ring_task_window", "be a power of 2 >= 4", lambda v: _is_int(v) and _is_pow2(v) and v >= 4),
+            (
+                "ring_heap",
+                "be a power of 2 >= 1024 (bytes per ring)",
+                lambda v: _is_int(v) and _is_pow2(v) and v >= 1024,
+            ),
+            ("ring_dep_pool", "be in [4, INT32_MAX]", lambda v: _is_int(v) and 4 <= v <= 2**31 - 1),
+        )
+        for name, phrase, ok in specs:
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                value = list(value)  # normalize tuple -> list for downstream use
+                if len(value) != _RING_DEPTH:
+                    raise ValueError(
+                        f"{name} must have exactly {_RING_DEPTH} entries "
+                        f"(one per scope-depth ring), got {len(value)}"
+                    )
+                for v in value:
+                    # Reject non-ints (incl. bool) before the 0 sentinel check so
+                    # ``False`` can't masquerade as "leave at default".
+                    if not _is_int(v) or (v != 0 and not ok(v)):
+                        raise ValueError(f"{name} entries must {phrase} (or 0 to keep default), got {v!r}")
+                setattr(self, name, value)
+            elif not ok(value):
+                raise ValueError(f"{name} must {phrase}, got {value!r}")
 
     def any_dfx_enabled(self) -> bool:
         """Return ``True`` when at least one DFX flag is enabled.
@@ -322,17 +358,8 @@ class RunResult:
         execution_time: Python wall-clock time in seconds for the full run
             (compile + execute + validate). This mixes host-side compile/golden
             overhead with the actual dispatch, so it cannot isolate device time
-            — use *device_wall_us* / *host_wall_us* for that (issue #1679).
-        device_wall_us: On-NPU orchestrator wall time in microseconds, taken
-            from the dispatch's :class:`RunTiming.device_wall_us`. ``None`` when
-            the run never reached device dispatch (pre-compile failure,
-            ``codegen_only``). For L2 single-task runs this is the real on-NPU
-            wall; on a runtime built without ``PTO2_PROFILING`` it is ``0``.
-        host_wall_us: Host-side wall time in microseconds around the dispatch
-            (:class:`RunTiming.host_wall_us`). ``None`` under the same
-            conditions as *device_wall_us*. Unlike *execution_time*, this
-            excludes compile/golden overhead — it brackets only the device
-            dispatch.
+            — read per-run device/host timing from the runtime's ``[STRACE]``
+            log markers (simpler PR #1177) instead.
     """
 
     __test__ = False  # Not a pytest test class
@@ -342,8 +369,6 @@ class RunResult:
     error: str | None = None
     execution_time: float | None = None
     profile: dict[str, Any] | None = None
-    device_wall_us: float | None = None
-    host_wall_us: float | None = None
 
     def __str__(self) -> str:
         time_str = f" ({self.execution_time:.2f}s)" if self.execution_time else ""
@@ -372,6 +397,7 @@ def compile_program(
     disabled_diagnostics: DiagnosticCheckSet | None = None,
     profiling: bool = False,
     analyze_auto_scopes_for_deps: bool = False,
+    memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Compile *program* to *work_dir* and patch orchestration headers.
 
@@ -402,6 +428,7 @@ def compile_program(
         disabled_diagnostics=disabled_diagnostics,
         profiling=profiling,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        memory_planner=memory_planner,
     )
     _patch_orchestration_headers(work_dir)
 
@@ -501,11 +528,11 @@ class _DfxOpts:
 
 
 def _execute_dfx_passes(
-    run_pass: Callable[["_DfxOpts"], "RunTiming"],
+    run_pass: Callable[["_DfxOpts"], None],
     capture_deps: Callable[[], None],
     dfx: "_DfxOpts",
     platform: str,
-) -> "RunTiming":
+) -> None:
     """Drive device execution, splitting into two passes when swimlane is on.
 
     The runtime swimlane converter joins per-task timing against a task graph
@@ -522,8 +549,7 @@ def _execute_dfx_passes(
         cap (``halHostRegister`` rc 8). A child process fully reclaims that
         state on exit. Best-effort — a failed capture is logged, not fatal.
       * Timing pass — swimlane (plus any other timing DFX), dep_gen off,
-        producing the clean ``l2_swimlane_records.json`` whose timing we return.
-        Runs in-process.
+        producing the clean ``l2_swimlane_records.json``. Runs in-process.
 
     Both passes write into the same ``output_prefix`` (the subprocess is pointed
     at the same ``dfx_outputs/``), so the converter finds ``deps.json`` and the
@@ -534,19 +560,16 @@ def _execute_dfx_passes(
     converter needs), so a second run buys nothing.
 
     Args:
-        run_pass: Executes one in-process device run with the given DFX flags
-            and returns its timing. Call-site closure over the static kwargs.
+        run_pass: Executes one in-process device run with the given DFX flags.
+            Call-site closure over the static kwargs.
         capture_deps: Captures ``deps.json`` in a subprocess (dep_gen only).
             Call-site closure; invoked once before the timing pass.
         dfx: The DFX toggles the caller requested.
         platform: Target execution platform (used only to detect ``*sim``).
-
-    Returns:
-        The :class:`RunTiming` from the kept pass (the timing pass when
-        two-pass, otherwise the single pass).
     """
     if not dfx.enable_l2_swimlane or platform.endswith("sim"):
-        return run_pass(dfx)
+        run_pass(dfx)
+        return
 
     # The two passes look like a double run, so announce what each is for.
     print(
@@ -694,7 +717,7 @@ def _coerced_to_orch_args(
         scalar_to_uint64,  # pyright: ignore[reportAttributeAccessIssue]
     )
     from .task_interface import (  # noqa: PLC0415
-        device_tensor_to_continuous,  # pyright: ignore[reportAttributeAccessIssue]
+        device_tensor_to_tensor,  # pyright: ignore[reportAttributeAccessIssue]
     )
 
     orch_args = ChipStorageTaskArgs()
@@ -713,7 +736,7 @@ def _coerced_to_orch_args(
             orch_args.add_tensor(make_tensor_arg(arg))
         elif isinstance(arg, DeviceTensor):
             try:
-                orch_args.add_tensor(device_tensor_to_continuous(arg))
+                orch_args.add_tensor(device_tensor_to_tensor(arg))
             except ValueError as e:
                 raise ValueError(f"At position {i}: {e}") from e
         elif isinstance(arg, _SimpleCData):
@@ -810,7 +833,9 @@ def _execute_on_device(
     platform: str,
     device_id: int,
     dfx: _DfxOpts = _DfxOpts(),
-) -> "RunTiming":
+    validate: bool = True,
+    actual_out_dir: "Path | None" = None,
+) -> None:
     """Load inputs, execute on device, and validate against golden.
 
     Shared execution logic used by both :func:`run` and the test harness
@@ -829,13 +854,6 @@ def _execute_on_device(
         dfx: Runtime DFX toggles. When any flag is enabled the artefacts
             land under ``<work_dir>/dfx_outputs/`` and the matching
             post-run converter is invoked.
-
-    Returns:
-        The :class:`RunTiming` from :func:`execute_on_device` (``host_wall_us``
-        plus ``device_wall_us``). The harness surfaces these on
-        :class:`RunResult` so callers can isolate device time from the
-        compile + golden + validate wall captured by ``execution_time``
-        (issue #1679).
     """
     from .device_runner import (  # noqa: PLC0415
         build_orch_args_from_inputs,
@@ -867,8 +885,8 @@ def _execute_on_device(
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_pass(pass_dfx: "_DfxOpts") -> "RunTiming":
-        return execute_on_device(
+    def _run_pass(pass_dfx: "_DfxOpts") -> None:
+        execute_on_device(
             chip_callable,
             orch_args,
             platform,
@@ -906,20 +924,52 @@ def _execute_on_device(
     # then run the clean-timing swimlane pass in-process. Collection uses the
     # original ``dfx`` so the converter joins the sibling ``deps.json`` and the
     # deps-render hint fires only when the user explicitly asked for dep_gen.
-    timing = _execute_dfx_passes(_run_pass, _capture_deps, dfx, platform)
+    _execute_dfx_passes(_run_pass, _capture_deps, dfx, platform)
 
     if dfx_dir is not None:
         _collect_dfx_artifacts(dfx_dir, platform, dfx)
 
-    # Validate
-    validate_golden(
-        outputs,
-        golden_out,
-        rtol=getattr(golden_module, "RTOL", 1e-5),
-        atol=getattr(golden_module, "ATOL", 1e-5),
-    )
+    # Persist actual device outputs (tolerance-independent) for callers that
+    # validate separately with the test's real tolerance — the "split
+    # execute/validate" path used by the task-submit harness, where the device
+    # run is eager/parallel and ``TestRunner.run`` does the allclose later.
+    if actual_out_dir is not None:
+        from .golden_writer import _save_data_files  # noqa: PLC0415
 
-    return timing
+        _save_data_files(outputs, actual_out_dir)
+
+    # Validate in-process unless the caller defers it.
+    if validate:
+        validate_golden(
+            outputs,
+            golden_out,
+            rtol=getattr(golden_module, "RTOL", 1e-5),
+            atol=getattr(golden_module, "ATOL", 1e-5),
+        )
+
+
+def validate_persisted_outputs(work_dir: Path, rtol: float, atol: float) -> None:
+    """Validate persisted device outputs against the golden with a given tolerance.
+
+    The counterpart to ``_execute_on_device(..., validate=False,
+    actual_out_dir=...)``: the device run (tolerance-independent) persisted the
+    actual outputs under ``data/actual/``; this compares them against the
+    pre-computed golden under ``data/out/`` using *rtol*/*atol* — letting the
+    harness apply each test's real tolerance after an eager, validation-free
+    device run. Raises ``AssertionError`` on mismatch.
+    """
+    from .device_runner import validate_golden  # noqa: PLC0415
+
+    golden_module = _load_golden_module(work_dir / "golden.py")
+    output_names = set(getattr(golden_module, "__outputs__", []))
+    actual = _load_golden_from_data_dir(work_dir / "data" / "actual", output_names)
+    expected = _load_golden_from_data_dir(work_dir / "data" / "out", output_names)
+    if actual is None or expected is None:
+        raise AssertionError(
+            f"validate_persisted_outputs: missing actual/expected outputs under {work_dir}/data "
+            f"(actual={'ok' if actual else 'missing'}, expected={'ok' if expected else 'missing'})"
+        )
+    validate_golden(actual, expected, rtol=rtol, atol=atol)
 
 
 # ---------------------------------------------------------------------------
@@ -943,7 +993,7 @@ def _collect_dfx_artifacts(
     # Synthesise the func_id→name map the profiling tools need for readable
     # labels. simpler's SceneTest harness writes this itself; pypto does not
     # use SceneTest, so we derive it from ``kernel_config.py`` and drop it next
-    # to the records. ``deps_to_graph`` auto-discovers ``name_map_*.json`` in
+    # to the records. ``deps_viewer`` auto-discovers ``name_map_*.json`` in
     # the same directory, and ``swimlane_converter`` is pointed at it below via
     # ``--func-names``. Written whenever swimlane or dep_gen is enabled (the two
     # consumers); harmless no-op when no kernel names are available.
@@ -969,7 +1019,7 @@ def _collect_dfx_artifacts(
             )
 
     if dfx.enable_dep_gen and (dfx_dir / "deps.json").exists():
-        # ``deps_to_graph`` is an offline post-processing tool; leave the
+        # ``deps_viewer`` is an offline post-processing tool; leave the
         # artefact in place and point the user at the rendering command.
         # Doing it inline on hot path risks hanging the run on large graphs
         # (Graphviz ``dot`` is O(N²~N³) and has SIGKILL'd taskqueue jobs).
@@ -978,19 +1028,19 @@ def _collect_dfx_artifacts(
         deps_path = shlex.quote(str(dfx_dir / "deps.json"))
         print(
             f"deps.json written to {deps_path} — render with:\n"
-            f"  python -m simpler_setup.tools.deps_to_graph {deps_path}\n"
-            f"  # for large graphs, pass --engine (default 'dot' works for <500 nodes):\n"
-            f"  python -m simpler_setup.tools.deps_to_graph {deps_path} --engine sfdp\n"
+            f"  python -m simpler_setup.tools.deps_viewer {deps_path}\n"
+            f"  # for large graphs, render HTML with a scalable layout engine:\n"
+            f"  python -m simpler_setup.tools.deps_viewer {deps_path} --format html --engine sfdp\n"
             f"  # --engine choices: dot | sfdp | fdp | neato | circo | twopi"
         )
 
-    if dfx.enable_dump_tensor > 0 and (dfx_dir / "tensor_dump" / "tensor_dump.json").exists():
+    if dfx.enable_dump_tensor > 0 and (dfx_dir / "args_dump" / "args_dump.json").exists():
         # ``dump_viewer`` is interactive; leave the artefact in place and
         # point the user at the inspection command.
         print(
-            f"tensor_dump written to {dfx_dir / 'tensor_dump'} — inspect with: "
+            f"args_dump written to {dfx_dir / 'args_dump'} — inspect with: "
             f"python -m simpler_setup.tools.dump_viewer "
-            f"{dfx_dir / 'tensor_dump'}"
+            f"{dfx_dir / 'args_dump'}"
         )
 
     if dfx.enable_pmu > 0 and (dfx_dir / "pmu.csv").exists():
@@ -1017,7 +1067,7 @@ def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
     The profiling tools render human-readable kernel names (``QK(rXtY)``
     instead of the anonymous ``task(rXtY)``) only when a name map sits next to
     the records: ``swimlane_converter`` consumes it via ``--func-names`` and
-    ``deps_to_graph`` auto-discovers any sibling ``name_map_*.json``. simpler's
+    ``deps_viewer`` auto-discovers any sibling ``name_map_*.json``. simpler's
     SceneTest harness writes this file itself, but pypto does not use SceneTest,
     so we build the same ``callable_id_to_name`` mapping from the
     ``func_id``/``name`` fields already emitted into ``kernel_config.py``.
@@ -1192,7 +1242,7 @@ def execute_compiled(  # noqa: PLR0913
     block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
     analyze_auto_scopes_for_deps: bool = False,
-) -> "RunTiming":
+) -> None:
     """Execute a pre-compiled program with user-provided tensors and scalars.
 
     Reuses :func:`device_runner.compile_and_assemble` for binary compilation
@@ -1231,13 +1281,9 @@ def execute_compiled(  # noqa: PLR0913
             compile and execute can pass it through safely. It has no effect
             after the program has already been compiled.
 
-    Returns:
-        The :class:`RunTiming` from :func:`execute_on_device` (``host_wall_us``
-        plus ``device_wall_us``; ``device_wall_us`` is the real on-NPU wall for
-        L2 single-task runs and ``0`` for L3+ DAG runs). Always a
-        :class:`RunTiming` — the underlying simpler ``Worker.run`` never returns
-        ``None`` (on a non-``PTO2_PROFILING`` build ``device_wall_us`` is ``0``,
-        not absent). Callers that do not need timing can ignore it.
+    Device results are written back into the host tensors in *args* in
+    place; per-run timing is no longer returned — read it from the runtime's
+    ``[STRACE]`` log markers (simpler PR #1177) or the L2 swimlane records.
     """
     del analyze_auto_scopes_for_deps
 
@@ -1269,8 +1315,8 @@ def execute_compiled(  # noqa: PLR0913
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_pass(pass_dfx: "_DfxOpts") -> "RunTiming":
-        return execute_on_device(
+    def _run_pass(pass_dfx: "_DfxOpts") -> None:
+        execute_on_device(
             chip_callable,
             orch_args,
             platform,
@@ -1312,13 +1358,10 @@ def execute_compiled(  # noqa: PLR0913
 
     # When swimlane is on (onboard), capture deps.json in a subprocess first,
     # then run the clean-timing swimlane pass in-process (see _execute_dfx_passes).
-    # The kept timing is the clean pass's.
-    timing = _execute_dfx_passes(_run_pass, _capture_deps, dfx, platform)
+    _execute_dfx_passes(_run_pass, _capture_deps, dfx, platform)
 
     # Collect DFX artefacts after execution (no-op when dfx_dir is None).
     # Original ``dfx`` drives collection so swimlane conversion auto-joins
     # ``deps.json`` and the deps-render hint fires only on explicit dep_gen.
     if dfx_dir is not None:
         _collect_dfx_artifacts(dfx_dir, platform, dfx)
-
-    return timing

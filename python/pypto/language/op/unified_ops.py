@@ -23,6 +23,12 @@ __all__ = [
     "sub",
     "mul",
     "div",
+    "part_add",
+    "part_mul",
+    "part_max",
+    "part_min",
+    "fmod",
+    "fmods",
     "maximum",
     "minimum",
     "exp",
@@ -37,26 +43,39 @@ __all__ = [
     "row_expand_div",
     "row_expand_add",
     "row_expand_sub",
+    "row_expand_max",
+    "row_expand_min",
+    "row_expand_expdif",
     "col_expand",
     "col_expand_mul",
     "col_expand_div",
     "col_expand_sub",
     "col_expand_add",
+    "col_expand_max",
+    "col_expand_min",
+    "col_expand_expdif",
     "concat",
     "expands",
     "reshape",
     "transpose",
     "slice",
     "fillpad",
+    "fillpad_expand",
     "matmul",
     "batch_matmul",
     "matmul_acc",
     "row_max",
     "row_sum",
     "row_min",
+    "row_prod",
     "col_sum",
     "col_max",
     "col_min",
+    "col_prod",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
     "cast",
     "cmp",
     "set_validshape",
@@ -229,6 +248,99 @@ def div(lhs, rhs):
     if _is_scalar_like(lhs) and _is_scalar_like(rhs):
         return Scalar(expr=_to_scalar_expr(lhs) / _to_scalar_expr(rhs))
     _raise_type_dispatch_error("div", lhs, rhs)
+
+
+# --- part_add / part_mul / part_max / part_min ---
+# Partial-combine binary ops: tensor-tensor or tile-tile only (no scalar form).
+
+
+@overload
+def part_add(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def part_add(lhs: Tile, rhs: Tile) -> Tile: ...
+def part_add(lhs, rhs):
+    """Partial element-wise add, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.part_add(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.part_add(lhs, rhs)
+    _raise_type_dispatch_error("part_add", lhs, rhs)
+
+
+@overload
+def part_mul(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def part_mul(lhs: Tile, rhs: Tile) -> Tile: ...
+def part_mul(lhs, rhs):
+    """Partial element-wise multiply, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.part_mul(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.part_mul(lhs, rhs)
+    _raise_type_dispatch_error("part_mul", lhs, rhs)
+
+
+@overload
+def part_max(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def part_max(lhs: Tile, rhs: Tile) -> Tile: ...
+def part_max(lhs, rhs):
+    """Partial element-wise max, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.part_max(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.part_max(lhs, rhs)
+    _raise_type_dispatch_error("part_max", lhs, rhs)
+
+
+@overload
+def part_min(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def part_min(lhs: Tile, rhs: Tile) -> Tile: ...
+def part_min(lhs, rhs):
+    """Partial element-wise min, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.part_min(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.part_min(lhs, rhs)
+    _raise_type_dispatch_error("part_min", lhs, rhs)
+
+
+# --- fmod ---
+
+
+@overload
+def fmod(lhs: Tensor, rhs: Tensor | int | float | Scalar) -> Tensor: ...
+@overload
+def fmod(lhs: Tile, rhs: Tile | int | float | Scalar) -> Tile: ...
+def fmod(lhs, rhs):
+    """Element-wise floating-point remainder, dispatched by input type.
+
+    Matches ``torch.fmod`` (the remainder takes the sign of the dividend).
+    """
+    if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, float, Scalar, _ir_core.Expr)):
+        return _tensor.fmod(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.fmod(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, (int, float, Scalar, _ir_core.Expr)):
+        return _tile.fmods(lhs, rhs)
+    _raise_type_dispatch_error("fmod", lhs, rhs)
+
+
+# --- fmods ---
+
+
+@overload
+def fmods(lhs: Tensor, rhs: int | float | Scalar) -> Tensor: ...
+@overload
+def fmods(lhs: Tile, rhs: int | float | Scalar) -> Tile: ...
+def fmods(lhs, rhs):
+    """Element-wise floating-point remainder with a scalar, dispatched by input type."""
+    if isinstance(lhs, Tensor):
+        return _tensor.fmods(lhs, rhs)
+    if isinstance(lhs, Tile):
+        return _tile.fmods(lhs, rhs)
+    _raise_type_dispatch_error("fmods", lhs, rhs)
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +537,60 @@ def col_expand_add(lhs: T, rhs: T) -> T:
     _raise_type_dispatch_error("col_expand_add", lhs, rhs)
 
 
+def row_expand_max(lhs: T, rhs: T) -> T:
+    """Row-wise broadcast maximum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_max(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_max(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_max", lhs, rhs)
+
+
+def row_expand_min(lhs: T, rhs: T) -> T:
+    """Row-wise broadcast minimum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_min(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_min(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_min", lhs, rhs)
+
+
+def row_expand_expdif(lhs: T, rhs: T) -> T:
+    """Row-wise exp-diff (exp(lhs - rhs) with per-row scalar), dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.row_expand_expdif(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.row_expand_expdif(lhs, rhs)
+    _raise_type_dispatch_error("row_expand_expdif", lhs, rhs)
+
+
+def col_expand_max(lhs: T, rhs: T) -> T:
+    """Column-wise broadcast maximum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_max(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_max(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_max", lhs, rhs)
+
+
+def col_expand_min(lhs: T, rhs: T) -> T:
+    """Column-wise broadcast minimum, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_min(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_min(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_min", lhs, rhs)
+
+
+def col_expand_expdif(lhs: T, rhs: T) -> T:
+    """Column-wise exp-diff (exp(lhs - rhs) with per-column scalar), dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        return _tensor.col_expand_expdif(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.col_expand_expdif(lhs, rhs)
+    _raise_type_dispatch_error("col_expand_expdif", lhs, rhs)
+
+
 def expands(target: Tensor | Tile, scalar: int | float | Scalar) -> Tensor | Tile:
     """Expand scalar to target shape, dispatched by target type."""
     if isinstance(target, Tensor):
@@ -493,6 +659,24 @@ def fillpad(value: T, pad_value: PadValue | int | float = PadValue.zero) -> T:
     if isinstance(value, Tile):
         return _tile.fillpad(value, pad_value)
     raise TypeError(f"pl.fillpad: expected Tensor or Tile, got {type(value).__name__}")
+
+
+def fillpad_expand(
+    value: T, shape: Sequence[IntLike], pad_value: PadValue | int | float = PadValue.zero
+) -> T:
+    """Copy a smaller source into a larger destination, padding the rest.
+
+    Dispatched by input type. The destination ``shape`` may be larger than the
+    source in either dimension; the source's valid region is copied into the
+    top-left of the destination and every other element is filled with
+    ``pad_value`` (``PadValue`` enum or the literal sugars ``0``, ``math.inf``,
+    ``-math.inf``).
+    """
+    if isinstance(value, Tensor):
+        return _tensor.fillpad_expand(value, shape, pad_value)
+    if isinstance(value, Tile):
+        return _tile.fillpad_expand(value, shape, pad_value)
+    raise TypeError(f"pl.fillpad_expand: expected Tensor or Tile, got {type(value).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +822,21 @@ def row_min(input: T, tmp_tile: Tile | None = None) -> T:
     raise TypeError(f"pl.row_min: expected Tensor or Tile, got {type(input).__name__}")
 
 
+def row_prod(input: T, tmp_tile: Tile | None = None) -> T:
+    """Row-wise product reduction, dispatched by input type.
+
+    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tensor inputs, tmp_tile is ignored.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.row_prod(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("row_prod on Tile requires tmp_tile argument")
+        return _tile.row_prod(input, tmp_tile)
+    raise TypeError(f"pl.row_prod: expected Tensor or Tile, got {type(input).__name__}")
+
+
 def col_sum(input: T, tmp_tile: Tile | None = None) -> T:
     """Column-wise sum reduction, dispatched by input type.
 
@@ -674,6 +873,78 @@ def col_min(input: T) -> T:
     if isinstance(input, Tile):
         return _tile.col_min(input)
     _raise_type_dispatch_error("col_min", input)
+
+
+def col_prod(input: T) -> T:
+    """Column-wise product reduction, dispatched by input type.
+
+    For Tensor inputs, the tensor-to-tile conversion lowers to ``tile.col_prod``.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.col_prod(input)
+    if isinstance(input, Tile):
+        return _tile.col_prod(input)
+    _raise_type_dispatch_error("col_prod", input)
+
+
+def row_argmax(input: T, tmp_tile: Tile | None = None) -> T:
+    """Row-wise argmax (per-row max index, int32), dispatched by input type.
+
+    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tensor inputs, tmp_tile is ignored.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.row_argmax(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("row_argmax on Tile requires tmp_tile argument")
+        return _tile.row_argmax(input, tmp_tile)
+    raise TypeError(f"pl.row_argmax: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def row_argmin(input: T, tmp_tile: Tile | None = None) -> T:
+    """Row-wise argmin (per-row min index, int32), dispatched by input type.
+
+    For Tile inputs, tmp_tile is required as a temporary buffer.
+    For Tensor inputs, tmp_tile is ignored.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.row_argmin(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("row_argmin on Tile requires tmp_tile argument")
+        return _tile.row_argmin(input, tmp_tile)
+    raise TypeError(f"pl.row_argmin: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def col_argmax(input: T, tmp_tile: Tile | None = None) -> T:
+    """Column-wise argmax (per-column max index, int32), dispatched by input type.
+
+    For Tile inputs, tmp_tile is required (unlike col_max). For Tensor inputs,
+    the conversion injects the tmp tile.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.col_argmax(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("col_argmax on Tile requires tmp_tile argument")
+        return _tile.col_argmax(input, tmp_tile)
+    raise TypeError(f"pl.col_argmax: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def col_argmin(input: T, tmp_tile: Tile | None = None) -> T:
+    """Column-wise argmin (per-column min index, int32), dispatched by input type.
+
+    For Tile inputs, tmp_tile is required (unlike col_min). For Tensor inputs,
+    the conversion injects the tmp tile.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.col_argmin(input)
+    if isinstance(input, Tile):
+        if tmp_tile is None:
+            raise ValueError("col_argmin on Tile requires tmp_tile argument")
+        return _tile.col_argmin(input, tmp_tile)
+    raise TypeError(f"pl.col_argmin: expected Tensor or Tile, got {type(input).__name__}")
 
 
 @overload

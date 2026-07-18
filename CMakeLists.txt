@@ -121,6 +121,7 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/get_comm_ctx.cpp
     src/ir/op/distributed/system.cpp
     src/ir/op/distributed/allreduce.cpp
+    src/ir/op/distributed/intrinsics.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp
     src/ir/op/tensor_ops/matmul.cpp
@@ -151,13 +152,16 @@ set(PYPTO_SOURCES
     src/ir/transforms/allocate_memory_addr_pass.cpp
     src/ir/transforms/canonicalize_tile_slice_pass.cpp
     src/ir/transforms/fold_no_op_reshape_pass.cpp
+    src/ir/transforms/stamp_tfree_split_pass.cpp
     src/ir/transforms/materialize_runtime_scopes_pass.cpp
     src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp
     src/ir/transforms/memory_reuse_pass.cpp
     src/ir/transforms/normalize_return_order_pass.cpp
     src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp
+    src/ir/transforms/synthesize_allreduce_signals_pass.cpp
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
+    src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -178,18 +182,16 @@ set(PYPTO_SOURCES
     src/ir/transforms/outline_cluster_scopes_pass.cpp
     src/ir/transforms/outline_hierarchy_scopes_pass.cpp
     src/ir/transforms/expand_mixed_kernel_pass.cpp
+    src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
     src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp
     src/ir/transforms/pass_context.cpp
     src/ir/transforms/passes.cpp
     src/ir/transforms/resolve_backend_op_layouts_pass.cpp
-    src/ir/transforms/lower_transpose_load_param_layout_pass.cpp
     src/ir/transforms/python_printer.cpp
     src/ir/transforms/simplify_pass.cpp
     src/ir/transforms/inject_gm_pipe_buffer_pass.cpp
-    src/ir/transforms/split_chunked_loops_pass.cpp
-    src/ir/transforms/interchange_chunk_loops_pass.cpp
     src/ir/transforms/unroll_loops_pass.cpp
     src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
@@ -208,9 +210,11 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/op_predicates.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
     src/ir/transforms/utils/return_lineage_utils.cpp
+    src/ir/transforms/utils/split_axis_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
+    src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Reporter
@@ -222,8 +226,11 @@ set(PYPTO_SOURCES
     src/ir/verifier/verifier.cpp
     src/ir/verifier/property_verifier_registry.cpp
     src/ir/verifier/mixed_kernel_expanded_verifier.cpp
+    src/ir/verifier/verify_hard_syncall_occupancy.cpp
+    src/ir/verifier/verify_aiv_split.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
+    src/ir/verifier/verify_no_nested_incore.cpp
     src/ir/verifier/verify_break_continue_pass.cpp
     src/ir/verifier/verify_inline_functions_eliminated.cpp
     src/ir/verifier/verify_use_after_def.cpp
@@ -254,8 +261,10 @@ set(PYPTO_SOURCES
 
     # Codegen
     src/codegen/code_emitter.cpp
+    src/codegen/codegen_preconditions.cpp
     src/codegen/codegen_base.cpp
     src/codegen/orchestration/orchestration_analysis.cpp
+    src/codegen/orchestration/iter_arg_carry_analyzer.cpp
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
@@ -280,6 +289,12 @@ set(PYPTO_SOURCES
     src/backend/common/backend_config.cpp
     src/backend/common/backend_registry.cpp
     src/backend/common/pto_ops_common.cpp
+    src/backend/common/pto_ops_shared.cpp
+    src/backend/common/pto_ops_elementwise.cpp
+    src/backend/common/pto_ops_datamove.cpp
+    src/backend/common/pto_ops_memory.cpp
+    src/backend/common/pto_ops_crosscore.cpp
+    src/backend/common/pto_ops_distributed.cpp
     src/backend/common/soc.cpp
 )
 

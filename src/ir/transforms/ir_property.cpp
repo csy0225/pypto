@@ -93,6 +93,10 @@ std::string IRPropertyToString(IRProperty prop) {
       return "ReturnParamsExplicit";
     case IRProperty::UnrollResolved:
       return "UnrollResolved";
+    case IRProperty::AivSplitValid:
+      return "AivSplitValid";
+    case IRProperty::HardSyncallOccupancyValid:
+      return "HardSyncallOccupancyValid";
     default:
       return "Unknown";
   }
@@ -137,7 +141,9 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::InOutUseValid,
                                    IRProperty::CallDirectionsResolved,
                                    IRProperty::ManualDepsOnSubmitOnly,
-                                   IRProperty::ReturnParamsExplicit};
+                                   IRProperty::ReturnParamsExplicit,
+                                   IRProperty::AivSplitValid,
+                                   IRProperty::HardSyncallOccupancyValid};
   return props;
 }
 

@@ -25,6 +25,21 @@ from ..typing.distributed_tensor import DistributedTensor
 from ._utils import _normalize_intlike, _unwrap
 
 
+def _is_region_arg(x: object) -> bool:
+    """True if a positional arg in the ``stage2`` slot is actually a region tuple.
+
+    The printer emits ``pld.tile.put`` / ``pld.tile.get`` region args
+    (``dst_offsets``, ``src_offsets``, ``shape``) positionally right after the
+    stage tile(s). A single-stage *subregion* call therefore lands a region tuple
+    in the optional ``stage2`` slot on reparse, while a real second staging tile
+    is a :class:`pl.Tile` / :class:`ir.Expr`. The parser's ``_dsl_invoker``
+    unwraps a printed region tuple to a plain ``list`` (of ``IntLike`` elements)
+    before it reaches this layer, so a region arg is always a ``list`` / ``tuple``
+    here; staging tiles never are.
+    """
+    return isinstance(x, (list, tuple))
+
+
 def remote_load(
     target: DistributedTensor,
     peer: IntLike,
@@ -117,6 +132,7 @@ def put(
     peer: IntLike,
     src: DistributedTensor | Tensor,
     stage: Tile,
+    stage2: Tile | None = None,
     dst_offsets: Sequence[IntLike] | None = None,
     src_offsets: Sequence[IntLike] | None = None,
     shape: Sequence[IntLike] | None = None,
@@ -129,11 +145,18 @@ def put(
     output roundtrips through the parser. User code calls :func:`pld.tensor.put`.
 
     ``src`` accepts either a :class:`pld.DistributedTensor` or a plain
-    :class:`pl.Tensor`; see :func:`pld.tensor.put` for the rationale.
+    :class:`pl.Tensor`; see :func:`pld.tensor.put` for the rationale. ``stage2``
+    is the optional second staging tile for ping-pong double-buffering.
     """
+    # The printer prints region tuples positionally after the stage(s); a
+    # single-stage subregion call therefore lands a region tuple in the stage2
+    # slot on reparse. Shift it back into the region args.
+    if _is_region_arg(stage2):
+        stage2, dst_offsets, src_offsets, shape = None, stage2, dst_offsets, src_offsets
     dst_expr = _unwrap(dst)
     src_expr = _unwrap(src)
     stage_expr = _unwrap(stage)
+    stage2_expr = _unwrap(stage2) if stage2 is not None else None
     if not isinstance(dst_expr, Expr) or not isinstance(dst_expr.type, _ir.DistributedTensorType):
         got = _ir.python_print_type(dst_expr.type) if isinstance(dst_expr, Expr) else type(dst_expr).__name__
         raise TypeError(f"pld.tile.put expects a DistributedTensor dst (window-bound); got {got}")
@@ -154,19 +177,21 @@ def put(
             _unwrap(peer),
             src_expr,
             stage_expr,
+            atomic=atomic,
+            stage2=stage2_expr,
             dst_offsets=_normalize_intlike(dst_offsets),
             src_offsets=_normalize_intlike(src_offsets),
             shape=_normalize_intlike(shape),
-            atomic=atomic,
         )
-    return _ir_tile.put(dst_expr, _unwrap(peer), src_expr, stage_expr, atomic=atomic)
+    return _ir_tile.put(dst_expr, _unwrap(peer), src_expr, stage_expr, atomic=atomic, stage2=stage2_expr)
 
 
 def get(
-    dst: DistributedTensor,
+    dst: DistributedTensor | Tensor,
     peer: IntLike,
     src: DistributedTensor,
     stage: Tile,
+    stage2: Tile | None = None,
     dst_offsets: Sequence[IntLike] | None = None,
     src_offsets: Sequence[IntLike] | None = None,
     shape: Sequence[IntLike] | None = None,
@@ -175,14 +200,24 @@ def get(
 
     Emitted by ``ConvertTensorToTileOps``; defined here only so the printer's
     output roundtrips through the parser. User code calls :func:`pld.tensor.get`.
+    ``stage2`` is the optional second staging tile for ping-pong double-buffering.
     """
+    # Mirror put(): a single-stage subregion call lands a region tuple in the
+    # stage2 slot on reparse; shift it back into the region args.
+    if _is_region_arg(stage2):
+        stage2, dst_offsets, src_offsets, shape = None, stage2, dst_offsets, src_offsets
     dst_expr = _unwrap(dst)
     src_expr = _unwrap(src)
     stage_expr = _unwrap(stage)
-    for role, expr in (("dst", dst_expr), ("src", src_expr)):
-        if not isinstance(expr, Expr) or not isinstance(expr.type, _ir.DistributedTensorType):
-            got = _ir.python_print_type(expr.type) if isinstance(expr, Expr) else type(expr).__name__
-            raise TypeError(f"pld.tile.get expects a DistributedTensor {role} (window-bound); got {got}")
+    stage2_expr = _unwrap(stage2) if stage2 is not None else None
+    if not isinstance(dst_expr, Expr) or not isinstance(
+        dst_expr.type, (_ir.TensorType, _ir.DistributedTensorType)
+    ):
+        got = _ir.python_print_type(dst_expr.type) if isinstance(dst_expr, Expr) else type(dst_expr).__name__
+        raise TypeError(f"pld.tile.get expects a Tensor or DistributedTensor dst; got {got}")
+    if not isinstance(src_expr, Expr) or not isinstance(src_expr.type, _ir.DistributedTensorType):
+        got = _ir.python_print_type(src_expr.type) if isinstance(src_expr, Expr) else type(src_expr).__name__
+        raise TypeError(f"pld.tile.get expects a DistributedTensor src (window-bound); got {got}")
     has_region = dst_offsets is not None or src_offsets is not None or shape is not None
     if has_region and (dst_offsets is None or src_offsets is None or shape is None):
         raise ValueError("pld.tile.get dst_offsets, src_offsets, and shape must be provided together")
@@ -195,11 +230,12 @@ def get(
             _unwrap(peer),
             src_expr,
             stage_expr,
+            stage2=stage2_expr,
             dst_offsets=_normalize_intlike(dst_offsets),
             src_offsets=_normalize_intlike(src_offsets),
             shape=_normalize_intlike(shape),
         )
-    return _ir_tile.get(dst_expr, _unwrap(peer), src_expr, stage_expr)
+    return _ir_tile.get(dst_expr, _unwrap(peer), src_expr, stage_expr, stage2=stage2_expr)
 
 
 __all__ = ["get", "remote_load", "remote_store", "put"]

@@ -39,6 +39,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
@@ -74,6 +75,23 @@ using ir::YieldStmtPtr;
 namespace transform_utils = ir::transform_utils;
 
 namespace {
+
+// Full-MemRef-identity key used by PTOAS memory-planner codegen to decide when
+// two tile variables denote the *same* buffer (and must share one tile_buf
+// handle so the op writes in place). Same base + byte_offset + size = same
+// buffer (loop-carried accumulator, in-place op result). A view shares the
+// base but differs in offset and/or size, so it gets a distinct key.
+std::string MemRefIdentityKey(const ir::MemRefPtr& memref) {
+  std::ostringstream key;
+  key << static_cast<const void*>(memref->base_.get()) << '|';
+  if (auto off = As<ir::ConstInt>(memref->byte_offset_)) {
+    key << "off" << off->value_;
+  } else {
+    key << "off@" << static_cast<const void*>(memref->byte_offset_.get());
+  }
+  key << "|sz" << memref->size_;
+  return key.str();
+}
 
 bool IsSameDimExpr(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (lhs == rhs) {
@@ -196,17 +214,23 @@ int GetGMPipeSlotCount(int dir_mask) {
   return 0;
 }
 
-// DPS scatter family: each op is `set_output_reuses_input(0)` with `dst` as
-// arg 0, so the result must be written in-place into the input tile rather than
-// a freshly-allocated result tile — otherwise the emitted tscatter targets an
-// uninitialized tile and the DPS rows that are not written lose their values.
-bool IsInPlaceScatterFamilyOp(const std::string& op_name) {
-  return op_name == "tile.scatter" || op_name == "tile.scatter_mask";
+// In-place DPS ops that write into input 0 rather than a freshly-allocated
+// result tile:
+//   * scatter family (`set_output_reuses_input(0)`): a tscatter into a fresh
+//     uninitialized tile would lose the rows it does not write;
+//   * `tile.assemble` (`set_output_memory_inherit_input()`): the result is the
+//     target with one window overwritten — written in place so the out-of-window
+//     data is preserved (and the Acc->Mat pto.tmov stays a clean converting move,
+//     not an unsupported Mat->Mat preservation copy).
+// The aliasing is gated below on the result and input actually sharing a base
+// memref, so it only triggers when memory reuse merged them in place.
+bool IsInPlaceInput0DpsOp(const ir::OpPtr& op) {
+  return ir::IsOp(op, "tile.scatter") || ir::IsOp(op, "tile.scatter_mask") || ir::IsOp(op, "tile.assemble");
 }
 
 bool ShouldAliasScatterResultToInput(const AssignStmtPtr& stmt) {
   auto call = As<ir::Call>(stmt->value_);
-  if (!call || !IsInPlaceScatterFamilyOp(call->op_->name_) || call->args_.empty()) {
+  if (!call || !IsInPlaceInput0DpsOp(call->op_) || call->args_.empty()) {
     return false;
   }
 
@@ -227,7 +251,7 @@ bool ShouldAliasScatterResultToInput(const AssignStmtPtr& stmt) {
 // name lets the emitted `pto.local_array_set` write the same storage — no copy.
 bool ShouldAliasArrayUpdateResultToInput(const AssignStmtPtr& stmt) {
   auto call = As<ir::Call>(stmt->value_);
-  return call && call->op_->name_ == "array.update_element" && !call->args_.empty() &&
+  return call && ir::IsOp(call, "array.update_element") && !call->args_.empty() &&
          As<ir::ArrayType>(stmt->var_->GetType());
 }
 
@@ -271,8 +295,8 @@ std::vector<VarPtr> CollectVarsFromShapeExpr(const ExprPtr& expr) {
 }
 
 // Visitor to collect all MemRef objects from TileType variables. Also
-// piggy-backs SPMD block-identity detection (tile.get_block_idx /
-// tile.get_block_num) on the same body walk so callers do not need a
+// piggy-backs SPMD identity detection (tile.get_block_idx / tile.get_block_num
+// / tile.get_subblock_idx) on the same body walk so callers do not need a
 // separate IR traversal.
 class MemRefCollectorVisitor : public ir::IRVisitor {
  public:
@@ -290,6 +314,13 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   /// get_block_num(args) at dispatch time.
   [[nodiscard]] bool UsesSpmdBlockOps() const { return uses_spmd_block_ops_; }
 
+  /// Returns true when the visited body invokes tile.get_subblock_idx. Drives
+  /// PTOCodegen's decision to append a synthetic i32 param to the func.func
+  /// signature; the kernel wrapper resolves it from
+  /// intrinsic.h::get_sub_block_id(args) at dispatch time, rather than reading
+  /// the ccec get_subblockid() register.
+  [[nodiscard]] bool UsesSubblockOp() const { return uses_subblock_op_; }
+
   void VisitExpr_(const VarPtr& op) override {
     if (iter_arg_ids_.count(op->UniqueId())) return;
     if (auto tile_type = ir::GetTileTypeWithMemRef(op->GetType())) {
@@ -303,9 +334,14 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   }
 
   void VisitExpr_(const ir::CallPtr& op) override {
-    if (!uses_spmd_block_ops_ && op->op_ &&
-        (op->op_->name_ == "tile.get_block_idx" || op->op_->name_ == "tile.get_block_num")) {
-      uses_spmd_block_ops_ = true;
+    if (op->op_) {
+      if (!uses_spmd_block_ops_ &&
+          (ir::IsOp(op, "tile.get_block_idx") || ir::IsOp(op, "tile.get_block_num"))) {
+        uses_spmd_block_ops_ = true;
+      }
+      if (!uses_subblock_op_ && ir::IsOp(op, "tile.get_subblock_idx")) {
+        uses_subblock_op_ = true;
+      }
     }
     ir::IRVisitor::VisitExpr_(op);
   }
@@ -316,6 +352,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   std::map<const ir::Var*, std::shared_ptr<const TileType>> memref_tile_types_;
   std::set<uint64_t> iter_arg_ids_;
   bool uses_spmd_block_ops_ = false;
+  bool uses_subblock_op_ = false;
 
   void AddMemRefIfUnique(const MemRefPtr& memref, const std::shared_ptr<const TileType>& tile_type) {
     const ir::Var* base_ptr = memref->base_.get();
@@ -358,11 +395,14 @@ PTOCodegen::PTOCodegen(const backend::Backend* backend) : backend_(backend) {
   CHECK(backend->GetHandler() != nullptr) << "PTOCodegen requires a backend that exposes a BackendHandler";
 }
 
+const backend::BackendHandler* PTOCodegen::GetBackendHandler() const { return backend_->GetHandler(); }
+
 // ========================================================================
 // Generate entry and GenerateFunction
 // ========================================================================
 
-std::string PTOCodegen::Generate(const ProgramPtr& program) {
+std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr) {
+  emit_tile_addr_ = emit_tile_addr;
   stream_.str("");
   stream_.clear();
   fs_.constants_section.str("");
@@ -525,53 +565,69 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   for (size_t i = 0; i < func->params_.size(); i++) {
     fs_.used_ssa_names.insert("arg" + std::to_string(i));
   }
-  // Reserve extra %argN slots for the trailing signature args: one
-  // CommContext ptr per DistributedTensor param, then the dyn-dim Vars
-  // (``dyn_vars`` computed at the top of GenerateFunction). Order here only
-  // affects the reserved name count; the actual layout is emitted below.
-  size_t dist_tensor_count = 0;
-  for (const auto& param : func->params_) {
-    if (As<ir::DistributedTensorType>(param->GetType())) {
-      ++dist_tensor_count;
-    }
-  }
-  for (size_t i = 0; i < dist_tensor_count + dyn_vars.size(); i++) {
+  // Reserve extra %argN slots for generated trailing signature args
+  // (``dyn_vars`` computed at the top of GenerateFunction). Explicit
+  // CommCtxType params are already included in func->params_.
+  for (size_t i = 0; i < dyn_vars.size(); i++) {
     fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + i));
   }
 
   BuildVarToMemRefMapping(func);
 
-  // One body walk: collects MemRefs and detects SPMD block-identity usage.
-  // SPMD block identity params are injected at codegen time (not at IR level)
-  // when the function body invokes tile.get_block_idx / tile.get_block_num;
-  // they are appended at the end of the func.func signature with named SSAs,
-  // and the two ops lower to arith.index_cast of those params (the kernel
-  // wrapper supplies the runtime values via intrinsic.h::get_block_idx(args) /
-  // get_block_num(args)).
+  // One body walk: collects MemRefs and detects SPMD identity usage. SPMD
+  // identity params are injected at codegen time (not at IR level) when the
+  // function body invokes tile.get_block_idx / tile.get_block_num /
+  // tile.get_subblock_idx; they are appended at the end of the func.func
+  // signature with named SSAs, and the ops lower to arith.index_cast of those
+  // params (the kernel wrapper supplies the runtime values via
+  // intrinsic.h::get_block_idx(args) / get_block_num(args) /
+  // get_sub_block_id(args)).
   MemRefCollectorVisitor collector;
   if (func->body_) {
     collector.VisitStmt(func->body_);
   }
   const bool uses_spmd_params = collector.UsesSpmdBlockOps();
+  const bool uses_subblock_param = collector.UsesSubblockOp();
   if (uses_spmd_params) {
     fs_.used_ssa_names.insert("__pypto_spmd_block_idx");
     fs_.used_ssa_names.insert("__pypto_spmd_block_num");
+  }
+  if (uses_subblock_param) {
+    fs_.used_ssa_names.insert("__pypto_spmd_subblock_idx");
   }
 
   // Still collect fs_.memref_to_tile_type for GetTileBufTypeString fallback paths
   fs_.memref_to_tile_type = collector.GetMemRefTileTypes();
 
-  // Per-var SSA binding: each tile variable gets its own SSA name
+  // Per-var SSA binding: each tile variable gets its own SSA name — except in
+  // PTOAS memory-planner mode (no addr baked), where variables denoting the
+  // *same* buffer (same MemRef base+offset+size, e.g. a loop-carried
+  // accumulator coalesced by MemoryReuse) must share one tile_buf handle. In
+  // level3 that aliasing was carried by an identical `addr`; without addr, ptoas
+  // PlanMemory would otherwise allocate them separately, so we instead emit a
+  // single alloc_tile and let the op write in place (`outs(%acc)`).
   for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    std::string ssa_name = NewNamedTemp(tile_var->name_hint_);
+    auto memref = ir::GetDefinedMemRef(tile_type);
+
+    std::string ssa_name;
+    if (!emit_tile_addr_) {
+      const std::string ident = MemRefIdentityKey(memref);
+      auto it = fs_.memref_identity_to_mlir.find(ident);
+      if (it != fs_.memref_identity_to_mlir.end()) {
+        ssa_name = it->second;  // reuse the shared handle (in-place aliasing)
+      } else {
+        ssa_name = NewNamedTemp(tile_var->name_hint_);
+        fs_.memref_identity_to_mlir[ident] = ssa_name;
+      }
+    } else {
+      ssa_name = NewNamedTemp(tile_var->name_hint_);
+    }
     BindVarToMlir(tile_var, ssa_name);
 
     // Pre-populate type so body visitors (e.g., tile.reshape no-op check)
     // can query it before per-variable alloc_tile emission runs.
     std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
     fs_.ssa_to_tile_buf_type[ssa_name] = type_str;
-
-    auto memref = ir::GetDefinedMemRef(tile_type);
 
     // Also maintain fs_.memref_to_mlir for compatibility (first var per allocation)
     const ir::Var* base_ptr = memref->base_.get();
@@ -583,13 +639,16 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // ``dyn_vars`` was computed at the top of GenerateFunction; it carries the
   // trailing %argN: index parameters in first-seen order.
 
-  // Collect ordered DistributedTensor params (in IR-param order). One
-  // CommContext pointer arg is appended per DistributedTensor at the end
-  // of the func.func signature.
+  // Collect ordered DistributedTensor params and their materialized CommCtx
+  // params (both in IR-param order) so get_comm_ctx aliases can resolve to the
+  // explicit ctx pointer argument.
   std::vector<VarPtr> dist_tensor_params;
+  std::vector<VarPtr> comm_ctx_params;
   for (const auto& param : func->params_) {
     if (As<ir::DistributedTensorType>(param->GetType())) {
       dist_tensor_params.push_back(param);
+    } else if (ir::IsA<ir::CommCtxType>(param->GetType())) {
+      comm_ctx_params.push_back(param);
     }
   }
 
@@ -640,38 +699,47 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     stream_ << "%arg" << (scalar_start_idx + j) << ": ";
     if (auto scalar_type = As<ScalarType>(param->GetType())) {
       stream_ << GetTypeString(scalar_type->dtype_);
+    } else if (ir::IsA<ir::CommCtxType>(param->GetType())) {
+      stream_ << "!pto.ptr<i64>";
     } else {
       stream_ << "!pto.ptr<f32>";
     }
   }
 
-  // Append one CommContext pointer arg per DistributedTensor param (in IR-param
-  // order). The runtime CommContext is passed as a GM ``uint64_t*`` (see
-  // ``runtime/src/common/platform_comm/comm_context.h``); codegen indexes its
-  // fields via ``pto.load_scalar`` and the ``comm_layout::k*`` constants. The
-  // host-side L2 orch flattens these as ``add_scalar(ctx)`` calls — i.e. they
-  // are passed as trailing scalar slots, mirroring dynamic-shape flattening.
-  size_t next_arg_idx = func->params_.size();
-  for (const auto& dist_param : dist_tensor_params) {
-    std::string arg_name = "%arg" + std::to_string(next_arg_idx++);
-    stream_ << ", " << arg_name << ": !pto.ptr<i64>";
-    fs_.dist_tensor_to_ctx[GetVarKey(dist_param)] = arg_name;
+  // Pair each DistributedTensor param with its explicit CommCtxType param (in
+  // IR-param order). The runtime CommContext is passed as a GM ``uint64_t*``
+  // (see ``runtime/src/common/platform_comm/comm_context.h``); codegen indexes
+  // its fields via ``pto.load_scalar`` and the ``comm_layout::k*`` constants.
+  INTERNAL_CHECK_SPAN(dist_tensor_params.size() == comm_ctx_params.size(), func->span_)
+      << "PTOCodegen: function '" << func->name_ << "' has " << dist_tensor_params.size()
+      << " DistributedTensor params but " << comm_ctx_params.size()
+      << " CommCtxType params; run MaterializeDistTensorCtx before PTO codegen";
+  for (size_t i = 0; i < dist_tensor_params.size(); ++i) {
+    fs_.dist_tensor_to_ctx[GetVarKey(dist_tensor_params[i])] = GetVarName(comm_ctx_params[i]);
   }
 
   // Append trailing index parameters for each unique dynamic dimension variable
+  size_t next_arg_idx = func->params_.size();
   for (const auto& dyn_var : dyn_vars) {
     std::string arg_name = "%arg" + std::to_string(next_arg_idx++);
     stream_ << ", " << arg_name << ": index";
     BindVarToMlir(dyn_var, arg_name);
   }
 
-  // Append SPMD block identity params after dynamic-dim args. Named SSAs make
-  // the synthetic origin obvious in the emitted MLIR and let lowerings refer
-  // to them via PTOCodegen::GetSpmdBlock{Idx,Num}ArgSSA().
+  // Append SPMD identity params after dynamic-dim args, in canonical order
+  // (block_idx, block_num, subblock_idx). Each is appended independently based
+  // on the ops the function actually uses; the Python kernel wrapper
+  // (pto_backend.py) mirrors this exact order when forwarding the call args.
+  // Named SSAs make the synthetic origin obvious in the emitted MLIR and let
+  // lowerings refer to them via PTOCodegen::GetSpmd{Block,Subblock}*ArgSSA().
   if (uses_spmd_params) {
     fs_.spmd_block_idx_arg = "%__pypto_spmd_block_idx";
     fs_.spmd_block_num_arg = "%__pypto_spmd_block_num";
     stream_ << ", " << fs_.spmd_block_idx_arg << ": i32, " << fs_.spmd_block_num_arg << ": i32";
+  }
+  if (uses_subblock_param) {
+    fs_.spmd_subblock_idx_arg = "%__pypto_spmd_subblock_idx";
+    stream_ << ", " << fs_.spmd_subblock_idx_arg << ": i32";
   }
 
   stream_ << ")";
@@ -694,11 +762,12 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   // For addr constants specifically, codegen preserves the IR ConstInt
   // dtype 1:1 (other operands like valid_row/valid_col adapt to the
   // consumer's type via cast_to_index — see ComputeAllocTileFields).
-  for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
-    if (fs_.tpop_result_vars.count(tile_var.get()) > 0) continue;
-    auto memref = ir::GetDefinedMemRef(tile_type);
-    if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
-      GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+  if (emit_tile_addr_) {
+    for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
+      auto memref = ir::GetDefinedMemRef(tile_type);
+      if (auto const_offset = memref ? As<ir::ConstInt>(memref->byte_offset_) : nullptr) {
+        GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+      }
     }
   }
 
@@ -780,16 +849,11 @@ void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
     std::map<const ir::Var*, const ir::Var*>& var_to_memref;    ///< tile var → base_ Ptr
     std::map<const ir::Var*, std::string>& memref_to_var_name;  ///< base_ Ptr → var name
     std::vector<std::pair<VarPtr, std::shared_ptr<const TileType>>>& tile_var_allocs;
-    std::map<const ir::Var*, TpopResultInfo>& tpop_result_vars;
 
     VarMemRefMapper(std::map<const ir::Var*, const ir::Var*>& mapping,
                     std::map<const ir::Var*, std::string>& reverse_mapping,
-                    std::vector<std::pair<VarPtr, std::shared_ptr<const TileType>>>& allocs,
-                    std::map<const ir::Var*, TpopResultInfo>& tpop_vars)
-        : var_to_memref(mapping),
-          memref_to_var_name(reverse_mapping),
-          tile_var_allocs(allocs),
-          tpop_result_vars(tpop_vars) {}
+                    std::vector<std::pair<VarPtr, std::shared_ptr<const TileType>>>& allocs)
+        : var_to_memref(mapping), memref_to_var_name(reverse_mapping), tile_var_allocs(allocs) {}
 
     void VisitStmt_(const AssignStmtPtr& op) override {
       if (auto tile_type = ir::GetTileTypeWithMemRef(op->var_->GetType())) {
@@ -800,27 +864,12 @@ void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {
           memref_to_var_name[base_ptr] = op->var_->name_hint_;
         }
         tile_var_allocs.emplace_back(op->var_, tile_type);
-
-        if (auto call = As<ir::Call>(op->value_)) {
-          // Track tpop result vars with their split value so codegen can:
-          // 1. Skip alloc_tile for them
-          // 2. Propagate split and explicit pipe id to tfree
-          if (call->op_->name_ == "tile.tpop_from_aiv" || call->op_->name_ == "tile.tpop_from_aic") {
-            int split = call->GetKwarg<int>("split", 0);
-            std::optional<int> pipe_id;
-            if (call->HasKwarg("id")) {
-              pipe_id = call->GetKwarg<int>("id", 0);
-            }
-            tpop_result_vars[op->var_.get()] = TpopResultInfo{split, call->op_->name_, pipe_id};
-          }
-        }
       }
       ir::IRVisitor::VisitStmt_(op);
     }
   };
 
-  VarMemRefMapper mapper(fs_.var_to_memref, fs_.memref_to_var_name, fs_.tile_var_allocs,
-                         fs_.tpop_result_vars);
+  VarMemRefMapper mapper(fs_.var_to_memref, fs_.memref_to_var_name, fs_.tile_var_allocs);
   if (func->body_) {
     mapper.VisitStmt(func->body_);
   }
@@ -1061,7 +1110,7 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   }
 
   auto memref = ir::GetDefinedMemRef(tile_type);
-  if (memref) {
+  if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
     }
@@ -1080,6 +1129,12 @@ void PTOCodegen::EmitAllocTileForVar(const ir::VarPtr& tile_var,
   INTERNAL_CHECK_SPAN(mlir_it != fs_.var_to_mlir.end(), tile_var->span_)
       << "Tile var " << tile_var->name_hint_ << " not found in fs_.var_to_mlir";
   std::string tile_buf = mlir_it->second;
+
+  // In PTOAS mode several vars may share one handle (in-place aliasing); emit
+  // the alloc_tile only once per handle so the shared buffer has a single def.
+  if (!fs_.emitted_tile_alloc_names.insert(tile_buf).second) {
+    return;
+  }
 
   AllocTileFields fields = ComputeAllocTileFields(tile_type);
 
@@ -1276,24 +1331,6 @@ std::string PTOCodegen::GetGMSlotBufferSSAForPipe(int pipe_id, int dir_mask) {
   return region_ssa;
 }
 
-const TpopResultInfo& PTOCodegen::GetValidatedTpopInfo(const ir::Var* var,
-                                                       const std::string& expected_tpop_op_name,
-                                                       const std::string& tfree_op_name) const {
-  INTERNAL_CHECK(var != nullptr) << "Internal error: null var passed to GetValidatedTpopInfo";
-  auto it = fs_.tpop_result_vars.find(var);
-  INTERNAL_CHECK_SPAN(it != fs_.tpop_result_vars.end(), var->span_)
-      << "Internal error: GetValidatedTpopInfo called for var not in fs_.tpop_result_vars";
-  CHECK(it->second.op_name == expected_tpop_op_name)
-      << tfree_op_name << " requires its tile argument to come from " << expected_tpop_op_name << ", got "
-      << it->second.op_name;
-  return it->second;
-}
-
-int PTOCodegen::GetValidatedTpopSplit(const ir::Var* var, const std::string& expected_tpop_op_name,
-                                      const std::string& tfree_op_name) const {
-  return GetValidatedTpopInfo(var, expected_tpop_op_name, tfree_op_name).split;
-}
-
 bool PTOCodegen::IsAICFunction() const {
   return fs_.current_function && fs_.current_function->func_type_ == ir::FunctionType::AIC;
 }
@@ -1310,7 +1347,7 @@ bool PTOCodegen::IsDualAivDispatchFunction() const {
 void PTOCodegen::EmitExtraAllocTiles() {
   for (const auto& alloc : fs_.extra_alloc_tiles) {
     stream_ << GetIndent() << alloc.name << " = pto.alloc_tile";
-    if (!alloc.addr_ssa.empty()) {
+    if (emit_tile_addr_ && !alloc.addr_ssa.empty()) {
       stream_ << " addr = " << alloc.addr_ssa;
     }
     if (!alloc.valid_row_ssa.empty()) {
@@ -1327,15 +1364,25 @@ void PTOCodegen::EmitExtraAllocTiles() {
 // Statement visitors
 // ========================================================================
 
+void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
+  // Defensive: the first-class SplitAivScopeStmt region is consumed and erased
+  // by LowerAutoVectorSplit (pass 21), ~19 passes before codegen. There is no
+  // ScopeStmt handler here, so a survivor would be silently unwrapped by the
+  // base visitor — losing the region semantics. Fail loudly instead.
+  INTERNAL_CHECK_SPAN(!ir::As<ir::SplitAivScopeStmt>(stmt), stmt->span_)
+      << "Internal error: SplitAivScopeStmt reached PTO codegen; it must be lowered and erased by "
+         "LowerAutoVectorSplit (pass 21).";
+  ir::IRVisitor::VisitStmt(stmt);
+}
+
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   auto call = As<ir::Call>(op->value_);
-  const bool is_set_validshape = call && call->op_->name_ == "tile.set_validshape";
+  const bool is_set_validshape = ir::IsOp(call, "tile.set_validshape");
   const bool alias_scatter_result_to_input = ShouldAliasScatterResultToInput(op);
   const bool alias_array_update_to_input = ShouldAliasArrayUpdateResultToInput(op);
 
   if (auto tile_type = ir::GetTileTypeWithMemRef(op->var_->GetType())) {
-    if (!is_set_validshape && fs_.tpop_result_vars.count(op->var_.get()) == 0 &&
-        !alias_scatter_result_to_input) {
+    if (!is_set_validshape && !alias_scatter_result_to_input) {
       EmitAllocTileForVar(op->var_, tile_type);
     }
   }
@@ -1362,7 +1409,18 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         }
         result_tile_type = tile_type;
       } else if (auto tile_type = As<TileType>(op->var_->GetType())) {
+        // A MemRef-less tile result (e.g. a cross-core tpop result, whose data
+        // lives in the reserved C2V/V2C slot) still needs a %-SSA name bound so
+        // consumers resolve it; its tile_buf type comes from the TileType since
+        // there is no MemRef to read. Register it before the op codegen runs so
+        // GetCurrentResultTileBufTypeString() can emit the `-> type` annotation.
         result_tile_type = tile_type;
+        result_buf = NewNamedTemp(op->var_->name_hint_);
+        BindVarToMlir(op->var_, result_buf);
+        std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
+        if (!type_str.empty()) {
+          fs_.ssa_to_tile_buf_type[result_buf] = type_str;
+        }
       } else if (alias_array_update_to_input) {
         // array.update_element: alias the result Var to the input array's SSA so
         // the emitted pto.local_array_set mutates the same declare_local_array
@@ -1433,7 +1491,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   VisitExpr(op->value_);
   // Register scalar/index/CommCtx result so subsequent expressions can look up
   // this variable. N7: CommCtxType is a singleton marker; the bound SSA is the
-  // matching ``!pto.ptr<i64>`` ctx ptr from the func.func trailing-ctx segment
+  // matching explicit ``!pto.ptr<i64>`` ctx ptr from the func.func signature
   // (no MLIR is emitted for ``pld.system.get_comm_ctx`` — its lambda just sets
   // ``current_expr_value`` to the ctx SSA). Treating it like a scalar here lets
   // downstream ``pld.system.rank(ctx)`` / ``pld.system.nranks(ctx)`` codegen

@@ -90,10 +90,10 @@ DEFINE_KIND_TRAIT(ReturnStmt, ObjectKind::ReturnStmt)
 DEFINE_KIND_TRAIT(ForStmt, ObjectKind::ForStmt)
 DEFINE_KIND_TRAIT(WhileStmt, ObjectKind::WhileStmt)
 DEFINE_KIND_TRAIT(InCoreScopeStmt, ObjectKind::InCoreScopeStmt)
-DEFINE_KIND_TRAIT(AutoInCoreScopeStmt, ObjectKind::AutoInCoreScopeStmt)
 DEFINE_KIND_TRAIT(ClusterScopeStmt, ObjectKind::ClusterScopeStmt)
 DEFINE_KIND_TRAIT(HierarchyScopeStmt, ObjectKind::HierarchyScopeStmt)
 DEFINE_KIND_TRAIT(SpmdScopeStmt, ObjectKind::SpmdScopeStmt)
+DEFINE_KIND_TRAIT(SplitAivScopeStmt, ObjectKind::SplitAivScopeStmt)
 DEFINE_KIND_TRAIT(RuntimeScopeStmt, ObjectKind::RuntimeScopeStmt)
 DEFINE_KIND_TRAIT(CommDomainScopeStmt, ObjectKind::CommDomainScopeStmt)
 DEFINE_KIND_TRAIT(SeqStmts, ObjectKind::SeqStmts)
@@ -143,10 +143,10 @@ struct KindTrait<Stmt> {
                                          ObjectKind::ForStmt,
                                          ObjectKind::WhileStmt,
                                          ObjectKind::InCoreScopeStmt,
-                                         ObjectKind::AutoInCoreScopeStmt,
                                          ObjectKind::ClusterScopeStmt,
                                          ObjectKind::HierarchyScopeStmt,
                                          ObjectKind::SpmdScopeStmt,
+                                         ObjectKind::SplitAivScopeStmt,
                                          ObjectKind::RuntimeScopeStmt,
                                          ObjectKind::CommDomainScopeStmt,
                                          ObjectKind::SeqStmts,
@@ -160,9 +160,9 @@ struct KindTrait<Stmt> {
 // ScopeStmt base class - matches any scope kind (7 derived classes)
 template <>
 struct KindTrait<ScopeStmt> {
-  static constexpr ObjectKind kinds[] = {ObjectKind::InCoreScopeStmt,    ObjectKind::AutoInCoreScopeStmt,
-                                         ObjectKind::ClusterScopeStmt,   ObjectKind::HierarchyScopeStmt,
-                                         ObjectKind::SpmdScopeStmt,      ObjectKind::RuntimeScopeStmt,
+  static constexpr ObjectKind kinds[] = {ObjectKind::InCoreScopeStmt,    ObjectKind::ClusterScopeStmt,
+                                         ObjectKind::HierarchyScopeStmt, ObjectKind::SpmdScopeStmt,
+                                         ObjectKind::SplitAivScopeStmt,  ObjectKind::RuntimeScopeStmt,
                                          ObjectKind::CommDomainScopeStmt};
   static constexpr size_t count = sizeof(kinds) / sizeof(ObjectKind);
 };

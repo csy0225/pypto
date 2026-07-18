@@ -147,6 +147,21 @@ PropertyVerifierPtr CreateIncoreTileOpsPropertyVerifier();
 PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
 
 /**
+ * @brief Factory function for creating AivSplitValid property verifier
+ *
+ * Structural verifier for the first-class ``SplitAivScopeStmt`` region (live
+ * between OutlineIncoreScopes and LowerAutoVectorSplit). Keyed on the node, it
+ * checks, per region: (a) no cube compute inside a region (each AIV lane holds
+ * only half the tile, so cube ops cannot be vector-split); (b) no AIV reduce
+ * over the split axis inside a region (partial per-lane reduction); (c) the
+ * ``tile.aiv_shard`` / ``tile.aic_gather`` boundary ops appear only inside a
+ * region. Full-width vector compute outside a region is legal (multi-mode), so
+ * "bare vector compute outside a region" is intentionally not checked.
+ * @return Shared pointer to AivSplitValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
+
+/**
  * @brief Factory function for creating AllocatedMemoryAddr property verifier
  *
  * Verifies that all non-DDR MemRefs have valid allocated addresses and
@@ -323,8 +338,9 @@ PropertyVerifierPtr CreateUnrollResolvedPropertyVerifier();
  *   - tensor arguments carry a non-Scalar direction; scalar arguments carry
  *     ``ArgDirection::Scalar``;
  *   - the per-argument ``ArgDirection`` is consistent with the callee's
- *     ``ParamDirection`` (``In`` ↔ ``Input``; ``InOut`` ↔ ``InOut``;
- *     ``Out`` ↔ ``Output`` / ``OutputExisting`` / ``InOut`` for WAW promotion).
+ *     ``ParamDirection`` (``In`` ↔ ``Input``; ``InOut`` ↔ ``InOut`` /
+ *     ``OutputExisting`` after auto-deps rewrite; ``Out`` ↔ ``Output`` /
+ *     ``OutputExisting`` / ``InOut`` for WAW promotion).
  *
  * The runtime requirement that ``add_input/add_output`` come before
  * ``add_scalar`` is satisfied by orchestration codegen (``stable_partition``
@@ -436,6 +452,24 @@ PropertyVerifierPtr CreateAssignTypeSymmetryPropertyVerifier();
  * @return Shared pointer to ReturnParamsExplicit PropertyVerifier
  */
 PropertyVerifierPtr CreateReturnParamsExplicitPropertyVerifier();
+
+/**
+ * @brief Factory function for creating HardSyncallOccupancyValid property verifier
+ *
+ * Verifies that every hard (FFTS) ``system.syncall`` is launched at full core
+ * occupancy: the enclosing ``pl.spmd(N)`` fills all physical cores of the
+ * barrier's ``core_type``. Runs after ExpandMixedKernel (kernel FunctionType
+ * resolved), mapping spmd blocks to physical cores per launch shape:
+ *   - Spmd -> standalone AIV kernel : required N == #VECTOR cores (aiv_only)
+ *   - Spmd -> standalone AIC kernel : required N == #CUBE cores (aic_only)
+ *   - Spmd -> Group (mixed kernel)  : required N == #CUBE core-groups (any barrier)
+ * A partial or over-occupancy launch deadlocks on device (507018); the error
+ * message points users at ``mode="soft"`` for partial occupancy. Bare
+ * hard-syncall kernels with no ``pl.spmd`` launch are not checked.
+ *
+ * @return Shared pointer to HardSyncallOccupancy PropertyVerifier
+ */
+PropertyVerifierPtr CreateHardSyncallOccupancyPropertyVerifier();
 
 }  // namespace ir
 }  // namespace pypto

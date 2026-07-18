@@ -134,6 +134,75 @@ def bar_all(*, span: Span | None = None) -> Call:
     return _create_barrier_op("system.bar_all", span=span)
 
 
+_SYNCALL_CORE_TYPES = ("aiv_only", "aic_only", "mix")
+
+
+def syncall(*, core_type: str = "mix", span: Span | None = None) -> Call:
+    """Cross-core all-participant barrier (``pto::SYNCALL``, hard/FFTS form).
+
+    Every core in the participant set selected by ``core_type`` must execute
+    past this point before any participant may proceed. Lowers to
+    ``pto.syncall() mode = #pto.sync_all_mode<hard>``.
+
+    .. warning::
+        The hard/FFTS form waits for **all** physical cores of the participant
+        set to arrive. The kernel must therefore be launched at full occupancy
+        (one block per physical core of that type). A partial-occupancy launch
+        leaves some cores unreached, so the barrier never completes and the
+        AICore times out (error 507018). The compiler enforces this at compile
+        time (``HardSyncallOccupancy`` verifier, issue #1935): a hard-mode
+        ``syncall`` whose enclosing ``pl.spmd`` does not fill all physical cores
+        of ``core_type`` is rejected. Use a full-core SPMD dispatch, or the soft
+        form (``mode="soft"``) for partial occupancy.
+
+    Args:
+        core_type: Participant set, one of "aiv_only", "aic_only", or "mix".
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for system.syncall
+    """
+    if core_type not in _SYNCALL_CORE_TYPES:
+        raise ValueError(f"syncall core_type must be one of {_SYNCALL_CORE_TYPES}, got {core_type!r}")
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call("system.syncall", [], {"core_type": core_type}, actual_span)
+
+
+def syncall_soft(core_type: str, args: list[Expr], *, span: Span | None = None) -> Call:
+    """Soft (GM-polling) form of ``system.syncall``.
+
+    Unlike the hard/FFTS form, the soft form polls a shared GM workspace and so
+    works at partial occupancy. ``args`` is the positional operand list, already
+    assembled by the DSL layer:
+
+    - aiv_only: ``[gm_workspace, ub_scratch, used_cores]``
+    - aic_only: ``[gm_workspace, l1_scratch, used_cores]``
+    - mix: ``[gm_workspace, ub_scratch, l1_scratch, used_cores]``
+
+    Args:
+        core_type: Participant set, one of "aiv_only", "aic_only", or "mix".
+        args: Positional operand Exprs (see above).
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression for the soft-mode system.syncall.
+    """
+    if core_type not in _SYNCALL_CORE_TYPES:
+        raise ValueError(f"soft syncall core_type must be one of {_SYNCALL_CORE_TYPES}, got {core_type!r}")
+    # aiv_only/aic_only carry one scratch tile (3 operands); mix carries both a UB
+    # and a flat L1 scratch (4 operands). Gate the arity here so direct IR callers
+    # cannot build a malformed barrier.
+    expected = 4 if core_type == "mix" else 3
+    if len(args) != expected:
+        raise ValueError(
+            f"soft syncall core_type={core_type!r} requires {expected} operands, got {len(args)}"
+        )
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call(
+        "system.syncall", args, {"core_type": core_type, "mode": "soft"}, actual_span
+    )
+
+
 # Sentinel value: compiler auto-assigns the buffer base address
 AUTO: int = -1
 
@@ -290,35 +359,45 @@ def import_peer_buffer(*, name: str, peer_func: str, span: Span | None = None) -
 # ============================================================================
 
 
-def tfree_to_aic(tile: Expr, span: Span | None = None, *, id: int | None = None) -> Call:
+def tfree_to_aic(
+    tile: Expr, span: Span | None = None, *, split: int | None = None, id: int | None = None
+) -> Call:
     """Release ring buffer slot back to AIC producer.
 
     Called by AIV consumer after finishing with data from tpop_from_aic.
 
     Args:
         tile: Tile expression obtained from tpop_from_aic to release
+        split: Split mode, copied from the originating tpop by StampTfreeSplit.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     kwargs = {}
+    if split is not None:
+        kwargs["split"] = split
     if id is not None:
         kwargs["id"] = id
     return _ir_core.create_op_call("system.tfree_to_aic", [tile], kwargs, actual_span)
 
 
-def tfree_to_aiv(tile: Expr, span: Span | None = None, *, id: int | None = None) -> Call:
+def tfree_to_aiv(
+    tile: Expr, span: Span | None = None, *, split: int | None = None, id: int | None = None
+) -> Call:
     """Release ring buffer slot back to AIV producer.
 
     Called by AIC consumer after finishing with data from tpop_from_aiv.
 
     Args:
         tile: Tile expression obtained from tpop_from_aiv to release
+        split: Split mode, copied from the originating tpop by StampTfreeSplit.
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     kwargs = {}
+    if split is not None:
+        kwargs["split"] = split
     if id is not None:
         kwargs["id"] = id
     return _ir_core.create_op_call("system.tfree_to_aiv", [tile], kwargs, actual_span)

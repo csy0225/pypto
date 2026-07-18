@@ -11,7 +11,7 @@
 
 import pytest
 import torch
-from pypto.runtime import DeviceTensor
+from pypto.runtime import DeviceTensor, StackedDeviceTensor
 
 
 class TestDeviceTensorConstruction:
@@ -94,6 +94,30 @@ class TestDeviceTensorImmutability:
         assert {t1, t2} == {t1}
 
 
+class TestDeviceTensorReshape:
+    def test_metadata_only_reshape_preserves_storage(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float16)
+        view = t.reshape((6, 4))
+        assert view.data_ptr == t.data_ptr
+        assert view.shape == (6, 4)
+        assert view.dtype is t.dtype
+        assert view.nbytes == t.nbytes
+
+    def test_element_count_mismatch_raises(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float32)
+        with pytest.raises(ValueError, match="preserve element count"):
+            t.reshape((5, 5))
+
+    def test_invalid_shape_rejected(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float32)
+        with pytest.raises(ValueError, match="non-empty"):
+            t.reshape(())
+        with pytest.raises(TypeError, match="contain ints"):
+            t.reshape((6.0, 4))  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="all positive"):
+            t.reshape((6, 0))
+
+
 class TestDeviceTensorRepr:
     def test_repr_hex(self):
         t = DeviceTensor(0xABCD, [2, 3], torch.int8)
@@ -101,6 +125,132 @@ class TestDeviceTensorRepr:
         assert "0xabcd" in r.lower()
         assert "(2, 3)" in r
         assert "int8" in r
+
+
+def _shards(n, shape=(4, 5), dtype=torch.float32):
+    return [DeviceTensor(0x1000 + i * 0x100, shape, dtype) for i in range(n)]
+
+
+class TestStackedDeviceTensorConstruction:
+    def test_basic(self):
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s.shards == tuple(sh)
+        assert s.full_shape == (3, 4, 5)
+        assert s.worker_ids == (0, 1, 2)
+        assert s.dtype is torch.float32
+
+    def test_non_identity_worker_ids(self):
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (2, 0, 1))
+        assert s.worker_ids == (2, 0, 1)
+        # __getitem__ is keyed by shard index, independent of worker placement.
+        assert s[0] is sh[0]
+
+    def test_shard_count_mismatch_raises(self):
+        with pytest.raises(ValueError, match="2 shards"):
+            StackedDeviceTensor(_shards(3), (2, 4, 5), (0, 1))
+
+    def test_worker_ids_count_mismatch_raises(self):
+        with pytest.raises(ValueError, match="worker_ids"):
+            StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1))
+
+    def test_duplicate_worker_ids_raises(self):
+        with pytest.raises(ValueError, match="distinct"):
+            StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 1))
+
+    def test_shard_shape_mismatch_raises(self):
+        bad = [DeviceTensor(0x1000 + i, (9, 9), torch.float32) for i in range(3)]
+        with pytest.raises(ValueError, match="per-shard shape"):
+            StackedDeviceTensor(bad, (3, 4, 5), (0, 1, 2))
+
+    def test_shard_dtype_mismatch_raises(self):
+        sh = [
+            DeviceTensor(0x1000, (4, 5), torch.float32),
+            DeviceTensor(0x2000, (4, 5), torch.float16),
+        ]
+        with pytest.raises(ValueError, match="dtype"):
+            StackedDeviceTensor(sh, (2, 4, 5), (0, 1))
+
+    def test_rank_one_full_shape_raises(self):
+        with pytest.raises(ValueError, match="rank >= 2"):
+            StackedDeviceTensor([DeviceTensor(0x1000, (4,), torch.float32)], (1,), (0,))
+
+    def test_empty_leading_dim_raises(self):
+        # B == 0 would leave shards empty; .dtype/.__repr__ would IndexError.
+        with pytest.raises(ValueError, match="at least one shard"):
+            StackedDeviceTensor([], (0, 4, 5), ())
+
+
+class TestStackedDeviceTensorIndexing:
+    def test_int_index_returns_shard(self):
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[0] is sh[0]
+        assert s[2] is sh[2]
+
+    def test_tuple_index_full_slices(self):
+        # The form the generated host_orch emits: x[r, 0:N, 0:M].
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[1, 0:4, 0:5] is sh[1]
+        assert s[1, :, :] is sh[1]
+
+    def test_ellipsis_index_returns_shard(self):
+        # The documented whole-shard form x[i, ...] must behave like x[i].
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[1, ...] is sh[1]
+        assert s[2, ...] is sh[2]
+
+    def test_ellipsis_with_leading_full_slice(self):
+        sh = _shards(3)
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        assert s[1, 0:4, ...] is sh[1]
+
+    def test_multiple_ellipsis_rejected(self):
+        s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
+        with pytest.raises(IndexError, match="at most one Ellipsis"):
+            _ = s[0, ..., ...]
+
+    def test_per_layer_plane_subview(self):
+        # The form the whole-decode host_orch emits for a stacked weight pool:
+        # x[r, k, 0:N, 0:M] selects layer k's contiguous plane of shard r.
+        sh = _shards(3, shape=(2, 4, 5))  # per-shard [L=2, N=4, M=5]
+        s = StackedDeviceTensor(sh, (3, 2, 4, 5), (0, 1, 2))
+        plane = s[2, 1, 0:4, 0:5]
+        elem = torch.tensor([], dtype=torch.float32).element_size()
+        assert plane.data_ptr == sh[2].data_ptr + 1 * (4 * 5) * elem
+        assert plane.shape == (4, 5)
+        assert plane.dtype == torch.float32
+        # Layer 0 is the shard base; whole trailing slices keep the plane full.
+        assert s[0, 0, 0:4, 0:5].data_ptr == sh[0].data_ptr
+
+    def test_contiguous_partial_leading_slice_subview(self):
+        # A contiguous leading-row sub-view is now representable (offset + shape).
+        sh = _shards(3)  # per-shard [4, 5]
+        s = StackedDeviceTensor(sh, (3, 4, 5), (0, 1, 2))
+        sub = s[0, 1:3, 0:5]
+        elem = torch.tensor([], dtype=torch.float32).element_size()
+        assert sub.data_ptr == sh[0].data_ptr + 1 * 5 * elem
+        assert sub.shape == (2, 5)
+
+    def test_noncontiguous_tail_slice_rejected(self):
+        # A non-contiguous selection (inner dim not full under a kept outer dim)
+        # is rejected by the shard's DeviceTensor indexer.
+        s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
+        with pytest.raises(NotImplementedError, match="outermost kept slice"):
+            _ = s[0, 0:4, 0:3]
+
+    def test_out_of_range_index_raises(self):
+        s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
+        with pytest.raises(IndexError, match="out of range"):
+            _ = s[3]
+
+    def test_non_int_leading_index_raises(self):
+        s = StackedDeviceTensor(_shards(3), (3, 4, 5), (0, 1, 2))
+        with pytest.raises(TypeError, match="leading index"):
+            _ = s[0:1]
 
 
 if __name__ == "__main__":

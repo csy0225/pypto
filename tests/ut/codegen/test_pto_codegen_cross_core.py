@@ -363,18 +363,16 @@ class TestCrossCoreTpushTpopCodegen:
             passes.unroll_loops,
             passes.convert_to_ssa,
             passes.flatten_call_expr,
-            passes.split_chunked_loops,
-            passes.interchange_chunk_loops,
             passes.outline_incore_scopes,
             passes.outline_cluster_scopes,
             passes.convert_tensor_to_tile_ops,
             passes.flatten_tile_nd_to_2d,
             passes.infer_tile_memory_space,
-            passes.lower_transpose_load_param_layout,
             passes.resolve_backend_op_layouts,
             passes.init_mem_ref,
             passes.memory_reuse,
             passes.allocate_memory_addr,
+            passes.stamp_tfree_split,
         ]:
             pipeline.add_pass(factory())
         optimized = pipeline.run(program)
@@ -470,9 +468,10 @@ class TestCrossCoreTpushTpopCodegen:
         span = ir.Span.unknown()
         valid_row = ir.Var("valid_row", ir.ScalarType(pl.INDEX), span)
         valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
-        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, pl.INT64, span), 16 * 64 * 4, 0)
         tile_view = ir.TileView(valid_shape=[valid_row, valid_col])
-        tile_type = ir.TileType([16, 64], pl.FP32, memref, tile_view, ir.MemorySpace.Vec)
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
         recv_tile = ir.Var("recv_tile", tile_type, span)
         tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 2}, tile_type, span)
         body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
@@ -499,9 +498,10 @@ class TestCrossCoreTpushTpopCodegen:
         """If one tpop valid_shape dim is dynamic, the other dim is still passed explicitly."""
         span = ir.Span.unknown()
         valid_col = ir.Var("valid_col", ir.ScalarType(pl.INDEX), span)
-        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, pl.INT64, span), 16 * 64 * 4, 0)
         tile_view = ir.TileView(valid_shape=[ir.ConstInt(8, pl.INT64, span), valid_col])
-        tile_type = ir.TileType([16, 64], pl.FP32, memref, tile_view, ir.MemorySpace.Vec)
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
         recv_tile = ir.Var("recv_tile", tile_type, span)
         tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
         body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
@@ -526,9 +526,10 @@ class TestCrossCoreTpushTpopCodegen:
     def test_tpop_static_non_full_valid_shape_operands(self):
         """Static tpop valid_shape smaller than physical shape should emit explicit operands."""
         span = ir.Span.unknown()
-        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, pl.INT64, span), 16 * 64 * 4, 0)
         tile_view = ir.TileView(valid_shape=[ir.ConstInt(0, pl.INDEX, span), ir.ConstInt(0, pl.INDEX, span)])
-        tile_type = ir.TileType([16, 64], pl.FP32, memref, tile_view, ir.MemorySpace.Vec)
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
         recv_tile = ir.Var("recv_tile", tile_type, span)
         tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
         body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
@@ -547,9 +548,10 @@ class TestCrossCoreTpushTpopCodegen:
         """Dynamic tpop valid_shape operands must be integer or index typed."""
         span = ir.Span.unknown()
         valid_row = ir.Var("valid_row", ir.ScalarType(pl.BOOL), span)
-        memref = ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, pl.INT64, span), 16 * 64 * 4, 0)
         tile_view = ir.TileView(valid_shape=[valid_row, ir.ConstInt(64, pl.INT64, span)])
-        tile_type = ir.TileType([16, 64], pl.FP32, memref, tile_view, ir.MemorySpace.Vec)
+        # MemRef-less: a tpop result owns no general-pool buffer (InitMemRef leaves
+        # it MemRef-less); codegen must emit no alloc_tile from the op name alone.
+        tile_type = ir.TileType([16, 64], pl.FP32, None, tile_view, ir.MemorySpace.Vec)
         recv_tile = ir.Var("recv_tile", tile_type, span)
         tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"split": 0}, tile_type, span)
         body = ir.SeqStmts([ir.AssignStmt(recv_tile, tpop_call, span)], span)
@@ -1335,14 +1337,13 @@ class TestExpandMixedKernelCodegen:
         pipeline.add_pass(passes.unroll_loops())
         pipeline.add_pass(passes.convert_to_ssa())
         pipeline.add_pass(passes.flatten_call_expr())
-        pipeline.add_pass(passes.split_chunked_loops())
-        pipeline.add_pass(passes.interchange_chunk_loops())
         pipeline.add_pass(passes.outline_incore_scopes())
         pipeline.add_pass(passes.outline_cluster_scopes())
         pipeline.add_pass(passes.convert_tensor_to_tile_ops())
         pipeline.add_pass(passes.flatten_tile_nd_to_2d())
         pipeline.add_pass(passes.infer_tile_memory_space())
         pipeline.add_pass(passes.expand_mixed_kernel())
+        pipeline.add_pass(passes.stamp_tfree_split())
         pipeline.add_pass(passes.init_mem_ref())
         pipeline.add_pass(passes.memory_reuse())
         pipeline.add_pass(passes.allocate_memory_addr())

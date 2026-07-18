@@ -18,6 +18,7 @@ fallback plus producer-TaskId capture and explicit ``deps=`` emission.
 import re
 
 import pypto.language as pl
+import pypto.language.distributed as pld
 import pytest
 from pypto import backend, codegen, passes
 from pypto.backend import BackendType
@@ -37,7 +38,7 @@ class TestSpmdScopeTaskIdCodegen:
 
     @staticmethod
     def _codegen(program):
-        """Run DeriveCallDirections + MaterializeRuntimeScopes + orchestration codegen.
+        """Run DeriveCallDirections + MaterializeDistTensorCtx + runtime-scope materialization + codegen.
 
         Runs under the repo conftest's default ``PYPTO_VERIFY_LEVEL=roundtrip``
         instrument (print -> parse -> structural_equal after each pass):
@@ -46,6 +47,7 @@ class TestSpmdScopeTaskIdCodegen:
         VerificationLevel.NONE bypass is needed.
         """
         program = passes.derive_call_directions()(program)
+        program = passes.materialize_dist_tensor_ctx()(program)
         program = passes.materialize_runtime_scopes()(program)
         for func in program.functions.values():
             if func.func_type == ir.FunctionType.Orchestration:
@@ -149,9 +151,9 @@ class TestSpmdScopeTaskIdCodegen:
         assert m is not None, f"first dispatch's producer TaskId not captured\n{code}"
         alias = m.group(1)
         # ... assert THAT alias (not just any TaskId) is pushed into a deps array ...
-        m2 = re.search(
-            rf"if \({re.escape(alias)}\.is_valid\(\)\) (\w+)\[[^\]]*\] = {re.escape(alias)};", code
-        )
+        # A fresh direct-producer TaskId (issue #1966) is statically valid, so its
+        # dep-array insert is emitted WITHOUT the is_valid() guard.
+        m2 = re.search(rf"(\w+)\[[^\]]*\] = {re.escape(alias)};", code)
         assert m2 is not None, f"captured TaskId {alias!r} not wired into a deps array\n{code}"
         deps_arr = m2.group(1)
         # ... and that the same deps array is handed to the consumer's set_dependencies.
@@ -224,6 +226,56 @@ class TestSpmdScopeTaskIdCodegen:
         # The other (distinct) args are each emitted exactly once, unaffected.
         assert code.count("params_t0.add_input(ext_b);") == 1, code
         assert code.count("params_t0.add_input(ext_bias);") == 1, code
+
+    def test_mixed_spmd_forwards_materialized_comm_ctx_scalar(self):
+        """DistributedTensor ctx params flow through Spmd -> Group wrappers as ordinary scalars.
+
+        Regression coverage for the #1913 family: wrapper codegen must not rely
+        on a side-channel ctx-synthesis helper. Once
+        MaterializeDistTensorCtx has appended ``signal_ctx`` to the wrapper
+        signature and inner call, BuildWrapperReorderedParams should forward it
+        with the normal scalar path.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                signal: pld.DistributedTensor[[1], pl.INT32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
+                tile_out = pl.add(tile_mm, pl.load(bias, [0, 0], [64, 64]))
+                return pl.store(tile_out, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                signal: pld.DistributedTensor[[1], pl.INT32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(4):
+                    out = self.kernel(a, b, bias, out, signal)
+                return out
+
+        transformed = self._mixed_spmd_pipeline(P)
+        code = self._codegen(transformed)
+        assert "uint64_t signal_ctx = orch_args.scalar(0);" in code, code
+        assert code.count("params_t0.add_scalar(signal_ctx);") == 1, code
+        assert "ext_signal_ctx" not in code, code
 
     def test_mixed_spmd_distinct_args_codegen_unchanged(self):
         """Control / no-regression: a MIXED ``pl.spmd`` dispatch with all-distinct
@@ -346,8 +398,186 @@ class TestSpmdScopeTaskIdCodegen:
         aliased = [n for n in set(consumer_args) if consumer_args.count(n) == 2]
         assert len(aliased) == 1, f"expected one buffer aliased twice, got {consumer_args}\n{code}"
         # And the deps edge is wired from the captured producer TaskId.
-        assert re.search(rf"if \({re.escape(tid)}\.is_valid\(\)\)", code) is not None, code
+        # Fresh direct-producer TaskId (issue #1966): unguarded dep insert, no
+        # redundant is_valid() branch.
+        assert re.search(rf"if \({re.escape(tid)}\.is_valid\(\)\)", code) is None, code
+        assert re.search(rf"\[[^\]]*\] = {re.escape(tid)};", code) is not None, code
         assert re.search(r"params_t1\.set_dependencies\(", code) is not None, code
+
+    def test_allow_early_resolve_emits_set_allow_early_resolve(self):
+        """``pl.spmd(..., allow_early_resolve=True) as tid`` emits the codegen hint.
+
+        End-to-end proof that the parser-level scope attr threads through the Spmd
+        outliner onto the ``ir.Submit`` and surfaces in orchestration codegen as
+        ``Arg::set_allow_early_resolve(true)`` (same rail as ``pl.submit`` /
+        ``pl.at``).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore)
+            def vkernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                t = pl.load(a, [0, 0], [512, 128])
+                out = pl.store(pl.add(t, t), [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1", allow_early_resolve=True) as tid:
+                    out = self.vkernel(a, out)
+                return out
+
+        transformed = self._mixed_spmd_pipeline(P)
+        code = self._codegen(transformed)
+        assert re.search(r"\w+\.set_allow_early_resolve\(true\);", code) is not None, code
+
+    def test_no_allow_early_resolve_omits_hint(self):
+        """An ordinary captured Spmd dispatch never emits ``set_allow_early_resolve``."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore)
+            def vkernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                t = pl.load(a, [0, 0], [512, 128])
+                out = pl.store(pl.add(t, t), [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[512, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
+            ) -> pl.Tensor[[512, 128], pl.FP32]:
+                with pl.spmd(4, name_hint="stage1") as tid:
+                    out = self.vkernel(a, out)
+                return out
+
+        transformed = self._mixed_spmd_pipeline(P)
+        code = self._codegen(transformed)
+        assert "set_allow_early_resolve" not in code, code
+
+    def test_spmd_dist_tensor_threads_comm_ctx(self):
+        """A ``pl.spmd`` dispatch of an InCore kernel taking a ``DistributedTensor``
+        must thread the per-tensor CommContext scalar into the task (issue #1913).
+
+        MaterializeDistTensorCtx appends one explicit CommContext scalar arg per
+        DistributedTensor formal; the L2 Spmd orchestration must forward the
+        matching ``signal_ctx`` exactly like the InCore path, or the kernel reads
+        a garbage CommContext and the cross-rank notify/wait deadlocks. Mirrors
+        ``tests/st/distributed/test_l3_notify_wait.py`` but
+        wraps the call in ``pl.spmd`` (the failing scope).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore)
+            def barrier_step(
+                self,
+                out: pl.Out[pl.Tensor[[1, 1], pl.INT32]],
+                signal: pl.InOut[pld.DistributedTensor[[1, 1], pl.INT32]],
+                peer: pl.Scalar[pl.INT32],
+                tag: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[1, 1], pl.INT32]:
+                pld.system.notify(target=signal, peer=peer, offsets=[0, 0], value=tag, op=pld.NotifyOp.Set)
+                pld.system.wait(signal=signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+                val: pl.Scalar[pl.INT32] = pl.read(signal, [0, 0])
+                pl.write(out, [0, 0], val)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                out: pl.Out[pl.Tensor[[1, 1], pl.INT32]],
+                signal: pl.InOut[pld.DistributedTensor[[1, 1], pl.INT32]],
+                peer: pl.Scalar[pl.INT32],
+                tag: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[1, 1], pl.INT32]:
+                with pl.spmd(2):
+                    out = self.barrier_step(out, signal, peer, tag)
+                return out
+
+        transformed = self._mixed_spmd_pipeline(P)
+        # Plain vector InCore kernel -> AIV Spmd dispatch (GenerateSpmdCallCode's
+        # non-Group branch), not a mixed cube+vector Group.
+        code = self._codegen(transformed)
+        assert "rt_submit_aiv_task" in code, code
+        # The DistributedTensor ``signal`` threads its explicit CommContext scalar last.
+        assert code.count("params_t0.add_scalar(signal_ctx);") == 1, code
+        assert "ext_signal_ctx" not in code, code
+
+    def test_mixed_spmd_dist_tensor_threads_comm_ctx_through_group_bridge(self):
+        """A MIXED (``split=``) ``pl.spmd`` dispatch carrying a ``DistributedTensor``
+        threads the CommContext scalar through the Spmd-wrapped-Group bridge too
+        (issue #1913).
+
+        The Spmd wrapper dispatches a cube+vector Group, so codegen routes through
+        ``GenerateGroupCallCode``'s MixedKernels branch (via ``WrapperBridge``) —
+        a different emit site than the plain-Spmd path above. Both must forward
+        the explicit ``signal_ctx`` scalar for the DistributedTensor formal.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[1, 1], pl.INT32]],
+                peer: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
+                tile_out = pl.add(tile_mm, pl.load(bias, [0, 0], [64, 64]))
+                pld.system.notify(target=signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.Set)
+                return pl.store(tile_out, [0, 0], out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[1, 1], pl.INT32]],
+                peer: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(4):
+                    out = self.kernel(a, b, bias, out, signal, peer)
+                return out
+
+        transformed = self._mixed_spmd_pipeline(P)
+        code = self._codegen(transformed)
+        # Mixed cube+vector dispatch through the Group bridge ...
+        assert "rt_submit_task(mixed_0, params_t0);" in code, code
+        # ... still threads the DistributedTensor CommContext scalar.
+        assert code.count("params_t0.add_scalar(signal_ctx);") == 1, code
+        assert "ext_signal_ctx" not in code, code
 
 
 if __name__ == "__main__":

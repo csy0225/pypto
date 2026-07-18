@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -22,15 +23,20 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
@@ -85,6 +91,106 @@ int GetOrCreateFuncId(const std::string& func_name, std::map<std::string, int>* 
   return (*func_name_to_id)[func_name];
 }
 
+std::optional<int64_t> EvalConstInt(const ExprPtr& expr) {
+  if (auto ci = As<ConstInt>(expr)) return ci->value_;
+  return std::nullopt;
+}
+
+int64_t EvalConstTripCount(const ForStmtPtr& for_stmt) {
+  auto start = EvalConstInt(for_stmt->start_);
+  auto stop = EvalConstInt(for_stmt->stop_);
+  auto step = EvalConstInt(for_stmt->step_);
+  if (!start || !stop || !step || *step <= 0) return 0;
+  int64_t trip = (*stop - *start + *step - 1) / *step;
+  return trip > 0 ? trip : 0;
+}
+
+namespace {
+
+int GetGMPipeSlotCount(int dir_mask) {
+  const int bidirectional = core_affinity::kDirMaskC2V | core_affinity::kDirMaskV2C;
+  if (dir_mask == bidirectional) {
+    return 4;
+  }
+  if (dir_mask == core_affinity::kDirMaskC2V || dir_mask == core_affinity::kDirMaskV2C) {
+    return 8;
+  }
+  return 0;
+}
+
+}  // namespace
+
+int64_t ComputeGMPipeWorkspaceElements(const ProgramPtr& program, const FunctionPtr& root_func) {
+  std::map<std::pair<int, int>, int> slot_size_by_pipe;
+
+  std::unordered_set<std::string> visited_funcs;
+  std::function<void(const std::vector<StmtPtr>&)> scan_stmts;
+  std::function<void(const FunctionPtr&)> scan_func;
+  scan_stmts = [&](const std::vector<StmtPtr>& stmts) {
+    for (const auto& stmt : stmts) {
+      auto call = transform_utils::GetCallFromStmt(stmt);
+      if (op_predicates::IsInitializePipe(call)) {
+        const int pipe_id = call->GetKwarg<int>("id", 0);
+        const int dir_mask = call->GetKwarg<int>("dir_mask", 0);
+        const int slot_size = call->GetKwarg<int>("slot_size", 0);
+        if (dir_mask > 0 && slot_size > 0) {
+          const auto key = std::make_pair(pipe_id, dir_mask);
+          auto [it, inserted] = slot_size_by_pipe.emplace(key, slot_size);
+          CHECK(inserted || it->second == slot_size)
+              << "initialize_pipe for frontend pipe id " << pipe_id << " and dir_mask " << dir_mask
+              << " uses inconsistent slot_size values: " << it->second << " and " << slot_size;
+        }
+      } else if (call) {
+        auto gv = As<GlobalVar>(call->op_);
+        if (gv) {
+          scan_func(program->GetFunction(gv->name_));
+        }
+      }
+
+      if (auto for_stmt = As<ForStmt>(stmt)) {
+        scan_stmts(transform_utils::FlattenToStmts(for_stmt->body_));
+      } else if (auto if_stmt = As<IfStmt>(stmt)) {
+        scan_stmts(transform_utils::FlattenToStmts(if_stmt->then_body_));
+        const auto& else_body = if_stmt->else_body_;
+        if (else_body) {
+          scan_stmts(transform_utils::FlattenToStmts(*else_body));
+        }
+      } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+        scan_stmts(transform_utils::FlattenToStmts(while_stmt->body_));
+      } else if (auto scope = As<RuntimeScopeStmt>(stmt)) {
+        scan_stmts(transform_utils::FlattenToStmts(scope->body_));
+      }
+    }
+  };
+
+  scan_func = [&](const FunctionPtr& func) {
+    if (!func || !visited_funcs.insert(func->name_).second) {
+      return;
+    }
+    if (func->body_) {
+      scan_stmts(transform_utils::FlattenToStmts(func->body_));
+    }
+  };
+
+  scan_func(root_func);
+
+  int64_t total_bytes = 0;
+  for (const auto& [key, slot_size] : slot_size_by_pipe) {
+    const int dir_mask = key.second;
+    const int slot_count = GetGMPipeSlotCount(dir_mask);
+    CHECK(slot_count > 0) << "initialize_pipe has invalid dir_mask for GM slot buffer: " << dir_mask;
+    CHECK(total_bytes <= std::numeric_limits<int64_t>::max() -
+                             static_cast<int64_t>(slot_count) * static_cast<int64_t>(slot_size))
+        << "GM slot buffer size overflow while sizing frontend pipe id " << key.first;
+    total_bytes += static_cast<int64_t>(slot_count) * static_cast<int64_t>(slot_size);
+  }
+
+  if (total_bytes == 0) {
+    return 0;
+  }
+  return (total_bytes + static_cast<int64_t>(sizeof(float)) - 1) / static_cast<int64_t>(sizeof(float));
+}
+
 // ---------------------------------------------------------------------------
 // OrchestrationInfoCollector
 // ---------------------------------------------------------------------------
@@ -95,7 +201,7 @@ void OrchestrationInfoCollector::VisitStmt_(const AssignStmtPtr& assign) {
   // would desynchronise this analysis from the codegen lookup (which now also
   // keys on the binding Var).
   if (auto call = AsCallOrSubmitView(assign->value_)) {
-    if (!IsBuiltinOp(call->op_->name_) && call->op_->name_ != "tensor.create") {
+    if (!IsBuiltinOp(call->op_->name_) && !IsOp(call, "tensor.create")) {
       if (As<TupleType>(call->GetType())) {
         std::string unique_key = "_tc_" + std::to_string(tuple_call_counter_++);
         tuple_var_to_key[assign->var_.get()] = unique_key;
@@ -162,9 +268,9 @@ void BufferRootCollector::VisitStmt_(const AssignStmtPtr& assign) {
   // op-name branches below are unaffected.
   if (auto call = AsCallOrSubmitView(assign->value_)) {
     const std::string& op_name = call->op_->name_;
-    if (op_name == "tensor.create" || op_name == "tensor.slice") {
+    if (IsOp(call, "tensor.create") || IsOp(call, "tensor.slice")) {
       buffer_roots[assign->var_.get()] = assign->var_.get();
-    } else if (op_name == "tensor.assemble") {
+    } else if (IsOp(call, "tensor.assemble")) {
       if (call->args_.size() == 3) {
         if (const Var* target_root = ResolveExpr(call->args_[0])) {
           buffer_roots[assign->var_.get()] = target_root;
@@ -445,6 +551,27 @@ BodyAliases CollectBodyAliases(const StmtPtr& body) {
   AliasingNodeCollector collector;
   collector.VisitStmt(body);
   return collector.result;
+}
+
+// ---------------------------------------------------------------------------
+// UnwrapAutoScope
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
+
+}  // namespace
+
+StmtPtr UnwrapAutoScope(const StmtPtr& stmt) {
+  if (auto scope = As<RuntimeScopeStmt>(stmt);
+      scope && (!scope->manual_ || scope->GetAttr<bool>(kAttrCompilerAutoManualScopeCandidate, false))) {
+    return UnwrapAutoScope(scope->body_);
+  }
+  if (auto seq = As<SeqStmts>(stmt); seq && seq->stmts_.size() == 1) {
+    return UnwrapAutoScope(seq->stmts_[0]);
+  }
+  return stmt;
 }
 
 }  // namespace codegen

@@ -77,6 +77,14 @@ enum class IRProperty : uint64_t {
   ReturnParamsExplicit,             ///< InCore/Group/Spmd tensor returns reference function params by
                                     ///< pointer identity, so the return->param map is a lookup (#1702)
   UnrollResolved,                   ///< No ForKind::Unroll survives; produced by UnrollLoops
+  AivSplitValid,                    ///< SplitAivScopeStmt regions are structurally valid: no cube compute
+                                    ///< or split-axis reduce inside a region, boundary ops only inside one
+  HardSyncallOccupancyValid,        ///< Every hard (FFTS) system.syncall is launched at full occupancy:
+                                    ///< the enclosing pl.spmd fills all physical cores of the barrier's
+                                    ///< core_type (standalone AIV/AIC = 1 block/core; mixed Group launch =
+                                    ///< 1 block/core-group). A partial/over launch deadlocks on device
+                                    ///< (507018) — use mode="soft" for partial occupancy. Verified after
+                                    ///< ExpandMixedKernel (kernel FunctionType resolved).
   kCount                            ///< Sentinel (must be last)
 };
 
@@ -208,8 +216,8 @@ enum class VerificationLevel {
  *
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
- * CallDirectionsResolved, ManualDepsOnSubmitOnly} — lightweight checks that
- * catch the most common IR errors.
+ * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
+ * AivSplitValid} — lightweight checks that catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 

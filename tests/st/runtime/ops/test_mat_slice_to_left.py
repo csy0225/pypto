@@ -49,6 +49,13 @@ class TestMatSliceToLeft(PTOTestCase):
 
     def __init__(self, *, platform: str | None = None, config=None):
         super().__init__(config, platform=platform)
+        # fp32 K-split matmul (K=128): the device reduces the two K-halves in a
+        # different order than the single-pass torch golden, drifting ~K*eps_fp32
+        # (~1.5e-5 at K=128) — above the 1e-5 default for near-zero (cancellation)
+        # elements. Same class as the AutoL0 matmul s-tests (rtol=1e-4).
+        if config is None:
+            self.config.rtol = 1e-4
+            self.config.atol = 1e-4
 
     def get_name(self) -> str:
         return f"mat_slice_to_left_{M}x{2 * K}x{N}"

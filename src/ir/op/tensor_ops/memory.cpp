@@ -297,6 +297,65 @@ TypePtr DeduceTensorFillpadType(const std::vector<ExprPtr>& args,
                                       std::move(tensor_view));
 }
 
+TypePtr DeduceTensorFillpadExpandType(const std::vector<ExprPtr>& args,
+                                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  // tensor.fillpad_expand(tensor, shape) — the destination may be larger than the
+  // source in either dimension; the source's valid region is copied into the
+  // top-left of the destination and the remainder is filled with pad_value.
+  CHECK(args.size() == 2) << "tensor.fillpad_expand requires exactly 2 arguments (tensor, shape), but got "
+                          << args.size();
+
+  auto tensor_type = As<TensorType>(args[0]->GetType());
+  CHECK(tensor_type) << "tensor.fillpad_expand requires first argument to be a TensorType, but got "
+                     << args[0]->GetType()->TypeName();
+
+  auto shape_tuple = As<MakeTuple>(args[1]);
+  CHECK(shape_tuple) << "tensor.fillpad_expand shape must be a literal tuple of constants, but got "
+                     << args[1]->GetType()->TypeName();
+  const std::vector<ExprPtr>& new_shape = shape_tuple->elements_;
+  CHECK(new_shape.size() == tensor_type->shape_.size())
+      << "tensor.fillpad_expand shape rank (" << new_shape.size() << ") must match source rank ("
+      << tensor_type->shape_.size() << ")";
+
+  for (size_t i = 0; i < new_shape.size(); ++i) {
+    auto dst_dim = As<ConstInt>(new_shape[i]);
+    CHECK(dst_dim) << "tensor.fillpad_expand shape dimension " << i << " must be a constant integer";
+    CHECK(dst_dim->value_ > 0) << "tensor.fillpad_expand shape dimension " << i << " must be positive, got "
+                               << dst_dim->value_;
+    if (auto src_dim = As<ConstInt>(tensor_type->shape_[i])) {
+      CHECK(dst_dim->value_ >= src_dim->value_)
+          << "tensor.fillpad_expand destination dimension " << i << " (" << dst_dim->value_
+          << ") must be >= source dimension (" << src_dim->value_ << ")";
+    }
+  }
+
+  PadValue pad_value = PadValue::zero;
+  for (const auto& kv : kwargs) {
+    if (kv.first == "pad_value") {
+      pad_value = std::any_cast<PadValue>(kv.second);
+      CHECK(pad_value != PadValue::null)
+          << "tensor.fillpad_expand requires pad_value to be zero/max/min, not null";
+    }
+  }
+
+  // After expand the entire destination is valid. Inherit the source view layout;
+  // only the (larger) shape, valid_shape, and pad change.
+  std::optional<TensorView> tensor_view = tensor_type->tensor_view_;
+  if (tensor_view.has_value()) {
+    tensor_view->valid_shape = new_shape;
+    tensor_view->pad = pad_value;
+  } else {
+    TensorView view;
+    view.valid_shape = new_shape;
+    view.pad = pad_value;
+    tensor_view = view;
+  }
+
+  // The destination is larger than the source, so it cannot share the source's
+  // backing buffer — return a fresh tensor (no inherited MemRef).
+  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt, std::move(tensor_view));
+}
+
 TypePtr DeduceTensorAssembleType(const std::vector<ExprPtr>& args,
                                  const std::vector<std::pair<std::string, std::any>>& kwargs) {
   // tensor.assemble requires exactly 3 arguments: target, source, and offset tuple
@@ -346,9 +405,12 @@ TypePtr DeduceTensorAssembleType(const std::vector<ExprPtr>& args,
       << "tensor.assemble atomic kwarg must be AtomicType.None_ or AtomicType.Add, but got int " << atomic;
   if (atomic == static_cast<int>(AtomicType::kAdd)) {
     const DataType& dt = target_type->dtype_;
-    CHECK(dt == DataType::FP32 || dt == DataType::FP16 || dt == DataType::INT32 || dt == DataType::INT16 ||
-          dt == DataType::INT8)
-        << "tensor.assemble with atomic=AtomicType.Add requires an fp32/fp16/int32/int16/int8 target "
+    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910B) and
+    // kirinX90 profiles (pto-isa SetAtomicAdd<bfloat16_t> -> set_atomic_bf16);
+    // it is NOT supported on the A5/kirin9030 store path.
+    CHECK(dt == DataType::FP32 || dt == DataType::BF16 || dt == DataType::FP16 || dt == DataType::INT32 ||
+          dt == DataType::INT16 || dt == DataType::INT8)
+        << "tensor.assemble with atomic=AtomicType.Add requires an fp32/bf16/fp16/int32/int16/int8 target "
            "(hardware atomic-add dtypes), but got "
         << dt.ToString();
   }
@@ -479,6 +541,17 @@ REGISTER_OP("tensor.fillpad")
       return DeduceTensorFillpadType(args, kwargs);
     });
 
+REGISTER_OP("tensor.fillpad_expand")
+    .set_op_category("TensorOp")
+    .set_description("Copy a smaller source tensor into a larger destination tensor, padding the remainder")
+    .add_argument("tensor", "Source tensor (TensorType)")
+    .add_argument("shape", "Destination shape (Tuple of ConstInt), each dim >= source dim")
+    .set_attr<PadValue>("pad_value")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorFillpadExpandType(args, kwargs);
+    });
+
 REGISTER_OP("tensor.full")
     .set_op_category("TensorOp")
     .set_description("Create a tensor of specified shape filled with a constant value")
@@ -562,6 +635,80 @@ TypePtr DeduceTensorCiType(const std::vector<ExprPtr>& args,
   return std::make_shared<TensorType>(shape, dtype);
 }
 
+TypePtr DeduceTensorRandomType(const std::vector<ExprPtr>& args,
+                               const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  // tensor.random signature: (key0, key1, counter0, counter1, counter2, counter3, shape)
+  // with attrs {dtype, rounds}. Lowers to tile.random. Generates a tensor of
+  // counter-based (Philox/ChaCha) pseudo-random values seeded by the key + 128-bit
+  // counter scalars; there is no source tensor.
+  CHECK(args.size() == 7) << "tensor.random requires exactly 7 arguments (key0, key1, counter0, "
+                             "counter1, counter2, counter3, shape), but got "
+                          << args.size();
+
+  bool found_dtype = false;
+  DataType dtype;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "dtype") {
+      dtype = AnyCast<DataType>(value, "kwarg key: dtype");
+      found_dtype = true;
+      break;
+    }
+  }
+  CHECK(found_dtype) << "tensor.random requires 'dtype' kwarg";
+  CHECK(dtype == DataType::INT32 || dtype == DataType::UINT32)
+      << "tensor.random dtype must be one of {INT32, UINT32}, but got " << dtype.ToString();
+
+  // rounds attr controls the cipher round count; the hardware only accepts 7 or 10.
+  // Mirror tile.random so an invalid tensor.random fails here, not after lowering.
+  int rounds = 10;
+  for (const auto& [key, value] : kwargs) {
+    if (key == "rounds") {
+      rounds = AnyCast<int>(value, "kwarg key: rounds");
+      break;
+    }
+  }
+  CHECK(rounds == 7 || rounds == 10) << "tensor.random requires rounds to be 7 or 10, but got " << rounds;
+
+  // The 6 seed arguments are 32-bit integer scalars (key[0..1], counter[0..3]).
+  for (size_t i = 0; i < 6; ++i) {
+    auto scalar_type = As<ScalarType>(args[i]->GetType());
+    CHECK(scalar_type) << "tensor.random requires argument " << i << " (seed scalar) to be a scalar, but got "
+                       << args[i]->GetType()->TypeName();
+    CHECK(scalar_type->dtype_ == DataType::INT32)
+        << "tensor.random requires seed argument " << i << " to have INT32 dtype, but got "
+        << scalar_type->dtype_.ToString();
+  }
+
+  // Shape: TupleType of integer scalars (mirrors tensor.ci).
+  auto shape_tuple_type = As<TupleType>(args[6]->GetType());
+  CHECK(shape_tuple_type) << "tensor.random requires shape to be TupleType, but got "
+                          << args[6]->GetType()->TypeName();
+  for (size_t i = 0; i < shape_tuple_type->types_.size(); ++i) {
+    auto scalar_type = As<ScalarType>(shape_tuple_type->types_[i]);
+    CHECK(scalar_type) << "tensor.random shape element " << i << " must be ScalarType, but got "
+                       << shape_tuple_type->types_[i]->TypeName();
+    CHECK(scalar_type->dtype_.IsInt())
+        << "tensor.random shape element " << i << " must have integer dtype, but got "
+        << scalar_type->dtype_.ToString();
+  }
+
+  std::vector<ExprPtr> shape;
+  shape.reserve(shape_tuple_type->types_.size());
+  if (auto make_tuple = As<MakeTuple>(args[6])) {
+    shape = make_tuple->elements_;
+  } else {
+    for (size_t i = 0; i < shape_tuple_type->types_.size(); ++i) {
+      shape.emplace_back(std::make_shared<TupleGetItemExpr>(args[6], static_cast<int>(i), args[6]->span_));
+    }
+  }
+  CHECK(!shape.empty()) << "tensor.random requires non-empty shape";
+  // pto.trandom is a 2D row/col generator; reject ranks that FlattenTileNd does
+  // not lower (it does not flatten random), mirroring tile.random.
+  CHECK(shape.size() == 2) << "tensor.random requires a 2D shape (rows, cols), but got rank " << shape.size();
+
+  return std::make_shared<TensorType>(shape, dtype);
+}
+
 REGISTER_OP("tensor.ci")
     .set_op_category("TensorOp")
     .set_description("Generate a contiguous integer sequence into a tensor (lowers to tile.ci)")
@@ -572,6 +719,23 @@ REGISTER_OP("tensor.ci")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorCiType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.random")
+    .set_op_category("TensorOp")
+    .set_description("Generate counter-based pseudo-random values into a tensor (lowers to tile.random)")
+    .add_argument("key0", "First key word (INT32 scalar)")
+    .add_argument("key1", "Second key word (INT32 scalar)")
+    .add_argument("counter0", "Counter word 0 (INT32 scalar)")
+    .add_argument("counter1", "Counter word 1 (INT32 scalar)")
+    .add_argument("counter2", "Counter word 2 (INT32 scalar)")
+    .add_argument("counter3", "Counter word 3 (INT32 scalar)")
+    .add_argument("shape", "Destination shape (TupleType of ScalarType integer)")
+    .set_attr<DataType>("dtype")
+    .set_attr<int>("rounds")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorRandomType(args, kwargs);
     });
 
 TypePtr DeduceTensorDimType(const std::vector<ExprPtr>& args,

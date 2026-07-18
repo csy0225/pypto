@@ -50,6 +50,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::HasMemRefs, CreateHasMemRefsPropertyVerifier);
   Register(IRProperty::IncoreTileOps, CreateIncoreTileOpsPropertyVerifier);
   Register(IRProperty::MixedKernelExpanded, CreateMixedKernelExpandedPropertyVerifier);
+  Register(IRProperty::AivSplitValid, CreateAivSplitValidPropertyVerifier);
   Register(IRProperty::AllocatedMemoryAddr, CreateAllocatedMemoryAddrPropertyVerifier);
   Register(IRProperty::TileOps2D, CreateTileOps2DPropertyVerifier);
   Register(IRProperty::TileMemoryInferred, CreateTileMemoryInferredPropertyVerifier);
@@ -84,12 +85,14 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // AssignTypeSymmetry (#1285): every AssignStmt(var, value) must satisfy
   // structural_equal(var->GetType(), value->GetType()). Registered so callers
   // can run it on demand via PropertyVerifierRegistry::verify; not yet promoted
-  // to GetStructuralProperties() (Phase 2) — that promotion is deferred until
-  // the latent violation it surfaces (the transposed-weight 3D batch-matmul
-  // rank asymmetry in LowerTransposeLoadParamLayout) is fixed, so it does not
-  // hard-fail that compile path.
+  // to GetStructuralProperties() (Phase 2).
   Register(IRProperty::AssignTypeSymmetry, CreateAssignTypeSymmetryPropertyVerifier);
   Register(IRProperty::ReturnParamsExplicit, CreateReturnParamsExplicitPropertyVerifier);
+  // HardSyncallOccupancyValid (#1935): a hard (FFTS) system.syncall requires the
+  // enclosing pl.spmd to fill all physical cores of the barrier's core_type;
+  // partial occupancy deadlocks on device. Produced by ExpandMixedKernel and in
+  // GetVerifiedProperties(), so it fires once right after that pass.
+  Register(IRProperty::HardSyncallOccupancyValid, CreateHardSyncallOccupancyPropertyVerifier);
 }
 
 void PropertyVerifierRegistry::Register(IRProperty prop, std::function<PropertyVerifierPtr()> factory) {

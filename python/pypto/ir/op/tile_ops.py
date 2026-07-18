@@ -119,6 +119,8 @@ def create(
     target_memory: MemorySpace = MemorySpace.Vec,
     transpose: bool | None = None,
     span: Span | None = None,
+    *,
+    flat_layout: bool | None = None,
 ) -> Call:
     """Create a tile from a shape.
 
@@ -133,6 +135,14 @@ def create(
             is omitted from the op kwargs, so ordinary ``tile.create`` output is
             unchanged; only forwarded to the op when explicitly set.
         span: Optional source span for debugging (auto-captured if not provided)
+        flat_layout: Keyword-only. When True, allocate a flat (non-fractal,
+            slayout=none_box) L1/cbuf tile — a contiguous byte-staging buffer
+            rather than the boxed NZ layout Mat tiles normally carry. Requires
+            ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
+            Used for the mix/aic_only soft ``system.syncall`` L1 scratch, whose
+            counter slots must be contiguous. Default ``None`` keeps the
+            canonical layout. Kept keyword-only so it does not shift ``span``'s
+            positional slot for existing callers.
 
     Returns:
         Call expression that returns a TileType with the created tile
@@ -142,6 +152,8 @@ def create(
     kwargs: dict[str, Any] = {"dtype": dtype, "target_memory": target_memory}
     if transpose is not None:
         kwargs["transpose"] = transpose
+    if flat_layout is not None:
+        kwargs["flat_layout"] = flat_layout
     return _ir_core.create_op_call("tile.create", [shape_tuple], kwargs, actual_span)
 
 
@@ -154,7 +166,6 @@ def load(
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     valid_shapes: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
-    transpose: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Copy data from tensor to specified memory level.
@@ -164,17 +175,13 @@ def load(
         offsets: Offsets in each dimension (sequence of scalars), or a MakeTuple.
             Always in the source tensor's coordinate system.
         shapes: Shape of the region to load in each dimension (sequence of scalars),
-            or a MakeTuple. Always in the source tensor's coordinate system, even
-            when transpose=True. The output TileType shape will be transposed
-            automatically by the type deduction layer.
+            or a MakeTuple. Always in the source tensor's coordinate system.
         valid_shapes: Valid shape of the tile in each dimension (sequence of scalars), or a
             MakeTuple. When provided, sets TileView.valid_shape in the output TileType.
             When omitted, shapes is used as valid_shape. Useful for dynamic shapes where
             the actual valid data region differs from the allocated tile size.
             Uses the same coordinate convention as shapes.
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
-        transpose: Whether to transpose the tile during load (default: False).
-            Only supported when target_memory is MemorySpace.Mat (L1).
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -183,20 +190,11 @@ def load(
     Example:
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
-        >>> # 2D load with transpose to L1 (tensor is [N, K], output tile is [K, N])
-        >>> tile = load(tensor, offsets=[0, 0], shapes=[N, K],
-        ...             target_memory=MemorySpace.Mat, transpose=True)
     """
     # Validate target_memory: only Vec and Mat are allowed for load
     if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
         raise ValueError(
             f"target_memory for tile.load must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
-        )
-
-    if transpose and target_memory != MemorySpace.Mat:
-        raise ValueError(
-            f"transpose=True is only supported when target_memory is MemorySpace.Mat (L1), "
-            f"got target_memory={target_memory}"
         )
 
     actual_span = _get_span_or_capture(span)
@@ -205,7 +203,7 @@ def load(
     shapes_tuple = _to_make_tuple(shapes, actual_span)
     _validate_offsets_shapes(offsets_tuple, shapes_tuple)
 
-    kwargs: dict[str, Any] = {"target_memory": target_memory, "transpose": transpose}
+    kwargs: dict[str, Any] = {"target_memory": target_memory}
 
     valid_shapes_tuple = shapes_tuple
     if valid_shapes is not None:
@@ -599,6 +597,57 @@ def ci(
 arange = ci
 
 
+def _to_int32_scalar(value: int | Expr, span: Span) -> Expr:
+    """Normalize a seed value to an INT32 scalar expression."""
+    if isinstance(value, Expr):
+        if isinstance(value, ConstInt) and value.dtype != DataType.INT32:
+            return ConstInt(value.value, DataType.INT32, span)
+        return value
+    return ConstInt(value, DataType.INT32, span)
+
+
+def random(  # noqa: PLR0913
+    key0: int | Expr,
+    key1: int | Expr,
+    counter0: int | Expr,
+    counter1: int | Expr,
+    counter2: int | Expr,
+    counter3: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    dtype: DataType = DataType.UINT32,
+    rounds: int = 10,
+    span: Span | None = None,
+) -> Call:
+    """Generate counter-based pseudo-random values into a tile (pto.trandom).
+
+    Implements a counter-based (Philox/ChaCha-style) RNG: each destination
+    element is derived deterministically from the 64-bit key ``(key0, key1)`` and
+    the 128-bit counter ``(counter0..counter3)`` plus the element position, so the
+    same seeds always produce the same tile.
+
+    Args:
+        key0, key1: The two INT32 key words.
+        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        shape: Destination tile shape (static, tuple of ConstInt).
+        valid_shape: Optional written region (tuple of ConstInt, each ``<= shape``).
+            ``pto.trandom`` only fills the dst valid rows/cols; defaults to the full shape.
+        dtype: Destination dtype. One of {INT32, UINT32}. Defaults to UINT32.
+        rounds: Cipher round count, 7 or 10. Defaults to 10.
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression that returns a TileType filled with random values.
+    """
+    actual_span = _get_span_or_capture(span)
+    seeds = [_to_int32_scalar(v, actual_span) for v in (key0, key1, counter0, counter1, counter2, counter3)]
+    op_args: list[Expr] = [*seeds, _to_make_tuple(shape, actual_span)]
+    if valid_shape is not None:
+        op_args.append(_to_make_tuple(valid_shape, actual_span))
+    kwargs: dict[str, Any] = {"dtype": dtype, "rounds": rounds}
+    return _ir_core.create_op_call("tile.random", op_args, kwargs, actual_span)
+
+
 def fillpad(tile: Expr, pad_value: PadValue | int | float = PadValue.zero, span: Span | None = None) -> Call:
     """Fill remaining tile elements with specified padding value.
 
@@ -642,6 +691,41 @@ def fillpad_inplace(
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call(
         "tile.fillpad_inplace", [tile], {"pad_value": normalize_pad_value(pad_value)}, actual_span
+    )
+
+
+def fillpad_expand(
+    tile: Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    pad_value: PadValue | int | float = PadValue.zero,
+    span: Span | None = None,
+) -> Call:
+    """Copy a smaller source tile into a larger destination tile, padding the rest.
+
+    Unlike :func:`fillpad` (which requires ``dst.shape == src.shape``), this op
+    allows the destination to be larger than the source in either dimension. The
+    source's valid region is copied into the top-left of the destination and all
+    other destination elements are filled with ``pad_value``.
+
+    Args:
+        tile: Source tile (TileType)
+        shape: Destination shape; each dimension must be >= the source dimension
+        pad_value: ``PadValue`` enum (``zero`` / ``max`` / ``min``), or one of
+            the literal sugars ``0``, ``math.inf``, ``-math.inf``. Default is
+            ``PadValue.zero``. Other values raise — the hardware only supports
+            the three padding modes.
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression that returns the expanded and padded tile
+    """
+    actual_span = _get_span_or_capture(span)
+    shape_tuple = _to_make_tuple(shape, actual_span)
+    return _ir_core.create_op_call(
+        "tile.fillpad_expand",
+        [tile, shape_tuple],
+        {"pad_value": normalize_pad_value(pad_value)},
+        actual_span,
     )
 
 
@@ -718,7 +802,7 @@ def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _create_tile_binary_call("tile.sub", "tile.subs", lhs, rhs, actual_span)
 
 
-def rem(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def rem(lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -> Call:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
@@ -726,16 +810,17 @@ def rem(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
+        tmp: Temporary tile (TileType) required by the hardware
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise remainder
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.rem", [lhs, rhs], {}, actual_span)
+    return _ir_core.create_op_call("tile.rem", [lhs, rhs, tmp], {}, actual_span)
 
 
-def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def rems(lhs: Expr, rhs: int | float | Expr, tmp: Expr, span: Span | None = None) -> Call:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
@@ -743,6 +828,7 @@ def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     Args:
         lhs: Tile (TileType)
         rhs: Scalar (int/float/Expr with ScalarType)
+        tmp: Temporary tile (TileType) required by the hardware
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -754,7 +840,120 @@ def rems(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         if not isinstance(rhs, Expr)
         else rhs
     )
-    return _ir_core.create_op_call("tile.rems", [lhs, rhs_expr], {}, actual_span)
+    return _ir_core.create_op_call("tile.rems", [lhs, rhs_expr, tmp], {}, actual_span)
+
+
+def part_add(src0: Expr, src1: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise add of two tiles.
+
+    Adds over the destination valid region; where only one source is valid the
+    result copies that source. Maps to the TPARTADD hardware intrinsic.
+
+    Args:
+        src0: First source tile (TileType)
+        src1: Second source tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise add
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.part_add", [src0, src1], {}, actual_span)
+
+
+def part_mul(src0: Expr, src1: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise multiply of two tiles.
+
+    Multiplies over the destination valid region; where only one source is valid
+    the result copies that source. Maps to the TPARTMUL hardware intrinsic.
+
+    Args:
+        src0: First source tile (TileType)
+        src1: Second source tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise multiply
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.part_mul", [src0, src1], {}, actual_span)
+
+
+def part_max(src0: Expr, src1: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise max of two tiles.
+
+    Takes the max over the destination valid region; where only one source is
+    valid the result copies that source. Maps to the TPARTMAX hardware intrinsic.
+
+    Args:
+        src0: First source tile (TileType)
+        src1: Second source tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise max
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.part_max", [src0, src1], {}, actual_span)
+
+
+def part_min(src0: Expr, src1: Expr, span: Span | None = None) -> Call:
+    """Partial element-wise min of two tiles.
+
+    Takes the min over the destination valid region; where only one source is
+    valid the result copies that source. Maps to the TPARTMIN hardware intrinsic.
+
+    Args:
+        src0: First source tile (TileType)
+        src1: Second source tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for partial element-wise min
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.part_min", [src0, src1], {}, actual_span)
+
+
+def fmod(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+    """Element-wise floating-point remainder of two tiles.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMOD hardware intrinsic.
+
+    Args:
+        lhs: Left-hand side tile (TileType)
+        rhs: Right-hand side tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise floating-point remainder
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.fmod", [lhs, rhs], {}, actual_span)
+
+
+def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+    """Element-wise floating-point remainder of tile and scalar.
+
+    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``). Maps to the TFMODS hardware intrinsic.
+
+    Args:
+        lhs: Tile (TileType)
+        rhs: Scalar (int/float/Expr with ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise floating-point remainder with scalar
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = (
+        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
+        if not isinstance(rhs, Expr)
+        else rhs
+    )
+    return _ir_core.create_op_call("tile.fmods", [lhs, rhs_expr], {}, actual_span)
 
 
 def shl(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
@@ -1690,6 +1889,59 @@ def row_expand_add(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_expand_add", [tile, row_vec], {}, actual_span)
 
 
+def row_expand_max(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast maximum.
+
+    Takes the element-wise maximum of each row and the row vector value.
+    max(tile[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_max", [tile, row_vec], {}, actual_span)
+
+
+def row_expand_min(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise broadcast minimum.
+
+    Takes the element-wise minimum of each row and the row vector value.
+    min(tile[i, :], row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_min", [tile, row_vec], {}, actual_span)
+
+
+def row_expand_expdif(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+    """Row-wise exp-diff with per-row scalar.
+
+    Computes exp(tile[i, :] - row_vec[i, 0]) for all i.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        row_vec: Row vector providing per-row scalar (TileType [M, 1])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_expand_expdif", [tile, row_vec], {}, actual_span)
+
+
 def col_expand(target: Expr, col_vec: Expr, span: Span | None = None) -> Call:
     """Expand column vector [1, cols] to target shape [rows, cols].
 
@@ -1757,6 +2009,57 @@ def col_expand_sub(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.col_expand_sub", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_max(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and take element-wise maximum with target tile.
+
+    max(tile[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast maximum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_max", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_min(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and take element-wise minimum with target tile.
+
+    min(tile[:, j], col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise broadcast minimum
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_min", [tile, col_vec], {}, actual_span)
+
+
+def col_expand_expdif(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
+    """Expand column vector and compute exp-diff with per-column scalar.
+
+    Computes exp(tile[:, j] - col_vec[0, j]) for all j.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        col_vec: Column vector providing per-column scalar (TileType [1, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise exp-diff
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_expand_expdif", [tile, col_vec], {}, actual_span)
 
 
 def col_expand_add(tile: Expr, col_vec: Expr, span: Span | None = None) -> Call:
@@ -2005,6 +2308,23 @@ def row_min(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_min", [tile, tmp_tile], {}, actual_span)
 
 
+def row_prod(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Row-wise product reduction (reduces along axis=1, maps to TROWPROD).
+
+    Reduces each row to a single value, producing output shape [rows, 1].
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise product reduction (TileType [M, 1])
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_prod", [tile, tmp_tile], {}, actual_span)
+
+
 def col_sum(tile: Expr, tmp_tile: Expr | None = None, span: Span | None = None) -> Call:
     """Column-wise sum reduction of a tile (reduces along axis=0, maps to TCOLSUM).
 
@@ -2057,6 +2377,92 @@ def col_min(tile: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.col_min", [tile], {}, actual_span)
+
+
+def col_prod(tile: Expr, span: Span | None = None) -> Call:
+    """Column-wise product reduction (reduces along axis=0, maps to TCOLPROD).
+
+    Output shape is [1, N] for an [M, N] input.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise product reduction (TileType [1, N])
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_prod", [tile], {}, actual_span)
+
+
+def row_argmax(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Row-wise argmax (column index of the per-row maximum, maps to TROWARGMAX).
+
+    Output shape is [rows, 1] with int32 index dtype.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise argmax (TileType [M, 1], int32)
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_argmax", [tile, tmp_tile], {}, actual_span)
+
+
+def row_argmin(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Row-wise argmin (column index of the per-row minimum, maps to TROWARGMIN).
+
+    Output shape is [rows, 1] with int32 index dtype.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for row-wise argmin (TileType [M, 1], int32)
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.row_argmin", [tile, tmp_tile], {}, actual_span)
+
+
+def col_argmax(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Column-wise argmax (row index of the per-column maximum, maps to TCOLARGMAX).
+
+    Output shape is [1, N] with int32 index dtype. Unlike col_max, the column
+    argmax requires a tmp scratch tile.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise argmax (TileType [1, N], int32)
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_argmax", [tile, tmp_tile], {}, actual_span)
+
+
+def col_argmin(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
+    """Column-wise argmin (row index of the per-column minimum, maps to TCOLARGMIN).
+
+    Output shape is [1, N] with int32 index dtype. Unlike col_min, the column
+    argmin requires a tmp scratch tile.
+
+    Args:
+        tile: Input tile (TileType [M, N])
+        tmp_tile: Temporary tile (TileType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for column-wise argmin (TileType [1, N], int32)
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.col_argmin", [tile, tmp_tile], {}, actual_span)
 
 
 def read(tile: Expr, indices: Expr | list[int | Expr] | _ir_core.MakeTuple, span: Span | None = None) -> Call:
@@ -2385,6 +2791,34 @@ def tpush_to_aic(tile: Expr, *, split: int, id: int | None = None, span: Span | 
     return _ir_core.create_op_call("tile.tpush_to_aic", [tile], kwargs, actual_span)
 
 
+def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
+    """Shard a 2D tile into half along the split axis (full -> half).
+
+    The result is a TileType with the split axis halved.
+
+    Args:
+        tile: Input tile (TileType, 2D)
+        split: Split mode (1=up-down/axis0, 2=left-right/axis1)
+        span: Optional source span
+    """
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call("tile.aiv_shard", [tile], {"split": split}, actual_span)
+
+
+def aic_gather(tile: Expr, *, split: int, span: Span | None = None) -> Call:
+    """Gather a 2D tile into full along the split axis (half -> full).
+
+    Inverse of :func:`aiv_shard`: the result is a TileType with the split axis doubled.
+
+    Args:
+        tile: Input tile (TileType, 2D)
+        split: Split mode (1=up-down/axis0, 2=left-right/axis1)
+        span: Optional source span
+    """
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _ir_core.create_op_call("tile.aic_gather", [tile], {"split": split}, actual_span)
+
+
 def tpop_from_aic(
     *,
     result_type: _ir_core.Type | None = None,
@@ -2640,11 +3074,13 @@ def scatter_mask(
 ) -> Call:
     """Scatter ``src`` rows into mask-marked columns of ``dst`` (mask form).
 
-    Maps to PTOAS ``pto.tscatter`` mask form. DPS — ``dst`` is the first (in/out)
-    argument, rewritten in place on mask-selected positions, and the call result
-    aliases ``dst``.
+    DPS — ``dst`` is the first (in/out) argument, rewritten in place on
+    mask-selected positions, and the call result aliases ``dst``.
 
-    This form is targeted at A3 / CPU-sim style backends; A5 rejects it.
+    Unlike :func:`gather_mask` (a real ``pto.tgather`` ISA op on A2/A3 and A5),
+    mask-pattern scatter is not a distinct pto-isa instruction — PyPTO emits it
+    as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim style lowering
+    paths.
 
     Args:
         dst: Destination tile (rewritten on positions selected by ``mask_pattern``)

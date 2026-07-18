@@ -53,6 +53,7 @@ class IRProperty(Enum):
     AssignTypeSymmetry = ...
     ManualDepsOnSubmitOnly = ...
     ReturnParamsExplicit = ...
+    AivSplitValid = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -90,6 +91,12 @@ class VerificationLevel(Enum):
     NONE = ...
     BASIC = ...
     ROUNDTRIP = ...
+
+class MemoryPlanner(Enum):
+    """Selects who plans on-chip buffer memory."""
+
+    PYPTO = ...
+    PTOAS = ...
 
 class DiagnosticPhase(Enum):
     """Controls when DiagnosticInstrument runs registered checks (warnings + perf hints)."""
@@ -263,8 +270,9 @@ class PassContext:
         verification_level: VerificationLevel = VerificationLevel.BASIC,
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
+        memory_planner: MemoryPlanner = MemoryPlanner.PYPTO,
     ) -> None:
-        """Create a PassContext with instruments, verification level, phase, and disabled diagnostics."""
+        """Create a PassContext with instruments and pass configuration (incl. memory planner)."""
         ...
 
     def __enter__(self) -> PassContext: ...
@@ -284,6 +292,10 @@ class PassContext:
 
     def get_disabled_diagnostics(self) -> DiagnosticCheckSet:
         """Get the diagnostic checks suppressed by this context."""
+        ...
+
+    def get_memory_planner(self) -> MemoryPlanner:
+        """Get the memory planner selection for this context."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:
@@ -314,6 +326,9 @@ class PassPipeline:
 
 def init_mem_ref() -> Pass:
     """Create an init memref pass."""
+
+def materialize_semantic_aliases() -> Pass:
+    """Create the semantic must-alias materialization pass (loop-carry / in-place)."""
 
 def memory_reuse() -> Pass:
     """Create a memory reuse pass."""
@@ -358,12 +373,6 @@ class TypeCheckErrorType(Enum):
     IF_CONDITION_MUST_BE_SCALAR = ...
     FOR_RANGE_MUST_BE_SCALAR = ...
     CONDITION_MUST_BE_BOOL = ...
-
-def split_chunked_loops() -> Pass:
-    """Create a pass that splits chunked loops into nested loops."""
-
-def interchange_chunk_loops() -> Pass:
-    """Create a pass that interchanges chunk loops and inserts InCore scopes."""
 
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
@@ -455,9 +464,14 @@ def auto_tile_matmul_l0() -> Pass:
     auto-inserted Mat→Left/Right moves. Already-L0-sized matmuls are left
     untouched.
 
-    Supported today: ``tile.matmul`` and ``tile.matmul_acc``;
-    ``tile.matmul_bias`` is deferred. Only K tiling; M/N tiling and
-    ``K % k != 0`` cases emit a perf hint and skip.
+    Supported today: ``tile.matmul`` and ``tile.matmul_acc``
+    (``tile.matmul_bias`` is deferred). The chooser is a roofline cost-model
+    search over ``(m, n, k, stationarity)``; besides the K-loop it emits
+    **M/N output tiling** (a direct-store grid, or an on-chip **Mat-scratch**
+    assemble when the result is consumed as a matmul operand), a
+    **non-divisor-K boundary peel** for 16-aligned K, and **operand-stationary**
+    (A/B-stationary) schedules. Non-16-aligned K and the other deferred regimes
+    emit a perf hint and are left untouched.
     """
 
 def canonicalize_tile_slice() -> Pass:
@@ -480,24 +494,6 @@ def canonicalize_tile_slice() -> Pass:
 def infer_tile_memory_space() -> Pass:
     """Create a pass that infers memory_space for TileType variables in InCore functions."""
 
-def lower_transpose_load_param_layout() -> Pass:
-    """Create the LowerTransposeLoadParamLayout pass (RFC #1300 P6).
-
-    For each InCore function, detects ``tile.load(..., transpose=True)`` whose
-    source is a function parameter ``p`` and rewrites the body to encode the
-    transpose intent as an explicit ``tensor.as_layout`` view:
-
-    - prepends ``p_dn = tensor.as_layout(p, layout=DN)`` to the InCore body
-      (``p_dn`` carries the canonical ``[..., b, a] DN`` view);
-    - substitutes body uses of ``p`` with ``p_dn``;
-    - swaps the trailing pair of offsets/shapes/valid_shapes on the matching
-      ``tile.load`` calls and drops ``transpose=True``.
-
-    Parameter signatures are left unchanged. Non-InCore (orch) functions are
-    untouched. Mixed-use parameters (both ``transpose=True`` and
-    ``transpose=False`` loads on the same param) are rejected.
-    """
-
 def materialize_tensor_strides() -> Pass:
     """Create the MaterializeTensorStrides pass (RFC #1300 §2.4).
 
@@ -513,6 +509,19 @@ def resolve_backend_op_layouts() -> Pass:
 
 def expand_mixed_kernel() -> Pass:
     """Create a pass that expands mixed InCore functions into AIC + AIV + Group."""
+
+def lower_auto_vector_split() -> Pass:
+    """Lower AUTO ``pl.split`` mixed InCore functions into the explicit ``split_aiv`` form.
+
+    Inserts ``tile.aiv_shard`` at C->V boundaries and ``tile.aic_gather`` at V->C
+    boundaries, halves only the vector sub-region (affinity-gated), injects
+    ``get_subblock_idx``, and stamps ``split`` + ``split_aiv`` — all BEFORE
+    ExpandMixedKernel folds the reshape ops into split-stamped tpush/tpop.
+
+    This is the live auto-split lowering path: it always runs immediately before
+    ExpandMixedKernel, so SplitVectorKernel only stamps attrs for the resulting
+    ``split_aiv`` functions.
+    """
 
 def inject_gm_pipe_buffer() -> Pass:
     """Create a backend-gated pass that injects ``__gm_pipe_buffer`` for cross-core pipes.
@@ -531,19 +540,19 @@ def simplify() -> Pass:
     """Create a pass that simplifies expressions and statements using algebraic rules and bound analysis."""
 
 def lower_composite_ops() -> Pass:
-    """Decompose composite tile ops into primitive arithmetic tile ops.
+    """Decompose composite tile/distributed ops into primitive ops.
 
-    Lowering rules are registered through the composite-lowering registry; today
-    the only composite ops handled are ``tile.sin`` / ``tile.cos`` (Cody-Waite
-    range reduction with a 4-part π split and a degree-9 odd Horner polynomial
-    in t²). The trig rules emit only ``tile.muls``, ``tile.adds``, ``tile.add``,
-    ``tile.sub``, ``tile.mul``, ``tile.cast``.
+    Lowering rules are registered through the composite-lowering registry.
+    Today the pass handles ``tile.sin`` / ``tile.cos`` and explicit-signal
+    InCore ``pld.tensor.allreduce``. Host-level allreduce is skipped here and
+    lowered later by :func:`lower_host_tensor_collectives`.
 
     FP32-only for the trig rules. Non-FP32 inputs are rejected at
     op-construction time.
 
-    Idempotent: every registered rule emits only primitives, so running the
-    pass twice yields the same IR after the first run.
+    Idempotent: registered rules emit ops that are not themselves in the
+    dispatch table, so running the pass twice yields the same IR after the
+    first run.
     """
 
 def derive_call_directions() -> Pass:
@@ -561,7 +570,9 @@ def auto_derive_task_dependencies(analyze_auto_scopes: bool = False) -> Pass:
 
     Runs after :func:`derive_call_directions` and writes
     ``Call.attrs['compiler_manual_dep_edges']`` for RAW/WAR/WAW hazards inside
-    analyzed AUTO runtime scopes. User-written manual runtime scopes are skipped.
+    analyzed AUTO runtime scopes. User-written manual runtime scopes are
+    skipped: they do not get compiler deps or automatic ``NoDep`` /
+    ``OutputExisting`` direction rewrites.
     AUTO scopes are skipped by default; pass ``analyze_auto_scopes=True`` to
     analyze them without changing their runtime scope mode. Unanalyzable hazards
     keep AUTO tracking with partial compiler deps stripped. User-written
@@ -588,8 +599,26 @@ def inline_functions() -> Pass:
     ``LHS = MakeTuple([rets...])`` at the call site.
     """
 
+def inline_orchestration_helpers() -> Pass:
+    """Expand CHIP Orchestration helpers marked with
+    ``attrs={"inline_orchestration": True}``.
+
+    Runs after InCore/Cluster outlining and never crosses the HOST -> CHIP
+    hierarchy boundary. The pass preserves the already-outlined kernel
+    functions, so each task keeps its own memory-planning boundary.
+    """
+
 def normalize_stmt_structure() -> Pass:
     """Create a pass that normalizes statement structure."""
+
+def synthesize_allreduce_signals() -> Pass:
+    """Synthesize private signal windows for host-level allreduce calls.
+
+    Host orchestration calls written as ``pld.tensor.allreduce(target, op=...)``
+    are normalized to the internal explicit-signal form by inserting ordinary
+    ``pld.tensor.alloc_window_buffer`` and ``pld.tensor.window`` assignments
+    before the call. Existing explicit-signal calls are preserved.
+    """
 
 def materialize_comm_domain_scopes() -> Pass:
     """Collect comm domains and materialise them as scope statements.
@@ -602,12 +631,26 @@ def materialize_comm_domain_scopes() -> Pass:
     :class:`CommDomainScopeStmt` nodes (one per inferred comm domain,
     outer = first declared, inner = last).
 
-    Runs immediately after :func:`inline_functions` — L2 orchestrations are
-    never inlined into L3, so the dispatch chain survives inlining.
+    Runs late in the default pipeline after
+    :func:`synthesize_allreduce_signals` and before
+    :func:`lower_host_tensor_collectives`, while the host dispatch chain is
+    still intact.
     """
 
 def lower_host_tensor_collectives() -> Pass:
     """Lower host-level ``pld.tensor.allreduce`` calls to builtin collective dispatches."""
+
+def materialize_dist_tensor_ctx() -> Pass:
+    """Materialize CommCtx parameters and arguments for DistributedTensor function parameters."""
+
+def stamp_tfree_split() -> Pass:
+    """Copy each cross-core tpop's split/pipe-id onto its matching tfree op.
+
+    A ``system.tfree_to_ai{c,v}`` carries no split/id of its own; those live on
+    the matching ``tile.tpop_from_ai{c,v}`` call. This pass stamps them onto the
+    tfree op so codegen reads them directly. Covers mixed-kernel and explicit
+    AIC/AIV tfrees. Runs late, before codegen.
+    """
 
 def materialize_runtime_scopes() -> Pass:
     """Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes.
@@ -696,10 +739,17 @@ class stmt_dependency_analysis:
         """
 
 class l0_tile_chooser:
-    """Closed-form chooser for L0 matmul tile shape (m, n, k)."""
+    """Chooser for the L0 matmul design point by roofline cost model."""
+
+    class Stationarity(Enum):
+        """Which GEMM operand is pinned across the L0 tiling loops."""
+
+        OutputStationary = 0
+        AStationary = 1
+        BStationary = 2
 
     class L0TileConfig:
-        """Inputs to choose_l0_tile: problem dims + hardware + schedule knobs."""
+        """Inputs to choose_l0_tile: problem dims + hardware + realizable-mask gates."""
 
         M: int
         N: int
@@ -716,32 +766,44 @@ class l0_tile_chooser:
         align_m: int
         align_n: int
         align_k: int
-        double_buffer_a: bool
-        double_buffer_b: bool
-        double_buffer_c: bool
+        allow_a_stationary: bool
+        allow_b_stationary: bool
+        allow_double_buffer_c: bool
         c_read: bool
+        bw_a: float
+        bw_b: float
+        bw_drain: float
+        drain_fixed_cycles: float
+        mad_head: int
+        mad_k_fractal_bytes: int
         allow_padding: bool
+        allow_k_boundary: bool
         def __init__(self) -> None: ...
 
     class L0TileResult:
-        """Output of choose_l0_tile: the chosen (m, n, k) plus diagnostics."""
+        """Output of choose_l0_tile: the chosen design point plus diagnostics."""
 
         m: int
         n: int
         k: int
         estimated_traffic_bytes: int
+        estimated_cost_cycles: int
         padded_compute_volume: int
+        stationarity: l0_tile_chooser.Stationarity
+        os_holds_a: bool
+        double_buffer_c: bool
         perf_hint: str
 
     @staticmethod
     def choose_l0_tile(config: L0TileConfig) -> L0TileResult:
-        """Pick an approximately-optimal L0 tile shape (m, n, k)."""
+        """Pick the minimum-wall L0 GEMM design point under the roofline cost model."""
 
 __all__ = [
     "IRProperty",
     "IRPropertySet",
     "VerificationMode",
     "VerificationLevel",
+    "MemoryPlanner",
     "DiagnosticPhase",
     "DiagnosticCheck",
     "DiagnosticCheckSet",
@@ -767,11 +829,10 @@ __all__ = [
     "allocate_memory_addr",
     "fuse_create_assemble_to_slice",
     "fold_no_op_reshape",
+    "stamp_tfree_split",
     "VerificationError",
     "SSAErrorType",
     "TypeCheckErrorType",
-    "split_chunked_loops",
-    "interchange_chunk_loops",
     "unroll_loops",
     "ctrl_flow_transform",
     "convert_to_ssa",
@@ -784,17 +845,19 @@ __all__ = [
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
-    "lower_transpose_load_param_layout",
     "materialize_tensor_strides",
     "resolve_backend_op_layouts",
     "normalize_return_order",
     "expand_mixed_kernel",
+    "lower_auto_vector_split",
     "inject_gm_pipe_buffer",
     "split_vector_kernel",
     "simplify",
     "lower_composite_ops",
+    "materialize_dist_tensor_ctx",
     "flatten_call_expr",
     "inline_functions",
+    "inline_orchestration_helpers",
     "normalize_stmt_structure",
     "derive_call_directions",
     "auto_derive_task_dependencies",
@@ -809,6 +872,7 @@ __all__ = [
     "create_function_pass",
     "create_program_pass",
     "stmt_dependency_analysis",
+    "l0_tile_chooser",
     "skew_cross_core_pipeline",
     "lower_pipeline_loops",
     "canonicalize_io_order",

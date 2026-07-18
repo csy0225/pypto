@@ -172,6 +172,69 @@ REGISTER_OP("tensor.divs")
       return DeduceTensorOpElementwiseScalarType(args, kwargs, "tensor.divs");
     });
 
+// Partial-combine binary ops (tensor-tensor only; the hardware has no scalar
+// form). At the tensor level the operands are fully valid, so these lower 1:1
+// to the matching tile.part_* op where the partial valid-region semantics apply.
+REGISTER_OP("tensor.part_add")
+    .set_op_category("TensorOp")
+    .set_description("Partial element-wise add of two tensors")
+    .add_argument("src0", "First source tensor (TensorType)")
+    .add_argument("src1", "Second source tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.part_add");
+    });
+
+REGISTER_OP("tensor.part_mul")
+    .set_op_category("TensorOp")
+    .set_description("Partial element-wise multiply of two tensors")
+    .add_argument("src0", "First source tensor (TensorType)")
+    .add_argument("src1", "Second source tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.part_mul");
+    });
+
+REGISTER_OP("tensor.part_max")
+    .set_op_category("TensorOp")
+    .set_description("Partial element-wise max of two tensors")
+    .add_argument("src0", "First source tensor (TensorType)")
+    .add_argument("src1", "Second source tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.part_max");
+    });
+
+REGISTER_OP("tensor.part_min")
+    .set_op_category("TensorOp")
+    .set_description("Partial element-wise min of two tensors")
+    .add_argument("src0", "First source tensor (TensorType)")
+    .add_argument("src1", "Second source tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.part_min");
+    });
+
+REGISTER_OP("tensor.fmod")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise floating-point remainder of two tensors")
+    .add_argument("lhs", "Left-hand side tensor (TensorType)")
+    .add_argument("rhs", "Right-hand side tensor (TensorType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.fmod");
+    });
+
+REGISTER_OP("tensor.fmods")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise floating-point remainder of tensor and scalar")
+    .add_argument("lhs", "Left-hand side tensor (TensorType)")
+    .add_argument("rhs", "Right-hand side scalar (ScalarType)")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorOpElementwiseScalarType(args, kwargs, "tensor.fmods");
+    });
+
 REGISTER_OP("tensor.maximum")
     .set_op_category("TensorOp")
     .set_description("Element-wise maximum of tensor and tensor or scalar")

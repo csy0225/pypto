@@ -149,6 +149,14 @@ class SpecializeContext:
     # Appended at the tail to preserve positional construction of this exported
     # dataclass for external callers (auto_scope is keyword-only in practice).
     auto_scope: bool = True
+    # External C++ kernel backing (func_type == "extern"). core_type is
+    # "aic" | "aiv" (single) or "mixed" (AIC+AIV pair dispatched as one
+    # MixedKernels submit). The specializer renders the corresponding
+    # ``@pl.function(external_source=...)`` declaration(s), plus a Group wrapper
+    # for "mixed". Paths are absolute .cpp files.
+    external_core_type: str | None = None
+    external_aic_source: str | None = None
+    external_aiv_source: str | None = None
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -406,7 +414,9 @@ def _collect_dep_names(func_def: ast.FunctionDef, jit_func_names: set[str]) -> l
 # ---------------------------------------------------------------------------
 
 
-def _build_tensor_annotation(meta: TensorMeta, is_out: bool, is_distributed: bool = False) -> str:
+def _build_tensor_annotation(
+    meta: TensorMeta, is_out: bool, is_distributed: bool = False, is_inout: bool = False
+) -> str:
     """Build the type annotation string for a tensor parameter.
 
     Static dims emit as integer literals; DynDim entries emit as their
@@ -415,14 +425,22 @@ def _build_tensor_annotation(meta: TensorMeta, is_out: bool, is_distributed: boo
     shape/dtype subscript form, only the IR ObjectKind differs (see
     ``pld.DistributedTensor``).
 
+    ``is_inout`` wraps the type in ``pl.InOut[...]`` (read-write parameter);
+    it takes precedence over ``is_out``. Both round-trip the direction so the
+    generated ``@pl.function`` source declares the same ``ir.ParamDirection``
+    the user wrote.
+
     Returns:
         Annotation string such as ``pl.Tensor[[M, 128], pl.FP32]``,
-        ``pl.Out[pl.Tensor[[128, 128], pl.FP32]]``, or
+        ``pl.Out[pl.Tensor[[128, 128], pl.FP32]]``,
+        ``pl.InOut[pl.Tensor[[128, 128], pl.FP32]]``, or
         ``pld.DistributedTensor[[256], pl.INT8]``.
     """
     dims = [d.name if isinstance(d, DynDim) else str(d) for d in meta.shape]
     head = "pld.DistributedTensor" if is_distributed else "pl.Tensor"
     inner = f"{head}[[{', '.join(dims)}], {_dtype_str(meta.dtype)}]"
+    if is_inout:
+        return f"pl.InOut[{inner}]"
     return f"pl.Out[{inner}]" if is_out else inner
 
 
@@ -1168,20 +1186,22 @@ def _infer_return_type(
 
 def _classify_params(
     func_def: ast.FunctionDef,
-) -> tuple[list[str], list[str], dict[str, str], set[str]]:
+) -> tuple[list[str], list[str], list[str], dict[str, str], set[str]]:
     """Classify function parameters.
 
     Returns:
-        (out_params, tensor_params, scalar_dtype_strs, distributed_params)
+        (out_params, inout_params, tensor_params, scalar_dtype_strs, distributed_params)
         - out_params: names annotated Out[pl.Tensor] / Out[pld.DistributedTensor]
+        - inout_params: names annotated InOut[pl.Tensor] / InOut[pld.DistributedTensor]
         - tensor_params: all names annotated as tensor-like — pl.Tensor or
-          pld.DistributedTensor (including Out ones)
+          pld.DistributedTensor (including Out and InOut ones)
         - scalar_dtype_strs: param_name → dtype string for scalar params
         - distributed_params: subset of tensor_params whose annotation uses
           ``DistributedTensor`` (and should round-trip as
           ``pld.DistributedTensor[...]`` in the generated @pl.program source)
     """
     out_params: list[str] = []
+    inout_params: list[str] = []
     tensor_params: list[str] = []
     scalar_dtype_strs: dict[str, str] = {}
     distributed_params: set[str] = set()
@@ -1194,17 +1214,22 @@ def _classify_params(
         if ann is None:
             continue
 
-        # Detect Out[pl.Tensor] / Out[pld.DistributedTensor] etc.
+        # Detect Out[pl.Tensor] / InOut[pl.Tensor] (or the pld.DistributedTensor
+        # variants). Both are direction wrappers around a tensor-like inner type;
+        # they round-trip so the generated source keeps the user's direction.
         if isinstance(ann, ast.Subscript):
             outer = ann.value
             is_out = (isinstance(outer, ast.Name) and outer.id == "Out") or (
                 isinstance(outer, ast.Attribute) and outer.attr == "Out"
             )
+            is_inout = (isinstance(outer, ast.Name) and outer.id == "InOut") or (
+                isinstance(outer, ast.Attribute) and outer.attr == "InOut"
+            )
             # The inner subscript value
             inner = ann.slice
             is_tensor = _is_tensor_annotation(inner)
-            if is_out and is_tensor:
-                out_params.append(name)
+            if (is_out or is_inout) and is_tensor:
+                (out_params if is_out else inout_params).append(name)
                 tensor_params.append(name)
                 if _is_distributed_tensor_annotation(inner):
                     distributed_params.add(name)
@@ -1227,7 +1252,7 @@ def _classify_params(
         if dtype_str is not None:
             scalar_dtype_strs[name] = dtype_str
 
-    return out_params, tensor_params, scalar_dtype_strs, distributed_params
+    return out_params, inout_params, tensor_params, scalar_dtype_strs, distributed_params
 
 
 def _is_tensor_annotation(node: ast.expr) -> bool:
@@ -1281,35 +1306,6 @@ def _extract_bare_dtype(node: ast.expr) -> str | None:
 def _ast_to_str(node: ast.expr) -> str:
     """Render a simple AST expression back to source."""
     return ast.unparse(node)
-
-
-# ---------------------------------------------------------------------------
-# InCore scope detection
-# ---------------------------------------------------------------------------
-
-
-def _has_incore_scope(func_def: ast.FunctionDef) -> bool:
-    """Return True if the function body contains a ``with pl.incore():`` scope.
-
-    Detects ``with pl.incore():`` and ``with pl.auto_incore():`` — the forms
-    that OutlineIncoreScopes processes.  Does not recurse into nested function
-    definitions.
-    """
-    for node in ast.walk(func_def):
-        if not isinstance(node, ast.With):
-            continue
-        for item in node.items:
-            ctx_expr = item.context_expr
-            if not isinstance(ctx_expr, ast.Call):
-                continue
-            func = ctx_expr.func
-            # pl.incore() or pl.auto_incore()
-            if isinstance(func, ast.Attribute) and func.attr in ("incore", "auto_incore"):
-                return True
-            # bare incore() or auto_incore() (less common)
-            if isinstance(func, ast.Name) and func.id in ("incore", "auto_incore"):
-                return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1500,22 +1496,25 @@ class Specializer:
         )
 
         # Classify parameters
-        out_params, tensor_params, scalar_dtype_strs, distributed_params = _classify_params(func_def)
+        out_params, inout_params, tensor_params, scalar_dtype_strs, distributed_params = _classify_params(
+            func_def
+        )
 
         # Inline helpers are spliced at the call site before SSA conversion,
         # so their parameters are already in-place aliases of the caller's
-        # variables — `pl.Out[...]` is redundant ceremony there. Warn the user
-        # so they migrate to bare `pl.Tensor[...]`, and drop the wrapper from
-        # the generated source so downstream passes see the simpler form.
+        # variables — `pl.Out[...]` / `pl.InOut[...]` is redundant ceremony
+        # there. Warn the user so they migrate to bare `pl.Tensor[...]`, and drop
+        # the wrapper from the generated source so downstream passes see the
+        # simpler form.
         is_inline = ctx.func_type == "inline"
-        if is_inline and out_params:
+        if is_inline and (out_params or inout_params):
             warnings.warn(
-                f"@pl.jit.inline helper '{ctx.func_name}' uses pl.Out[...] on "
-                f"parameter(s) {out_params!r}. pl.Out annotations are deprecated "
-                f"for inline helpers because the body is spliced at the call "
+                f"@pl.jit.inline helper '{ctx.func_name}' uses pl.Out[...]/pl.InOut[...] on "
+                f"parameter(s) {(out_params + inout_params)!r}. Direction annotations are "
+                f"deprecated for inline helpers because the body is spliced at the call "
                 f"site before SSA conversion — the parameter is already an "
-                f"in-place alias of the caller's variable. Drop the pl.Out "
-                f"wrapper; bare pl.Tensor[...] works the same.",
+                f"in-place alias of the caller's variable. Drop the wrapper; "
+                f"bare pl.Tensor[...] works the same.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -1524,7 +1523,7 @@ class Specializer:
         all_param_names = [arg.arg for arg in func_def.args.args if arg.arg != "self"]
 
         # Build decorator
-        decorator = self._build_decorator(ctx, func_def)
+        decorator = self._build_decorator(ctx)
 
         # Non-tensor, non-scalar params with an evaluable typed annotation
         # (e.g. ``tids: pl.Array[N, pl.TASK_ID]``) — render the annotation with
@@ -1552,6 +1551,7 @@ class Specializer:
         params = self._build_params(
             all_param_names,
             out_params,
+            inout_params,
             tensor_params,
             scalar_dtype_strs,
             distributed_params,
@@ -1563,6 +1563,13 @@ class Specializer:
         # Infer return type
         ret_type = _infer_return_type(func_def, ctx.tensor_meta, out_params, distributed_params)
         ret_ann = f" -> {ret_type}" if ret_type else ""
+
+        # External C++ kernel: emit header-only declaration(s) backed by the
+        # hand-written source instead of a transformed DSL body. A "mixed"
+        # kernel expands to an AIC member + AIV member + Group wrapper so the
+        # entry's call lowers to a single MixedKernels submit.
+        if ctx.func_type == "extern":
+            return self._render_external(ctx, params, ret_ann, all_param_names)
 
         # Transform body
         dep_names = set(ctx.dep_names)
@@ -1646,14 +1653,68 @@ class Specializer:
 
         return result_lines
 
-    def _build_decorator(self, ctx: SpecializeContext, func_def: ast.FunctionDef | None = None) -> str:
+    def _render_external(
+        self,
+        ctx: SpecializeContext,
+        params: list[str],
+        ret_ann: str,
+        all_param_names: list[str],
+    ) -> list[str]:
+        """Render an external C++ kernel declaration as @pl.function source lines.
+
+        Single core (``core_type`` "aic"/"aiv") emits one header-only function.
+        "mixed" emits an AIC member, an AIV member, and a Group wrapper that
+        calls both — reproducing the ``@pl.program`` ``pl.group`` route so the
+        entry's call lowers to a single MixedKernels submit.
+        """
+        name = ctx.func_name
+        sig_params = ", ".join(params)
+        call_args = ", ".join(all_param_names)
+        header = f"def {name}(self, {sig_params}){ret_ann}:"
+
+        def _member(member_name: str, core_upper: str, source: str) -> list[str]:
+            return [
+                f"@pl.function(type=pl.FunctionType.{core_upper}, external_source={source!r})",
+                f"def {member_name}(self, {sig_params}){ret_ann}:",
+                "    ...",
+            ]
+
+        # The @pl.jit.extern decorator guarantees the source(s) for the selected
+        # core_type are set; assert to narrow str | None -> str for the type checker.
+        core = ctx.external_core_type
+        if core == "aic":
+            assert ctx.external_aic_source is not None
+            return _member(name, "AIC", ctx.external_aic_source)
+        if core == "aiv":
+            assert ctx.external_aiv_source is not None
+            return _member(name, "AIV", ctx.external_aiv_source)
+
+        # Mixed: two members + a Group wrapper named after the extern so the
+        # entry's ``self.<name>(...)`` call resolves to the group.
+        assert ctx.external_aic_source is not None and ctx.external_aiv_source is not None
+        lines = _member(f"{name}_aic", "AIC", ctx.external_aic_source)
+        lines += _member(f"{name}_aiv", "AIV", ctx.external_aiv_source)
+        lines.append("@pl.function(type=pl.FunctionType.Group)")
+        lines.append(header)
+        # AIV lanes never capture a return; the AIC lane echoes the outputs, so
+        # a value-returning kernel threads through the AIC member (matching the
+        # @pl.program group example). A void kernel emits both calls uncaptured.
+        if ret_ann:
+            lines.append(f"    _r = self.{name}_aic({call_args})")
+            lines.append(f"    self.{name}_aiv({call_args})")
+            lines.append("    return _r")
+        else:
+            lines.append(f"    self.{name}_aic({call_args})")
+            lines.append(f"    self.{name}_aiv({call_args})")
+        return lines
+
+    def _build_decorator(self, ctx: SpecializeContext) -> str:
         """Build the @pl.function(...) decorator line.
 
         Entry functions (func_type is None or 'orchestration') are emitted as
-        Opaque when they contain ``with pl.incore():`` scopes so that
-        OutlineIncoreScopes can outline them and promote the function to
-        Orchestration.  Entry functions without InCore scopes (multi-function
-        style B) are emitted directly as Orchestration.
+        Orchestration.  OutlineIncoreScopes outlines any inner
+        ``with pl.at(level=pl.Level.CORE_GROUP):`` scopes into per-core InCore
+        kernels.
 
         Host orchestrators (func_type == 'host') emit as
         ``@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)`` —
@@ -1675,8 +1736,6 @@ class Specializer:
         if ctx.func_type == "host":
             return f"@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator{auto_scope_suffix})"
         if ctx.func_type is None or ctx.func_type == "orchestration":
-            if func_def is not None and _has_incore_scope(func_def):
-                return f"@pl.function(type=pl.FunctionType.Opaque{auto_scope_suffix})"
             return f"@pl.function(type=pl.FunctionType.Orchestration{auto_scope_suffix})"
         if ctx.func_type == "inline":
             return f"@pl.function(type=pl.FunctionType.Inline{auto_scope_suffix})"
@@ -1693,6 +1752,7 @@ class Specializer:
         self,
         all_param_names: list[str],
         out_params: list[str],
+        inout_params: list[str],
         tensor_params: list[str],
         scalar_dtype_strs: dict[str, str],
         distributed_params: set[str],
@@ -1707,9 +1767,9 @@ class Specializer:
         arrays) — without it those params would be emitted bare and the
         generated source would fail to parse.
 
-        When ``is_inline`` is True, ``pl.Out[...]`` wrappers are stripped from
-        tensor params — inline helpers don't have a calling convention boundary,
-        so the direction tag carries no information.
+        When ``is_inline`` is True, ``pl.Out[...]`` / ``pl.InOut[...]`` wrappers
+        are stripped from tensor params — inline helpers don't have a calling
+        convention boundary, so the direction tag carries no information.
 
         Params listed in ``distributed_params`` round-trip as
         ``pld.DistributedTensor[...]`` and trigger the corresponding import in
@@ -1719,6 +1779,7 @@ class Specializer:
         for name in all_param_names:
             if name in tensor_params:
                 is_out = (name in out_params) and not is_inline
+                is_inout = (name in inout_params) and not is_inline
                 is_distributed = name in distributed_params
                 if is_distributed:
                     self._needs_pld_import = True
@@ -1731,7 +1792,9 @@ class Specializer:
                         "ensure any intermediate pl.create_tensor() used for this parameter "
                         "has a statically inferable shape and dtype."
                     )
-                ann = _build_tensor_annotation(meta, is_out=is_out, is_distributed=is_distributed)
+                ann = _build_tensor_annotation(
+                    meta, is_out=is_out, is_distributed=is_distributed, is_inout=is_inout
+                )
                 result.append(f"{name}: {ann}")
             elif name in scalar_dtype_strs:
                 dtype_s = scalar_dtype_strs[name]
@@ -1767,7 +1830,7 @@ def specialize(class_name: str, contexts: list[SpecializeContext]) -> str:
     return Specializer(class_name, contexts).specialize()
 
 
-def build_specialize_context(
+def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each arg maps to a SpecializeContext field
     func: Any,
     func_name: str,
     func_type: str | None,
@@ -1777,6 +1840,9 @@ def build_specialize_context(
     scalar_dtypes: dict[str, DataType],
     dep_names: list[str],
     auto_scope: bool = True,
+    external_core_type: str | None = None,
+    external_aic_source: str | None = None,
+    external_aiv_source: str | None = None,
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -1836,6 +1902,9 @@ def build_specialize_context(
         orig_file=orig_file,
         orig_start_line=orig_start_line,
         orig_col_offset=orig_col_offset,
+        external_core_type=external_core_type,
+        external_aic_source=external_aic_source,
+        external_aiv_source=external_aiv_source,
     )
 
 

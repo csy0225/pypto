@@ -147,6 +147,18 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
 Pass InitMemRef();
 
 /**
+ * @brief Create the semantic must-alias materialization pass
+ *
+ * Propagates each loop-carried iter_arg/initValue MemRef down the yield/producer
+ * chain so accumulator producers (and other loop-carry chains) write directly
+ * into the carried buffer. This is a semantics-required aliasing (the loop
+ * accumulator must live in one buffer), split out of MemoryReuse so it can run
+ * without the opportunistic lifetime-reuse phase (e.g. when ptoas owns reuse via
+ * memory_planner=PTOAS). Runs after InitMemRef, before MemoryReuse.
+ */
+Pass MaterializeSemanticAliases();
+
+/**
  * @brief Create a memory reuse pass
  *
  * Uses dependency analysis to identify memory reuse opportunities.
@@ -161,25 +173,6 @@ Pass MemoryReuse();
  * Updates MemRef addresses and alloc statement arguments in place.
  */
 Pass AllocateMemoryAddr();
-
-/**
- * @brief Create a loop chunking pass
- *
- * Splits ForStmt nodes with chunk_size into nested loops: an outer loop
- * iterating over chunk indices and an inner loop iterating within each chunk.
- * Requires SSA form input and produces SSA form output.
- */
-Pass SplitChunkedLoops();
-
-/**
- * @brief Interchange chunk loops and insert InCore scopes
- *
- * Reorders nested ChunkOuter/ChunkInner loop pairs so that all outer loops
- * are on top, then wraps the inner loops + body in a ScopeStmt(InCore).
- * Only interchanges when all ChunkInner loops are Parallel.
- * Requires SSA form input and produces SSA form output.
- */
-Pass InterchangeChunkLoops();
 
 /**
  * @brief Eliminate FunctionType::Inline functions by splicing their bodies
@@ -200,6 +193,29 @@ Pass InterchangeChunkLoops();
  *    call site.
  */
 Pass InlineFunctions();
+
+/**
+ * @brief Expand CHIP Orchestration helpers marked with
+ *        ``attrs={"inline_orchestration": true}``.
+ *
+ * Runs after InCore/Cluster outlining and before tensor-to-tile conversion, so
+ * the pass only splices orchestration control flow and calls to already
+ * independent InCore / Group / Spmd functions. It never crosses the HOST ->
+ * CHIP hierarchy edge. The cloned helper body receives an equivalent
+ * compiler-generated AUTO runtime-scope boundary; no second SSA conversion is
+ * used to hide malformed substitutions.
+ */
+Pass InlineOrchestrationHelpers();
+
+/**
+ * @brief Synthesize private signal windows for host-level allreduce calls that omit signal.
+ *
+ * Rewrites host orchestration ``pld.tensor.allreduce(target, op=...)`` calls to
+ * the internal explicit-signal form by inserting ordinary
+ * ``pld.tensor.alloc_window_buffer`` and ``pld.tensor.window`` assignments
+ * immediately before the call. Existing explicit-signal calls are preserved.
+ */
+Pass SynthesizeAllReduceSignals();
 
 /**
  * @brief Materialise comm-domain scope statements for distributed window-buffer allocations.
@@ -242,6 +258,11 @@ Pass MaterializeCommDomainScopes();
  * @brief Lower host-level ``pld.tensor.allreduce`` calls to internal builtin chip dispatches.
  */
 Pass LowerHostTensorCollectives();
+
+/**
+ * @brief Materialize one CommCtx parameter/argument per DistributedTensor parameter.
+ */
+Pass MaterializeDistTensorCtx();
 
 /**
  * @brief Create a loop unrolling pass
@@ -504,36 +525,6 @@ Pass CanonicalizeTileSlice();
 Pass InferTileMemorySpace();
 
 /**
- * @brief Lower ``tile.load(transpose=True)`` to a body-local DN view (RFC #1300 P6)
- *
- * For each InCore function, detects ``tile.load(..., transpose=True)`` whose source
- * is a function parameter ``p`` and rewrites the body so the transpose intent is
- * encoded as an explicit ``tensor.as_layout`` view at the top of the body
- * (RFC #1300 §3.3 + §4.2):
- *
- *   - Prepends ``p_dn = tensor.as_layout(p, layout=DN)`` to the InCore body.
- *     ``p_dn`` carries the canonical ``[..., b, a] DN`` view; ``p``'s parameter
- *     signature is left unchanged.
- *   - Substitutes body uses of ``p`` with ``p_dn``.
- *   - Rewrites each ``tile.load(p_dn, offsets, shapes, valid_shapes, ..., transpose=True)``
- *     to swap the trailing pair of offsets / shapes / valid_shapes into canonical
- *     coords and drop the ``transpose=True`` kwarg — the DN-source + Mat-target
- *     signal on ``p_dn`` now fully encodes the load's tile-view orientation.
- *
- * Non-InCore (orch) functions are left untouched: the orch caller continues to
- * pass its original row-major ND tensor straight through to the kernel, which
- * keeps the cross-function type boundary trivial.
- *
- * Mixed-use parameters (same param loaded with both ``transpose=True`` and
- * ``transpose=False``) are rejected with ``pypto::ValueError``.
- *
- * Requirements:
- * - Input IR must have tile ops (run ConvertTensorToTileOps first)
- * - Input IR must have InCore scopes outlined (run OutlineIncoreScopes first)
- */
-Pass LowerTransposeLoadParamLayout();
-
-/**
  * @brief Materialize implicit ND/DN strides on every TensorType (RFC #1300 §2.4)
  *
  * Walks every TensorType reachable from the program and rewrites any
@@ -574,6 +565,25 @@ Pass ResolveBackendOpLayouts();
  * - Input IR must have InCore scopes outlined (run OutlineIncoreScopes first)
  */
 Pass ExpandMixedKernel();
+
+/**
+ * @brief Lower AUTO pl.split mixed InCore functions into the explicit split_aiv
+ *        form before ExpandMixedKernel (RFC #1300 staged convergence).
+ *
+ * For each mixed InCore function carrying a function-level split mode (UP_DOWN /
+ * LEFT_RIGHT), inserts tile.aiv_shard at C->V boundaries and tile.aic_gather at
+ * V->C boundaries, halves only the VECTOR sub-region (affinity-gated reuse of the
+ * split_axis machinery), injects get_subblock_idx, and stamps split + split_aiv.
+ * ExpandMixedKernel then folds aiv_shard/aic_gather into split-stamped tpush/tpop
+ * via its op-driven boundary arm, and SplitVectorKernel takes its "already
+ * explicit" arm (attribute stamping only).
+ *
+ * This is the LIVE auto-split lowering path: it always runs, immediately before
+ * ExpandMixedKernel. SplitVectorKernel's former per-op halving driver was deleted
+ * once this pass became unconditional — the halving machinery now lives only in
+ * split_axis_utils, shared by this pass.
+ */
+Pass LowerAutoVectorSplit();
 
 /**
  * @brief Inject __gm_pipe_buffer workspace parameter for cross-core pipes
@@ -618,16 +628,15 @@ Pass RunVerifier(const IRPropertySet& properties);
 Pass Simplify();
 
 /**
- * @brief Decompose composite tile ops into primitive tile ops.
+ * @brief Decompose composite tile/distributed ops into primitive ops.
  *
  * Lowering rules live in a file-local dispatch table inside
- * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the only composite
- * ops handled are ``tile.sin`` / ``tile.cos``, which lower to ``tile.muls``,
- * ``tile.adds``, ``tile.add``, ``tile.sub``, ``tile.mul``, and ``tile.cast``
- * using Cody-Waite range reduction with a 4-part π split and a degree-9 odd
- * Horner polynomial in t². Future composite ops (softmax, gelu, layernorm, ...)
- * are added by appending a rule function + one dispatch-table row, without
- * touching the mutator.
+ * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
+ * ``tile.sin`` / ``tile.cos`` and explicit-signal InCore
+ * ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered later
+ * by ``LowerHostTensorCollectives``. Future composite ops (softmax, gelu,
+ * layernorm, ...) are added by appending a rule function + one dispatch-table
+ * row, without touching the mutator.
  *
  * FP32-only for the trig rules — non-FP32 inputs are rejected at
  * op-construction time by the op deducer, never reaching this pass.
@@ -718,10 +727,12 @@ Pass ExpandManualPhaseFence();
  * @brief Derive explicit task-to-task dependency edges inside runtime scopes.
  *
  * User-written manual runtime scopes are skipped: the user's explicit
- * ``deps=[...]`` edges are treated as the complete scheduling contract. AUTO
- * scopes are skipped by default; pass ``analyze_auto_scopes=true`` to analyze
- * them while keeping ``manual=false`` in the output IR. For each analyzed AUTO
- * scope, the pass computes a conservative storage access summary from
+ * ``deps=[...]`` edges are treated as the complete scheduling contract, and the
+ * pass does not rewrite their call-site directions to ``NoDep`` or
+ * ``OutputExisting``. AUTO scopes are skipped by default; pass
+ * ``analyze_auto_scopes=true`` to analyze them while keeping ``manual=false`` in
+ * the output IR. For each analyzed AUTO scope, the pass computes a conservative
+ * storage access summary from
  * ``arg_directions`` and attaches RAW/WAR/WAW hazards against prior calls in the
  * same scope under ``Call.attrs["compiler_manual_dep_edges"]``. On unanalyzable
  * hazards, partial compiler deps are stripped and AUTO tracking remains active.
@@ -771,6 +782,17 @@ Pass FoldNoOpReshape();
  * to reason about the inserted scopes. Only Orchestration functions are touched.
  */
 Pass MaterializeRuntimeScopes();
+
+/**
+ * @brief Copy each cross-core tpop's split/pipe-id onto its matching tfree op
+ *
+ * A `system.tfree_to_ai{c,v}` carries no split/id of its own — those live on the
+ * matching `tile.tpop_from_ai{c,v}` call. This pass stamps them onto the tfree op
+ * so codegen reads them directly from the op (no codegen-side tpop lookup table).
+ * Covers both finalizer-created (mixed-kernel) and user-written (explicit AIC/AIV)
+ * tfrees. Runs late (after split is finalized on tpops), before codegen.
+ */
+Pass StampTfreeSplit();
 
 /**
  * @brief Verify properties on a program and throw on errors

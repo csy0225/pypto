@@ -104,7 +104,8 @@ def _parse_param(text: str) -> Param:
 def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
     """Return (kernel_name, is_mixed, params) from the kernel .cpp.
 
-    A *pure* kernel exposes one ``__global__ AICORE void <name>(...)``.
+    A *pure* kernel exposes one ``__global__ AICORE void <name>(...)`` on older
+    PTOAS, or a bare ``AICORE void <name>(...)`` body on newer PTOAS.
     A *mixed* (cube+vector) kernel exposes ``AICORE void <name>_aic(...)`` and
     ``<name>_aiv(...)`` with no merged ``__global__`` — we synthesize one.
     """
@@ -114,7 +115,16 @@ def parse_cpp(cpp_text: str) -> tuple[str, bool, list[Param]]:
     m = re.search(r"\bAICORE\s+void\s+(\w+)_aic\s*\(([^)]*)\)", cpp_text)
     if m:
         return m.group(1), True, [_parse_param(p) for p in _split_params(m.group(2))]
-    raise ValueError("no '__global__ AICORE void <name>' or '<name>_aic' decl found in kernel .cpp")
+    m = re.search(
+        r'(?<!static\s)(?<!inline\s)(?:extern\s+"C"\s+)?AICORE\s+void\s+(\w+)\s*\(([^)]*)\)',
+        cpp_text,
+    )
+    if m and not m.group(1).endswith(("_aic", "_aiv")):
+        return m.group(1), False, [_parse_param(p) for p in _split_params(m.group(2))]
+    raise ValueError(
+        "no '__global__ AICORE void <name>', bare 'AICORE void <name>', "
+        "or '<name>_aic' decl found in kernel .cpp"
+    )
 
 
 # ── Parse the sibling .pto for static buffer sizes ───────────────────────────
@@ -364,19 +374,43 @@ def emit_kernel_cpp(cpp_text: str, name: str, is_mixed: bool, params: list[Param
     self-contained (each builds its own GM pipe from the slot buffer), so the
     merged entry just dispatches by core type — no body inlining needed.
     """
-    out = _PREAMBLE + "\n" + cpp_text
-    if is_mixed:
-        decl = ", ".join(
-            (f"__gm__ {p.cpp_type}* {p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
+    decl = ", ".join(
+        (f"__gm__ {p.cpp_type}* {p.name}" if p.is_ptr else f"{p.cpp_type} {p.name}") for p in params
+    )
+    call = ", ".join(p.name for p in params)
+
+    has_global_entry = re.search(rf"__global__\s+AICORE\s+void\s+{re.escape(name)}\s*\(", cpp_text)
+    if not is_mixed and not has_global_entry:
+        impl_name = f"{name}_impl"
+        cpp_text = re.sub(
+            rf'(?:extern\s+"C"\s+)?AICORE\s+void\s+{re.escape(name)}\s*\(',
+            f"static AICORE void {impl_name}(",
+            cpp_text,
         )
-        call = ", ".join(p.name for p in params)
+
+    out = _PREAMBLE + "\n" + cpp_text
+    if not is_mixed and not has_global_entry:
+        out += f'\n\nextern "C" __global__ AICORE void {name}({decl}) {{\n  {name}_impl({call});\n}}\n'
+    if is_mixed:
+        # The AIV side of a mixed kernel may take extra trailing scalar args
+        # beyond the AIC launch ABI (e.g. block-partition offsets the runtime
+        # derives per AIV subblock). The synthesized single-core dispatcher has
+        # no such runtime, so we pass 0 for each extra arg — that profiles the
+        # first partition, and per-instruction cost is partition-independent.
+        aiv_call = call
+        m_aiv = re.search(rf"\bAICORE\s+void\s+{re.escape(name)}_aiv\s*\(([^)]*)\)", cpp_text)
+        if m_aiv:
+            n_extra = len(_split_params(m_aiv.group(1))) - len(params)
+            if n_extra > 0:
+                extra_args = ", ".join(["0"] * n_extra)
+                aiv_call = f"{call}, {extra_args}" if call else extra_args
         # extern "C" so the merged dispatcher's launch-ABI symbol matches the
         # non-mangled forward decl in launch.cpp (mirrors the ptoas pure-kernel
         # convention, which is always `extern "C" __global__`).
         out += (
             f'\n\nextern "C" __global__ AICORE void {name}({decl}) {{\n'
             f"#if defined(__DAV_CUBE__)\n  {name}_aic({call});\n#endif\n"
-            f"#if defined(__DAV_VEC__)\n  {name}_aiv({call});\n#endif\n}}\n"
+            f"#if defined(__DAV_VEC__)\n  {name}_aiv({aiv_call});\n#endif\n}}\n"
         )
     return out
 

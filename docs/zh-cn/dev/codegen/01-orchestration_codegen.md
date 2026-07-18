@@ -4,7 +4,7 @@
 
 编排代码生成遵循与 [PTO 代码生成](00-pto_codegen.md#设计原则严格的-1-to-1-映射)相同的原则：从 IR 到生成 C++ 代码的**严格 1-to-1 转换**。代码生成不应执行优化、分析或间接转换——此类工作属于前置 Pass。
 
-例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
+例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
 
 ## 概述
 
@@ -106,7 +106,7 @@ const Tensor& tmp = alloc_0.get_ref(0);
 ### 阶段 6–8：任务提交与控制流
 
 所有任务提交包裹在顶层 `PTO2_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
-决定 scope 位置：[MaterializeRuntimeScopes](../passes/39-materialize_runtime_scopes.md)
+决定 scope 位置：[MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md)
 pass 会向 IR 中插入显式的 AUTO `RuntimeScopeStmt` 节点（函数体以及每个
 `for` / `if` 体），codegen 从这些节点 1:1 地 emit `PTO2_SCOPE`（manual scope
 降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`）：
@@ -188,7 +188,7 @@ params_t1.add_input(ext_output);  // result -> ext_output（无别名声明）
 
 结果别名到哪个 `Out`/`InOut` 参数是查表而非启发式：流水线 IR 满足
 `ReturnParamsExplicit` 属性
-（[`NormalizeReturnOrder`](../passes/24-normalize_return_order.md)），
+（[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)），
 `FindReturnedParamIndex` 通过 `ir::return_lineage` 以指针同一性把每个返回值解析到参数。旧的血缘追踪（Var 到 Var 别名、循环 carry、builtin 回
 写、tuple 调用的 `TupleGetItem`、Group/Spmd 包装函数）仅保留给手工解析的
 IR。当追踪不到任何参数时，仅在被调用者恰好只有一个 `Out`/`InOut` 时单返回
@@ -419,15 +419,17 @@ params_t1.add_input(...);
 // ...
 PTO2TaskId params_t1_deps[K];          // K = 精确的 dep 边数
 uint32_t params_t1_deps_count = 0;
-if (tid.is_valid()) params_t1_deps[params_t1_deps_count++] = tid;      // 每个条目都有 is_valid() 守卫
-if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;
+params_t1_deps[params_t1_deps_count++] = tid;                          // 新鲜生产者——不加守卫
+if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;  // 循环 carry——可能无效
 params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
 ```
 
-每个 dep 槽位都被 `if (task_id.is_valid())` 包裹：任何 TaskId 都可能合法地
-持有 `PTO2TaskId::invalid()` 哨兵——`None` 循环 carry 种子、循环首次迭代的
-iter_arg carry，或未写入的数组槽——invalid id 绝不能进入
-`set_dependencies`。对已知有效的 id，该守卫只是一个恒真的廉价分支。
+只有当 TaskId 可能合法地持有 `PTO2TaskId::invalid()` 哨兵时，dep 槽位才被
+`if (task_id.is_valid())` 包裹——`None` 循环 carry 种子、循环首次迭代的
+iter_arg carry，或未写入的数组槽——因为 invalid id 绝不能进入
+`set_dependencies`。而**新鲜的直接生产者** TaskId（同一直线作用域中更早的
+`pl.submit(...)` 的输出）静态上恒为有效，因此其插入不加守卫（issue #1966），
+从编排热路径上消除了这个恒真分支。
 
 不再有 `params.add_dep(...)` 调用，也没有 16 条依赖上限——runtime 的
 `Arg::set_dependencies` 原语没有上限，栈数组按精确数量定长。dep 边
@@ -460,24 +462,27 @@ call 上）。Codegen 会按这个顺序合并两组列表，并按 Var identity
 `pl.submit` call 的 kernel-result tuple 元素与普通多输出 kernel call 一样，
 直接 alias kernel 的 `Out`/`InOut` 参数。
 
-每个 dep 数组填充条目都会被 `if (<task_id>.is_valid())` 包裹——包括直接来自
-`pl.submit` 的 producer TaskId。`EmitManualDeps` 对所有标量（string 形式）
-TaskId 统一加守卫，因为任何 TaskId 都可能持有 `PTO2TaskId::invalid()` 哨兵
-（首轮迭代的 iter_arg carry、未写入的数组槽、数组槽读取，或 `None` 种子）。
-array-carry iter_arg 则按元素逐槽生成带守卫的填充。
+当 id 可能持有 `PTO2TaskId::invalid()` 哨兵时，dep 数组填充条目才会被
+`if (<task_id>.is_valid())` 包裹（首轮迭代的 iter_arg carry、未写入的数组槽、
+数组槽读取，或 `None` 种子）。而**新鲜的 `pl.submit` producer** TaskId 静态上
+恒为有效，因此 `EmitManualDeps` 对其插入不加守卫（issue #1966）；其余所有标量
+（string 形式）TaskId 仍保留守卫。array-carry iter_arg 则按元素逐槽生成带守卫的填充。
 
 **词法作用域生命周期。** TaskId 绑定命名的是在其产生所在的 `PTO2_SCOPE { ... }`
 块内声明的 C++ 局部变量（`PTO2TaskId tid = ...`）。每个 `PTO2_SCOPE`（AUTO 或
-MANUAL）在进入时快照 `manual_task_id_map_`、退出时恢复，因此在某作用域内产生的
-绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。循环 / 分支的 carry
-在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
+MANUAL）在进入时快照 `manual_task_id_map_` 与 `array_carry_vars_`、退出时恢复，
+因此在某作用域内产生的绑定不会泄漏到外层作用域（否则其标识符会超出 C++ 作用域）。
+循环 / 分支的 carry 在其 body 的 `PTO2_SCOPE` *之前*声明，因此能正确地在块结束后存活。
 
-当后续 sibling scope 或父 scope 通过 `compiler_manual_dep_edges` 引用在更早的嵌套
-scope 或 sibling scope 中创建的 producer TaskId 时，codegen 只提升这个 TaskId 绑定：
-先在 producer 的 `PTO2_SCOPE` 前声明
-`PTO2TaskId <name> = PTO2TaskId::invalid();`，在块内执行
-`<name> = task_<n>_outs.task_id();`，再在外层 C++ 作用域里生成后续带 guard 的
-`set_dependencies(...)` 条目。普通 scope-local TaskId 仍然保持局部。
+对 `MANUAL` 作用域的 `array_carry_vars_` 恢复有一个例外：在该作用域 *内部* 注册、
+但其底层数组声明于 *外层* 作用域的 array carry 必须在恢复后存活。这就是将
+`manual_scope` 产生的 TaskId loop-carry 进 `Array[TASK_ID]` 的场景（issue #1811）——
+例如从外层 `pl.range` 循环的底层存储穿入的 `pl.parallel` array carry，每次迭代写入
+一个槽位（`carry[n] = prod_tid`）。外层循环的 `YieldStmt` 在 `PTO2_SCOPE(MANUAL)`
+块 *之后* 发出并引用该 carry；若将其抹除会丢失被 loop-carry 的 TaskId，并触发
+*scalar yield to array carry* 的 `INTERNAL_CHECK`。因此退出时 codegen 会保留底层存储
+为 enclosing-scope-valid（由不在该作用域 local 集合中的标识符命名）的 array carry，
+仅回退作用域内局部的那些。
 
 **跨作用域张量与 `manual_scope`。** `manual_scope` 是一个*调度*区域，而非存储/取值
 作用域：它所触及的张量会透明地流向 `PTO2_SCOPE(MANUAL) { ... }` 块*之后*的 task。
@@ -536,6 +541,14 @@ call；这个 dummy call 自己的 `manual_dep_edges` attr 仍然引用原始 Ta
 （这是该 attr 唯一被允许的 op-call 载体——普通跨函数 `Call` 永不携带它）。Orchestration
 codegen 会把带标记的 call 降低为 `rt_submit_dummy_task(...)`，随后对被改写的 consumer
 继续使用普通标量 dependency lowering。
+
+**空 deps 与带 deps 的 dummy 区别。** 带 deps 的 dummy 会在 `if (deps_count > 0)`
+运行时守卫下提交：它的每条 dep 都在 per-edge `is_valid()` 守卫下追加，运行时可能
+全部解析为 invalid sentinel（即什么都不 fence）。而静态空 deps 的 dummy——只能来自
+用户手写的 `pl.system.task_dummy(deps=[])`，因为 `ExpandManualPhaseFence` 从不插入
+空 barrier——则**无条件**提交。没有前驱的 barrier 依然是一个立即就绪的真实 task，
+其有效 id 必须加入每个 consumer 的 fanin；没有前驱既不影响它的提交，也不影响它到
+后继的边，因此若用 `deps_count > 0` 守卫它就会被静态消除，从而悄悄丢掉这些边。
 
 这会保留 phase boundary，同时避免重复 all-to-all fanout：
 

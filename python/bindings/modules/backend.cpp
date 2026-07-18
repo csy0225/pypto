@@ -155,6 +155,8 @@ void BindBackend(nb::module_& m) {
            "L0b (Right) on-chip SRAM capacity in bytes")
       .def("get_l0c_capacity_bytes", &BackendHandler::GetL0cCapacityBytes,
            "L0c (Acc) on-chip SRAM capacity in bytes")
+      .def("get_mat_capacity_bytes", &BackendHandler::GetMatCapacityBytes,
+           "Mat (L1) on-chip SRAM capacity in bytes")
       .def("get_l0_fractal_alignment", &BackendHandler::GetL0FractalAlignment,
            "Cube fractal alignment in elements for L0 tile dimensions m, n, k")
       .def("get_min_l0_tile_dim", &BackendHandler::GetMinL0TileDim,
@@ -177,6 +179,8 @@ void BindBackend(nb::module_& m) {
            "Find memory path from source to destination")
       .def("get_mem_size", &Backend::GetMemSize, nb::arg("mem_type"),
            "Get total memory size for given memory type")
+      .def("get_core_count", &Backend::GetCoreCount, nb::arg("core_type"),
+           "Get total physical core count of a given core type across the SoC")
       .def_prop_ro(
           "soc", [](const Backend& backend) -> const SoC& { return backend.GetSoC(); }, "Get SoC object");
 

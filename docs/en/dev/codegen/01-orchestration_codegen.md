@@ -4,7 +4,7 @@
 
 Orchestration codegen follows the same principle as [PTO codegen](00-pto_codegen.md#design-principle-strict-1-to-1-mapping): a **strict 1-to-1 translation** from IR to generated C++ code. The codegen should not perform optimization, analysis, or indirection — such work belongs in earlier passes.
 
-For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
+For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
 
 ## Overview
 
@@ -107,7 +107,7 @@ const Tensor& tmp = alloc_0.get_ref(0);
 
 All task submission is wrapped in a top-level `PTO2_SCOPE()`. Codegen no longer
 decides scope placement from the `for` / `if` structure: the
-[MaterializeRuntimeScopes](../passes/39-materialize_runtime_scopes.md) pass
+[MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) pass
 inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
 `for` / `if` body) into the IR, and codegen emits `PTO2_SCOPE` 1:1 from those
 nodes (manual scopes lower to `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`):
@@ -191,7 +191,7 @@ params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 
 Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic:
 pipeline IR satisfies the `ReturnParamsExplicit` property
-([`NormalizeReturnOrder`](../passes/24-normalize_return_order.md)),
+([`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)),
 so `FindReturnedParamIndex` resolves each return value to a param by pointer
 identity via `ir::return_lineage`. The legacy lineage tracing (var-to-var
 aliases, loop carries, builtin writebacks, `TupleGetItem` of tuple calls,
@@ -429,16 +429,19 @@ params_t1.add_input(...);
 // ...
 PTO2TaskId params_t1_deps[K];          // K = exact dep-edge count
 uint32_t params_t1_deps_count = 0;
-if (tid.is_valid()) params_t1_deps[params_t1_deps_count++] = tid;      // every entry is is_valid()-guarded
-if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;
+params_t1_deps[params_t1_deps_count++] = tid;                          // fresh producer — unguarded
+if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;  // loop carry — may be invalid
 params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
 ```
 
-Every dep slot is wrapped in `if (task_id.is_valid())`: any TaskId may
+A dep slot is wrapped in `if (task_id.is_valid())` only when the TaskId may
 legitimately hold the `PTO2TaskId::invalid()` sentinel — a `None` loop-carry
 seed, an early loop iteration's iter_arg carry, or an unwritten array slot —
-and an invalid id must never reach `set_dependencies`. The guard is a cheap
-always-true branch for ids known valid.
+because an invalid id must never reach `set_dependencies`. A **fresh
+direct-producer** TaskId (the output of a `pl.submit(...)` earlier in the same
+straight-line scope) is statically always-valid, so its insert is emitted
+unguarded (issue #1966), dropping the redundant always-true branch from the
+orchestration hot path.
 
 There is no `params.add_dep(...)` call any more, and there is no 16-dep cap
 — the runtime `Arg::set_dependencies` primitive has no upper bound, and the
@@ -475,28 +478,33 @@ plain calls. Each entry resolves at codegen time through
 The kernel-result tuple elements of a `pl.submit` call alias the kernel's
 `Out`/`InOut` args exactly like an ordinary multi-output kernel call.
 
-Every dep array-fill entry is wrapped in `if (<task_id>.is_valid())` —
-including direct `pl.submit`-producer TaskId bindings. `EmitManualDeps` guards
-every scalar (string-backed) TaskId uniformly because any TaskId may hold the
-`PTO2TaskId::invalid()` sentinel (a first-iteration iter_arg carry, an unwritten
-array slot, an array-slot read, or a `None` seed). Array-carry iter_args fill
-one guarded slot per element.
+A dep array-fill entry is wrapped in `if (<task_id>.is_valid())` when the id may
+hold the `PTO2TaskId::invalid()` sentinel — a first-iteration iter_arg carry, an
+unwritten array slot, an array-slot read, or a `None` seed. A **fresh
+`pl.submit`-producer** TaskId is statically always-valid, so `EmitManualDeps`
+emits its insert unguarded (issue #1966); every other scalar (string-backed)
+TaskId keeps the guard. Array-carry iter_args fill one guarded slot per element.
 
 **Lexical-scope lifetime.** TaskId bindings name C++ locals (`PTO2TaskId tid
 = ...`) declared inside the generated `PTO2_SCOPE { ... }` block they are
 produced in. Each `PTO2_SCOPE` (AUTO or MANUAL) snapshots `manual_task_id_map_`
-on entry and restores it on exit, so a binding produced inside a scope does not
-leak to an enclosing scope where its identifier would be out of C++ scope. Loop
-/ branch carries are declared *before* their body's `PTO2_SCOPE`, so they
-correctly survive the block.
+and `array_carry_vars_` on entry and restores them on exit, so a binding
+produced inside a scope does not leak to an enclosing scope where its identifier
+would be out of C++ scope. Loop / branch carries are declared *before* their
+body's `PTO2_SCOPE`, so they correctly survive the block.
 
-When a later sibling or parent scope references a producer TaskId created in an
-earlier nested or sibling scope through `compiler_manual_dep_edges`, codegen
-hoists only that TaskId binding: it declares a
-`PTO2TaskId <name> = PTO2TaskId::invalid();` sentinel before the producer
-`PTO2_SCOPE`, assigns `<name> = task_<n>_outs.task_id();` inside the block, and
-then emits the later guarded `set_dependencies(...)` entry from the enclosing
-C++ scope. Ordinary scope-local TaskIds still stay local.
+One exception applies to the `array_carry_vars_` restore on a `MANUAL` scope: an
+array carry registered *inside* the scope whose backing array was declared in
+the *enclosing* scope must survive the restore. This is the loop-carry of a
+`manual_scope`-produced TaskId into an `Array[TASK_ID]` (issue #1811) — e.g. a
+`pl.parallel` array carry threaded from an outer `pl.range` loop's backing
+store, where each iteration writes one slot (`carry[n] = prod_tid`). The
+enclosing loop's `YieldStmt`, emitted *after* the `PTO2_SCOPE(MANUAL)` block,
+references that carry; wiping it would drop the loop-carried TaskIds and trip
+the *scalar yield to array carry* `INTERNAL_CHECK`. On exit codegen therefore
+preserves array carries whose backing storage is enclosing-scope-valid (named by
+an identifier not in the scope's local set), and reverts only the scope-local
+ones.
 
 **Cross-scope tensors and `manual_scope`.** A `manual_scope` is a *scheduling*
 region, not a storage/value scope: a tensor it touches flows transparently to
@@ -568,6 +576,17 @@ the original TaskId array (the sanctioned op-call carrier of the attr —
 plain cross-function `Call`s never carry it). Orchestration codegen lowers that marked
 call to `rt_submit_dummy_task(...)`, then emits ordinary scalar dependency
 lowering for the rewritten consumers.
+
+**Empty-deps vs dep-carrying dummies.** Codegen submits a dep-carrying dummy
+under an `if (deps_count > 0)` runtime guard, because its deps are appended
+under per-edge `is_valid()` guards and may all resolve to an invalid sentinel
+(fencing nothing). A statically empty-deps dummy — which can only come from a
+user-written `pl.system.task_dummy(deps=[])`, since `ExpandManualPhaseFence`
+never inserts an empty barrier — is instead submitted **unconditionally**. A
+no-predecessor barrier is still a real, ready-immediately task whose valid id
+must join each consumer's fanin; having no predecessors affects neither its
+submission nor the edges to its successors, so guarding it on `deps_count > 0`
+would statically elide it and silently drop those edges.
 
 This preserves the phase boundary while avoiding repeated all-to-all fanout:
 

@@ -23,6 +23,33 @@ namespace pypto {
 namespace backend {
 
 /**
+ * @brief Closed-form GEMM cost-model parameters consumed by ChooseL0Tile.
+ *
+ * Bandwidths are in BYTES PER CORE CYCLE, so the chooser can weight L1->L0
+ * traffic and the L0C drain directly in cycles. Defaults are Ascend a2a3 (910B),
+ * op-sim work-calibrated: L1->L0A ~200, L1->L0B ~132 B/cyc (~1.5:1, not the
+ * datasheet 2:1). The FIXPIPE L0C drain is PER-DRAIN: `drain_fixed_cycles` issue
+ * overhead plus `bytes_c*m*n/bw_drain`, scaled by the output-tile count
+ * `ceil(M/m)*ceil(N/n)` -- so splitting the OUTPUT (M/N) adds drains while
+ * splitting K does not (accumulate in one L0C). Device-validated (op-sim).
+ *
+ * The MAD term mirrors the cube's per-TMATMUL cost
+ * `mad_head_cycles + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16)`, where
+ * `kt = mad_k_fractal_bytes / bytes_a` and `cpr` (1 for 2-byte inputs, 2 for
+ * 4-byte) is derived from the operand byte width in the chooser.
+ */
+struct L0CostModel {
+  double bw_l0a = 200.0;  ///< L1->L0A bytes/cycle (a2a3 op-sim work-fit; datasheet 441 GB/s/1.85 GHz = 238).
+  double bw_l0b =
+      132.0;  ///< L1->L0B bytes/cycle (a2a3 op-sim work-fit; ~1.5:1 vs L0A, not the datasheet 2:1).
+  double bw_drain = 118.0;  ///< FIXPIPE L0C drain bytes/cycle (a2a3 op-sim work-fit; per-drain byte slope).
+  double drain_fixed_cycles =
+      245.0;                ///< Per-FIXPIPE-drain fixed cycles (a2a3 op-sim work-fit; penalizes M/N-split).
+  int mad_head_cycles = 6;  ///< Fixed per-TMATMUL issue overhead.
+  int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
+};
+
+/**
  * @brief Backend-specific behavior dispatch interface
  *
  * BackendHandler centralises every behavioural difference between backends
@@ -131,6 +158,36 @@ class BackendHandler {
   [[nodiscard]] virtual bool RequiresNoSplitDualAivDispatch() const = 0;
 
   /**
+   * @brief Whether a tiled (offset) Acc->Mat FIXPIPE writeback must downcast to
+   *        a low-precision (bf16/f16) destination.
+   *
+   * The only offset Acc->Mat path on A2/A3 is `pto.tinsert`, whose verifier
+   * requires `src=f32, dst=f16/bf16` — it cannot keep f32 (PTOAS
+   * `TInsertOp::verify`). So AutoTileMatmulL0's oversized chained-matmul result,
+   * when M/N-tiled into an L1/Mat scratch, must be bf16/f16 on Ascend910B; the
+   * pass folds a `tile.cast(result, bf16)` into the per-sub-tile assemble.
+   *
+   * Ascend950 (a5) `tinsert` accepts `dst=f32`, so the Mat scratch may stay f32
+   * there and this returns false (no cast required, the producer may keep f32).
+   */
+  [[nodiscard]] virtual bool RequiresLowPrecisionMatScratch() const = 0;
+
+  /**
+   * @brief Whether this backend's store pipe honours a bf16 atomic-add into GM.
+   *
+   * The pto-isa `SetAtomicAdd<T>` dispatch accepts `__gm__ bfloat16_t`
+   * (`set_atomic_bf16`) on the A2/A3 store path (Ascend910B) but NOT on the A5
+   * path (Ascend950), where a bf16 atomic-add store fails a pto-isa
+   * `static_assert`. PTOCodegen gates a bf16 atomic-add `pto.tstore` on this so
+   * A5 users get a clean PyPTO error instead of a downstream C++ compile
+   * failure. The atomic dispatch keys on the GM *destination* dtype, so this
+   * also covers the cube path (fp32 Acc -> bf16 GM via fix-pipe).
+   *
+   * Ascend910B: true. Ascend950: false.
+   */
+  [[nodiscard]] virtual bool SupportsBf16AtomicAdd() const = 0;
+
+  /**
    * @brief Compute the destination tile view for a cross-core transfer.
    *
    * Encapsulates the per-backend rule for how to lay out the bridge tile
@@ -218,6 +275,15 @@ class BackendHandler {
   [[nodiscard]] virtual uint32_t GetL0cCapacityBytes() const = 0;
 
   /**
+   * @brief Mat (L1) on-chip SRAM capacity, in bytes.
+   *
+   * Used by passes that need a conservative per-core capacity gate without
+   * walking the global Backend SoC object. This keeps pass-level backend
+   * decisions on the BackendHandler / PassContext path.
+   */
+  [[nodiscard]] virtual uint64_t GetMatCapacityBytes() const = 0;
+
+  /**
    * @brief Cube fractal alignment in *elements* for L0 tile dimensions.
    *
    * Distinct from memory access alignment (which is a byte-level concept on
@@ -235,6 +301,16 @@ class BackendHandler {
    * outer matmul shape is itself smaller than this threshold).
    */
   [[nodiscard]] virtual int GetMinL0TileDim() const { return 16; }
+
+  /**
+   * @brief Closed-form GEMM cost-model parameters (L1<->L0 / drain bandwidths
+   * and MAD constants) consumed by ChooseL0Tile.
+   *
+   * Default is Ascend a2a3 (910B), validated against the pto-isa perf-sim. The
+   * a5 (950) numbers are not yet measured; the a2a3 default stands in as a
+   * placeholder until characterised — override here once measured.
+   */
+  [[nodiscard]] virtual L0CostModel GetL0CostModel() const { return L0CostModel{}; }
 };
 
 }  // namespace backend

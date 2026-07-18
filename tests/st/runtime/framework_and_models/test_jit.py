@@ -23,7 +23,7 @@ from pypto.ir.compiled_program import CompiledProgram
 
 @pl.jit
 def add_kernel(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
-    with pl.incore():
+    with pl.at(level=pl.Level.CORE_GROUP):
         M, N = a.shape
         tile_a = pl.load(a, [0, 0], [M, N])
         tile_b = pl.load(b, [0, 0], [M, N])
@@ -170,6 +170,91 @@ class TestJITDynamicBatch:
         assert torch.allclose(out16, a16, rtol=1e-5, atol=1e-5)
         # Same dynamic artifact serves the smaller batch — no recompilation.
         assert len(copy_dyn_batch._cache) == 1
+
+
+# Subscript-slice sugar forwarded into an inline dep (issue #1836). The entry
+# slices its GM input with subscript sugar ``src[a:b]`` (an ``ast.Subscript``,
+# not ``pl.slice``) and forwards the view into an ``@pl.jit.inline`` dep. The JIT
+# front-end metadata walker must infer the view's static shape so the inline can
+# be specialized — pre-fix it skipped ``ast.Subscript`` and specialization raised
+# "missing inferred tensor metadata".
+_SUB_SRC_ROWS = 256
+_SUB_TILE_ROWS = 128
+_SUB_COLS = 128
+
+
+@pl.jit.inline
+def addone_inline(x: pl.Tensor, c: pl.Tensor):
+    """c = x + 1.0 over a 128x128 tile. Bare-``pl.Tensor`` params, so ``x``'s
+    shape comes entirely from the caller's forwarded subscript-slice view."""
+    with pl.at(level=pl.Level.CORE_GROUP):
+        t = pl.load(x, [0, 0], [_SUB_TILE_ROWS, _SUB_COLS])
+        r = pl.add(t, 1.0)
+        pl.store(r, [0, 0], c)
+    return c
+
+
+@pl.jit
+def subscript_slice_addone(
+    src: pl.Tensor[[_SUB_SRC_ROWS, _SUB_COLS], pl.FP32],
+    c: pl.Out[pl.Tensor[[_SUB_TILE_ROWS, _SUB_COLS], pl.FP32]],
+):
+    """Entry: ``c = src[0:128] + 1`` forwarding a subscript-slice view to the dep."""
+    x_view = src[0:_SUB_TILE_ROWS]  # subscript-slice sugar → (128, 128)
+    c = addone_inline(x_view, c)
+    return c
+
+
+@pl.jit
+def open_slice_addone(
+    src: pl.Tensor[[_SUB_SRC_ROWS, _SUB_COLS], pl.FP32],
+    c: pl.Out[pl.Tensor[[_SUB_TILE_ROWS, _SUB_COLS], pl.FP32]],
+):
+    """Entry: ``c = src[128:] + 1`` forwarding an open-upper-bound view whose
+    extent is ``parent_rows - start`` (256 - 128 = 128).
+
+    The nonzero lower bound is what exercises the fix: the metadata walker must
+    infer the view rows as ``parent - start`` (matching the parser), not the
+    full parent extent. Pre-fix it recorded the full 256 rows, so the inline dep
+    was specialized for a 256-row input and mismatched the real 128-row view."""
+    x_view = src[_SUB_TILE_ROWS:]  # open upper bound → (256 - 128, 128) = (128, 128)
+    c = addone_inline(x_view, c)
+    return c
+
+
+class TestJITSubscriptSliceForwarding:
+    """End-to-end (issue #1836): a subscript-slice view ``src[a:b]`` forwarded
+    from a @pl.jit entry into an @pl.jit.inline dep must compile and run
+    correctly on device."""
+
+    def test_subscript_slice_into_inline(self, test_config):
+        subscript_slice_addone._cache.clear()
+
+        torch.manual_seed(0)
+        src = torch.randn(_SUB_SRC_ROWS, _SUB_COLS, dtype=torch.float32)
+        c = torch.zeros(_SUB_TILE_ROWS, _SUB_COLS, dtype=torch.float32)
+        expected = src[0:_SUB_TILE_ROWS] + 1.0
+
+        subscript_slice_addone(src, c, config=test_config)
+        assert torch.allclose(c, expected, rtol=1e-5, atol=1e-5), (
+            f"subscript-slice forwarding numerical mismatch: max diff = {(c - expected).abs().max().item()}"
+        )
+
+    def test_open_upper_slice_into_inline(self, test_config):
+        """Open-upper-bound view ``src[128:]`` (extent = parent - start) forwarded
+        into an inline dep must specialize to the 128-row view, not the 256-row
+        parent, and run correctly on device."""
+        open_slice_addone._cache.clear()
+
+        torch.manual_seed(0)
+        src = torch.randn(_SUB_SRC_ROWS, _SUB_COLS, dtype=torch.float32)
+        c = torch.zeros(_SUB_TILE_ROWS, _SUB_COLS, dtype=torch.float32)
+        expected = src[_SUB_TILE_ROWS:] + 1.0
+
+        open_slice_addone(src, c, config=test_config)
+        assert torch.allclose(c, expected, rtol=1e-5, atol=1e-5), (
+            f"open-upper-bound slice forwarding mismatch: max diff = {(c - expected).abs().max().item()}"
+        )
 
 
 if __name__ == "__main__":

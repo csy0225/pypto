@@ -11,6 +11,7 @@
 
 #include "pypto/ir/transforms/op_conversion_registry.h"
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -65,17 +66,6 @@ std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
   return {-1, -1};
 }
 
-template <typename T>
-T GetKwargOr(const std::vector<std::pair<std::string, std::any>>& kwargs, const std::string& key,
-             const T& default_value) {
-  for (const auto& [k, v] : kwargs) {
-    if (k == key) {
-      return AnyCast<T>(v, "kwarg key: " + key);
-    }
-  }
-  return default_value;
-}
-
 }  // namespace
 
 OpConversionRegistry& OpConversionRegistry::GetInstance() {
@@ -96,6 +86,7 @@ OpConversionRegistry::OpConversionRegistry() {
   RegisterScatterOps();
   RegisterCmpOps();
   RegisterDistributedOps();
+  RegisterCrossCoreOps();
 }
 
 // ============================================================================
@@ -107,6 +98,10 @@ void OpConversionRegistry::RegisterScalarAndUnaryOps() {
   RegisterSimple("tensor.subs", "tile.subs");
   RegisterSimple("tensor.muls", "tile.muls");
   RegisterSimple("tensor.divs", "tile.divs");
+  // fmod has no broadcast (row-expand) form, so both the tensor-tensor and
+  // tensor-scalar variants are simple 1:1 lowerings.
+  RegisterSimple("tensor.fmod", "tile.fmod");
+  RegisterSimple("tensor.fmods", "tile.fmods");
 
   RegisterSimple("tensor.neg", "tile.neg");
   RegisterSimple("tensor.abs", "tile.abs");
@@ -168,6 +163,12 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.col_expand", "tile.col_expand");
   RegisterSimple("tensor.col_expand_sub", "tile.col_expand_sub");
   RegisterSimple("tensor.col_expand_div", "tile.col_expand_div");
+  RegisterSimple("tensor.row_expand_max", "tile.row_expand_max");
+  RegisterSimple("tensor.row_expand_min", "tile.row_expand_min");
+  RegisterSimple("tensor.row_expand_expdif", "tile.row_expand_expdif");
+  RegisterSimple("tensor.col_expand_max", "tile.col_expand_max");
+  RegisterSimple("tensor.col_expand_min", "tile.col_expand_min");
+  RegisterSimple("tensor.col_expand_expdif", "tile.col_expand_expdif");
   RegisterSimple("tensor.expands", "tile.expands");
 
   RegisterSimple("tensor.reshape", "tile.reshape");
@@ -200,6 +201,7 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
 
   RegisterSimple("tensor.full", "tile.full");
   RegisterSimple("tensor.ci", "tile.ci");
+  RegisterSimple("tensor.random", "tile.random");
 }
 
 // ============================================================================
@@ -252,6 +254,13 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
   };
   RegisterCustom("tensor.maximum", MakeMinMaxConv("tile.maximum", "tile.maximums"));
   RegisterCustom("tensor.minimum", MakeMinMaxConv("tile.minimum", "tile.minimums"));
+
+  // Partial-combine ops have no broadcast (row-expand) or scalar form, so each
+  // is a simple 1:1 lowering.
+  RegisterSimple("tensor.part_add", "tile.part_add");
+  RegisterSimple("tensor.part_mul", "tile.part_mul");
+  RegisterSimple("tensor.part_max", "tile.part_max");
+  RegisterSimple("tensor.part_min", "tile.part_min");
 }
 
 // ============================================================================
@@ -295,8 +304,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
           // lost here — a follow-up tile.fillpad is the workaround until tile.load
           // grows its own pad_value kwarg.
           auto valid_shapes = (args.size() == 4) ? args[3] : shape;
-          std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                       {"transpose", false}};
+          std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
           auto load_call =
               op_reg.Create("tile.load", {input, offset, shape, valid_shapes}, load_kwargs, span);
           return ConversionResult{load_call};
@@ -372,8 +380,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
           std::vector<StmtPtr> prologue;
           auto offsets_load = MakeZeroOffsets(source_tensor_type->shape_.size(), span);
           auto shapes = MakeShapeTuple(source_tensor_type->shape_, span);
-          std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", MemorySpace::Vec},
-                                                                   {"transpose", false}};
+          std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", MemorySpace::Vec}};
           auto load_call = op_reg.Create("tile.load", {source, offsets_load, shapes, shapes}, load_kw, span);
           auto source_tile_var = std::make_shared<Var>("assemble_src", load_call->GetType(), span);
           prologue.push_back(std::make_shared<AssignStmt>(source_tile_var, load_call, span));
@@ -589,8 +596,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
         }
         auto valid_shapes = MakeShapeTuple(valid_shape, span);
 
-        std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                     {"transpose", false}};
+        std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
         auto load_call =
             op_reg.Create("tile.load", {input, offsets, shapes, valid_shapes}, load_kwargs, span);
         auto load_var = std::make_shared<Var>("fillpad_src", load_call->GetType(), span);
@@ -605,6 +611,48 @@ void OpConversionRegistry::RegisterMemoryOps() {
           fillpad_call = op_reg.Create("tile.fillpad", {load_var}, kwargs, span);
         }
         return ConversionResult{std::move(prologue), fillpad_call};
+      });
+
+  // tensor.fillpad_expand → tile.fillpad_expand (with auto-load for TensorType inputs).
+  // args[0] = source (tensor or tile), args[1] = destination shape tuple.
+  RegisterCustom(
+      "tensor.fillpad_expand",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        INTERNAL_CHECK_SPAN(args.size() == 2, span)
+            << "tensor.fillpad_expand conversion expects 2 args (input, shape)";
+        auto& op_reg = OpRegistry::GetInstance();
+        const auto& input = args[0];
+        const auto& shape = args[1];
+
+        if (As<TileType>(input->GetType())) {
+          return ConversionResult{op_reg.Create("tile.fillpad_expand", {input, shape}, kwargs, span)};
+        }
+
+        auto tensor_type = As<TensorType>(input->GetType());
+        INTERNAL_CHECK_SPAN(tensor_type, span)
+            << "tensor.fillpad_expand conversion: input must be TensorType or TileType, got "
+            << input->GetType()->TypeName();
+
+        // Load the (smaller) source tensor into a tile carrying its valid region.
+        auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
+        auto shapes = MakeShapeTuple(tensor_type->shape_, span);
+        std::vector<ExprPtr> valid_shape = tensor_type->shape_;
+        if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->valid_shape.empty()) {
+          valid_shape = tensor_type->tensor_view_->valid_shape;
+        }
+        auto valid_shapes = MakeShapeTuple(valid_shape, span);
+
+        std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
+        auto load_call =
+            op_reg.Create("tile.load", {input, offsets, shapes, valid_shapes}, load_kwargs, span);
+        auto load_var = std::make_shared<Var>("fillpad_expand_src", load_call->GetType(), span);
+
+        std::vector<StmtPtr> prologue;
+        prologue.push_back(std::make_shared<AssignStmt>(load_var, load_call, span));
+
+        auto expand_call = op_reg.Create("tile.fillpad_expand", {load_var, shape}, kwargs, span);
+        return ConversionResult{std::move(prologue), expand_call};
       });
 
   // tensor.read → tensor.read (gm_tensor) or tile.read (local_tensor)
@@ -735,8 +783,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
                                     std::vector<StmtPtr>& stmts) -> ExprPtr {
           auto shapes = MakeShapeTuple(shape, span);
           auto valid_shapes = MakeShapeTuple(valid_shape, span);
-          std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                       {"transpose", false}};
+          std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
           auto load_call =
               op_reg.Create("tile.load", {tensor, offsets, shapes, valid_shapes}, load_kwargs, span);
           auto load_var = std::make_shared<Var>(name_hint, load_call->GetType(), span);
@@ -863,8 +910,9 @@ void OpConversionRegistry::RegisterMatmulOps() {
 
   // tensor.matmul: 2D × 2D → tile.matmul; any operand ≥3D → tile.batch_matmul.
   // a_trans/b_trans are honored via InputSpaceReq below — the producer load is
-  // emitted with target_memory=Mat and transpose=True, so the transposed tile
-  // arrives at matmul/batch_matmul already in the correct orientation.
+  // emitted natural (target_memory=Mat) plus a zero-copy tile.transpose_view, so
+  // the transposed tile arrives at matmul/batch_matmul already in the correct
+  // orientation.
   RegisterCustom(
       "tensor.matmul",
       [rank_of](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -931,9 +979,41 @@ void OpConversionRegistry::RegisterReductionOps() {
     };
   };
 
+  // Argmax/argmin require a tmp tile shaped EXACTLY like the source (the pto-isa
+  // TROWARGMAX/TCOLARGMAX kernels read the column count from the tmp/src extent).
+  // Unlike the row_sum-style scratch above, the last dim must NOT be padded to
+  // 128 — a wider tmp makes the column argmax iterate past the valid columns and
+  // return the last-row index for every column.
+  auto MakeArgReductionConv = [](const std::string& tile_op) -> ConversionFunc {
+    return [tile_op](const std::vector<ExprPtr>& args,
+                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                     const Span& span) -> ConversionResult {
+      INTERNAL_CHECK_SPAN(args.size() == 1, span) << tile_op << " conversion expects 1 arg (input tile)";
+      auto& op_reg = OpRegistry::GetInstance();
+
+      const auto& input = args[0];
+      auto tile_type = As<TileType>(input->GetType());
+      INTERNAL_CHECK_SPAN(tile_type, span)
+          << tile_op << " conversion: input must be TileType, got " << input->GetType()->TypeName();
+
+      auto shape_tuple = std::make_shared<MakeTuple>(tile_type->shape_, span);
+      std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", tile_type->dtype_},
+                                                                     {"target_memory", MemorySpace::Vec}};
+      auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
+
+      auto tmp_var = std::make_shared<Var>("tmp_tile", create_call->GetType(), span);
+      std::vector<StmtPtr> prologue;
+      prologue.push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
+
+      auto reduction_call = op_reg.Create(tile_op, {input, tmp_var}, span);
+      return ConversionResult{std::move(prologue), reduction_call};
+    };
+  };
+
   RegisterCustom("tensor.row_max", MakeReductionConv("tile.row_max"));
   RegisterCustom("tensor.row_sum", MakeReductionConv("tile.row_sum"));
   RegisterCustom("tensor.row_min", MakeReductionConv("tile.row_min"));
+  RegisterCustom("tensor.row_prod", MakeReductionConv("tile.row_prod"));
 
   // tile.col_sum's 1-arg form is the sequential reduction path — no tmp_tile workspace
   // needed, so a plain 1:1 name rewrite is enough. tile.col_max / tile.col_min are
@@ -941,6 +1021,14 @@ void OpConversionRegistry::RegisterReductionOps() {
   RegisterSimple("tensor.col_sum", "tile.col_sum");
   RegisterSimple("tensor.col_max", "tile.col_max");
   RegisterSimple("tensor.col_min", "tile.col_min");
+  RegisterSimple("tensor.col_prod", "tile.col_prod");
+
+  // Argmax/argmin all require a tmp scratch tile (including the column variants,
+  // unlike col_max/col_min), sized exactly like the source (no 128 padding).
+  RegisterCustom("tensor.row_argmax", MakeArgReductionConv("tile.row_argmax"));
+  RegisterCustom("tensor.row_argmin", MakeArgReductionConv("tile.row_argmin"));
+  RegisterCustom("tensor.col_argmax", MakeArgReductionConv("tile.col_argmax"));
+  RegisterCustom("tensor.col_argmin", MakeArgReductionConv("tile.col_argmin"));
 }
 
 // ============================================================================
@@ -1127,8 +1215,7 @@ void OpConversionRegistry::RegisterGatherOps() {
         auto zero = make_idx(0);
         auto one = make_idx(1);
 
-        std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec},
-                                                                     {"transpose", false}};
+        std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
         std::vector<std::pair<std::string, std::any>> tmp_create_kwargs = {
             {"dtype", DataType(DataType::INT32)}, {"target_memory", MemorySpace::Vec}};
 
@@ -1658,10 +1745,10 @@ void OpConversionRegistry::RegisterPagedGatherOps() {
 //   select blend. The surrounding pass wraps the tile result in a tile.store to
 //   the output tensor param.
 //
-// tensor.scatter_mask: same idea — pto.tscatter (mask form) zero-fills the whole
-//   dst before writing the selected columns, so it does not preserve dst either.
-//   We reconstruct DPS preserve with the same zeroed-scatter + mask + select
-//   blend, which also makes chaining two patterns into one dst sound.
+// tensor.scatter_mask: same idea — the mask-form scatter emission zero-fills the
+//   whole dst before writing the selected columns, so it does not preserve dst
+//   either. We reconstruct DPS preserve with the same zeroed-scatter + mask +
+//   select blend, which also makes chaining two patterns into one dst sound.
 // ============================================================================
 
 void OpConversionRegistry::RegisterScatterOps() {
@@ -1869,9 +1956,9 @@ void OpConversionRegistry::RegisterScatterOps() {
         INTERNAL_CHECK_SPAN(input_tile && dst_tile, span)
             << "tensor.scatter_mask conversion: input/dst must be Vec tiles after bridge";
 
-        // pto.tscatter (mask form) zero-fills the entire dst tile before writing
-        // the mask-selected columns (TScatterMaskImpl calls InitUBBuffer), so it
-        // does NOT preserve dst's unselected columns — they read back as 0. To
+        // The mask-form scatter emission zero-fills the entire dst tile before
+        // writing the mask-selected columns, so it does NOT preserve dst's
+        // unselected columns — they read back as 0. To
         // honour the DPS preserve contract (and make chaining two patterns into
         // one dst sound), reconstruct preserve on the PyPTO side with the same
         // zeroed-scatter + mask + select blend as the index form:
@@ -2026,6 +2113,79 @@ void OpConversionRegistry::RegisterCmpOps() {
 // memory allocator assigns UB addresses before codegen (--pto-level=level3)
 // ============================================================================
 
+namespace {
+
+// Build the 2-D [rows, cols] VEC staging-tile shape tuple for a put/get
+// transfer. Flattens the N-D transfer shape (rows = product(leading dims),
+// cols = innermost dim). When the user supplied chunk_rows / chunk_cols attrs
+// (0 = unset), caps the staging tile to that sub-tile so pto-isa TPUT/TGET
+// auto-chunks the full transfer through it — transfers larger than UB no longer
+// need a full-size staging tile. Oversized chunk values are clamped to the
+// flattened extent (a no-op single transfer).
+//
+// The transfer extent may be dynamic (a runtime sub-extent of the fixed
+// window). A dynamic flattened dim must be bounded by the corresponding static
+// chunk (the staging tile is statically allocated in UB) — the deducer's
+// ValidateDynamicTransferHasChunk has already enforced this, so a missing chunk
+// here is a compiler bug.
+ExprPtr MakeTputStageShape(const std::vector<ExprPtr>& transfer_shape,
+                           const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span,
+                           const char* op_name) {
+  const int chunk_rows = GetKwargOr<int>(kwargs, "chunk_rows", 0);
+  const int chunk_cols = GetKwargOr<int>(kwargs, "chunk_cols", 0);
+
+  // cols = innermost dim (chunk_cols caps it; chunk_cols bounds it when dynamic).
+  int64_t cols_val;
+  if (auto last = As<ConstInt>(transfer_shape.back())) {
+    cols_val = (chunk_cols > 0) ? std::min<int64_t>(last->value_, chunk_cols) : last->value_;
+  } else {
+    INTERNAL_CHECK_SPAN(chunk_cols > 0, span)
+        << op_name << ": dynamic innermost transfer dim requires a static chunk_cols";
+    cols_val = chunk_cols;
+  }
+
+  // rows = product(leading dims) (chunk_rows caps it; bounds it when any leading
+  // dim is dynamic).
+  int64_t rows_prod = 1;
+  bool rows_static = true;
+  for (size_t i = 0; i + 1 < transfer_shape.size(); ++i) {
+    if (auto d = As<ConstInt>(transfer_shape[i])) {
+      rows_prod *= d->value_;
+    } else {
+      rows_static = false;
+    }
+  }
+  int64_t rows_val;
+  if (rows_static) {
+    rows_val = (chunk_rows > 0) ? std::min<int64_t>(rows_prod, chunk_rows) : rows_prod;
+  } else {
+    INTERNAL_CHECK_SPAN(chunk_rows > 0, span)
+        << op_name << ": dynamic leading transfer dim requires a static chunk_rows";
+    rows_val = chunk_rows;
+  }
+
+  auto rows_expr = std::make_shared<ConstInt>(rows_val, DataType::INDEX, span);
+  auto cols_expr = std::make_shared<ConstInt>(cols_val, DataType::INDEX, span);
+  return std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows_expr, cols_expr}, span);
+}
+
+// Drop the staging-only chunk_rows / chunk_cols / pipeline attrs before
+// forwarding the remaining kwargs (e.g. put's `atomic`) to the tile-level op —
+// the stage tile's shape encodes the chunk and the presence of a second stage
+// tile encodes the pipeline, so the tile-level op needs neither attr of its own.
+std::vector<std::pair<std::string, std::any>> StripChunkKwargs(
+    const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  std::vector<std::pair<std::string, std::any>> out;
+  out.reserve(kwargs.size());
+  for (const auto& kv : kwargs) {
+    if (kv.first == "chunk_rows" || kv.first == "chunk_cols" || kv.first == "pipeline") continue;
+    out.push_back(kv);
+  }
+  return out;
+}
+
+}  // namespace
+
 void OpConversionRegistry::RegisterDistributedOps() {
   // pld.tensor.put -> tile.create(stage) + pld.tile.put(dst, peer, src, stage).
   // Stage shape is [rows, cols] with rows = product(leading dims), cols =
@@ -2056,37 +2216,37 @@ void OpConversionRegistry::RegisterDistributedOps() {
         INTERNAL_CHECK_SPAN(!transfer_shape.empty(), span)
             << "pld.tensor.put conversion: transfer shape requires rank >= 1";
 
-        // Flatten N-D to [rows, cols]: rows = ∏ leading dims, cols = innermost.
-        int64_t cols_val = 0;
-        {
-          auto last = As<ConstInt>(transfer_shape.back());
-          INTERNAL_CHECK_SPAN(last, span)
-              << "pld.tensor.put conversion: transfer innermost dimension must be ConstInt";
-          cols_val = last->value_;
-        }
-        int64_t rows_val = 1;
-        for (size_t i = 0; i + 1 < transfer_shape.size(); ++i) {
-          auto d = As<ConstInt>(transfer_shape[i]);
-          INTERNAL_CHECK_SPAN(d, span)
-              << "pld.tensor.put conversion: transfer dimension " << i << " must be ConstInt";
-          rows_val *= d->value_;
-        }
-        auto rows_expr = std::make_shared<ConstInt>(rows_val, DataType::INDEX, span);
-        auto cols_expr = std::make_shared<ConstInt>(cols_val, DataType::INDEX, span);
-        auto shape_tuple = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows_expr, cols_expr}, span);
+        // Flatten N-D to [rows, cols] and (optionally) cap to the chunk attrs so
+        // pto-isa TPUT auto-chunks the full transfer through a sub-tile.
+        auto shape_tuple = MakeTputStageShape(transfer_shape, kwargs, span, "pld.tensor.put conversion");
 
         std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", dst_type->dtype_},
                                                                        {"target_memory", MemorySpace::Vec}};
-        auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
-        auto stage_var = std::make_shared<Var>("tput_stage", create_call->GetType(), span);
         std::vector<StmtPtr> prologue;
-        prologue.push_back(std::make_shared<AssignStmt>(stage_var, create_call, span));
+        // Materialize one (single-buffer) or two (pipeline / ping-pong) VEC
+        // staging tiles. Two distinct tile.create Vars give the memory allocator
+        // two non-overlapping UB addresses, satisfying pto-isa's ping/pong
+        // constraint. `pipeline` was validated (both chunk dims set) by the
+        // deducer; here it only selects the buffer count.
+        const bool pipeline = GetKwargOr<bool>(kwargs, "pipeline", false);
+        auto make_stage = [&](const char* hint) -> ExprPtr {
+          auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
+          auto v = std::make_shared<Var>(hint, create_call->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(v, create_call, span));
+          return v;
+        };
 
-        std::vector<ExprPtr> put_args{args[0], args[1], args[2], stage_var};
+        std::vector<ExprPtr> put_args{args[0], args[1], args[2],
+                                      make_stage(pipeline ? "tput_stage_ping" : "tput_stage")};
+        if (pipeline) {
+          put_args.push_back(make_stage("tput_stage_pong"));
+        }
         if (args.size() == 6) {
           put_args.insert(put_args.end(), args.begin() + 3, args.end());
         }
-        auto put_call = op_reg.Create("pld.tile.put", put_args, kwargs, span);
+        // chunk_* / pipeline attrs are consumed by the stage sizing/count above;
+        // forward only the tile-level op's own attrs (atomic).
+        auto put_call = op_reg.Create("pld.tile.put", put_args, StripChunkKwargs(kwargs), span);
         return ConversionResult{std::move(prologue), put_call};
       });
 
@@ -2102,12 +2262,14 @@ void OpConversionRegistry::RegisterDistributedOps() {
             << "pld.tensor.get conversion expects 3 args (dst, peer, src) or 6 "
                "(dst, peer, src, dst_offsets, src_offsets, shape), got "
             << args.size();
-        INTERNAL_CHECK_SPAN(kwargs.empty(), span) << "pld.tensor.get conversion expects no kwargs";
+        // Only the optional chunk_rows / chunk_cols / pipeline staging attrs are
+        // accepted here; they are consumed by the stage sizing / count below
+        // (not forwarded to the tile-level op).
         auto& op_reg = OpRegistry::GetInstance();
 
-        auto dst_type = As<DistributedTensorType>(args[0]->GetType());
+        auto dst_type = AsTensorTypeLike(args[0]->GetType());
         INTERNAL_CHECK_SPAN(dst_type, span)
-            << "pld.tensor.get conversion: dst must be DistributedTensorType, got "
+            << "pld.tensor.get conversion: dst must be Tensor or DistributedTensor, got "
             << args[0]->GetType()->TypeName();
         std::vector<ExprPtr> transfer_shape = dst_type->shape_;
         if (args.size() == 6) {
@@ -2118,38 +2280,89 @@ void OpConversionRegistry::RegisterDistributedOps() {
         INTERNAL_CHECK_SPAN(!transfer_shape.empty(), span)
             << "pld.tensor.get conversion: transfer shape requires rank >= 1";
 
-        int64_t cols_val = 0;
-        {
-          auto last = As<ConstInt>(transfer_shape.back());
-          INTERNAL_CHECK_SPAN(last, span)
-              << "pld.tensor.get conversion: transfer innermost dimension must be ConstInt";
-          cols_val = last->value_;
-        }
-        int64_t rows_val = 1;
-        for (size_t i = 0; i + 1 < transfer_shape.size(); ++i) {
-          auto d = As<ConstInt>(transfer_shape[i]);
-          INTERNAL_CHECK_SPAN(d, span)
-              << "pld.tensor.get conversion: transfer dimension " << i << " must be ConstInt";
-          rows_val *= d->value_;
-        }
-        auto rows_expr = std::make_shared<ConstInt>(rows_val, DataType::INDEX, span);
-        auto cols_expr = std::make_shared<ConstInt>(cols_val, DataType::INDEX, span);
-        auto shape_tuple = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows_expr, cols_expr}, span);
+        // Flatten N-D to [rows, cols] and (optionally) cap to the chunk attrs so
+        // pto-isa TGET auto-chunks the full transfer through a sub-tile.
+        auto shape_tuple = MakeTputStageShape(transfer_shape, kwargs, span, "pld.tensor.get conversion");
 
         std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", dst_type->dtype_},
                                                                        {"target_memory", MemorySpace::Vec}};
-        auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
-        auto stage_var = std::make_shared<Var>("tget_stage", create_call->GetType(), span);
         std::vector<StmtPtr> prologue;
-        prologue.push_back(std::make_shared<AssignStmt>(stage_var, create_call, span));
+        // One (single-buffer) or two (pipeline / ping-pong) VEC staging tiles —
+        // mirror the put path. `pipeline` validated (both chunk dims) by the
+        // deducer.
+        const bool pipeline = GetKwargOr<bool>(kwargs, "pipeline", false);
+        auto make_stage = [&](const char* hint) -> ExprPtr {
+          auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
+          auto v = std::make_shared<Var>(hint, create_call->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(v, create_call, span));
+          return v;
+        };
 
-        std::vector<ExprPtr> get_args{args[0], args[1], args[2], stage_var};
+        std::vector<ExprPtr> get_args{args[0], args[1], args[2],
+                                      make_stage(pipeline ? "tget_stage_ping" : "tget_stage")};
+        if (pipeline) {
+          get_args.push_back(make_stage("tget_stage_pong"));
+        }
         if (args.size() == 6) {
           get_args.insert(get_args.end(), args.begin() + 3, args.end());
         }
+        // No kwargs forwarded: pld.tensor.get's only attrs are chunk_rows /
+        // chunk_cols / pipeline, all consumed by the stage sizing/count above;
+        // pld.tile.get registers no attrs. (put forwards `atomic`.)
         auto get_call = op_reg.Create("pld.tile.get", get_args, span);
         return ConversionResult{std::move(prologue), get_call};
       });
+}
+
+// ============================================================================
+// Cross-core split-axis ops: tensor.aiv_shard / tensor.aic_gather
+// ============================================================================
+// High-level (@pl.jit / pl.spmd) author-facing shard / gather emitted inside a
+// ``for aiv_id in pl.split_aiv(...)`` region. Each lowers 1:1 to its tile op
+// (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
+// AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 18).
+//
+// Memory-space re-attachment. The tile-level split deducer (DeduceSplitReshape)
+// intentionally drops the boundary memory space (returns a TileType with a null
+// memref / null memory_space), because the deduction fixpoint must not inherit an
+// input-side layout. The AUTO path restores it in ReshapeTypeWithMemory:
+//   * C->V aiv_shard  -> the move's Vec DESTINATION memory.
+//   * V->C aic_gather -> the Vec half-tile SOURCE memory (inherit input side).
+// Both boundaries resolve to MemorySpace::Vec (verified against the AUTO oracle:
+// _shard_vec / _gather_vec in test_lower_auto_vector_split.py both assert Vec),
+// so this converter re-attaches Vec to the deduced half/full type.
+//
+// No InputSpaceReq. The realistic (region-only) operand is an on-chip tile — a
+// cube (Mat/Acc) matmul result for aiv_shard, a Vec vector-compute result for
+// aic_gather — already lowered to a TileType earlier in this same pass, so it
+// reaches the converter tile-typed and passes straight into the tile op (the tile
+// deducer accepts any 2D TileType regardless of memory space). aiv_shard / gather
+// ARE the cross-core transfer, so no tile.load should be synthesized; adding a Vec
+// InputSpaceReq would inject a spurious Vec load and force a cube input to Vec,
+// diverging from the AUTO oracle's Mat-tile input. Distributed operands were
+// rejected upstream (parser + tensor deducer), so only a plain TileType arrives.
+void OpConversionRegistry::RegisterCrossCoreOps() {
+  auto convert = [](const std::string& tile_op) -> ConversionFunc {
+    return [tile_op](const std::vector<ExprPtr>& args,
+                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                     const Span& span) -> ConversionResult {
+      INTERNAL_CHECK_SPAN(args.size() == 1, span)
+          << "Internal error: " << tile_op << " conversion expects 1 arg, got " << args.size();
+      auto& op_reg = OpRegistry::GetInstance();
+      // args[0] is already tile-typed here (its producer lowered earlier in this
+      // pass); the tile deducer forwards the "split" attr and halves/doubles the
+      // split-axis extent.
+      auto call = op_reg.Create(tile_op, args, kwargs, span);
+      auto tt = As<TileType>(call->GetType());
+      INTERNAL_CHECK_SPAN(tt, span) << "Internal error: " << tile_op << " must deduce a TileType";
+      // Re-attach the vector-side (Vec) boundary memory the split deducer drops.
+      auto typed =
+          std::make_shared<TileType>(tt->shape_, tt->dtype_, tt->memref_, tt->tile_view_, MemorySpace::Vec);
+      return ConversionResult{std::make_shared<Call>(call->op_, call->args_, call->kwargs_, typed, span)};
+    };
+  };
+  RegisterCustom("tensor.aiv_shard", convert("tile.aiv_shard"));
+  RegisterCustom("tensor.aic_gather", convert("tile.aic_gather"));
 }
 
 void OpConversionRegistry::RegisterSimple(const std::string& from_op, const std::string& to_op,

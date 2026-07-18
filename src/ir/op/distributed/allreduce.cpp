@@ -16,12 +16,16 @@
  * Composite collective op: in-place allreduce of a window-bound
  * :class:`DistributedTensorType` across every rank of its comm group, using a
  * window-bound INT32 ``signal`` matrix for the cross-rank barrier. Sibling of
- * ``pld.system.notify`` / ``pld.system.wait`` / ``pld.tile.remote_load``; the
- * 4-phase decomposition lives in
- * ``src/ir/transforms/lower_composite_ops_pass.cpp``.
+ * ``pld.system.notify`` / ``pld.system.wait`` / ``pld.tile.remote_load``.
+ * Explicit-signal InCore allreduce uses the 4-phase decomposition in
+ * ``src/ir/transforms/lower_composite_ops_pass.cpp``; host-level allreduce is
+ * lowered later by ``LowerHostTensorCollectives``.
+ * Explicit signal buffers are single-shot: callers issuing multiple allreduces
+ * must provide a fresh signal for each call.
  *
  * IR signature:
  *
+ *     pld.tensor.allreduce(target, *, op: int)          -> DistributedTensorType
  *     pld.tensor.allreduce(target, signal, *, op: int)  -> DistributedTensorType
  *
  * The ``op`` integer is the underlying value of :enum:`ReduceOp` (see
@@ -71,9 +75,9 @@ namespace {
 
 TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CHECK(args.size() == 2) << "pld.tensor.allreduce requires exactly 2 positional arguments "
-                             "(target, signal), but got "
-                          << args.size();
+  CHECK(args.size() == 1 || args.size() == 2)
+      << "pld.tensor.allreduce requires 1 or 2 positional arguments (target[, signal]), but got "
+      << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.allreduce positional argument #" << i << " must not be null";
   }
@@ -83,13 +87,16 @@ TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
                         "got "
                      << args[0]->GetType()->TypeName();
 
-  auto signal_type = As<DistributedTensorType>(args[1]->GetType());
-  CHECK(signal_type) << "pld.tensor.allreduce signal must be a DistributedTensor (window-bound), "
-                        "got "
-                     << args[1]->GetType()->TypeName();
-  CHECK(signal_type->dtype_ == DataType::INT32) << "pld.tensor.allreduce signal must have INT32 element type "
-                                                   "(the barrier slot is an int counter), got dtype "
-                                                << signal_type->dtype_.ToString();
+  if (args.size() == 2) {
+    auto signal_type = As<DistributedTensorType>(args[1]->GetType());
+    CHECK(signal_type) << "pld.tensor.allreduce signal must be a DistributedTensor (window-bound), "
+                          "got "
+                       << args[1]->GetType()->TypeName();
+    CHECK(signal_type->dtype_ == DataType::INT32)
+        << "pld.tensor.allreduce signal must have INT32 element type "
+           "(the barrier slot is an int counter), got dtype "
+        << signal_type->dtype_.ToString();
+  }
 
   // Validate `op` kwarg falls in the ReduceOp range — first version supports
   // kSum only; the other enum values are accepted by the parser binding but
@@ -117,13 +124,15 @@ REGISTER_OP("pld.tensor.allreduce")
     .set_description(
         "In-place all-reduce of a window-bound DistributedTensor across every rank of its comm "
         "group. After the call, every rank's slice of `target` holds the reduced value. "
-        "`signal` is a window-bound INT32 matrix used as the cross-rank barrier (one slot per "
-        "rank). `op` selects the reduction operator. Lowered to a 4-phase decomposition "
-        "(notify / wait / remote_load + accumulate / store) by LowerCompositeOps; this op never "
-        "survives past that pass.")
+        "`signal`, when present, is a window-bound INT32 matrix used as the cross-rank barrier "
+        "(one slot per rank). Host one-argument calls synthesize a private signal before lowering. "
+        "`op` selects the reduction operator. Explicit-signal InCore calls are lowered to a 4-phase "
+        "decomposition (notify / wait / remote_load + accumulate / store) by LowerCompositeOps; "
+        "host-level calls are lowered later by LowerHostTensorCollectives.")
     .set_op_category("DistributedOp")
     .add_argument("target", "Window-bound DistributedTensor (InOut)")
-    .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
+    .add_argument("signal",
+                  "Optional window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .set_attr<int>("op")
     .no_memory_spec()
     .f_deduce_type(DeduceTensorAllReduceType);

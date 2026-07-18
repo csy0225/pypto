@@ -77,9 +77,13 @@ _ACTIVE_WORKERS: contextvars.ContextVar[tuple[ChipWorker, ...]] = contextvars.Co
     "_pypto_active_workers", default=()
 )
 
-# Default runtime name — matches ``compile_and_assemble``'s fallback in
-# ``device_runner.py`` and the most common user-program runtime.
-_DEFAULT_RUNTIME = "host_build_graph"
+# Default runtime name — matches the runtime that ``pto_backend`` bakes into
+# every generated ``kernel_config.py`` (``RUNTIME_CONFIG["runtime"]``). That is
+# the value ``CompiledProgram.runtime_name`` reports and the one the reuse
+# lookup in ``device_runner.execute_on_device`` searches for, so a
+# default-constructed ``with ChipWorker():`` bind-matches a freshly compiled
+# program instead of silently falling through to a one-shot worker.
+_DEFAULT_RUNTIME = "tensormap_and_ringbuffer"
 
 
 class ChipWorker(Worker):
@@ -111,7 +115,8 @@ class ChipWorker(Worker):
             :class:`~pypto.runtime.distributed_runner.DistributedWorker`.
         runtime: Runtime implementation name. Must match the runtime the
             program is compiled against; otherwise reuse silently falls
-            through to the one-shot path. Defaults to ``"host_build_graph"``.
+            through to the one-shot path. Defaults to
+            ``"tensormap_and_ringbuffer"``.
         auto_init: If ``True``, call :meth:`init` from ``__init__``. Default
             is ``True``.
     """
@@ -378,7 +383,25 @@ class ChipWorker(Worker):
                 ``compiled.runtime_name`` != ``self.runtime``.
             RuntimeError: ChipWorker not initialized.
         """
-        self._require_initialized("run")
+        outputs = self._dispatch(compiled, args, config, op="run")
+        return outputs
+
+    def _dispatch(
+        self,
+        compiled: CompiledProgram,
+        args: tuple[CallArg, ...],
+        config: RunConfig | None,
+        *,
+        op: str,
+    ) -> Any:
+        """Dispatch core for :meth:`run`.
+
+        Returns *outputs* following :meth:`run`'s contract (``None`` for
+        in-place calls, a single tensor for one-output return-style calls, or
+        a tuple otherwise). *op* is the calling method name, used so the
+        not-initialized error names the public entry point the caller used.
+        """
+        self._require_initialized(op)
         self._check_binding(compiled)
 
         # Import lazily to avoid a cycle: compiled_program imports from
@@ -435,13 +458,13 @@ class ChipWorker(Worker):
     # Internal hook for the runner reuse path
     # ------------------------------------------------------------------
 
-    def _run_chip(self, chip_callable: Any, orch_args: Any, cfg: Any) -> Any:
-        """Dispatch *chip_callable* and return the simpler ``RunTiming``.
+    def _run_chip(self, chip_callable: Any, orch_args: Any, cfg: Any) -> None:
+        """Dispatch *chip_callable* on the underlying simpler ``Worker``.
 
-        Returns the ``RunTiming`` produced by the underlying simpler
-        ``Worker.run`` (host + device wall). :meth:`run` ignores it — it
-        returns tensor outputs instead — but :func:`execute_on_device`
-        surfaces it on the ChipWorker-reuse path.
+        Registers the callable (caching its cid) and runs it. The simpler
+        ``Worker.run`` returns ``None`` (per-run timing is read from the
+        runtime's ``[STRACE]`` log markers, simpler PR #1177); this method
+        returns ``None`` as well.
         """
         if not self._initialized:
             raise RuntimeError("ChipWorker is not initialized; call init() or use `with chipworker:`")
@@ -450,7 +473,7 @@ class ChipWorker(Worker):
         if cid is None:
             cid = self._impl.register(chip_callable)
             self._cid_cache[key] = cid
-        return self._impl.run(cid, orch_args, cfg)
+        self._impl.run(cid, orch_args, cfg)
 
     # ------------------------------------------------------------------
     # Context manager — publishes ``self`` on the active stack

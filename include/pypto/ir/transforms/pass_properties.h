@@ -28,19 +28,45 @@ namespace pass {
 
 inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::InlineFunctionsEliminated}};
 
-// -- MaterializeCommDomainScopes pass (runs at the end of the pipeline, just before -----
-//    the final Simplify). Nothing between InlineFunctions and here touches
-//    the host_orch alloc/window/dispatch chain (host_orch is never tile-
-//    lowered), so the alloc/view/dispatch sites are still discoverable.
+// Runs after InCore/Cluster outlining and before tensor-to-tile conversion. It only
+// splices CHIP Orchestration control flow; the already-outlined kernel
+// functions and their independent memory-planning boundaries remain intact.
+// DeepClone alpha-renames every local definition and substitutes already-SSA
+// formals positionally, so the pass preserves the surrounding SSA form.
+inline const PassProperties kInlineOrchestrationHelpersProperties{
+    .required = {IRProperty::SSAForm, IRProperty::NoNestedCalls,
+                 IRProperty::NormalizedStmtStructure,
+                 IRProperty::SplitIncoreOrch,
+                 IRProperty::ClusterOutlined,
+                 IRProperty::OrchestrationReferencesResolved},
+    .produced = {IRProperty::SSAForm, IRProperty::NoNestedCalls,
+                 IRProperty::NormalizedStmtStructure,
+                 IRProperty::SplitIncoreOrch,
+                 IRProperty::ClusterOutlined,
+                 IRProperty::OrchestrationReferencesResolved}};
+
+// -- SynthesizeAllReduceSignals and MaterializeCommDomainScopes passes (run
+//    late in the pipeline, after phase-fence expansion and immediately before
+//    LowerHostTensorCollectives).
+//    Nothing between InlineFunctions and here removes the host_orch
+//    alloc/window/dispatch/allreduce chain (host_orch is never tile-lowered), so
+//    alloc/view/dispatch/allreduce sites are still discoverable. The synthesizer
+//    first normalizes host allreduce calls to explicit-signal IR.
 //    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r),
 //    materialises WindowBuffer back-references on every DistributedTensorType view,
 //    and wraps the host_orch body in nested CommDomainScopeStmts (one per
 //    inferred comm domain).
 
+inline const PassProperties kSynthesizeAllReduceSignalsProperties{};
+
 inline const PassProperties kMaterializeCommDomainScopesProperties{
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
 inline const PassProperties kLowerHostTensorCollectivesProperties{
+    .required = {IRProperty::CommDomainScopesMaterialized},
+    .produced = {IRProperty::CommDomainScopesMaterialized}};
+
+inline const PassProperties kMaterializeDistTensorCtxProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
@@ -53,23 +79,11 @@ inline const PassProperties kMaterializeRuntimeScopesProperties{
 
 // -- Loop unrolling pass (runs before SSA) ------------------------------------
 
-inline const PassProperties kUnrollLoopsProperties{};
+inline const PassProperties kUnrollLoopsProperties{.produced = {IRProperty::UnrollResolved}};
 
 // -- Control flow structuring pass (runs before SSA, after unrolling) ---------
 
 inline const PassProperties kCtrlFlowTransformProperties{.produced = {IRProperty::StructuredCtrlFlow}};
-
-// -- Loop chunking pass (runs after SSA) --------------------------------------
-
-inline const PassProperties kSplitChunkedLoopsProperties{
-    .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure, IRProperty::UnrollResolved}};
-
-// -- Chunk loop interchange pass (runs after SplitChunkedLoops) ---------------
-
-inline const PassProperties kInterchangeChunkLoopsProperties{
-    .required = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::NormalizedStmtStructure}};
 
 // -- SSA conversion pass ------------------------------------------------------
 
@@ -89,21 +103,28 @@ inline const PassProperties kNormalizeStmtStructureProperties{
 
 inline const PassProperties kSimplifyProperties{};
 
-// -- Composite op lowering pass (tile.sin / tile.cos -> primitives, etc.) -----
+// -- Composite op lowering pass (tile.sin / tile.cos / InCore allreduce -> primitives, etc.) -----
 //
-// LowerCompositeOps decomposes composite tile ops into primitive arithmetic
-// ops. Today the only composite ops handled are tile.sin / tile.cos (Cody-Waite
-// range reduction + degree-9 Horner polynomial); future composite ops add a
-// rule to the file-local dispatch table in lower_composite_ops_pass.cpp. The
-// pass operates purely within the existing tile-op vocabulary, so it neither
-// requires nor produces nor invalidates any IRProperty.
+// LowerCompositeOps decomposes composite tile/distributed ops into primitive
+// ops. Today it handles tile.sin / tile.cos (Cody-Waite range reduction +
+// degree-9 Horner polynomial) and explicit-signal InCore pld.tensor.allreduce;
+// host-level allreduce is skipped and lowered later by LowerHostTensorCollectives.
+// Future composite ops add a rule to the file-local dispatch table in
+// lower_composite_ops_pass.cpp. The pass operates within existing op
+// vocabularies, so it neither requires nor produces nor invalidates any
+// IRProperty.
 
 inline const PassProperties kLowerCompositeOpsProperties{};
 
 // -- Outlining pass -----------------------------------------------------------
 
+// OutlineIncoreScopes opens the AivSplitValid verification window: it preserves
+// the first-class SplitAivScopeStmt regions inside each outlined InCore function,
+// so the structural region verifier can run from here until LowerAutoVectorSplit
+// erases the node (pass 21).
 inline const PassProperties kOutlineIncoreScopesProperties{
-    .required = {IRProperty::SSAForm}, .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch}};
+    .required = {IRProperty::SSAForm},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::AivSplitValid}};
 
 // -- Cluster outlining pass ---------------------------------------------------
 
@@ -168,14 +189,6 @@ inline const PassProperties kInferTileMemorySpaceProperties{
                  IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
 
-// -- Lower transpose-load parameter layout pass (RFC #1300 P6) ----------------
-
-inline const PassProperties kLowerTransposeLoadParamLayoutProperties{
-    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D},
-    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
-                 IRProperty::TileOps2D}};
-
 // -- Materialize tensor strides pass (RFC #1300 §2.4) ------------------------
 
 inline const PassProperties kMaterializeTensorStridesProperties{
@@ -196,12 +209,38 @@ inline const PassProperties kResolveBackendOpLayoutsProperties{
     .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
 
+// -- Auto vector-split lowering pass (RFC #1300; live, always-on) --------------
+//
+// Converts AUTO pl.split mixed InCore functions into the explicit split_aiv form
+// (aiv_shard / aic_gather + halved vector sub-region) BEFORE ExpandMixedKernel.
+// Runs unconditionally in the Default strategy. Same pre/post properties as
+// ExpandMixedKernel's required set: it rewrites the still-mixed InCore body in
+// place without changing the structural property set (and is a no-op for
+// functions with no split mode or already in explicit split_aiv form).
+//
+// This pass closes the AivSplitValid verification window: it consumes and erases
+// the first-class SplitAivScopeStmt regions (so the structural region verifier
+// can no longer run afterwards), hence it requires AivSplitValid on entry and
+// invalidates it on exit.
+inline const PassProperties kLowerAutoVectorSplitProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
+                 IRProperty::AivSplitValid},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .invalidated = {IRProperty::AivSplitValid}};
+
 // -- Mixed kernel expansion pass ----------------------------------------------
 
+// HardSyncallOccupancyValid is produced here (not by a transformation ExpandMixedKernel
+// performs, but because this pass resolves each kernel's FunctionType to AIV/AIC/Group —
+// the precondition the hard-syncall occupancy verifier depends on). The verifier fires
+// once, right after this pass.
 inline const PassProperties kExpandMixedKernelProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded, IRProperty::NormalizedStmtStructure,
+                 IRProperty::HardSyncallOccupancyValid}};
 
 // -- GM pipe buffer injection pass (backend-gated; extracted from ExpandMixedKernel) --
 
@@ -222,6 +261,14 @@ inline const PassProperties kInitMemRefProperties{
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred},
     .produced = {IRProperty::HasMemRefs, IRProperty::NormalizedStmtStructure},
     .invalidated = {IRProperty::SSAForm}};
+
+// Semantic must-alias materialization (Step 0 formerly inside MemoryReuse).
+// Same requirements as MemoryReuse; retargets MemRefs in place without adding or
+// removing structural IR properties.
+inline const PassProperties kMaterializeSemanticAliasesProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
+                 IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::NormalizedStmtStructure}};
 
 inline const PassProperties kMemoryReuseProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
@@ -302,6 +349,10 @@ inline const PassProperties kAutoDeriveTaskDependenciesProperties{
 inline const PassProperties kFoldNoOpReshapeProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps, IRProperty::HasMemRefs,
                  IRProperty::TileOps2D}};
+
+// -- Stamp tpop split/id onto tfree ops --------------------------------------
+
+inline const PassProperties kStampTfreeSplitProperties{.required = {IRProperty::SplitIncoreOrch}};
 
 }  // namespace pass
 }  // namespace ir

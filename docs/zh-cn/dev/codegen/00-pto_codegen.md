@@ -14,7 +14,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 **原因：** 嵌入分析逻辑的代码生成会变得脆弱——它重复了 Pass 已有的逻辑，且更难以独立测试。保持代码生成为直接的转换，确保其可预测性和可维护性。
 
-**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass。
+**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass。
 
 ## 概述
 
@@ -140,6 +140,7 @@ print(pto_code)
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.add(a, b, c)` | `pto.taddc` (三操作数加法) |
 | `tile.adds(tile, scalar)` | `pto.tadds` (Tile + 标量) |
+| `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)`（`shape` 元组仅用于类型推导；更大的 `dst` 及其 pad 来自结果类型） |
 
 **`tile.slice` / `tile.assemble` 下沉细节。** 两个 op 都通过 `pto.subview`
 下沉，它是源 tile 的纯视图别名（不搬数据，也不会额外发 `pto.alloc_tile`）。
@@ -173,6 +174,8 @@ print(pto_code)
 | `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {[id = I, ]dir_mask = D, slot_size = S[, slot_num = N][, local_slot_num = L]} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector 管道初始化（仅在显式设置时输出 `slot_num`/`local_slot_num`，否则由 PTOAS 取默认值） |
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | 预留缓冲区 |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | 导入对等缓冲区 |
+| `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | 跨核全员屏障（hard/FFTS 形态） |
+| `system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview, %scratch, %used : !pto.partition_tensor_view<...xi32>, !pto.tile_buf<loc=vec, ...i32>, i32) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<aiv_only>` | soft/GM 轮询屏障（部分占用即可；`gm_workspace` 下沉为 `pto.partition_view`，scratch tile 由编译器合成） |
 
 **说明：**
 
@@ -270,6 +273,28 @@ print(pto_code)
 - 每个 Tile 变量对应一次分配 (不是每个唯一 MemRef)
 - `addr` 属性来自 `MemRef.addr_`，输出为 `arith.constant ... : i64`
 - 共享同一 MemRef 的变量共享相同的 `addr` SSA 值
+
+#### 由谁规划内存：`compile(memory_planner=...)`
+
+物理 `addr` 由谁分配，通过 `memory_planner` 选项选择
+（`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | PTOAS)`，默认
+`PYPTO`）。它同时作用于 pass 流水线（经 `PassContext`）与 codegen：
+
+| 模式 | 流水线 | `pto.alloc_tile` | ptoas |
+| ---- | ------ | ---------------- | ----- |
+| `PYPTO`（默认） | 运行 `MaterializeSemanticAliases` + `MemoryReuse` + `AllocateMemoryAddr` | 发射 `addr = <const>`（来自 `MemRef.byte_offset_`） | `--pto-level=level3`（信任已烘焙地址） |
+| `PTOAS` | 运行 `MaterializeSemanticAliases`；**跳过** `MemoryReuse` + `AllocateMemoryAddr` | 省略 `addr`（`PTOCodegen.generate(emit_tile_addr=False)`） | `--pto-level=level2`（ptoas `PlanMemory` 做复用 + 定址） |
+
+内存规划拆成两个 pass：**`MaterializeSemanticAliases`** 把**语义强制**的别名
+（循环累加器、原地算子）归一到同一 MemRef；**`MemoryReuse`** 只做**机会性**的、
+基于生命周期的独立 buffer 合并。`InitMemRef` + `MaterializeSemanticAliases`
+两种模式都跑,所以强制别名得以保留;`PTOAS` 模式下 codegen 把这些共享 MemRef
+渲染成单个 `tile_buf` handle、原地 `outs(%acc)`,由 ptoas `PlanMemory`
+(level2 强制要求、拒绝任何 `addr` 操作数)完成生命周期复用与地址分配。
+
+> **注意：** `PTOAS` 模式跳过了 `MemoryReuse` 里的 Ascend910B `load + tpop_from_aic`
+> 原地写冒险守卫,以及 `AllocateMemoryAddr` 的 reserve-buffer 基址解析,这些交由
+> ptoas 处理。`compile()` 会输出告警 —— 相关 kernel 请上机验证。
 
 ### 加载操作转换
 
@@ -565,13 +590,15 @@ output_dir/
 | `TensorType` | `Tensor*` -> `buffer.addr` -> 带类型指针 |
 | `ScalarType` | `uint64_t` -> 联合体解码 -> 带类型值 |
 
-### SPMD Block 身份参数
+### SPMD 身份参数
 
-`tile.get_block_idx()` 和 `tile.get_block_num()` 在 codegen 阶段被降阶为两个
-合成 `i32` 形参，PTOCodegen 把它们**追加到** `func.func` 签名末尾，并使用
-有意义的命名 SSA(`%__pypto_spmd_block_idx`、`%__pypto_spmd_block_num`)。
-这两个 op 的 IR 契约不变 -- 合成形参只出现在生成的 MLIR / C++ 中，绝不进入
-`Function.params`。
+`tile.get_block_idx()`、`tile.get_block_num()` 和 `tile.get_subblock_idx()`
+在 codegen 阶段被降阶为合成 `i32` 形参，PTOCodegen 把它们**追加到**
+`func.func` 签名末尾，并使用有意义的命名 SSA(`%__pypto_spmd_block_idx`、
+`%__pypto_spmd_block_num`、`%__pypto_spmd_subblock_idx`)。这些 op 的 IR
+契约不变 -- 合成形参只出现在生成的 MLIR / C++ 中，绝不进入
+`Function.params`。追加顺序固定为 `block_idx, block_num, subblock_idx`，
+并各自根据函数实际使用的 op 独立决定是否追加。
 
 ```mlir
 func.func @spmd_kernel(%arg0: !pto.ptr<f32>, %arg1: !pto.ptr<f32>,
@@ -601,12 +628,25 @@ void kernel_entry(__gm__ int64_t* args) {
 }
 ```
 
+**subblock_idx(AIV lane)。** `tile.get_subblock_idx()` 走相同的合成形参通道:
+wrapper 从 `intrinsic.h::get_sub_block_id(args)`(调度器写入
+`GlobalContext.sub_block_id` 的运行时 per-core lane id)解析出值,并把
+`__pypto_spmd_subblock_idx` 追加在 block 身份实参之后。它刻意读取运行时
+lane id,而非 ccec `get_subblockid()` 寄存器 -- 后者在
+`tensormap_and_ringbuffer` 调度下返回过期值。这与 A2A3 dual-AIV wrapper 为
+ptoas **内部** pipe-slot 偏移安装的 `get_subblockid()` 宏桥接
+(`pypto_runtime_subblock_id`)相互独立、并存。与 block 身份一样,它无条件发射
+(无 `__CPU_SIM` 分叉),因为 `GlobalContext.sub_block_id` 在每个平台都由调度器
+填充。
+
 **检测范围。** 两层各自基于函数体独立检测 SPMD usage:
 
-- `FunctionUsesSpmdBlockOps`(C++，位于 `src/codegen/pto/pto_codegen.cpp`)
-  决定 PTOCodegen 是否给该函数签名追加两个形参。
-- `_uses_spmd_block_ops`(Python，位于 `python/pypto/backend/pto_backend.py`)
-  决定 wrapper 是否把这两个局部变量追加到对内函数调用末尾。
+- `MemRefCollectorVisitor::UsesSpmdBlockOps` / `UsesSubblockOp`(C++，位于
+  `src/codegen/pto/pto_codegen.cpp`)决定 PTOCodegen 是否给该函数签名追加
+  block / subblock 形参。
+- `_uses_spmd_block_ops` / `_uses_dynamic_subblock_id`(Python，位于
+  `python/pypto/backend/pto_backend.py`)决定 wrapper 是否把相应局部变量追加到
+  对内函数调用末尾。
 
 对于 SPMD 组内自身不调用 `tile.get_block_*` 的 sibling 函数
 (`group_uses_spmd=True` 但函数本身不用 SPMD ops)，wrapper 仍会声明这两个

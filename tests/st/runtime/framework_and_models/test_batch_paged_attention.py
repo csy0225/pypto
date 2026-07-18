@@ -142,13 +142,13 @@ class BatchQKMatmulTestCase(PTOTestCase):
                         [q_tile, head_dim],
                         target_memory=pl.MemorySpace.Mat,
                     )
-                    kj_l1 = pl.load(
+                    kj_nat = pl.load(
                         key_cache,
                         [kj_row, 0],
                         [block_size, head_dim],
                         target_memory=pl.MemorySpace.Mat,
-                        transpose=True,
                     )
+                    kj_l1 = pl.tile.transpose_view(kj_nat)
                     qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
                     kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right)
                     sij_l0c = pl.matmul(qi_l0a, kj_l0b)
@@ -233,6 +233,23 @@ class BatchSoftmaxPrepareTestCase(PTOTestCase):
         **kwargs,
     ):
         super().__init__(**kwargs)
+        # BF16-precision tolerance. pij_batch is a BF16 output and lij is a
+        # row_sum of BF16-quantized exp values (exp -> cast BF16 -> FP32 ->
+        # row_sum). The device's hardware exp is a ~1-2 ULP approximation, so an
+        # exp value near a BF16 rounding boundary rounds to a different BF16 than
+        # the torch.exp golden -- a full one-ULP mismatch on that element. BF16
+        # has 8 significand bits, so eps = 2^-7 ~ 7.8e-3 and one ULP is up to
+        # 2^-8 ~ 3.9e-3 absolute for a value near 0.5. rtol must therefore be
+        # >= one BF16 ULP relative; rtol=1.6e-2 (PyTorch's bf16 assert_close
+        # default, ~2 ULP of margin) covers it across (0, 1] -- e.g. at 0.5 the
+        # threshold is atol + rtol*0.5 = 9e-3 > 3.9e-3 -- with atol=1e-3 for
+        # near-zero summands. Observed CI flake (a2a3): 1/32 elements,
+        # |1.6414794921875 - 1.6405029296875| = 2^-10 ~ 9.8e-4 (1 bf16 ULP of a
+        # summand); 1.6e-2 clears it. The default rtol=atol=1e-5 is ~3 orders of
+        # magnitude too tight and flakes intermittently.
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 1.6e-2
         self.batch = batch
         self.num_heads = num_heads
         self.block_size = block_size
@@ -864,8 +881,15 @@ class BatchPagedAttentionTestCase(PTOTestCase):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.config.atol = 1e-3
-        self.config.rtol = 1e-3
+        # Full attention: BF16 QK/PV matmuls + an FP16 softmax pij intermediate (the
+        # assembled program's pij_b is pl.FP16; the golden casts pij through
+        # torch.float16). The dominant error is the bf16 matmul reductions -- one bf16
+        # ULP (up to 2^-8 ~ 3.9e-3) exceeds the fp16 pij's ULP -- so rtol=2e-2 (bf16
+        # scale) matches the other bf16 attention s-tests; the prior 1e-3 is below one
+        # bf16 ULP.
+        if kwargs.get("config") is None:  # respect a caller-supplied (e.g. stricter) config
+            self.config.atol = 1e-3
+            self.config.rtol = 2e-2
         self.batch = batch
         self.num_heads = num_heads
         self.head_dim = head_dim

@@ -976,57 +976,6 @@ class ForKind(enum.Enum):
     persists as a marker through ``CanonicalizeIOOrder`` (which demotes it to
     ``Sequential`` on exit) and must not survive past that pass."""
 
-class ChunkPolicy(enum.Enum):
-    """Chunk policy for loop chunking.
-
-    Controls how iterations are distributed across chunks.
-    """
-
-    LeadingFull = ...
-    """Full chunks first, smaller remainder at end (splits into main + remainder kernels)."""
-
-    Guarded = ...
-    """Single loop over ceil(N/C) chunks with per-iteration if-guard (default)."""
-
-class ChunkConfig:
-    """Chunk configuration for parallel loop splitting."""
-
-    size: Final[Expr]
-    """Chunk size expression."""
-
-    policy: Final[ChunkPolicy]
-    """Chunk distribution policy."""
-
-    def __init__(self, size: Expr, policy: ChunkPolicy = ChunkPolicy.Guarded) -> None:
-        """Create a chunk configuration.
-
-        Args:
-            size: Chunk size expression
-            policy: Chunk distribution policy (default: Guarded)
-        """
-
-class LoopOrigin(enum.Enum):
-    """Loop origin classification.
-
-    Tracks how a loop was generated:
-    - Original: Regular loop (default)
-    - ChunkOuter: Outer loop from chunk splitting
-    - ChunkInner: Inner loop from chunk splitting
-    - ChunkRemainder: Remainder loop from chunk splitting
-    """
-
-    Original = ...
-    """Regular loop (default)."""
-
-    ChunkOuter = ...
-    """Outer loop from chunk splitting."""
-
-    ChunkInner = ...
-    """Inner loop from chunk splitting."""
-
-    ChunkRemainder = ...
-    """Remainder loop from chunk splitting."""
-
 class MemorySpace(enum.Enum):
     """Memory space enumeration."""
 
@@ -2094,15 +2043,6 @@ class ForStmt(Stmt):
     kind: Final[ForKind]
     """Loop kind (Sequential, Parallel, or Unroll)."""
 
-    chunk_config: Final[ChunkConfig | None]
-    """Chunk configuration (None = no chunking)."""
-
-    chunk_size: Final[Expr | None]
-    """Chunk size expression (None if no chunking). Convenience for chunk_config.size."""
-
-    chunk_policy: Final[ChunkPolicy]
-    """Chunk distribution policy. Convenience for chunk_config.policy."""
-
     attrs: Final[dict[str, object]]
     """Loop-level attributes (key-value metadata)."""
 
@@ -2117,8 +2057,6 @@ class ForStmt(Stmt):
         return_vars: list[Var],
         span: Span,
         kind: ForKind = ForKind.Sequential,
-        chunk_size: Expr | None = None,
-        chunk_policy: ChunkPolicy = ChunkPolicy.Guarded,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
     ) -> None:
         """Create a for loop statement.
@@ -2133,8 +2071,6 @@ class ForStmt(Stmt):
             return_vars: Return variables (can be empty)
             span: Source location
             kind: Loop kind (default: Sequential)
-            chunk_size: Optional chunk size for loop chunking
-            chunk_policy: Chunk distribution policy (default: Guarded)
             attrs: Loop-level attributes (default: empty)
         """
 
@@ -2177,9 +2113,6 @@ class ScopeKind(enum.Enum):
     InCore = 0
     """InCore scope for AICore sub-graphs."""
 
-    AutoInCore = 1
-    """AutoInCore scope for automatic chunking."""
-
     Cluster = 2
     """Cluster scope for co-scheduled AIC + AIV groups."""
 
@@ -2195,6 +2128,9 @@ class ScopeKind(enum.Enum):
     CommDomain = 6
     """Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch
     window buffers)."""
+
+    SplitAiv = 7
+    """Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)."""
 
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
@@ -2289,8 +2225,8 @@ class ScopeStmt(Stmt):
     (a ``list[Var]`` of TaskId producers populated by ``pl.at(..., deps=[...])``)."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
-        """ScopeStmt is abstract — construct an InCoreScopeStmt, AutoInCoreScopeStmt,
-        ClusterScopeStmt, HierarchyScopeStmt, or SpmdScopeStmt instead."""
+        """ScopeStmt is abstract — construct an InCoreScopeStmt, ClusterScopeStmt,
+        HierarchyScopeStmt, SplitAivScopeStmt, or SpmdScopeStmt instead."""
 
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
@@ -2307,22 +2243,6 @@ class InCoreScopeStmt(ScopeStmt):
         span: Span,
     ) -> None:
         """Create an InCore scope statement."""
-
-class AutoInCoreScopeStmt(ScopeStmt):
-    """AutoInCore scope: InCore region with automatic chunking."""
-
-    split: Final[SplitMode | None]
-    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
-
-    def __init__(
-        self,
-        split: SplitMode | None = None,
-        name_hint: str = "",
-        *,
-        body: Stmt,
-        span: Span,
-    ) -> None:
-        """Create an AutoInCore scope statement."""
 
 class ClusterScopeStmt(ScopeStmt):
     """Cluster scope: co-scheduled AIC + AIV group."""
@@ -2374,6 +2294,22 @@ class SpmdScopeStmt(ScopeStmt):
         ``Expr`` of integer type.
         """
 
+class SplitAivScopeStmt(ScopeStmt):
+    """Explicit AIV-split region: `for aiv_id in pl.split_aiv(2, mode=...)`.
+
+    Dispatches a region across the 2 AIV subblocks. ``mode=SplitMode.NONE`` is
+    task-parallel (no halving; both lanes run the full body, dispatched via
+    ``aiv_id``); ``UP_DOWN`` / ``LEFT_RIGHT`` are data-parallel (vector compute
+    halved on the split axis). Erased by LowerAutoVectorSplit (pass 20); never
+    reaches codegen.
+    """
+
+    split: Final[SplitMode]
+    count: Final[int]
+    def __init__(
+        self, split: SplitMode, count: int = 2, name_hint: str = "", *, body: Stmt, span: Span
+    ) -> None: ...
+
 class RuntimeScopeStmt(ScopeStmt):
     """Runtime orchestration scope: a PTO2_SCOPE wrapper at codegen.
 
@@ -2405,8 +2341,8 @@ class CommDomainScopeStmt(ScopeStmt):
     buffers=[CommBufferSpec(...)]) as __comm_d<n>:`` block at the top of the
     host orchestration function, then emits ``body`` inside that block.
 
-    Synthesized by the ``MaterializeCommDomainScopes`` pass (formerly
-    ``MaterializeCommDomainScopes``); no user DSL surface. The Python printer is
+    Synthesized by the ``MaterializeCommDomainScopes`` pass; no user DSL surface.
+    The Python printer is
     transparent over this stmt — reparse + re-run the pass pipeline restores
     the scope. ``.pto`` binary round-trip is lossless via reflection.
     """
@@ -2975,6 +2911,22 @@ def create_op_call(
         Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
+def set_call_attrs(call: Call, attrs: Mapping[str, object]) -> Call:
+    """Return a copy of ``call`` with compiler-internal ``attrs_`` set.
+
+    Used by the round-trip parser to re-attach generic op-call attrs (e.g.
+    ``pipeline_membership``) surfaced by the printer as ``attrs={...}``; op DSL
+    wrappers / IR builders take no attrs parameter, so the call is built first
+    and attrs are layered on here.
+
+    Args:
+        call: The Call to copy
+        attrs: Compiler-internal metadata to attach
+
+    Returns:
+        A new Call with the given attrs
+    """
+
 def is_incore_type(func_type: FunctionType) -> bool:
     """Check if a FunctionType is an InCore variant (InCore, AIC, or AIV).
 
@@ -3148,8 +3100,6 @@ class IRBuilder:
         step: Expr,
         span: Span,
         kind: ForKind = ForKind.Sequential,
-        chunk_size: Expr | None = None,
-        chunk_policy: ChunkPolicy = ChunkPolicy.Guarded,
         attrs: dict[str, object] | list[tuple[str, object]] | None = None,
     ) -> None:
         """Begin building a for loop.
@@ -3161,8 +3111,6 @@ class IRBuilder:
             step: Step value expression
             span: Source location for loop definition
             kind: Loop kind (default: Sequential)
-            chunk_size: Optional chunk size for loop chunking
-            chunk_policy: Chunk distribution policy (default: Guarded)
             attrs: Loop-level attributes (default: empty)
         """
 
@@ -3832,10 +3780,10 @@ class IRVisitor:
     def visit_for_stmt(self, op: ForStmt) -> None: ...
     def visit_while_stmt(self, op: WhileStmt) -> None: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
-    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> None: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
+    def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> None: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> None: ...
     def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> None: ...
     def visit_seq_stmts(self, op: SeqStmts) -> None: ...
@@ -3914,10 +3862,10 @@ class IRMutator:
     def visit_for_stmt(self, op: ForStmt) -> Stmt: ...
     def visit_while_stmt(self, op: WhileStmt) -> Stmt: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
-    def visit_auto_in_core_scope_stmt(self, op: AutoInCoreScopeStmt) -> Stmt: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
+    def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> Stmt: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> Stmt: ...
     def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> Stmt: ...
     def visit_seq_stmts(self, op: SeqStmts) -> Stmt: ...

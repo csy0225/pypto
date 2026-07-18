@@ -81,5 +81,28 @@ REGISTER_OP("system.bar_all")
     .no_argument()
     .f_deduce_type(DeduceUnknownType);
 
+// Register system.syncall (Cross-core all-participant barrier). Models
+// pto::SYNCALL with two modes selected by the `mode` attribute:
+//   - "hard" (default): FFTS barrier, no operands. Codegen emits
+//     `pto.syncall() mode = <hard>`. Requires full-core occupancy.
+//   - "soft": GM-polling barrier with operands. Codegen emits
+//     `pto.syncall(%gm, %scratch[, %l1], %used : ...) mode = <soft>`.
+//     Operand order (positional, count not enforced by the registry):
+//       aiv_only / aic_only: [gm_workspace, scratch_tile, used_cores]
+//       mix:                 [gm_workspace, ub_scratch, l1_scratch, used_cores]
+//     where gm_workspace is a shared GM int32 buffer (used_cores*8 slots,
+//     zero-initialized), scratch tiles are local int32 staging (UB on AIV,
+//     L1 on AIC), and used_cores is an i32 participant count (0 = auto).
+// Attributes: core_type ("aiv_only"|"aic_only"|"mix"), mode ("hard"|"soft").
+REGISTER_OP("system.syncall")
+    .set_description("Cross-core all-participant barrier (pto::SYNCALL)")
+    .set_op_category("SyncOp")
+    .add_argument("gm_workspace", "Soft form: shared GM int32 workspace (used_cores*8 slots, zero-init)")
+    .add_argument("scratch", "Soft form: local int32 staging tile (UB on AIV, L1 on AIC)")
+    .add_argument("used_cores", "Soft form: participant core count (i32; 0 = auto)")
+    .set_attr<std::string>("core_type")
+    .set_attr<std::string>("mode")
+    .f_deduce_type(DeduceUnknownType);
+
 }  // namespace ir
 }  // namespace pypto

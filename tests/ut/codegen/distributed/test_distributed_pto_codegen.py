@@ -12,8 +12,9 @@
 Covers the InCore PTO codegen for ``pld.tile.remote_load``,
 ``pld.system.notify`` and ``pld.system.wait``:
 
-- CommContext ``!pto.ptr<i64>`` parameter is appended at the end of the
-  ``func.func`` signature, one per ``DistributedTensor`` IR param.
+- MaterializeDistTensorCtx adds one explicit CommContext IR parameter per
+  ``DistributedTensor`` IR param; PTO codegen lowers each one to
+  ``!pto.ptr<i64>``.
 - One module-level ``func.func @CommRemoteOffset_<dtype>`` helper is
   emitted per distinct element dtype consumed by remote ops. The helper
   reads the CommContext field, computes the byte→element delta between
@@ -61,8 +62,8 @@ def _generate_mlir(program_cls) -> str:
     return codegen.PTOCodegen().generate(optimized)
 
 
-def test_ctx_arg_appended_per_distributed_tensor():
-    """One ``!pto.ptr<i64>`` arg appended per DistributedTensor param."""
+def test_ctx_arg_materialized_per_distributed_tensor():
+    """One explicit ``!pto.ptr<i64>`` arg is emitted per DistributedTensor param."""
 
     @pl.program
     class P:
@@ -84,7 +85,7 @@ def test_ctx_arg_appended_per_distributed_tensor():
     # (peer) + 2 ctx ptrs (one per DistributedTensor).
     header = next(line for line in mlir.splitlines() if "func.func @kernel" in line)
     assert header.count("%arg") == 6, header
-    # Trailing args after the explicit IR params are the ctx ptrs.
+    # Args after user scalars are the explicit ctx ptrs materialized in IR.
     assert "%arg4: !pto.ptr<i64>" in header, header
     assert "%arg5: !pto.ptr<i64>" in header, header
     # The CtxArg type only appears in the func header at this point (later
@@ -542,6 +543,146 @@ def test_put_emits_comm_tput_with_attr_and_staging_tile():
     assert "pto.addptr" in mlir
     assert "_peer_pview" in mlir
     assert "_local_pview" in mlir
+
+
+def test_put_chunk_shrinks_staging_tile_keeping_full_partition_view():
+    """``chunk_rows`` / ``chunk_cols`` shrink the VEC staging tile while the
+    partition views keep the full transfer extent — pto-isa TPUT then 2-D-slides
+    the full transfer through the sub-tile, so transfers larger than UB no longer
+    need a full tile."""
+
+    @pl.program
+    class PChunk:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.put(dst, peer=peer, src=src, atomic=pld.AtomicType.None_, chunk_rows=4, chunk_cols=32)
+
+    mlir = _generate_mlir(PChunk)
+    tput_line = next(line for line in mlir.splitlines() if "pto.comm.tput(" in line)
+    # Partition views still describe the FULL 16x64 transfer (TPUT reads the full
+    # extent from these and chunks internally).
+    assert tput_line.count("!pto.partition_tensor_view<16x64xf16>") == 2
+    # The staging tile is the [4, 32] chunk, not the full [16, 64] transfer.
+    stage_alloc_line = next(
+        line for line in mlir.splitlines() if "pto.alloc_tile" in line and "tput_stage" in line
+    )
+    assert "rows=4" in stage_alloc_line and "cols=32" in stage_alloc_line, (
+        f"staging tile must be the [4, 32] chunk, got: {stage_alloc_line}"
+    )
+    # A drain barrier is emitted immediately after the tput so a following
+    # cross-rank notify can't race the chunked stores (PTOAS#872 workaround).
+    lines = mlir.splitlines()
+    tput_idx = next(i for i, line in enumerate(lines) if "pto.comm.tput(" in line)
+    assert "pto.barrier <PIPE_ALL>" in lines[tput_idx + 1], (
+        f"expected a PIPE_ALL drain right after tput, got: {lines[tput_idx + 1]}"
+    )
+
+
+def test_put_pipeline_emits_two_staging_buffers_in_one_buf_group():
+    """``pipeline=True`` emits two VEC staging tiles inside a single ``buf(...)``
+    operand group, each contributing a trailing ``!pto.tile_buf`` type — pto-isa's
+    ping-pong TPUT overload."""
+
+    @pl.program
+    class PPipe:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.put(
+                dst,
+                peer=peer,
+                src=src,
+                atomic=pld.AtomicType.None_,
+                chunk_rows=4,
+                chunk_cols=32,
+                pipeline=True,
+            )
+
+    mlir = _generate_mlir(PPipe)
+    tput_line = next(line for line in mlir.splitlines() if "pto.comm.tput(" in line)
+    # Both ping/pong tiles ride in a single buf(...) group: two comma-separated
+    # SSA tile operands and two trailing tile_buf types.
+    buf_inner = tput_line.split("buf(", 1)[1].split(")", 1)[0]
+    assert buf_inner.count(",") == 1, f"expected two staging tiles in buf(...), got: {tput_line}"
+    assert tput_line.count("!pto.tile_buf<loc=vec") == 2, (
+        f"double-buffered tput must list two tile_buf types, got: {tput_line}"
+    )
+    # Two distinct staging tiles are allocated (ping + pong), each the [4, 32] chunk.
+    ping = next(line for line in mlir.splitlines() if "pto.alloc_tile" in line and "tput_stage_ping" in line)
+    pong = next(line for line in mlir.splitlines() if "pto.alloc_tile" in line and "tput_stage_pong" in line)
+    for line in (ping, pong):
+        assert "rows=4" in line and "cols=32" in line, f"staging tile must be [4, 32], got: {line}"
+
+
+def test_get_pipeline_emits_two_staging_buffers_in_one_buf_group():
+    """``pipeline=True`` on get emits the two-buffer ping-pong TGET form."""
+
+    @pl.program
+    class PGetPipe:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.get(dst, peer=peer, src=src, chunk_rows=4, chunk_cols=32, pipeline=True)
+
+    mlir = _generate_mlir(PGetPipe)
+    tget_line = next(line for line in mlir.splitlines() if "pto.comm.tget(" in line)
+    buf_inner = tget_line.split("buf(", 1)[1].split(")", 1)[0]
+    assert buf_inner.count(",") == 1, f"expected two staging tiles in buf(...), got: {tget_line}"
+    assert tget_line.count("!pto.tile_buf<loc=vec") == 2, (
+        f"double-buffered tget must list two tile_buf types, got: {tget_line}"
+    )
+    assert any("tget_stage_ping" in line for line in mlir.splitlines())
+    assert any("tget_stage_pong" in line for line in mlir.splitlines())
+
+
+def test_put_subregion_dynamic_shape_with_chunk():
+    """A dynamic subregion transfer extent emits a dynamic partition view while
+    the staging tile stays statically sized from the chunk — pto-isa chunks the
+    runtime extent. The fixed window stays static; only the transfer is dynamic."""
+
+    @pl.program
+    class PDyn:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[16, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+            n: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.put(
+                dst,
+                peer=peer,
+                src=src,
+                dst_offsets=[0, 0],
+                src_offsets=[0, 0],
+                shape=[n, 64],
+                chunk_rows=4,
+                chunk_cols=32,
+            )
+
+    mlir = _generate_mlir(PDyn)
+    tput_line = next(line for line in mlir.splitlines() if "pto.comm.tput(" in line)
+    # Dynamic rows in the partition view (the `n` runtime extent), static cols.
+    assert tput_line.count("!pto.partition_tensor_view<?x64xf16>") == 2, tput_line
+    # Staging tile is the static [4, 32] chunk (UB allocation is static).
+    stage_alloc_line = next(
+        line for line in mlir.splitlines() if "pto.alloc_tile" in line and "tput_stage" in line
+    )
+    assert "rows=4" in stage_alloc_line and "cols=32" in stage_alloc_line, stage_alloc_line
 
 
 def test_put_atomic_add_variant():

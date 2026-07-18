@@ -620,10 +620,7 @@ def _kw_dtype(kw: dict[str, Any]) -> str:
 
 def _handle_tile_load(a: list[str], kw: dict[str, Any]) -> str:
     # args: [tensor, offsets_tuple, shapes_tuple, valid_shapes_tuple]
-    expr = f"_tile_load({a[0]}, {a[1]}, {a[2]}, {a[3]})"
-    if kw.get("transpose"):
-        expr += ".mT"
-    return expr
+    return f"_tile_load({a[0]}, {a[1]}, {a[2]}, {a[3]})"
 
 
 def _handle_tile_store(a: list[str], kw: dict[str, Any]) -> str:
@@ -661,6 +658,14 @@ def _handle_slice(a: list[str], _kw: dict[str, Any]) -> str:
     if len(a) >= 4:
         return f"_tensor_slice({a[0]}, {a[2]}, {a[1]}, {a[3]})"
     return f"_tensor_slice({a[0]}, {a[2]}, {a[1]})"
+
+
+def _handle_tile_extract(a: list[str], _kw: dict[str, Any]) -> str:
+    # args: [src, idx_row, idx_col, shape] — the SSA-form Mat->Left/Right slice
+    # produced by AutoTileMatmulL0.  Numerically a 2D slice
+    # ``src[idx_row : idx_row + shape[0], idx_col : idx_col + shape[1]]``; the
+    # target memory space is irrelevant to the reference semantics.
+    return f"_tensor_slice({a[0]}, [{a[1]}, {a[2]}], {a[3]})"
 
 
 def _pad_mode_literal(kw: dict[str, Any]) -> str:
@@ -853,7 +858,29 @@ def _build_group_meta(program: _ir.Program) -> dict[str, dict[str, Any]]:
 _OP_MAP: dict[str, OpHandler] = {}
 
 
-def _register_ops() -> None:
+def _register_reductions(m: dict, prefix: str) -> None:
+    """Register row/col reduction handlers (tile forms may carry an ignored tmp_tile)."""
+    m[f"{prefix}.row_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-1, keepdim=True)"
+    m[f"{prefix}.row_max"] = lambda a, _kw: f"{a[0]}.amax(dim=-1, keepdim=True)"
+    m[f"{prefix}.row_min"] = lambda a, _kw: f"{a[0]}.amin(dim=-1, keepdim=True)"
+    m[f"{prefix}.row_prod"] = lambda a, _kw: f"{a[0]}.prod(dim=-1, keepdim=True)"
+    m[f"{prefix}.col_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-2, keepdim=True)"
+    m[f"{prefix}.col_max"] = lambda a, _kw: f"{a[0]}.amax(dim=-2, keepdim=True)"
+    m[f"{prefix}.col_min"] = lambda a, _kw: f"{a[0]}.amin(dim=-2, keepdim=True)"
+    m[f"{prefix}.col_prod"] = lambda a, _kw: f"{a[0]}.prod(dim=-2, keepdim=True)"
+
+
+def _register_expands(m: dict, prefix: str) -> None:
+    """Register row/col expand max/min/expdif handlers (torch broadcasting)."""
+    m[f"{prefix}.row_expand_max"] = lambda a, _kw: f"torch.maximum({a[0]}, {a[1]})"
+    m[f"{prefix}.row_expand_min"] = lambda a, _kw: f"torch.minimum({a[0]}, {a[1]})"
+    m[f"{prefix}.row_expand_expdif"] = lambda a, _kw: f"torch.exp({a[0]} - {a[1]})"
+    m[f"{prefix}.col_expand_max"] = lambda a, _kw: f"torch.maximum({a[0]}, {a[1]})"
+    m[f"{prefix}.col_expand_min"] = lambda a, _kw: f"torch.minimum({a[0]}, {a[1]})"
+    m[f"{prefix}.col_expand_expdif"] = lambda a, _kw: f"torch.exp({a[0]} - {a[1]})"
+
+
+def _register_ops() -> None:  # noqa: PLR0915
     m = _OP_MAP
 
     # --- Tensor element-wise binary ---
@@ -864,6 +891,14 @@ def _register_ops() -> None:
         m[f"{prefix}.div"] = _torch_fn("div", 2)
         m[f"{prefix}.maximum"] = _torch_fn("maximum", 2)
         m[f"{prefix}.minimum"] = _torch_fn("minimum", 2)
+        m[f"{prefix}.fmod"] = _torch_fn("fmod", 2)
+
+        # partial-combine ops reduce to the plain op when both inputs are
+        # fully valid (the reference path has no partial valid regions)
+        m[f"{prefix}.part_add"] = _torch_fn("add", 2)
+        m[f"{prefix}.part_mul"] = _torch_fn("mul", 2)
+        m[f"{prefix}.part_max"] = _torch_fn("maximum", 2)
+        m[f"{prefix}.part_min"] = _torch_fn("minimum", 2)
 
         # scalar variants: same math, torch broadcasting handles it
         m[f"{prefix}.adds"] = _binop("+")
@@ -873,6 +908,7 @@ def _register_ops() -> None:
         m[f"{prefix}.maximums"] = _torch_fn("maximum", 2)
         m[f"{prefix}.minimums"] = _torch_fn("minimum", 2)
         m[f"{prefix}.rems"] = _binop("%")
+        m[f"{prefix}.fmods"] = _torch_fn("fmod", 2)
 
         # unary
         m[f"{prefix}.neg"] = _torch_fn("neg")
@@ -888,17 +924,14 @@ def _register_ops() -> None:
         # cast
         m[f"{prefix}.cast"] = _handle_cast
 
-        # row reductions (take a tmp_tile arg in tile, ignore it)
-        m[f"{prefix}.row_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-1, keepdim=True)"
-        m[f"{prefix}.row_max"] = lambda a, _kw: f"{a[0]}.amax(dim=-1, keepdim=True)"
-        m[f"{prefix}.row_min"] = lambda a, _kw: f"{a[0]}.amin(dim=-1, keepdim=True)"
-
-        # col reductions — tile.col_sum may carry an optional tmp_tile arg; ignore it.
-        m[f"{prefix}.col_sum"] = lambda a, _kw: f"{a[0]}.sum(dim=-2, keepdim=True)"
+        # row / col reductions (tile forms may carry an ignored tmp_tile)
+        _register_reductions(m, prefix)
 
         # reshape / transpose / slice / concat
         m[f"{prefix}.reshape"] = lambda a, _kw: f"{a[0]}.reshape({a[1]})"
         m[f"{prefix}.transpose"] = lambda a, _kw: f"{a[0]}.transpose({a[1]}, {a[2]})"
+        # transpose_view: zero-copy reinterpret swapping the trailing two dims.
+        m[f"{prefix}.transpose_view"] = lambda a, _kw: f"{a[0]}.mT"
         m[f"{prefix}.concat"] = lambda a, _kw: f"torch.cat([{a[0]}, {a[1]}], dim=-1)"
 
         # fillpad
@@ -923,6 +956,7 @@ def _register_ops() -> None:
         m[f"{prefix}.col_expand"] = _expand_as_target()
         m[f"{prefix}.row_expand"] = _expand_as_target()
         m[f"{prefix}.expands"] = lambda a, _kw: f"torch.full_like({a[0]}, {a[1]})"
+        _register_expands(m, prefix)
 
     # --- Tensor-only ops ---
     m["tensor.matmul"] = _handle_tensor_matmul
@@ -942,6 +976,7 @@ def _register_ops() -> None:
     m["tile.alloc"] = _handle_create
     m["tile.move"] = _identity()
     m["tile.slice"] = _handle_slice
+    m["tile.extract"] = _handle_tile_extract
     m["tile.read"] = lambda a, _kw: f"{a[0]}[{a[1]}]"
     m["tile.write"] = lambda a, _kw: f"_write_and_return({a[0]}, {a[1]}, {a[2]})"
     m["tile.get_block_idx"] = lambda _a, _kw: "0"

@@ -364,31 +364,6 @@ class StructuralEqualImpl {
     return true;
   }
 
-  result_type VisitLeafField(const ChunkPolicy& lhs, const ChunkPolicy& rhs) {
-    if (lhs != rhs) {
-      if constexpr (AssertMode) {
-        std::ostringstream msg;
-        msg << "ChunkPolicy mismatch (" << ChunkPolicyToString(lhs) << " != " << ChunkPolicyToString(rhs)
-            << ")";
-        ThrowMismatch(msg.str(), IRNodePtr(), IRNodePtr(), "", "");
-      }
-      return false;
-    }
-    return true;
-  }
-
-  result_type VisitLeafField(const std::optional<ChunkConfig>& lhs, const std::optional<ChunkConfig>& rhs) {
-    if (lhs.has_value() != rhs.has_value()) {
-      if constexpr (AssertMode) {
-        ThrowMismatch("ChunkConfig presence mismatch", IRNodePtr(), IRNodePtr(), "", "");
-      }
-      return false;
-    }
-    if (!lhs.has_value()) return true;
-    if (!VisitIRNodeField(lhs->size, rhs->size)) return false;
-    return VisitLeafField(lhs->policy, rhs->policy);
-  }
-
   [[nodiscard]] result_type VisitLeafField(const ScopeKind& lhs, const ScopeKind& rhs) {
     if (lhs != rhs) {
       if constexpr (AssertMode) {
@@ -635,9 +610,6 @@ class StructuralEqualImpl {
       } else if (lhs_val.type() == typeid(MemorySpace)) {
         values_equal = (AnyCast<MemorySpace>(lhs_val, "comparing kwarg: " + lhs_key) ==
                         AnyCast<MemorySpace>(rhs_val, "comparing kwarg: " + lhs_key));
-      } else if (lhs_val.type() == typeid(LoopOrigin)) {
-        values_equal = (AnyCast<LoopOrigin>(lhs_val, "comparing kwarg: " + lhs_key) ==
-                        AnyCast<LoopOrigin>(rhs_val, "comparing kwarg: " + lhs_key));
       } else if (lhs_val.type() == typeid(TensorLayout)) {
         values_equal = (AnyCast<TensorLayout>(lhs_val, "comparing kwarg: " + lhs_key) ==
                         AnyCast<TensorLayout>(rhs_val, "comparing kwarg: " + lhs_key));
@@ -990,10 +962,10 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(ForStmt)
   EQUAL_DISPATCH(WhileStmt)
   EQUAL_DISPATCH(InCoreScopeStmt)
-  EQUAL_DISPATCH(AutoInCoreScopeStmt)
   EQUAL_DISPATCH(ClusterScopeStmt)
   EQUAL_DISPATCH(HierarchyScopeStmt)
   EQUAL_DISPATCH(SpmdScopeStmt)
+  EQUAL_DISPATCH(SplitAivScopeStmt)
   EQUAL_DISPATCH(RuntimeScopeStmt)
   EQUAL_DISPATCH(CommDomainScopeStmt)
   EQUAL_DISPATCH_TRANSPARENT(SeqStmts)

@@ -145,27 +145,15 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       break;
     }
   }
-  bool transpose = GetKwarg<bool>(kwargs, "transpose", false);
-
-  // Transpose semantics are Mat-specific. Callers that use transpose=true must
-  // commit to target_memory=Mat at construction — InferTileMemorySpace does not
-  // revisit transpose decisions.
-  CHECK(!transpose || (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat))
-      << "The operator " << op_name << " only supports transpose=true when target_memory is Mat (L1)";
-
-  CHECK(!transpose || shapes_tuple->elements_.size() >= 2)
-      << "The operator " << op_name << " requires at least 2D shapes for transpose=true, but got "
-      << shapes_tuple->elements_.size() << "D";
-
   // Nz/Zn layout: only chosen when target_memory is known. If it is absent,
   // the default-constructed view is kept and InferTileMemorySpace rebuilds it
   // once the memory space is resolved.
   //
   // Source-DN equivalence (RFC #1300 §3.3 + P6): a DN-tagged source tensor
   // describes the same physical bytes as the canonical-pair ND view, so
-  // ``tile.load`` of a DN source produces the same tile layout as
-  // ``transpose=True`` on the equivalent ND source. Treat the two signals
-  // (source layout == DN, transpose kwarg) as an XOR.
+  // ``tile.load`` of a DN source produces the transposed (ZN) Mat layout.
+  // A transposed matmul operand is realised by a zero-copy ``tile.transpose_view``
+  // at the matmul site, not by the load.
   bool source_is_dn =
       tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == TensorLayout::DN;
   TileView tile_view;
@@ -173,7 +161,7 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     if (*target_memory_opt == MemorySpace::Mat) {
       tile_view.blayout = TileLayout::col_major;
       tile_view.slayout = TileLayout::row_major;
-      if (transpose != source_is_dn) {
+      if (source_is_dn) {
         std::swap(tile_view.blayout, tile_view.slayout);
       }
     } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
@@ -182,20 +170,10 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     }
   }
 
-  // Build tile shape from shapes tuple.
-  // When transpose=true, shapes are in original (source tensor) coordinates;
-  // swap the last two dimensions to transposed coordinates for the output TileType.
-  auto shape_elements = shapes_tuple->elements_;
-  if (transpose && shape_elements.size() >= 2) {
-    std::iter_swap(shape_elements.end() - 2, shape_elements.end() - 1);
-  }
-  std::vector<ExprPtr> tile_shape(shape_elements.begin(), shape_elements.end());
+  // Build tile shape from shapes tuple (always in source-tensor coordinates).
+  std::vector<ExprPtr> tile_shape(shapes_tuple->elements_.begin(), shapes_tuple->elements_.end());
 
-  auto valid_elements = valid_shapes_tuple->elements_;
-  if (transpose && valid_elements.size() >= 2) {
-    std::iter_swap(valid_elements.end() - 2, valid_elements.end() - 1);
-  }
-  tile_view.valid_shape = valid_elements;
+  tile_view.valid_shape = valid_shapes_tuple->elements_;
 
   // Return TileType with same dtype as tensor and TileView containing valid_shape.
   // When target_memory is specified, write it into memory_space_ so the constructed
@@ -259,10 +237,15 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << " atomic kwarg must be AtomicType.None_ or AtomicType.Add, but got int " << atomic;
   if (atomic == static_cast<int>(AtomicType::kAdd)) {
     const DataType& dt = tile_type->dtype_;
-    CHECK(dt == DataType::FP32 || dt == DataType::FP16 || dt == DataType::INT32 || dt == DataType::INT16 ||
-          dt == DataType::INT8)
+    // Hardware atomic-add dtypes. bf16 is honoured on the A2/A3 (Ascend910B) and
+    // kirinX90 profiles (pto-isa SetAtomicAdd<bfloat16_t> -> set_atomic_bf16);
+    // it is NOT supported on the A5/kirin9030 store path, where a bf16 atomic
+    // store is rejected downstream by the pto-isa static_assert.
+    CHECK(dt == DataType::FP32 || dt == DataType::BF16 || dt == DataType::FP16 || dt == DataType::INT32 ||
+          dt == DataType::INT16 || dt == DataType::INT8)
         << "The operator " << op_name
-        << " with atomic=AtomicType.Add requires an fp32/fp16/int32/int16/int8 tile (hardware atomic-add "
+        << " with atomic=AtomicType.Add requires an fp32/bf16/fp16/int32/int16/int8 tile (hardware "
+           "atomic-add "
            "dtypes), but got "
         << dt.ToString();
   }
@@ -383,8 +366,15 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   // carries when loaded with b_trans, and the only Mat layout a DN-source
   // gather_row (DN2ZN tload) can fill. Default false keeps the canonical NZ.
   bool transpose_layout = false;
+  // `flat_layout=true` requests a flat (non-fractal, slayout=none_box) L1/cbuf
+  // tile: a contiguous byte-staging buffer rather than the boxed NZ layout Mat
+  // tiles normally carry. Used for the mix/aic_only soft `system.syncall` L1
+  // scratch (pto-isa `Tile<TileType::Mat, ..., SLayout::NoneBox>`), whose 8
+  // int32 counter slots must be contiguous — a fractal layout mis-places them.
+  bool flat_layout = false;
   for (const auto& [k, v] : kwargs) {
     if (k == "transpose") transpose_layout = AnyCast<bool>(v, "transpose");
+    if (k == "flat_layout") flat_layout = AnyCast<bool>(v, "flat_layout");
   }
   // The transposed Mat (ZN) layout is a 2D L1 matmul-`b_trans` operand layout; it
   // is meaningless for a non-Mat space or a non-2D shape. Fail fast rather than
@@ -393,8 +383,22 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
         (tile_shape.size() == 2 && target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat))
       << "The operator " << op_name
       << " supports transpose=true only for a 2D tile with target_memory=Mat (L1)";
+  // flat_layout is a Mat (L1/cbuf) staging layout and mutually exclusive with the
+  // transposed NZ layout.
+  CHECK(!flat_layout ||
+        (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat && !transpose_layout))
+      << "The operator " << op_name
+      << " supports flat_layout=true only for target_memory=Mat (L1) without transpose";
 
-  if (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Acc) {
+  // A flat L1 tile keeps the canonical flat view (blayout=row_major,
+  // slayout=none_box, fractal default) — it is deliberately NOT boxed. We also
+  // stamp memory_space_=Mat at creation so InferTileMemorySpace sees the space
+  // is already resolved and preserves the none_box view instead of overwriting
+  // it with Mat's implicit boxed layout (see ComputeRewrittenType).
+  std::optional<MemorySpace> creation_space = std::nullopt;
+  if (flat_layout) {
+    creation_space = MemorySpace::Mat;
+  } else if (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Acc) {
     tile_view.blayout = TileLayout::col_major;
     tile_view.slayout = TileLayout::row_major;
     tile_view.fractal = 1024;
@@ -409,7 +413,7 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
     }
   }
   tile_view.valid_shape = tile_shape;
-  return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
+  return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view, creation_space);
 }
 
 TypePtr DeduceTileFullType(const std::vector<ExprPtr>& args,
@@ -521,6 +525,95 @@ TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
 
   TileView tile_view;
   tile_view.valid_shape = tile_shape;
+  return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
+}
+
+TypePtr DeduceTileRandomType(const std::vector<ExprPtr>& args,
+                             const std::vector<std::pair<std::string, std::any>>& kwargs,
+                             const std::string& op_name) {
+  // tile.random signature: (key0, key1, counter0, counter1, counter2, counter3, shape,
+  // [valid_shape]) with attrs {dtype, rounds}. Generates a tile of counter-based
+  // (Philox/ChaCha) pseudo-random values; the 6 scalars seed the generator (key +
+  // 128-bit counter) and the shape tuple gives the destination extent. There is no
+  // source tile. The optional trailing valid_shape tuple narrows the written region:
+  // pto.trandom only fills the dst valid rows/cols, leaving the rest untouched.
+  CHECK(args.size() == 7 || args.size() == 8)
+      << "The operator " << op_name
+      << " requires 7 or 8 arguments (key0, key1, counter0, counter1, counter2, counter3, "
+         "shape, [valid_shape]), but got "
+      << args.size();
+
+  // Destination dtype: pto.trandom emits 32-bit lanes only (INT32 or UINT32).
+  DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
+  CHECK(dtype == DataType::INT32 || dtype == DataType::UINT32)
+      << "The operator " << op_name << " requires dtype to be one of {INT32, UINT32}, but got "
+      << dtype.ToString();
+
+  // rounds attr controls the cipher round count; the hardware only accepts 7 or 10.
+  int rounds = GetKwarg<int>(kwargs, "rounds", 10);
+  CHECK(rounds == 7 || rounds == 10) << "The operator " << op_name
+                                     << " requires rounds to be 7 or 10, but got " << rounds;
+
+  // The 6 seed arguments are 32-bit integer scalars (key[0..1], counter[0..3]).
+  for (size_t i = 0; i < 6; ++i) {
+    auto scalar_type = As<ScalarType>(args[i]->GetType());
+    CHECK(scalar_type) << "The operator " << op_name << " requires argument " << i
+                       << " (seed scalar) to be a scalar, but got " << args[i]->GetType()->TypeName();
+    CHECK(scalar_type->dtype_ == DataType::INT32)
+        << "The operator " << op_name << " requires seed argument " << i << " to have INT32 dtype, but got "
+        << scalar_type->dtype_.ToString();
+  }
+
+  // Shape must be a literal tuple of positive compile-time constants.
+  auto make_tuple = As<MakeTuple>(args[6]);
+  CHECK(make_tuple) << "The operator " << op_name
+                    << " requires the shape argument to be a MakeTuple of compile-time constants, but got "
+                    << args[6]->TypeName();
+
+  std::vector<ExprPtr> tile_shape;
+  tile_shape.reserve(make_tuple->elements_.size());
+  for (size_t i = 0; i < make_tuple->elements_.size(); ++i) {
+    auto const_int = As<ConstInt>(make_tuple->elements_[i]);
+    CHECK(const_int) << "The operator " << op_name << " shape element " << i
+                     << " must be a compile-time constant (ConstInt), but got "
+                     << make_tuple->elements_[i]->TypeName();
+    CHECK(const_int->value_ > 0) << "The operator " << op_name << " shape element " << i
+                                 << " must be positive, got " << const_int->value_;
+    tile_shape.push_back(make_tuple->elements_[i]);
+  }
+  CHECK(!tile_shape.empty()) << "The operator " << op_name << " requires non-empty shape";
+  // pto.trandom is a 2D row/col generator and FlattenTileNd does not lower it, so
+  // reject N-D shapes here rather than emit a tile the codegen cannot handle.
+  CHECK(tile_shape.size() == 2) << "The operator " << op_name
+                                << " requires a 2D shape (rows, cols), but got rank " << tile_shape.size();
+
+  // Default: the entire destination is populated (valid == full shape). An optional
+  // valid_shape tuple narrows the written region (must match rank and 0 < v <= shape).
+  std::vector<ExprPtr> valid_shape = tile_shape;
+  if (args.size() == 8) {
+    auto valid_tuple = As<MakeTuple>(args[7]);
+    CHECK(valid_tuple) << "The operator " << op_name
+                       << " requires valid_shape to be a MakeTuple of compile-time constants, but got "
+                       << args[7]->TypeName();
+    CHECK(valid_tuple->elements_.size() == tile_shape.size())
+        << "The operator " << op_name << " valid_shape rank (" << valid_tuple->elements_.size()
+        << ") must match shape rank (" << tile_shape.size() << ")";
+    valid_shape.clear();
+    valid_shape.reserve(valid_tuple->elements_.size());
+    for (size_t i = 0; i < valid_tuple->elements_.size(); ++i) {
+      auto v = As<ConstInt>(valid_tuple->elements_[i]);
+      CHECK(v) << "The operator " << op_name << " valid_shape element " << i
+               << " must be a compile-time constant (ConstInt)";
+      auto dim = As<ConstInt>(tile_shape[i]);
+      CHECK(v->value_ > 0 && (!dim || v->value_ <= dim->value_))
+          << "The operator " << op_name << " valid_shape element " << i << " (" << v->value_
+          << ") must be in (0, shape dim " << (dim ? dim->value_ : -1) << "]";
+      valid_shape.push_back(valid_tuple->elements_[i]);
+    }
+  }
+
+  TileView tile_view;
+  tile_view.valid_shape = valid_shape;
   return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
 }
 
@@ -671,6 +764,7 @@ REGISTER_OP("tile.create")
     .set_attr<DataType>("dtype")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<bool>("transpose")
+    .set_attr<bool>("flat_layout")
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
     .set_output_memory_from_kwarg("target_memory")
@@ -692,7 +786,6 @@ REGISTER_OP("tile.load")
         "valid_shapes",
         "Valid shape of tile in each dimension, in source tensor coordinates (TupleType of ScalarType). ")
     .set_attr<MemorySpace>("target_memory")
-    .set_attr<bool>("transpose")
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
     .set_output_memory_from_kwarg("target_memory")
@@ -847,6 +940,25 @@ REGISTER_OP("tile.ci")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileCiType(args, kwargs, "tile.ci");
+    });
+
+REGISTER_OP("tile.random")
+    .set_op_category("TileOp")
+    .set_description("Generate counter-based pseudo-random values into a destination tile (pto.trandom)")
+    .add_argument("key0", "First key word (INT32 scalar)")
+    .add_argument("key1", "Second key word (INT32 scalar)")
+    .add_argument("counter0", "Counter word 0 (INT32 scalar)")
+    .add_argument("counter1", "Counter word 1 (INT32 scalar)")
+    .add_argument("counter2", "Counter word 2 (INT32 scalar)")
+    .add_argument("counter3", "Counter word 3 (INT32 scalar)")
+    .add_argument("shape", "Destination shape (TupleType of ConstInt)")
+    .add_argument("valid_shape", "Optional written region (TupleType of ConstInt, <= shape)")
+    .set_attr<DataType>("dtype")
+    .set_attr<int>("rounds")
+    .set_output_memory(MemorySpace::Vec)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileRandomType(args, kwargs, "tile.random");
     });
 
 }  // namespace ir

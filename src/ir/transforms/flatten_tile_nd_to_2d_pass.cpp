@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
@@ -38,6 +41,7 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -163,6 +167,45 @@ ExprPtr MakeCanonicalIndexAdd(const ExprPtr& lhs, const ExprPtr& rhs, const Span
     return lhs;
   }
   return MakeAdd(lhs, rhs, span);
+}
+
+/// Mat (L1) byte budget for the whole-tile batch_matmul slicing path. Returns the
+/// backend's Mat size when a backend is configured (codegen / ST); otherwise
+/// SIZE_MAX so passes run without a backend (most unit tests) always take the fit
+/// path and keep the whole-load + slice behaviour.
+uint64_t GetMatBudgetBytes() {
+  if (!backend::BackendConfig::IsConfigured()) return std::numeric_limits<uint64_t>::max();
+  return backend::GetBackend()->GetMemSize(ir::MemorySpace::Mat);
+}
+
+/// Whole (un-sliced) byte size of an operand from its original ND type. nullopt
+/// when any dim is dynamic (size unknown — treated as "fits").
+std::optional<uint64_t> OperandWholeBytes(const TileTypePtr& original_type) {
+  if (!original_type) return std::nullopt;
+  uint64_t elems = 1;
+  for (const auto& d : original_type->shape_) {
+    auto ci = As<ConstInt>(d);
+    if (!ci || ci->value_ < 0) return std::nullopt;
+    elems *= static_cast<uint64_t>(ci->value_);
+  }
+  const uint64_t bytes_per = std::max<uint64_t>(1, original_type->dtype_.GetBit() / 8);
+  return elems * bytes_per;
+}
+
+/// Whether both operands' whole tiles fit Mat together, so each can be brought
+/// whole into L1 and per-batch sliced. When false (large shapes), a load-sourced
+/// (GM) operand is loaded per batch instead (ExtractBatchPage !fit path). Dynamic
+/// dims / no backend -> fit (keep the simpler whole+slice path).
+///
+/// TODO(V2C !fit): a move-sourced operand (Vec compute result moved to Mat, mixed
+/// kernel) has no underlying tile.load, so when !fit it still takes the whole-slice
+/// path — correct only while the whole moved tile fits the fixed cross-core ring.
+/// A per-batch V2C move (slice in Vec → move per batch) is the deferred fallback.
+bool BatchOperandsWholeFit(const TileTypePtr& lhs_type, const TileTypePtr& rhs_type) {
+  auto lhs_bytes = OperandWholeBytes(lhs_type);
+  auto rhs_bytes = OperandWholeBytes(rhs_type);
+  if (!lhs_bytes || !rhs_bytes) return true;
+  return *lhs_bytes + *rhs_bytes <= GetMatBudgetBytes();
 }
 
 /// Convert a vector of ExprPtr shape dimensions into static int64 values.
@@ -392,9 +435,9 @@ std::vector<TypePtr> FindYieldTypes(const std::vector<StmtPtr>& stmts) {
 //
 // Overall flow:
 //
-//   1. Normalize operand transpose semantics — peel off inline tile.transpose
-//      wrappers and recognize tile.load(transpose=True) as the same logical
-//      operand-transpose contract (batch_matmul uses structural transpose, not kwargs).
+//   1. Normalize operands — peel safe batch-only tile.reshape wrappers and flag a
+//      tile.transpose_view operand (the b_trans / a_trans form: the view already
+//      presents [.., K, N], so batch_matmul itself carries no transpose semantic).
 //
 //   2. Broadcast batch dimensions — compute the output batch shape via
 //      NumPy-style broadcasting (e.g. [2,1] x [1,3] -> [2,3]).
@@ -403,18 +446,20 @@ std::vector<TypePtr> FindYieldTypes(const std::vector<StmtPtr>& stmts) {
 //      consuming this result, fuse per-batch stores directly instead of
 //      assembling into a temporary tile. This avoids an intermediate buffer.
 //
-//   4. Unroll — for each flat batch index 0..batch_count-1:
+//   4. Capacity gate — decide once whether both operands' whole tiles fit Mat
+//      together (BatchOperandsWholeFit).
+//
+//   5. Unroll — for each flat batch index 0..batch_count-1:
 //      a. Decompose the flat index into per-dim indices for lhs and rhs,
 //         respecting broadcast (size-1 dims always map to index 0).
-//      b. Extract the 2D [M,K] / [K,N] page via one of three strategies:
-//         - Re-emit tile.load with batch-adjusted offsets (when the original
-//           operand was a Mat-memory tile.load — avoids a slice+reshape).
-//         - tile.slice on already-flattened 2D tile (row-offset slicing).
-//         - rank>2 tile.slice + tile.reshape to 2D (general fallback).
-//      c. Optionally append tile.transpose(0,1) for transposed operands.
-//      d. Emit tile.matmul(lhs_2d, rhs_2d).
-//      e. Cast dtype if matmul output (FP32) differs from expected result dtype.
-//      f. Either tile.store (fused path) or tile.assemble into output tile.
+//      b. Extract the 2D [M,K] / [K,N] page (ExtractBatchPage). When the whole
+//         tiles fit, every operand is sliced from its kept whole Mat tile (row
+//         slice for plain operands, column slice for tile.transpose_view); when
+//         they do not, each operand is loaded per batch instead. Transposed
+//         operands are realised by a zero-copy tile.transpose_view — never a copy.
+//      c. Emit tile.matmul(lhs_2d, rhs_2d).
+//      d. Cast dtype if matmul output (FP32) differs from expected result dtype.
+//      e. Either tile.store (fused path) or tile.assemble into output tile.
 //
 // The result is a flat 2D tile [batch_count*M, N] (non-fused) or a chain
 // of per-batch tile.store calls (fused), with no tile.batch_matmul remaining.
@@ -435,32 +480,37 @@ AssignDefMap BuildAssignDefMap(const std::vector<StmtPtr>& stmts) {
 
 /// Parsed information about a batch_matmul operand.
 struct BatchOperandInfo {
-  ExprPtr operand;            ///< After var_map substitution
-  ExprPtr original_operand;   ///< Before substitution (for def lookup)
-  TileTypePtr operand_type;   ///< Type after substitution
-  TileTypePtr original_type;  ///< Type before substitution
-  bool transpose = false;     ///< True if wrapped in trailing-axis tile.transpose
+  ExprPtr operand;                   ///< After var_map substitution
+  ExprPtr original_operand;          ///< Before substitution (for def lookup)
+  TileTypePtr operand_type;          ///< Type after substitution
+  TileTypePtr original_type;         ///< Type before substitution
+  bool from_transpose_view = false;  ///< True if the operand is a tile.transpose_view result.
+                                     ///< Its trailing two dims are already swapped to the matmul
+                                     ///< orientation, but when flattened the batch is concatenated
+                                     ///< on the COLUMN axis ([K, B*N]), so per-batch extraction is a
+                                     ///< column slice (offset {0, b*N}) rather than a row slice.
+  bool whole_fits = true;            ///< Whether both operands' whole tiles fit Mat together. When
+                                     ///< false, ExtractBatchPage loads this operand per batch (from
+                                     ///< base_load) instead of slicing a kept whole tile.
+  CallPtr base_load;                 ///< Underlying natural tile.load for this operand (traced through
+                                     ///< the tile.transpose_view when from_transpose_view). Used by the
+                                     ///< !fit per-batch path to re-emit a per-batch load.
 };
 
-/// Resolve an inline or single-definition tile.transpose wrapper around a batch_matmul operand.
-CallPtr ResolveBatchOperandTranspose(const ExprPtr& operand_expr, const AssignDefMap& def_map) {
-  if (auto transpose_call = As<Call>(operand_expr)) {
-    if (transpose_call->op_ && transpose_call->op_->name_ == "tile.transpose") {
-      return transpose_call;
-    }
+/// Resolve an inline or single-definition `op_name` wrapper around a batch_matmul operand.
+CallPtr ResolveBatchOperandCall(const ExprPtr& operand_expr, const AssignDefMap& def_map,
+                                const std::string& op_name) {
+  if (auto call = As<Call>(operand_expr)) {
+    if (call->op_ && call->op_->name_ == op_name) return call;
   }
-
   if (auto operand_var = As<Var>(operand_expr)) {
     auto def_it = def_map.find(operand_var.get());
     if (def_it != def_map.end()) {
-      if (auto transpose_call = As<Call>(def_it->second->value_)) {
-        if (transpose_call->op_ && transpose_call->op_->name_ == "tile.transpose") {
-          return transpose_call;
-        }
+      if (auto call = As<Call>(def_it->second->value_)) {
+        if (call->op_ && call->op_->name_ == op_name) return call;
       }
     }
   }
-
   return nullptr;
 }
 
@@ -472,7 +522,7 @@ CallPtr ResolveBatchOperandTranspose(const ExprPtr& operand_expr, const AssignDe
 ///   * the last two dims (the matmul page) are identical static values,
 ///   * the product of the leading batch dims is the same on both sides.
 bool IsSafePeelableBatchMatmulReshape(const CallPtr& reshape_call) {
-  if (!reshape_call || !reshape_call->op_ || reshape_call->op_->name_ != "tile.reshape") {
+  if (!reshape_call || !reshape_call->op_ || !IsOp(reshape_call, "tile.reshape")) {
     return false;
   }
   if (reshape_call->args_.size() != 2) return false;
@@ -510,7 +560,7 @@ bool IsSafePeelableBatchMatmulReshape(const CallPtr& reshape_call) {
 ///
 /// Peeling lets `LowerBatchMatmul` look through e.g. `tile.reshape([1, M, N],
 /// [1, 1, M, N])` and reuse the upstream `tile.load` operand directly. The
-/// alternative (Strategy 3 in `ExtractBatchPage`) would otherwise emit a
+/// alternative (the rank>2 fallback in `ExtractBatchPage`) would otherwise emit a
 /// redundant ND `tile.slice` + `tile.reshape` chain per batch element, which
 /// can lower to invalid degenerate tiles for zero-valid sub-blocks.
 ///
@@ -522,7 +572,7 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
   while (true) {
     CallPtr reshape_call;
     if (auto call = As<Call>(current)) {
-      if (call->op_ && call->op_->name_ == "tile.reshape") {
+      if (IsOp(call, "tile.reshape")) {
         reshape_call = call;
       }
     }
@@ -531,7 +581,7 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
         auto def_it = def_map.find(var.get());
         if (def_it != def_map.end()) {
           if (auto call = As<Call>(def_it->second->value_)) {
-            if (call->op_ && call->op_->name_ == "tile.reshape") {
+            if (IsOp(call, "tile.reshape")) {
               reshape_call = call;
             }
           }
@@ -544,72 +594,65 @@ ExprPtr PeelSafeBatchReshape(const ExprPtr& operand_expr, const AssignDefMap& de
   }
 }
 
-/// Normalize one batch_matmul operand by:
-///  - peeling off safe tile.reshape wrappers that only reinterpret batch dims
-///  - peeling off a direct tile.transpose wrapper
-///  - recognizing tile.load(transpose=True) as the same operand-transpose semantic
-///  - returning a base operand plus unified transpose/type information
+/// Whether a natural `tile.load`'s whole source window collapses to a contiguous
+/// 2D row axis (the precondition the codegen ND2NZ collapse enforces). A
+/// non-contiguous whole load (a partial middle dim under a non-singleton outer
+/// dim, e.g. a multi-batch slice that also cuts the matrix-row dim) cannot be
+/// legalized as one 2D ND2NZ load, so the operand must instead be re-emitted per
+/// batch (ExtractBatchPage !fit path). Returns true (keep whole) when the load is
+/// absent / 2D / dynamic-shaped. The contiguity rule itself is shared with the
+/// codegen guard via `IsRowMajorCollapseContiguous`, so routing and guard agree.
+bool WholeLoadContiguous(const CallPtr& base_load) {
+  if (!base_load || base_load->args_.size() < 4) return true;
+  auto tensor_type = As<TensorType>(base_load->args_[0]->GetType());
+  auto valid = As<MakeTuple>(base_load->args_[3]);
+  if (!tensor_type || !valid) return true;
+  const size_t ndim = valid->elements_.size();
+  if (ndim <= 2 || tensor_type->shape_.size() != ndim) return true;
+  return tile_conversion_utils::IsRowMajorCollapseContiguous(valid->elements_, tensor_type->shape_);
+}
+
+/// The per-operand whole-vs-per-batch routing decision, shared by LowerBatchMatmul,
+/// LowerBatchMatmulAcc, and the dead-load drop pre-scan so all three stay in sync:
+/// keep this operand whole only when both operands' whole tiles fit Mat together
+/// (the joint `capacity_fits` gate) AND its whole load collapses contiguously;
+/// otherwise it is re-emitted per batch.
+bool KeepOperandWhole(bool capacity_fits, const CallPtr& base_load) {
+  return capacity_fits && WholeLoadContiguous(base_load);
+}
+
+/// Trace a batch_matmul operand var to its underlying natural `tile.load` (through
+/// safe batch reshape wrappers and a tile.transpose_view), mirroring
+/// NormalizeBatchMatmulOperand's base_load resolution. Used by the drop pre-scan
+/// to apply the same whole-vs-per-batch routing decision as LowerBatchMatmul.
+CallPtr TraceOperandBaseLoad(const ExprPtr& operand_expr, const AssignDefMap& def_map) {
+  ExprPtr base = PeelSafeBatchReshape(operand_expr, def_map);
+  if (auto tv = ResolveBatchOperandCall(base, def_map, "tile.transpose_view")) {
+    if (!tv->args_.empty()) base = tv->args_[0];
+  }
+  return ResolveBatchOperandCall(base, def_map, "tile.load");
+}
+
+/// Normalize one batch_matmul operand:
+///  - peel safe batch-only tile.reshape wrappers that only reinterpret batch dims
+///  - recognize a tile.transpose_view operand (the canonical b_trans/a_trans form):
+///    its trailing dims are already swapped to the matmul orientation, so no
+///    per-batch transpose is needed; we only record that per-batch extraction must
+///    column-slice (the flattened view concatenates batch on the column axis).
+///  - return the base operand plus type information.
 BatchOperandInfo NormalizeBatchMatmulOperand(const ExprPtr& operand_expr, const std::string& operand_name,
                                              const AssignDefMap& def_map, const FlattenContext& ctx) {
   BatchOperandInfo info;
-  // Peel safe batch-only tile.reshape wrappers first so the transpose/load checks
-  // below see the underlying operand (typically a tile.load) directly.
+  // Peel safe batch-only tile.reshape wrappers first so the transpose_view check
+  // below sees the underlying operand directly.
   ExprPtr base_operand = PeelSafeBatchReshape(operand_expr, def_map);
 
-  if (auto transpose_call = ResolveBatchOperandTranspose(base_operand, def_map)) {
-    if (transpose_call->op_ && transpose_call->op_->name_ == "tile.transpose") {
-      // batch_matmul lowering peels the transpose off and only reads input + axes; the
-      // scratch tmp (when present) is irrelevant here. High-level transposes are 3-arg.
-      CHECK(transpose_call->args_.size() == 3 || transpose_call->args_.size() == 4)
-          << "FlattenTileNdTo2D: tile.transpose inside tile.batch_matmul must have 3 or 4 arguments "
-             "(input, axis1, axis2[, tmp]), got "
-          << transpose_call->args_.size();
-
-      auto input_type = As<TileType>(transpose_call->args_[0]->GetType());
-      CHECK(input_type) << "FlattenTileNdTo2D: tile.batch_matmul " << operand_name
-                        << " transpose operand must wrap a TileType, but got "
-                        << transpose_call->args_[0]->GetType()->TypeName();
-
-      auto axis1_const = As<ConstInt>(transpose_call->args_[1]);
-      auto axis2_const = As<ConstInt>(transpose_call->args_[2]);
-      CHECK(axis1_const && axis2_const)
-          << "FlattenTileNdTo2D: tile.batch_matmul " << operand_name << " transpose axes must be ConstInt";
-
-      int64_t axis1 = NormalizeAxisIndex(axis1_const->value_, input_type->shape_.size(),
-                                         "tile.batch_matmul " + operand_name + " transpose axis1");
-      int64_t axis2 = NormalizeAxisIndex(axis2_const->value_, input_type->shape_.size(),
-                                         "tile.batch_matmul " + operand_name + " transpose axis2");
-      CHECK(IsTrailingMatrixAxisSwap(axis1, axis2, input_type->shape_.size()))
-          << "FlattenTileNdTo2D: tile.batch_matmul only supports operand transpose on the trailing "
-             "matrix axes, but got axes "
-          << axis1 << " and " << axis2;
-
-      base_operand = transpose_call->args_[0];
-      info.transpose = true;
-    }
-  }
-
-  // If no tile.transpose wrapper found, check if the operand is a tile.load(transpose=True).
-  // In this case the load result already has swapped trailing dims (done by DeduceTileLoadType),
-  // so we record transpose=true but must also un-swap original_type so that LowerBatchMatmul
-  // sees the pre-transpose "source" shape (matching the tile.transpose-wrapper convention).
-  bool transpose_from_load = false;
-  if (!info.transpose) {
-    ExprPtr check_expr = base_operand;
-    // Resolve through Var to its definition if needed.
-    if (auto operand_var = As<Var>(check_expr)) {
-      auto def_it = def_map.find(operand_var.get());
-      if (def_it != def_map.end()) {
-        check_expr = def_it->second->value_;
-      }
-    }
-    if (auto load_call = As<Call>(check_expr)) {
-      if (load_call->op_ && load_call->op_->name_ == "tile.load" &&
-          load_call->GetKwarg<bool>("transpose", false)) {
-        info.transpose = true;
-        transpose_from_load = true;
-      }
-    }
+  // A b_trans/a_trans operand arrives as a tile.transpose_view (issues #1776 / ND
+  // extension): the view already presents the operand in [.., K, N] orientation, so
+  // batch_matmul carries no transpose semantic. Keep the view as the operand (it is
+  // a whole Mat tile we slice per batch); just flag column-slicing.
+  if (ResolveBatchOperandCall(base_operand, def_map, "tile.transpose_view") != nullptr) {
+    info.from_transpose_view = true;
   }
 
   info.original_operand = base_operand;
@@ -617,16 +660,14 @@ BatchOperandInfo NormalizeBatchMatmulOperand(const ExprPtr& operand_expr, const 
   CHECK(info.original_type) << "FlattenTileNdTo2D: tile.batch_matmul " << operand_name
                             << " expects TileType operand, but got " << base_operand->GetType()->TypeName();
 
-  // When transpose came from tile.load(transpose=True), the result shape is already
-  // post-transpose. Un-swap the trailing two dims so original_type matches the convention
-  // expected by LowerBatchMatmul (pre-transpose "source" shape).
-  if (transpose_from_load && info.original_type->shape_.size() >= 2) {
-    auto unswapped_shape = info.original_type->shape_;
-    std::iter_swap(unswapped_shape.end() - 2, unswapped_shape.end() - 1);
-    info.original_type =
-        std::make_shared<TileType>(unswapped_shape, info.original_type->dtype_, info.original_type->memref_,
-                                   info.original_type->tile_view_, info.original_type->memory_space_);
+  // Trace the underlying NATURAL tile.load (through the tile.transpose_view when
+  // transposed). The !fit per-batch path re-emits a per-batch load from it.
+  ExprPtr load_src = base_operand;
+  if (info.from_transpose_view) {
+    auto tv = ResolveBatchOperandCall(base_operand, def_map, "tile.transpose_view");
+    if (tv && !tv->args_.empty()) load_src = tv->args_[0];
   }
+  info.base_load = ResolveBatchOperandCall(load_src, def_map, "tile.load");
 
   info.operand = Substitute(base_operand, ctx.var_map);
   info.operand_type = As<TileType>(info.operand->GetType());
@@ -662,18 +703,24 @@ struct BatchPageResult {
   std::vector<StmtPtr> stmts;  ///< Statements emitted to produce it
 };
 
-/// Extract the 2D matrix page for a given batch index from an operand.
+/// Extract the 2D matrix page for one batch index from a batch_matmul operand.
 ///
-/// Three strategies:
-///  (1) Mat-load: re-emit tile.load with batch-adjusted offsets (avoids intermediate tile)
-///  (2) 2D-flat: tile.slice at the right row offset (operand already flattened)
-///  (3) Rank>2 fallback: tile.slice + tile.reshape to 2D
+/// Every operand — lhs or rhs, transposed or not, load- or move-sourced — is
+/// handled identically:
+///  * whole_fits (default): the operand's whole tile is already in Mat; take its
+///    [source_rows, source_cols] page with a single tile.slice — a ROW slice for a
+///    plain (row-batched) operand, a COLUMN slice for a tile.transpose_view
+///    (column-batched) operand. A broadcast operand reuses its single page.
+///  * !whole_fits (large operands): load THIS operand per batch from its
+///    underlying natural tile.load, adding a per-batch tile.transpose_view when the
+///    operand is transposed. The dead whole load/view is dropped during rewriting.
 ///
-/// Appends tile.transpose if the operand should be transposed.
+/// The operand is always 2D by the time it reaches here (loads flatten to 2D,
+/// transpose_views are 2D, safe batch-only reshapes are peeled to the 2D load).
 BatchPageResult ExtractBatchPage(const BatchOperandInfo& info, const std::vector<int64_t>& operand_dims,
                                  const std::vector<int64_t>& operand_batch_shape, int64_t batch_index,
-                                 const std::string& base_name, const AssignDefMap& def_map,
-                                 const FlattenContext& ctx, const OpRegistry& op_registry, const Span& span) {
+                                 const std::string& base_name, const FlattenContext& ctx,
+                                 const OpRegistry& op_registry, const Span& span) {
   BatchPageResult page;
   const auto& operand = info.operand;
   const auto& operand_type = info.operand_type;
@@ -682,133 +729,102 @@ BatchPageResult ExtractBatchPage(const BatchOperandInfo& info, const std::vector
   int64_t source_cols = operand_dims.back();
   std::string suffix = std::to_string(batch_index);
 
-  // Check if original operand was produced by a tile.load with Mat target_memory.
-  auto original_var = As<Var>(info.original_operand);
-  auto def_it = original_var ? def_map.find(original_var.get()) : def_map.end();
-  auto original_assign = (def_it != def_map.end()) ? def_it->second : nullptr;
-  auto original_load_call = original_assign ? As<Call>(original_assign->value_) : nullptr;
-  bool is_mat_load = original_load_call && original_load_call->op_->name_ == "tile.load" &&
-                     original_load_call->args_.size() >= 4;
-  auto original_load_offsets = is_mat_load ? As<MakeTuple>(original_load_call->args_[1]) : nullptr;
-  auto original_load_input = is_mat_load ? Substitute(original_load_call->args_[0], ctx.var_map) : nullptr;
-  auto original_load_input_type =
-      original_load_input ? As<TensorType>(original_load_input->GetType()) : nullptr;
-  auto original_target_memory =
-      is_mat_load ? original_load_call->GetKwarg<MemorySpace>("target_memory") : MemorySpace::DDR;
-  bool original_load_transpose = is_mat_load ? original_load_call->GetKwarg<bool>("transpose", false) : false;
-
   VarPtr current;
 
-  // Track whether Strategy 1 is used so we can skip redundant tile.transpose.
-  bool used_strategy1 = false;
+  if (!info.whole_fits && info.base_load) {
+    // !fit + load (GM): the operands' whole tiles do not fit Mat together, so load
+    // THIS operand PER BATCH from its underlying natural tile.load (a per-batch
+    // [1,..,X,Y] window → 2D [X,Y], which the hardware ND2NZ path accepts as the
+    // leading dims are 1). A transposed operand then gets a per-batch
+    // tile.transpose_view — same as the whole-tile path, just one batch at a time.
+    // The whole load/view is dropped upstream (no longer referenced) so it does not
+    // occupy L1.
+    //
+    // NOTE: this only covers load-sourced (GM) operands. A move-sourced operand
+    // (V2C mixed kernel: a Vec compute result moved to Mat) has base_load == null,
+    // so a !fit V2C operand falls through to the whole-slice path below — correct
+    // only while the whole moved tile fits the fixed cross-core ring. A per-batch
+    // V2C move for large shapes is a deferred follow-up (see BatchOperandsWholeFit).
+    auto load_tensor = info.base_load->args_[0];
+    auto load_tensor_type = As<TensorType>(load_tensor->GetType());
+    auto base_offsets = As<MakeTuple>(info.base_load->args_[1]);
+    auto base_shapes = As<MakeTuple>(info.base_load->args_[2]);
+    INTERNAL_CHECK_SPAN(load_tensor_type && base_offsets && base_shapes &&
+                            load_tensor_type->shape_.size() >= 2 &&
+                            base_shapes->elements_.size() == load_tensor_type->shape_.size(),
+                        span)
+        << "FlattenTileNdTo2D: !fit per-batch load expects a tensor-backed tile.load with rank >= 2";
+    // Use the load's WINDOW matrix dims (the actual sliced tile), not the source
+    // tensor's full trailing dims — they differ when the operand is a partial
+    // sub-tile of a larger tensor (e.g. a multi-batch slice that also cuts the
+    // matrix-row dim, the non-contiguous case routed here).
+    const size_t win_rank = base_shapes->elements_.size();
+    auto x_dim = As<ConstInt>(base_shapes->elements_[win_rank - 2]);
+    auto y_dim = As<ConstInt>(base_shapes->elements_.back());
+    INTERNAL_CHECK_SPAN(x_dim && y_dim, span)
+        << "FlattenTileNdTo2D: !fit per-batch load needs static trailing dims";
 
-  if (is_mat_load && original_load_offsets && original_load_input_type &&
-      original_target_memory == MemorySpace::Mat) {
-    // Strategy 1: Re-emit tile.load with batch-adjusted offsets.
-    // transpose=True is preserved in the kwargs, so per-batch loads inherit it.
     auto batch_indices = BuildBatchIndices(batch_index, operand_batch_shape);
-    auto load_offset_elems = BuildBatchAdjustedOffsets(original_load_offsets->elements_, batch_indices,
-                                                       operand_batch_shape.size(), span);
-
+    auto load_offset_elems =
+        BuildBatchAdjustedOffsets(base_offsets->elements_, batch_indices, operand_batch_shape.size(), span);
     std::vector<int64_t> load_shape_values(operand_batch_shape.size(), 1);
-    load_shape_values.push_back(source_rows);
-    load_shape_values.push_back(source_cols);
+    load_shape_values.push_back(x_dim->value_);
+    load_shape_values.push_back(y_dim->value_);
+    auto load_offsets = std::make_shared<MakeTuple>(load_offset_elems, span);
+    auto load_shape = MakeShapeTupleFromInts(load_shape_values, span);
+    std::vector<ExprPtr> load_args = {load_tensor, load_offsets, load_shape, load_shape};
+    auto per_batch_load = op_registry.Create("tile.load", load_args, info.base_load->kwargs_, span);
 
-    // Keep the original tensor-rank offsets and shapes on the load call so
-    // codegen still sees the original source window. Type inference will still
-    // produce a rank>2 TileType from these shapes; this pass immediately
-    // overrides the call result type to 2D below because hardware tiles are
-    // always 2D.
-    // For transposed loads (transpose=True), the original tensor-rank offsets
-    // are required so that codegen routes the load through the standard DN
-    // path. A flat 2D view cannot represent within-batch column-major
-    // addressing.
+    // The [1,..,X,Y] window deduces a rank>2 TileType; hardware tiles are 2D —
+    // override the result to a 2D [X,Y] tile with the implicit Mat view.
+    auto load_2d_shape = Make2DShapeExprs(x_dim->value_, y_dim->value_, span);
+    auto load_2d_view = tile_view_semantics::GetImplicitTileView(load_2d_shape, MemorySpace::Mat);
+    auto pbl_type = As<TileType>(per_batch_load->GetType());
+    auto load_2d_type =
+        std::make_shared<TileType>(load_2d_shape, pbl_type ? pbl_type->dtype_ : operand_type->dtype_,
+                                   std::nullopt, load_2d_view, MemorySpace::Mat);
+    auto load_2d =
+        std::make_shared<Call>(per_batch_load->op_, load_args, per_batch_load->kwargs_, load_2d_type, span);
+    current = std::make_shared<Var>(base_name + "_pbload_" + suffix, load_2d_type, span);
+    page.stmts.push_back(std::make_shared<AssignStmt>(current, load_2d, span));
 
-    auto batch_load_offsets = std::make_shared<MakeTuple>(load_offset_elems, span);
-    auto batch_load_shape = MakeShapeTupleFromInts(load_shape_values, span);
-    std::vector<ExprPtr> batch_load_args = {original_load_input, batch_load_offsets, batch_load_shape,
-                                            batch_load_shape};
-    auto batch_load = op_registry.Create("tile.load", batch_load_args, original_load_call->kwargs_, span);
-
-    // DeduceTileLoadType produces a rank>2 TileType from these shapes, but
-    // hardware tiles are always 2D. Manually override the result type to 2D.
-    int64_t flat_rows = original_load_transpose ? source_cols : source_rows;
-    int64_t flat_cols = original_load_transpose ? source_rows : source_cols;
-    auto flat_shape_exprs = Make2DShapeExprs(flat_rows, flat_cols, span);
-    auto batch_load_type = As<TileType>(batch_load->GetType());
-    std::optional<TileView> flat_tile_view;
-    if (batch_load_type && batch_load_type->tile_view_.has_value()) {
-      const auto& orig_tv = *batch_load_type->tile_view_;
-      flat_tile_view = TileView(flat_shape_exprs, /*stride=*/{}, /*start_offset=*/nullptr, orig_tv.blayout,
-                                orig_tv.slayout, orig_tv.fractal, orig_tv.pad);
+    if (info.from_transpose_view) {
+      auto view = op_registry.Create("tile.transpose_view", {current}, {}, span);
+      auto view_var = std::make_shared<Var>(base_name + "_pbview_" + suffix, view->GetType(), span);
+      page.stmts.push_back(std::make_shared<AssignStmt>(view_var, view, span));
+      current = view_var;
     }
-    auto flat_type = std::make_shared<TileType>(
-        flat_shape_exprs, batch_load_type ? batch_load_type->dtype_ : operand_type->dtype_, std::nullopt,
-        flat_tile_view, batch_load_type ? batch_load_type->memory_space_ : operand_type->memory_space_);
-    auto flat_load = std::make_shared<Call>(batch_load->op_, batch_load_args, batch_load->kwargs_, flat_type,
-                                            batch_load->span_);
-    current = std::make_shared<Var>(base_name + "_load_" + suffix, flat_type, span);
-    page.stmts.push_back(std::make_shared<AssignStmt>(current, flat_load, span));
-    used_strategy1 = true;
+    page.var = current;
+    return page;
 
-  } else if (operand_type->shape_.size() == 2) {
-    // Strategy 2: Slice from already-flattened 2D tile.
-    auto offset = MakeShapeTupleFromInts({batch_index * source_rows, 0}, span);
+  } else {
+    // Whole-fit: slice the [source_rows, source_cols] page from the kept whole 2D
+    // tile. The operand is ALWAYS 2D here — a load flattens to a 2D result, a
+    // tile.transpose_view is 2D, and a safe batch-only reshape is peeled to its 2D
+    // load — so no rank>2 fallback is needed (verified: this assert fires on no
+    // test across the full UT + ST suites). A plain operand is row-batched
+    // ([B*rows, cols]) so the page is a row slice at row b*source_rows; a
+    // tile.transpose_view operand is COLUMN-batched ([source_rows, B*source_cols] =
+    // [K, B*N]: the whole-tile transpose concatenates the batches along the column
+    // axis), so its page is a column slice at col b*source_cols. Either way the
+    // page is [source_rows, source_cols].
+    INTERNAL_CHECK_SPAN(operand_type->shape_.size() == 2, span)
+        << "FlattenTileNdTo2D: batch_matmul operand must be flattened to 2D before "
+           "ExtractBatchPage, got rank "
+        << operand_type->shape_.size();
+    std::vector<int64_t> offset_values = info.from_transpose_view
+                                             ? std::vector<int64_t>{0, batch_index * source_cols}
+                                             : std::vector<int64_t>{batch_index * source_rows, 0};
+    auto offset = MakeShapeTupleFromInts(offset_values, span);
     auto shape = MakeShapeTupleFromInts({source_rows, source_cols}, span);
     auto slice = op_registry.Create("tile.slice", {operand, shape, offset}, span);
     current = std::make_shared<Var>(base_name + "_slice_" + suffix, slice->GetType(), span);
     page.stmts.push_back(std::make_shared<AssignStmt>(current, slice, span));
-
-  } else {
-    // Strategy 3: rank>2 tile.slice + tile.reshape to 2D.
-    auto batch_indices = BuildBatchIndices(batch_index, operand_batch_shape);
-    std::vector<int64_t> offset_values = batch_indices;
-    offset_values.push_back(0);
-    offset_values.push_back(0);
-
-    std::vector<int64_t> slice_shape_values(operand_batch_shape.size(), 1);
-    slice_shape_values.push_back(source_rows);
-    slice_shape_values.push_back(source_cols);
-
-    auto offset = MakeShapeTupleFromInts(offset_values, span);
-    auto slice_shape = MakeShapeTupleFromInts(slice_shape_values, span);
-    auto slice = op_registry.Create("tile.slice", {operand, slice_shape, offset}, span);
-    auto slice_var = std::make_shared<Var>(base_name + "_nd_slice_" + suffix, slice->GetType(), span);
-    page.stmts.push_back(std::make_shared<AssignStmt>(slice_var, slice, span));
-
-    auto reshape_shape = std::make_shared<MakeTuple>(Make2DShapeExprs(source_rows, source_cols, span), span);
-    auto reshape = op_registry.Create("tile.reshape", {slice_var, reshape_shape}, span);
-    current = std::make_shared<Var>(base_name + "_2d_" + suffix, reshape->GetType(), span);
-    page.stmts.push_back(std::make_shared<AssignStmt>(current, reshape, span));
   }
 
-  // Optionally transpose the 2D page.
-  // Skip if Strategy 1 was used AND the original load has transpose=True: the re-emitted
-  // tile.load already carries transpose=True in its kwargs, so an extra tile.transpose
-  // would double-transpose. When Strategy 1 is used but the load doesn't have transpose,
-  // we still need the explicit tile.transpose (old tile.transpose-wrapper pattern).
-  if (info.transpose && !(used_strategy1 && original_load_transpose)) {
-    auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
-    auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-
-    auto cur_tile = As<TileType>(current->GetType());
-    INTERNAL_CHECK(cur_tile) << "FlattenTileNdTo2D: transpose operand must be TileType";
-    auto tmp_shape = std::make_shared<MakeTuple>(cur_tile->shape_, span);
-    MemorySpace tmp_mem = cur_tile->memory_space_.has_value() ? *cur_tile->memory_space_ : MemorySpace::Vec;
-    std::vector<std::pair<std::string, std::any>> tmp_kwargs = {
-        {"dtype", cur_tile->dtype_},
-        {"target_memory", tmp_mem},
-    };
-    auto tmp_create = op_registry.Create("tile.create", {tmp_shape}, tmp_kwargs, span);
-    auto tmp_var = std::make_shared<Var>(base_name + "_ttmp_" + suffix, tmp_create->GetType(), span);
-    page.stmts.push_back(std::make_shared<AssignStmt>(tmp_var, tmp_create, span));
-
-    auto transpose_call = op_registry.Create("tile.transpose", {current, axis0, axis1, tmp_var}, span);
-    auto transpose_var = std::make_shared<Var>(base_name + "_t_" + suffix, transpose_call->GetType(), span);
-    page.stmts.push_back(std::make_shared<AssignStmt>(transpose_var, transpose_call, span));
-    current = transpose_var;
-  }
-
+  // No per-batch transpose: a transposed (b_trans/a_trans) operand arrives as a
+  // tile.transpose_view whose page is already in the matmul orientation (the
+  // column-slice above extracts batch_b^T directly).
   page.var = current;
   return page;
 }
@@ -827,7 +843,7 @@ DirectStoreInfo DetectDirectStore(const std::vector<StmtPtr>& stmts, size_t stmt
 
   auto store_assign = As<AssignStmt>(stmts[stmt_index + 1]);
   auto store_call = store_assign ? As<Call>(store_assign->value_) : nullptr;
-  if (!store_call || store_call->op_->name_ != "tile.store") return info;
+  if (!store_call || !IsOp(store_call, "tile.store")) return info;
 
   auto store_input = !store_call->args_.empty() ? As<Var>(store_call->args_[0]) : nullptr;
   if (!store_input || store_input.get() != result_var.get()) return info;
@@ -862,6 +878,14 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   // Normalize operands.
   auto lhs_info = NormalizeBatchMatmulOperand(call->args_[0], "lhs", def_map, ctx);
   auto rhs_info = NormalizeBatchMatmulOperand(call->args_[1], "rhs", def_map, ctx);
+  // Route each operand to whole-slice vs per-batch independently: keep whole only
+  // when the operands' whole tiles fit Mat together (capacity) AND this operand's
+  // whole load collapses contiguously. A non-contiguous whole load (multi-batch +
+  // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
+  // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
+  const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
+  lhs_info.whole_fits = KeepOperandWhole(capacity_fits, lhs_info.base_load);
+  rhs_info.whole_fits = KeepOperandWhole(capacity_fits, rhs_info.base_load);
   auto orig_result_type = As<TileType>(call->GetType());
   CHECK(orig_result_type) << "FlattenTileNdTo2D: tile.batch_matmul expects TileType result";
 
@@ -885,21 +909,19 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
   std::vector<int64_t> lhs_batch_dims(lhs_dims.begin(), lhs_dims.end() - 2);
   std::vector<int64_t> rhs_batch_dims(rhs_dims.begin(), rhs_dims.end() - 2);
 
-  // Compute effective matrix dimensions (after transpose).
-  int64_t lhs_source_rows = lhs_dims[lhs_dims.size() - 2];
-  int64_t lhs_source_cols = lhs_dims.back();
-  int64_t rhs_source_rows = rhs_dims[rhs_dims.size() - 2];
-  int64_t rhs_source_cols = rhs_dims.back();
+  // Matrix dimensions. A transposed operand already arrives in matmul orientation
+  // via its tile.transpose_view (original_type is the post-transpose [.., K, N]),
+  // so the trailing two dims are used directly — no swap.
+  int64_t lhs_rows = lhs_dims[lhs_dims.size() - 2];
+  int64_t lhs_cols = lhs_dims.back();
+  int64_t rhs_rows = rhs_dims[rhs_dims.size() - 2];
+  int64_t rhs_cols = rhs_dims.back();
 
-  int64_t lhs_rows = lhs_info.transpose ? lhs_source_cols : lhs_source_rows;
-  int64_t lhs_cols = lhs_info.transpose ? lhs_source_rows : lhs_source_cols;
-  int64_t rhs_rows = rhs_info.transpose ? rhs_source_cols : rhs_source_rows;
-  int64_t rhs_cols = rhs_info.transpose ? rhs_source_rows : rhs_source_cols;
-
-  CHECK(lhs_cols == rhs_rows)
-      << "FlattenTileNdTo2D: tile.batch_matmul requires matching inner dimensions after "
-         "transpose, but got "
-      << lhs_cols << " and " << rhs_rows;
+  // K-match is validated user-facing at op construction (DeduceTileBatchMatMulType);
+  // a mismatch here would be a compiler bug in an earlier pass.
+  INTERNAL_CHECK_SPAN(lhs_cols == rhs_rows, span)
+      << "Internal error: tile.batch_matmul inner dimensions must match, but got " << lhs_cols << " and "
+      << rhs_rows;
 
   // Detect direct-store fusion opportunity.
   auto direct_store = DetectDirectStore(stmts, stmt_index, assign->var_);
@@ -925,10 +947,10 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
     int64_t rhs_batch_idx =
         BuildOperandFlatBatchIndex(rhs_batch_dims, output_batch_dims, output_batch_indices);
 
-    auto lhs_page = ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", def_map, ctx,
-                                     op_registry, span);
-    auto rhs_page = ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", def_map, ctx,
-                                     op_registry, span);
+    auto lhs_page =
+        ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", ctx, op_registry, span);
+    auto rhs_page =
+        ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", ctx, op_registry, span);
     auto matmul = op_registry.Create("tile.matmul", {lhs_page.var, rhs_page.var}, span);
     auto matmul_type = As<TileType>(matmul->GetType());
     bool needs_cast = matmul_type && matmul_type->dtype_ != orig_result_type->dtype_;
@@ -997,10 +1019,10 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
         BuildOperandFlatBatchIndex(rhs_batch_dims, output_batch_dims, output_batch_indices);
 
     // Extract 2D pages.
-    auto lhs_page = ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", def_map, ctx,
-                                     op_registry, span);
-    auto rhs_page = ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", def_map, ctx,
-                                     op_registry, span);
+    auto lhs_page =
+        ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", ctx, op_registry, span);
+    auto rhs_page =
+        ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", ctx, op_registry, span);
     out.stmts.insert(out.stmts.end(), lhs_page.stmts.begin(), lhs_page.stmts.end());
     out.stmts.insert(out.stmts.end(), rhs_page.stmts.begin(), rhs_page.stmts.end());
 
@@ -1123,9 +1145,17 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
       << "FlattenTileNdTo2D: tile.batch_matmul_acc expects acc to be 2D after flatten, got rank "
       << acc_type->shape_.size();
 
-  // Normalize lhs/rhs operands (peel transpose, recognize tile.load(transpose=True)).
+  // Normalize lhs/rhs operands (peel safe reshape, flag tile.transpose_view).
   auto lhs_info = NormalizeBatchMatmulOperand(call->args_[1], "lhs", def_map, ctx);
   auto rhs_info = NormalizeBatchMatmulOperand(call->args_[2], "rhs", def_map, ctx);
+  // Route each operand to whole-slice vs per-batch independently: keep whole only
+  // when the operands' whole tiles fit Mat together (capacity) AND this operand's
+  // whole load collapses contiguously. A non-contiguous whole load (multi-batch +
+  // partial matrix-row dim) is re-emitted per batch — each per-batch page is a
+  // [1, X, Y] window that collapses cleanly — instead of erroring in codegen.
+  const bool capacity_fits = BatchOperandsWholeFit(lhs_info.original_type, rhs_info.original_type);
+  lhs_info.whole_fits = KeepOperandWhole(capacity_fits, lhs_info.base_load);
+  rhs_info.whole_fits = KeepOperandWhole(capacity_fits, rhs_info.base_load);
 
   // Extract original (pre-flatten) static dimensions for batch + matrix axes.
   auto lhs_dims = ToStaticDims(lhs_info.original_type->shape_, "tile.batch_matmul_acc lhs");
@@ -1148,19 +1178,18 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
   std::vector<int64_t> lhs_batch_dims(lhs_dims.begin(), lhs_dims.end() - 2);
   std::vector<int64_t> rhs_batch_dims(rhs_dims.begin(), rhs_dims.end() - 2);
 
-  int64_t lhs_source_rows = lhs_dims[lhs_dims.size() - 2];
-  int64_t lhs_source_cols = lhs_dims.back();
-  int64_t rhs_source_rows = rhs_dims[rhs_dims.size() - 2];
-  int64_t rhs_source_cols = rhs_dims.back();
+  // Transposed operands arrive in matmul orientation via tile.transpose_view, so
+  // the trailing two dims are used directly (no swap).
+  int64_t lhs_rows = lhs_dims[lhs_dims.size() - 2];
+  int64_t lhs_cols = lhs_dims.back();
+  int64_t rhs_rows = rhs_dims[rhs_dims.size() - 2];
+  int64_t rhs_cols = rhs_dims.back();
 
-  int64_t lhs_rows = lhs_info.transpose ? lhs_source_cols : lhs_source_rows;
-  int64_t lhs_cols = lhs_info.transpose ? lhs_source_rows : lhs_source_cols;
-  int64_t rhs_rows = rhs_info.transpose ? rhs_source_cols : rhs_source_rows;
-  int64_t rhs_cols = rhs_info.transpose ? rhs_source_rows : rhs_source_cols;
-
-  CHECK(lhs_cols == rhs_rows)
-      << "FlattenTileNdTo2D: tile.batch_matmul_acc requires matching K after transpose, got " << lhs_cols
-      << " and " << rhs_rows;
+  // K-match is validated user-facing at op construction (DeduceTileBatchMatMulAccType);
+  // a mismatch here would be a compiler bug in an earlier pass.
+  INTERNAL_CHECK_SPAN(lhs_cols == rhs_rows, span)
+      << "Internal error: tile.batch_matmul_acc inner dimensions must match, got " << lhs_cols << " and "
+      << rhs_rows;
 
   // Sanity check on flat acc shape: should be [batch_count*M, N].
   auto acc_rows_const = As<ConstInt>(acc_type->shape_[0]);
@@ -1205,10 +1234,10 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
     int64_t rhs_batch_idx =
         BuildOperandFlatBatchIndex(rhs_batch_dims, output_batch_dims, output_batch_indices);
 
-    auto lhs_page = ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", def_map, ctx,
-                                     op_registry, span);
-    auto rhs_page = ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", def_map, ctx,
-                                     op_registry, span);
+    auto lhs_page =
+        ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", ctx, op_registry, span);
+    auto rhs_page =
+        ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", ctx, op_registry, span);
     out.stmts.insert(out.stmts.end(), lhs_page.stmts.begin(), lhs_page.stmts.end());
     out.stmts.insert(out.stmts.end(), rhs_page.stmts.begin(), rhs_page.stmts.end());
 
@@ -1227,10 +1256,10 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
     int64_t rhs_batch_idx =
         BuildOperandFlatBatchIndex(rhs_batch_dims, output_batch_dims, output_batch_indices);
 
-    auto lhs_page = ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", def_map, ctx,
-                                     op_registry, span);
-    auto rhs_page = ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", def_map, ctx,
-                                     op_registry, span);
+    auto lhs_page =
+        ExtractBatchPage(lhs_info, lhs_dims, lhs_batch_dims, lhs_batch_idx, "lhs", ctx, op_registry, span);
+    auto rhs_page =
+        ExtractBatchPage(rhs_info, rhs_dims, rhs_batch_dims, rhs_batch_idx, "rhs", ctx, op_registry, span);
     out.stmts.insert(out.stmts.end(), lhs_page.stmts.begin(), lhs_page.stmts.end());
     out.stmts.insert(out.stmts.end(), rhs_page.stmts.begin(), rhs_page.stmts.end());
 
@@ -1416,15 +1445,21 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
                                    const OpRegistry& op_registry, const Span& span) {
   std::vector<StmtPtr> result;
 
-  // Pre-scan: identify tile.load/tile.transpose results consumed exclusively by
-  // tile.batch_matmul. When ExtractBatchPage Strategy 1 re-emits per-batch loads
-  // from the original tensor, the full-batch load becomes dead code. Skip emitting
-  // it to avoid wasted memory and potential hardware pipeline interference.
+  // Pre-scan: identify operand chains (tile.load -> tile.transpose_view/reshape)
+  // consumed EXCLUSIVELY by tile.batch_matmul. Used for two things: (a) the
+  // tile.transpose / tile.reshape rewrite-loop skips below (peeled by the lowering),
+  // and (b) the !fit capacity drop — when a matmul's whole operands do not fit Mat,
+  // ExtractBatchPage loads them per batch and the dead whole chain is dropped.
   //
   // Safety: we count ALL Var references across every statement type (Return, Yield,
   // If conditions, For/While bounds, etc.), not just Call arguments. A Var used
-  // anywhere outside a tile.batch_matmul Call prevents it from being skipped.
+  // anywhere outside a tile.batch_matmul Call prevents it from being treated as a
+  // batch_matmul-only chain.
   std::unordered_set<const Var*> batch_matmul_only_vars;
+  // Operand-chain vars (whole load + transpose_view) feeding EXCLUSIVELY !fit
+  // batch_matmuls — their whole tile would overflow Mat, so ExtractBatchPage loads
+  // them per batch and the dead whole chain is dropped during rewriting below.
+  std::unordered_set<const Var*> not_fit_drop_vars;
   {
     std::unordered_map<const Var*, int> use_count;
     std::vector<const Var*> batch_matmul_operands;  // ordered to avoid nondeterministic iteration
@@ -1448,9 +1483,9 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
     for (const auto& s : stmts) {
       // AssignStmt: count call args; mark batch_matmul[_acc] operands separately.
-      // For tile.batch_matmul_acc, only lhs (arg 1) and rhs (arg 2) are eligible
-      // for Strategy 1 skip-load — the acc operand (arg 0) is in Acc memory and
-      // never goes through tile.load(target_memory=Mat).
+      // For tile.batch_matmul_acc, only lhs (arg 1) and rhs (arg 2) are Mat
+      // operand chains — the acc operand (arg 0) is in Acc memory and never goes
+      // through tile.load(target_memory=Mat).
       if (auto a = As<AssignStmt>(s)) {
         if (auto c = As<Call>(a->value_)) {
           const std::string& cname = c->op_->name_;
@@ -1506,10 +1541,77 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         continue;
       }
     }
-    // De-duplicate batch_matmul_operands before checking counts.
+    // The per-statement scan above counts only TOP-LEVEL uses (for an
+    // IfStmt/ForStmt/WhileStmt it counts the condition / loop bounds / iter_arg
+    // inits, but NOT uses inside the nested body). Separately count EVERY use of
+    // each Var, recursing into nested IfStmt/ForStmt/WhileStmt/ScopeStmt bodies.
+    // A batch_matmul operand load that is also consumed inside a nested block
+    // must NOT be skipped: dropping its definition would leave the nested use
+    // referencing an undefined Var after the nested block is rewritten.
+    std::unordered_map<const Var*, int> total_counts;
+    std::function<void(const ExprPtr&)> CountTotalExprRefs = [&](const ExprPtr& expr) {
+      if (!expr) return;
+      if (auto v = As<Var>(expr)) {
+        total_counts[v.get()]++;
+        return;
+      }
+      if (auto tup = As<MakeTuple>(expr)) {
+        for (const auto& e : tup->elements_) CountTotalExprRefs(e);
+        return;
+      }
+      if (auto call = As<Call>(expr)) {
+        for (const auto& a : call->args_) CountTotalExprRefs(a);
+        return;
+      }
+    };
+    std::function<void(const StmtPtr&)> CountTotalStmtRefs = [&](const StmtPtr& s) {
+      if (!s) return;
+      if (auto seq = As<SeqStmts>(s)) {
+        for (const auto& inner : seq->stmts_) CountTotalStmtRefs(inner);
+      } else if (auto scope = As<ScopeStmt>(s)) {
+        CountTotalStmtRefs(scope->body_);
+      } else if (auto if_stmt = As<IfStmt>(s)) {
+        CountTotalExprRefs(if_stmt->condition_);
+        CountTotalStmtRefs(if_stmt->then_body_);
+        if (if_stmt->else_body_.has_value()) CountTotalStmtRefs(*if_stmt->else_body_);
+      } else if (auto for_stmt = As<ForStmt>(s)) {
+        CountTotalExprRefs(for_stmt->start_);
+        CountTotalExprRefs(for_stmt->stop_);
+        CountTotalExprRefs(for_stmt->step_);
+        for (const auto& ia : for_stmt->iter_args_) CountTotalExprRefs(ia->initValue_);
+        CountTotalStmtRefs(for_stmt->body_);
+      } else if (auto while_stmt = As<WhileStmt>(s)) {
+        CountTotalExprRefs(while_stmt->condition_);
+        for (const auto& ia : while_stmt->iter_args_) CountTotalExprRefs(ia->initValue_);
+        CountTotalStmtRefs(while_stmt->body_);
+      } else if (auto a = As<AssignStmt>(s)) {
+        CountTotalExprRefs(a->value_);
+      } else if (auto ret = As<ReturnStmt>(s)) {
+        for (const auto& v : ret->value_) CountTotalExprRefs(v);
+      } else if (auto yield = As<YieldStmt>(s)) {
+        for (const auto& v : yield->value_) CountTotalExprRefs(v);
+      } else if (auto eval = As<EvalStmt>(s)) {
+        CountTotalExprRefs(eval->expr_);
+      }
+    };
+    for (const auto& s : stmts) CountTotalStmtRefs(s);
+
+    // Collect operands whose EVERY use is a (top-level) batch_matmul operand.
+    // Two conditions: all top-level uses are batch_matmul operands
+    // (batch_matmul_operand_uses == use_count) AND the Var has no nested uses
+    // (use_count == total_counts). Comparing against the total use count —
+    // rather than requiring use_count == 1 — covers the shared-operand case:
+    // e.g. a SwiGLU FFN where the activation X is the common LHS of both the
+    // gate (X@W1) and up (X@W3) matmuls (use_count > 1). Treating a shared
+    // operand as batch_matmul-only is safe: in the fit path it is sliced (not
+    // dropped); in the !fit path it is dropped only when EVERY consuming matmul
+    // is !fit (see the capacity gate below).
+    std::unordered_map<const Var*, int> batch_matmul_operand_uses;
+    for (const auto* v : batch_matmul_operands) batch_matmul_operand_uses[v]++;
     std::unordered_set<const Var*> seen;
     for (const auto* v : batch_matmul_operands) {
-      if (seen.insert(v).second && use_count[v] == 1) {
+      if (seen.insert(v).second && batch_matmul_operand_uses[v] == use_count[v] &&
+          use_count[v] == total_counts[v]) {
         batch_matmul_only_vars.insert(v);
       }
     }
@@ -1517,7 +1619,12 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     // Walk back through safe peelable `tile.reshape` chains so the upstream
     // dead `tile.reshape` (and any further-upstream `tile.load`) are also
     // skipped during rewriting. Without this, the orphan reshape would emit a
-    // rank>2 tile that violates the post-pass `TileOps2D` property.
+    // rank>2 tile that violates the post-pass `TileOps2D` property. Require the
+    // input to have exactly one use across the WHOLE block (total_counts) so a
+    // load also consumed inside a nested body is never peeled away.
+    // Also walk back through a single-use tile.transpose_view so its underlying
+    // whole tile.load joins the chain (needed so the !fit path can drop the dead
+    // whole load, not just the view).
     auto stmt_def_map = BuildAssignDefMap(stmts);
     std::vector<const Var*> reshape_worklist(batch_matmul_only_vars.begin(), batch_matmul_only_vars.end());
     while (!reshape_worklist.empty()) {
@@ -1525,14 +1632,61 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       reshape_worklist.pop_back();
       auto def_it = stmt_def_map.find(current);
       if (def_it == stmt_def_map.end()) continue;
-      auto reshape_call = As<Call>(def_it->second->value_);
-      if (!IsSafePeelableBatchMatmulReshape(reshape_call)) continue;
-      auto input_var = As<Var>(reshape_call->args_[0]);
+      auto chain_call = As<Call>(def_it->second->value_);
+      const bool is_view = IsOp(chain_call, "tile.transpose_view");
+      if (!is_view && !IsSafePeelableBatchMatmulReshape(chain_call)) continue;
+      auto input_var = As<Var>(chain_call->args_[0]);
       if (!input_var) continue;
-      if (use_count[input_var.get()] != 1) continue;
+      if (total_counts[input_var.get()] != 1) continue;
       if (batch_matmul_only_vars.insert(input_var.get()).second) {
         reshape_worklist.push_back(input_var.get());
       }
+    }
+
+    // Per-batch_matmul capacity gate: when the operands' whole tiles do not fit
+    // Mat together, their batch_matmul_only operand chains are loaded per batch
+    // (ExtractBatchPage !fit path) — drop the dead whole chain here. A chain
+    // shared with any FIT matmul stays whole (drop only chains feeding
+    // exclusively !fit matmuls).
+    std::unordered_set<const Var*> any_fit, any_notfit;
+    std::function<void(const Var*, bool)> MarkChain = [&](const Var* v, bool fits) {
+      if (!v) return;
+      (fits ? any_fit : any_notfit).insert(v);
+      auto it = stmt_def_map.find(v);
+      if (it == stmt_def_map.end()) return;
+      auto c = As<Call>(it->second->value_);
+      if (!c || !c->op_ || c->args_.empty()) return;
+      const std::string& n = c->op_->name_;
+      if (n == "tile.transpose_view" || n == "tile.reshape") {
+        if (auto in = As<Var>(c->args_[0])) MarkChain(in.get(), fits);
+      }
+    };
+    for (const auto& s : stmts) {
+      auto a = As<AssignStmt>(s);
+      auto c = a ? As<Call>(a->value_) : nullptr;
+      if (!c || !c->op_) continue;
+      const std::string& n = c->op_->name_;
+      const bool is_bmm = (n == "tile.batch_matmul");
+      const bool is_bmm_acc = (n == "tile.batch_matmul_acc");
+      if (!is_bmm && !is_bmm_acc) continue;
+      const size_t lhs_i = is_bmm ? 0 : 1;
+      const size_t rhs_i = is_bmm ? 1 : 2;
+      if (rhs_i >= c->args_.size()) continue;
+      // Mirror LowerBatchMatmul's per-operand routing so a non-contiguous whole
+      // load (which goes per-batch) is also recognized as !fit here and its dead
+      // whole chain is dropped (otherwise it would survive to codegen and trip the
+      // ND2NZ contiguity guard).
+      const bool capacity_fits = BatchOperandsWholeFit(As<TileType>(c->args_[lhs_i]->GetType()),
+                                                       As<TileType>(c->args_[rhs_i]->GetType()));
+      const bool lhs_fits =
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[lhs_i], stmt_def_map));
+      const bool rhs_fits =
+          KeepOperandWhole(capacity_fits, TraceOperandBaseLoad(c->args_[rhs_i], stmt_def_map));
+      if (auto lv = As<Var>(c->args_[lhs_i])) MarkChain(lv.get(), lhs_fits);
+      if (auto rv = As<Var>(c->args_[rhs_i])) MarkChain(rv.get(), rhs_fits);
+    }
+    for (const auto* v : batch_matmul_only_vars) {
+      if (any_notfit.count(v) != 0 && any_fit.count(v) == 0) not_fit_drop_vars.insert(v);
     }
   }
 
@@ -1580,14 +1734,14 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       };
       if (auto in_core = As<InCoreScopeStmt>(stmt)) {
         result.push_back(rewrite(in_core));
-      } else if (auto auto_in_core = As<AutoInCoreScopeStmt>(stmt)) {
-        result.push_back(rewrite(auto_in_core));
       } else if (auto cluster = As<ClusterScopeStmt>(stmt)) {
         result.push_back(rewrite(cluster));
       } else if (auto hier = As<HierarchyScopeStmt>(stmt)) {
         result.push_back(rewrite(hier));
       } else if (auto spmd = As<SpmdScopeStmt>(stmt)) {
         result.push_back(rewrite(spmd));
+      } else if (auto split_aiv = As<SplitAivScopeStmt>(stmt)) {
+        result.push_back(rewrite(split_aiv));
       } else if (auto runtime_scope = As<RuntimeScopeStmt>(stmt)) {
         result.push_back(rewrite(runtime_scope));
       } else {
@@ -1762,6 +1916,14 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       continue;
     }
 
+    // Drop the dead whole load/transpose_view chain of a !fit batch_matmul: it is
+    // loaded per batch at the matmul (ExtractBatchPage !fit path), so the whole
+    // tile is never referenced and must not occupy L1.
+    if (not_fit_drop_vars.count(assign->var_.get()) != 0) {
+      ctx.Insert(assign->var_, assign->var_);  // identity mapping so any lookup resolves
+      continue;
+    }
+
     auto call = As<Call>(assign->value_);
     auto global_var = call ? As<GlobalVar>(call->op_) : nullptr;
 
@@ -1781,24 +1943,15 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
     const auto& op_name = call->op_->name_;
 
-    // ---- tile.load on >2D tile: preserve the original tensor-rank source window,
-    //      but flatten the result tile ----
-    // Keep the original tensor-rank offsets/shapes on the call for codegen, then
-    // manually replace the inferred rank>2 TileType with a 2D TileType because
-    // hardware tiles are always 2D.
-    if (op_name == "tile.load") {
-      // Skip tile.load whose result is consumed exclusively by tile.batch_matmul,
-      // but ONLY when ExtractBatchPage Strategy 1 can reconstruct per-batch loads
-      // (i.e. target_memory == Mat). Strategy 1 now supports transpose=True loads
-      // by propagating the kwarg to per-batch loads. Other strategies (2/3) need
-      // the original load result as their input operand.
-      if (batch_matmul_only_vars.count(assign->var_.get())) {
-        auto target_mem = call->GetKwarg<MemorySpace>("target_memory", MemorySpace::DDR);
-        if (target_mem == MemorySpace::Mat) {
-          ctx.Insert(assign->var_, assign->var_);  // identity mapping so lookups still work
-          continue;
-        }
-      }
+    // ---- tile.load on >2D tile: flatten the result tile to 2D (hardware tiles
+    //      are always 2D), keeping the tensor-rank source window for codegen —
+    //      except a natural Mat load with a real batch (>1) collapses its window
+    //      to 2D as well (the ND2NZ path rejects rank>2 GlobalTensors). ----
+    if (IsOp(call, "tile.load")) {
+      // A batch_matmul operand load is KEPT here and sliced per batch by
+      // ExtractBatchPage (the fit path) — both operands, transposed or not, are
+      // handled identically (whole tile in L1 + per-batch slice). Only a !fit
+      // operand load is dropped (above), to be re-emitted per batch.
 
       // Substitute args via ctx.var_map so all operand Vars reference the latest SSA values.
       std::vector<ExprPtr> sub_args;
@@ -1820,8 +1973,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         // already carried — e.g. LowerCompositeOps tags a transposed-load Mat
         // rhs with TileView(blayout=row_major, slayout=col_major) so the
         // downstream TLOAD matches the DN2ZN pattern. The implicit Mat default
-        // (col/row = ND) would otherwise emit an unsupported DN2ND TLOAD
-        // (#1540). Mirrors ExtractBatchPage Strategy 1 above.
+        // (col/row = ND) would otherwise emit an unsupported DN2ND TLOAD (#1540).
         std::optional<TileView> flat_tile_view;
         if (result_tile->tile_view_.has_value()) {
           const auto& orig_tv = *result_tile->tile_view_;
@@ -1842,6 +1994,11 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         }
         auto flat_tile_type = std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_, std::nullopt,
                                                          flat_tile_view, result_tile->memory_space_);
+
+        // The rank>2 source window is preserved as-is for codegen. A natural Mat
+        // load lowers to ND2NZ, which requires a 2-dim GlobalTensor — that
+        // collapse is owned by the tile.load codegen (it triggers on the NZ result
+        // tile), so flatten only needs to flatten the RESULT tile to 2D here.
         auto flat_call =
             std::make_shared<Call>(call->op_, sub_args, call->kwargs_, flat_tile_type, call->span_);
         auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, flat_tile_type, assign->var_->span_);
@@ -1863,7 +2020,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     // offsets are preserved; codegen uses the tensor view plus a partition_view
     // over the original tensor-rank window to produce the 2D result.
     // Signature: (tile, offsets, output_tensor[, shapes])
-    if (op_name == "tile.store") {
+    if (IsOp(call, "tile.store")) {
       auto orig_tile_type = As<TileType>(call->args_[0]->GetType());
 
       std::vector<ExprPtr> new_args;
@@ -1918,7 +2075,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     }
 
     // ---- tile.create / tile.full with >2D shape: flatten shape directly ----
-    if (op_name == "tile.create" || op_name == "tile.full") {
+    if (IsOp(call, "tile.create") || IsOp(call, "tile.full")) {
       auto result_tile = As<TileType>(call->GetType());
       if (result_tile && result_tile->shape_.size() > 2) {
         auto [merged, last] = ComputeMergedShape(result_tile->shape_, op_name);
@@ -1946,7 +2103,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     }
 
     // ---- tile.sum/tile.max/tile.min: remap axis to 1 (last axis of 2D) ----
-    if (op_name == "tile.sum" || op_name == "tile.max" || op_name == "tile.min") {
+    if (IsOp(call, "tile.sum") || IsOp(call, "tile.max") || IsOp(call, "tile.min")) {
       if (!call->args_.empty()) {
         auto input_tile = As<TileType>(call->args_[0]->GetType());
         if (IsNdTile(input_tile)) {
@@ -1978,7 +2135,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     }
 
     // ---- tile.batch_matmul: delegate to LowerBatchMatmul ----
-    if (op_name == "tile.batch_matmul") {
+    if (IsOp(call, "tile.batch_matmul")) {
       auto lowering = LowerBatchMatmul(assign, call, stmts, stmt_index, ctx, op_registry, span);
       result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
       if (lowering.fused_store) {
@@ -1991,7 +2148,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     }
 
     // ---- tile.batch_matmul_acc: delegate to LowerBatchMatmulAcc ----
-    if (op_name == "tile.batch_matmul_acc") {
+    if (IsOp(call, "tile.batch_matmul_acc")) {
       auto lowering = LowerBatchMatmulAcc(assign, call, stmts, ctx, op_registry, span);
       result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
       ctx.Insert(assign->var_, lowering.output_var);
@@ -1999,7 +2156,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     }
 
     // ---- tile.transpose feeding only tile.batch_matmul[_acc]: skip and let lowering peel it ----
-    if (op_name == "tile.transpose" && batch_matmul_only_vars.count(assign->var_.get()) != 0) {
+    if (IsOp(call, "tile.transpose") && batch_matmul_only_vars.count(assign->var_.get()) != 0) {
       ctx.Insert(assign->var_, assign->var_);  // identity mapping for safety
       continue;
     }
@@ -2011,7 +2168,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     //   2D   → emit one scratch tile.create + a 4-arg tile.transpose.
     // An already-4-arg 2D transpose (e.g. hand-built IR) falls through to the generic
     // re-create path unchanged.
-    if (op_name == "tile.transpose" && batch_matmul_only_vars.count(assign->var_.get()) == 0) {
+    if (IsOp(call, "tile.transpose") && batch_matmul_only_vars.count(assign->var_.get()) == 0) {
       if (IsNdTile(As<TileType>(call->args_[0]->GetType()))) {
         auto lowering = LowerNdTranspose(assign, call, ctx, op_registry, span);
         result.insert(result.end(), lowering.stmts.begin(), lowering.stmts.end());
@@ -2046,11 +2203,11 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       // 4-arg 2D transpose: fall through to the generic re-create path below.
     }
 
-    // ---- tile.reshape feeding only tile.batch_matmul: skip if it is a safe
-    //      batch-only reshape that `NormalizeBatchMatmulOperand` will peel. The
-    //      pre-scan above also marks the reshape's upstream chain so the dead
-    //      `tile.load` underneath is dropped by the `tile.load` skip path. ----
-    if (op_name == "tile.reshape" && batch_matmul_only_vars.count(assign->var_.get()) != 0 &&
+    // ---- tile.reshape feeding only tile.batch_matmul: skip (identity) when it is
+    //      a safe batch-only reshape that `NormalizeBatchMatmulOperand` peels, so
+    //      no orphan rank>2 reshape survives. The underlying tile.load is reused by
+    //      the lowering (fit path) or re-emitted per batch (!fit path). ----
+    if (IsOp(call, "tile.reshape") && batch_matmul_only_vars.count(assign->var_.get()) != 0 &&
         IsSafePeelableBatchMatmulReshape(call)) {
       ctx.Insert(assign->var_, assign->var_);  // identity mapping for safety
       continue;

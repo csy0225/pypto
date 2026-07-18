@@ -59,6 +59,7 @@ import os
 import re
 import shutil
 import textwrap
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 from pypto.pypto_core import DataType
@@ -503,12 +504,17 @@ def _func_name_lookup(func: Any) -> dict[str, Any]:
 def _scan_dep_io(
     func: Any, caller_func_type: str = "orchestration"
 ) -> dict[str, tuple[list[str], list[str]]]:
-    """Return ``dep_name → (param_names, out_param_names)`` for every @pl.jit
+    """Return ``dep_name → (param_names, output_param_names)`` for every @pl.jit
     dep called from ``func``'s body.
 
     Used by :func:`_extract_local_tensor_metas` to propagate metas through
     ``v1, ..., vk = dep(args)`` assignments (each ``vi`` inherits the meta of
-    the caller arg bound to the i-th ``Out`` parameter).
+    the caller arg bound to the i-th output-like parameter).
+
+    ``output_param_names`` covers both ``pl.Out[...]`` and ``pl.InOut[...]``
+    params — a caller can capture either from ``v = dep(...)`` — and is kept in
+    declaration order so it stays aligned with the callee's return order (the
+    positional target<->param zip in :func:`_propagate_dep_out_metas`).
 
     ``caller_func_type`` mirrors :func:`_discover_deps`'s gating: a host
     orchestrator also admits ``orchestration`` deps (its chip orchestrators).
@@ -516,10 +522,13 @@ def _scan_dep_io(
     out: dict[str, tuple[list[str], list[str]]] = {}
     for dep in _discover_deps(func, caller_func_type):
         try:
-            out_params, _, _, _ = _classify_params(_get_func_def(dep._func))
+            out_params, inout_params, _, _, _ = _classify_params(_get_func_def(dep._func))
         except OSError:
             continue
-        out[dep.__name__] = (dep._param_names(), out_params)
+        param_names = dep._param_names()
+        output_set = set(out_params) | set(inout_params)
+        output_params = [p for p in param_names if p in output_set]
+        out[dep.__name__] = (param_names, output_params)
     return out
 
 
@@ -582,6 +591,54 @@ def _fold_int_arith(op: ast.operator, lhs: int, rhs: int) -> int | None:
     return None
 
 
+def _subscript_slice_meta(
+    sub: ast.Subscript,
+    local: dict[str, TensorMeta],
+    resolve_int: Callable[[ast.expr], int | None],
+) -> TensorMeta | None:
+    """Infer the ``TensorMeta`` of ``var = src[a:b, i, ...]`` subscript-slice sugar.
+
+    The documented equivalent of ``pl.slice`` (see ``_extract_local_tensor_metas``
+    form 2): dtype is inherited from ``src``; each slice dim resolves to
+    ``stop - start`` (``start`` defaults to 0), and an open upper bound ``a:``
+    resolves to ``parent_dim - start`` — mirroring the parser's
+    ``_build_subscript_slice_args``. A dim falls back to the parent extent when
+    its bounds aren't static — a ``DynDim`` parent flows through transparently
+    that way; a scalar index drops its dim (numpy-style rank reduction); dims
+    past the supplied indices are implicit ``:`` and keep the parent extent.
+    Returns ``None`` (skipped, leaving the clear ``_build_params`` error) when
+    ``src`` is unknown, a step slice is used, or the index count exceeds
+    ``src``'s rank.
+    """
+    src = sub.value
+    if not isinstance(src, ast.Name) or src.id not in local:
+        return None
+    src_meta = local[src.id]
+    slc = sub.slice
+    indices = list(slc.elts) if isinstance(slc, ast.Tuple) else [slc]
+    if len(indices) > len(src_meta.shape):
+        return None
+    dims: list[ShapeDim] = []
+    for dim_idx, idx in enumerate(indices):
+        if not isinstance(idx, ast.Slice):
+            continue  # scalar index → rank-reducing, dim dropped
+        if idx.step is not None:
+            return None
+        start = 0 if idx.lower is None else resolve_int(idx.lower)
+        parent = src_meta.shape[dim_idx]
+        if idx.upper is None:
+            # Open upper bound ``a:`` — the parser bounds it at ``parent - start``
+            # (see ``_build_subscript_slice_args``), so mirror that here instead
+            # of falling back to the full parent extent for a nonzero ``start``.
+            extent = parent - start if isinstance(parent, int) and isinstance(start, int) else None
+        else:
+            stop = resolve_int(idx.upper)
+            extent = stop - start if isinstance(start, int) and isinstance(stop, int) else None
+        dims.append(extent if extent is not None else parent)
+    dims.extend(src_meta.shape[len(indices) :])  # trailing implicit ``:``
+    return TensorMeta(shape=tuple(dims), dtype=src_meta.dtype)
+
+
 def _extract_local_tensor_metas(
     func: Any,
     seed_meta: dict[str, TensorMeta] | None = None,
@@ -607,7 +664,11 @@ def _extract_local_tensor_metas(
        as-is, and a non-static dim (e.g. a runtime ``valid_len``) falls back to
        ``src``'s corresponding dim, since a slice is bounded above by its
        parent. ``src`` dims that are themselves ``DynDim`` flow through
-       transparently.
+       transparently. The subscript-slice sugar ``var = src[a:b, i, ...]`` (an
+       ``ast.Subscript``) is the documented equivalent and is tracked the same
+       way: each slice dim resolves to ``stop - start`` (parent-dim fallback
+       when not static), a scalar index drops its dim, and trailing implicit
+       ``:`` dims keep the parent extent.
     3. ``v1, ..., vk = jit_dep(args)`` where ``jit_dep`` is an
        ``@pl.jit.incore`` / ``inline`` / ``opaque`` callee with ``k``
        ``pl.Out[...]`` parameters — each ``vi`` inherits the meta of the caller
@@ -811,23 +872,23 @@ def _extract_local_tensor_metas(
                 target = stmt.target
             else:
                 continue
-            call = stmt.value
-            if not isinstance(call, ast.Call):  # AnnAssign.value may be None
-                continue
-            fn = call.func
-            if (
-                isinstance(fn, ast.Attribute)
-                and isinstance(fn.value, ast.Name)
-                and isinstance(target, ast.Name)
-            ):
-                handler = _pl_attr_handlers.get(fn.attr)
-                if handler is not None:
-                    meta = handler(call)
-                    if meta is not None:
-                        local[target.id] = meta
-                    continue
-            if isinstance(fn, ast.Name) and fn.id in dep_io:
-                _record_dep_result_metas(call, fn.id, target)
+            value = stmt.value
+            named = target if isinstance(target, ast.Name) else None
+            meta: TensorMeta | None = None
+            # Subscript-slice sugar ``v = src[a:b, ...]`` (an ast.Subscript, not a
+            # pl.slice Call) is the documented equivalent of pl.slice; a tracked
+            # ``pl.<attr>(...)`` call dispatches through the handler table.
+            if isinstance(value, ast.Subscript) and named is not None:
+                meta = _subscript_slice_meta(value, local, _resolve_int)
+            elif isinstance(value, ast.Call):  # AnnAssign.value may be None
+                fn = value.func
+                if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name) and named is not None:
+                    handler = _pl_attr_handlers.get(fn.attr)
+                    meta = handler(value) if handler is not None else None
+                elif isinstance(fn, ast.Name) and fn.id in dep_io:
+                    _record_dep_result_metas(value, fn.id, target)
+            if meta is not None and named is not None:
+                local[named.id] = meta
 
     _walk(func_def.body)
     return local
@@ -1116,11 +1177,19 @@ class JITFunction:
         func_type: str | None = None,
         level: Any = None,
         auto_scope: bool = True,
+        external_core_type: str | None = None,
+        external_aic_source: str | None = None,
+        external_aiv_source: str | None = None,
     ) -> None:
         self._func = func
         self._func_type = func_type or "orchestration"
         self._level = level
         self._auto_scope = auto_scope
+        # External C++ kernel backing (func_type == "extern"): resolved absolute
+        # paths the specializer emits as @pl.function(external_source=...).
+        self._external_core_type = external_core_type
+        self._external_aic_source = external_aic_source
+        self._external_aiv_source = external_aiv_source
         self._dep_graph: (
             tuple[
                 list[JITFunction],
@@ -1132,12 +1201,6 @@ class JITFunction:
         ) = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
         self._source_hash: str | None = None
-
-        # RunTiming from the most recent __call__, forwarded from the dispatched
-        # CompiledProgram (host_wall_us / device_wall_us), or None before the
-        # first on-device run. Lets callers read timing for a plain
-        # ``kernel(*args, config=...)`` dispatch without changing its return.
-        self.last_run_timing: Any = None
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -1246,13 +1309,34 @@ class JITFunction:
     # Source hash (includes all dep sources; lazily computed after deps found)
     # ------------------------------------------------------------------
 
+    def _external_source_paths(self) -> list[str]:
+        """Absolute paths of the C++ source(s) backing an external kernel dep."""
+        return [p for p in (self._external_aic_source, self._external_aiv_source) if p is not None]
+
     def _get_source_hash(self) -> str:
-        if self._source_hash is None:
-            sources = [inspect.getsource(self._func)]
-            for dep in self._get_deps():
+        deps = self._get_deps()
+        # External kernel .cpp files are mutable on disk, unlike the (fixed once
+        # loaded) Python source. When any extern dep is present, recompute the
+        # hash on every lookup so an edited kernel is picked up even within a
+        # long-lived process; otherwise cache it.
+        has_extern = any(d._func_type == "extern" for d in deps)
+        if self._source_hash is not None and not has_extern:
+            return self._source_hash
+        sources = [inspect.getsource(self._func)]
+        for dep in deps:
+            if dep._func_type == "extern":
+                # The Python stub is just ``...``; the real implementation is
+                # the C++ file(s). Hash their content so editing a kernel
+                # invalidates the JIT cache (the stub source never changes).
+                for path in dep._external_source_paths():
+                    with open(path) as f:
+                        sources.append(f.read())
+            else:
                 sources.append(inspect.getsource(dep._func))
-            self._source_hash = compute_source_hash(sources)
-        return self._source_hash
+        source_hash = compute_source_hash(sources)
+        if not has_extern:
+            self._source_hash = source_hash
+        return source_hash
 
     # ------------------------------------------------------------------
     # Parameter introspection
@@ -1434,17 +1518,14 @@ class JITFunction:
         Returns:
             ``None`` for in-place calls (output tensors modified on device),
             or ``torch.Tensor`` / ``tuple[torch.Tensor, ...]`` for return-style
-            calls. The on-device timing for this call is stored on
-            :attr:`last_run_timing` (a simpler ``RunTiming`` with
-            ``host_wall_us`` / ``device_wall_us``).
+            calls. Per-run on-device timing is no longer surfaced as an
+            attribute — read it from the runtime's ``[STRACE]`` log markers
+            (simpler PR #1177).
         """
         compiled, ordered_args, run_config = self._resolve_compiled(args, kwargs)
         if run_config is not None:
-            result = compiled(*ordered_args, config=run_config)
-        else:
-            result = compiled(*ordered_args)
-        self.last_run_timing = getattr(compiled, "last_run_timing", None)
-        return result
+            return compiled(*ordered_args, config=run_config)
+        return compiled(*ordered_args)
 
     def compile(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize + compile for the shape/dtype combination implied by *args*,
@@ -1651,6 +1732,9 @@ class JITFunction:
                     scalar_dtypes=dep_sd,
                     dep_names=callees_by_id[id(dep._func)],
                     auto_scope=dep._auto_scope,
+                    external_core_type=dep._external_core_type,
+                    external_aic_source=dep._external_aic_source,
+                    external_aiv_source=dep._external_aiv_source,
                 )
             )
         dep_contexts.reverse()
@@ -1774,7 +1858,7 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
 
     all_vars = {**func_globals, **closure_vars}
 
-    allowed_dep_types: set[str] = {"incore", "inline", "opaque"}
+    allowed_dep_types: set[str] = {"incore", "inline", "opaque", "extern"}
     if caller_func_type == "host":
         allowed_dep_types.add("orchestration")
 
@@ -1839,6 +1923,82 @@ class _SubFunctionDecorator:
         return JITFunction(func, func_type=self._func_type, level=None, auto_scope=resolved_auto_scope)
 
 
+def _resolve_extern_source(source: str | Any, func: Any) -> str:
+    """Resolve an external-kernel source path to an absolute file string.
+
+    A relative path is resolved against the directory of the file defining the
+    decorated ``@pl.jit.extern`` stub (``inspect.getsourcefile``), matching the
+    ``@pl.program`` external_source convention.
+    """
+    path = os.fspath(source)
+    if not os.path.isabs(path):
+        src_file = inspect.getsourcefile(func)
+        if src_file is not None and not src_file.startswith("<"):
+            path = os.path.join(os.path.dirname(src_file), path)
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        raise ValueError(
+            f"@pl.jit.extern source file not found: {path}. "
+            "Provide an absolute path, or one relative to the file defining the kernel."
+        )
+    return path
+
+
+class _ExternKernelDecorator:
+    """Sub-decorator for ``@pl.jit.extern`` — a hand-written C++ InCore kernel.
+
+    The decorated function is a signature-only stub (``...`` body); its
+    implementation is the referenced ``.cpp``. Forms::
+
+        @pl.jit.extern(source="k_aiv.cpp", core_type="aiv")     # single core
+        @pl.jit.extern(source="k_aic.cpp", core_type="aic")
+        @pl.jit.extern(core_type="mixed",                       # AIC+AIV pair
+                       aic_source="k.cpp", aiv_source="k.cpp")
+
+    A ``mixed`` kernel is dispatched as one ``MixedKernels`` submit: the
+    specializer emits an AIC member, an AIV member, and a Group wrapper.
+    """
+
+    def __call__(
+        self,
+        func: Any = None,
+        *,
+        core_type: str = "aiv",
+        source: str | Any = None,
+        aic_source: str | Any = None,
+        aiv_source: str | Any = None,
+    ) -> Any:
+        if core_type not in ("aic", "aiv", "mixed"):
+            raise ValueError(f"@pl.jit.extern core_type must be 'aic', 'aiv', or 'mixed', got {core_type!r}")
+
+        def _make(f: Any) -> JITFunction:
+            if core_type == "mixed":
+                if aic_source is None or aiv_source is None:
+                    raise ValueError(
+                        "@pl.jit.extern(core_type='mixed') requires both aic_source= and aiv_source="
+                    )
+                ext_aic = _resolve_extern_source(aic_source, f)
+                ext_aiv = _resolve_extern_source(aiv_source, f)
+            else:
+                single = source if source is not None else (aic_source or aiv_source)
+                if single is None:
+                    raise ValueError(f"@pl.jit.extern(core_type={core_type!r}) requires source=")
+                resolved = _resolve_extern_source(single, f)
+                ext_aic = resolved if core_type == "aic" else None
+                ext_aiv = resolved if core_type == "aiv" else None
+            return JITFunction(
+                f,
+                func_type="extern",
+                external_core_type=core_type,
+                external_aic_source=ext_aic,
+                external_aiv_source=ext_aiv,
+            )
+
+        if func is None:
+            return _make
+        return _make(func)
+
+
 class _JITDecorator:
     """The ``pl.jit`` object.
 
@@ -1864,6 +2024,7 @@ class _JITDecorator:
         self.incore = _SubFunctionDecorator("incore", allow_level=True)
         self.inline = _SubFunctionDecorator("inline", allow_level=False, allow_auto_scope=True)
         self.opaque = _SubFunctionDecorator("opaque", allow_level=False)
+        self.extern = _ExternKernelDecorator()
 
     def __call__(self, func: Any = None, *, auto_scope: bool = True) -> Any:
         """Decorate an entry-point JIT function (Orchestration).

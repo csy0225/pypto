@@ -37,15 +37,22 @@ struct OrchestrationResult {
   /// kernel_config.py to set each CoreCallable signature so the runtime tensor
   /// dump's per-subtask tensor-arg count matches the task payload tensor_count.
   std::map<std::string, std::vector<std::string>> func_name_to_signature;
+  /// Orchestration entry's per-tensor runtime ArgDirection names ("IN"/"OUT"/
+  /// "INOUT"), in orch_args tensor order (declaration order, scalars skipped).
+  /// This matches the orch tensor index the runtime uses in
+  /// bind_callable_to_runtime_impl (orch_args.tensor(i)), letting it set the
+  /// ChipCallable signature so read-only IN tensors skip the D2H copy-back and
+  /// pure-OUT tensors take the on-device memset fast path.
+  std::vector<std::string> orchestration_signature;
 };
 
 /**
  * @brief Generate C++ orchestration code for a function
  *
  * Generates C++ code using PTO2 runtime API:
- * - aicpu_orchestration_config(TaskArg* orch_args) returns PTO2OrchestrationConfig
- * - aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args)
- * - from_task_arg() for ND external tensors, make_tensor for internal tensors
+ * - aicpu_orchestration_config(const L2TaskArgs& orch_args) returns PTO2OrchestrationConfig
+ * - aicpu_orchestration_entry(const L2TaskArgs& orch_args)
+ * - orch_args.tensor(i).ref() for ND external tensors, make_tensor for internal tensors
  * - PTOParam + rt_submit_*_task for task submission (rt_submit_aic_task /
  *   rt_submit_aiv_task for single-core kernels; rt_submit_task for mixed kernels)
  * - No manual dependency management (runtime handles automatically)

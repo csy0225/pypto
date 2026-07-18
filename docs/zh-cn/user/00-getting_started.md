@@ -281,6 +281,89 @@ for batch in stream:
 完整三种使用模式（推理服务、训练循环、register/dispatch 开销验证）见
 `examples/runtime/explicit_dispatch.py`。
 
+### 读取单次 launch 的计时
+
+`worker.run` / `handle(...)` 只返回张量输出，不再暴露单次 launch 的计时对象。
+runtime 以 `[STRACE]` 日志标记的形式输出每次运行的 host/device 计时（simpler
+PR #1177，在 `PTO2_PROFILING` 下默认开启）；用 simpler 的 `strace_timing` /
+`device_log_timing` 工具解析这些标记，而不是读取返回值。需要 per-task 的 device
+计时时，开启 L2 swimlane DFX（`RunConfig(enable_l2_swimlane=True)`）并读取
+`l2_swimlane_records.json`。
+
+### 性能基准（`benchmark`）
+
+对于 register-once + 多轮（rounds）模式，`pypto.runtime.benchmark` 封装了循环
+与聚合：它注册 *compiled* 一次并发起 `rounds` 次廉价 launch（不再每轮重付
+register/load），读取每次 launch 的 `[STRACE]` 标记并返回 `BenchmarkStats`：
+
+```python
+from pypto.runtime import benchmark
+
+stats = benchmark(compiled, [a, b, c], rounds=100, warmup=3,
+                  platform="a2a3", device_id=0)
+print(stats.device_wall_us_median, stats.device_wall_us_min, len(stats.samples))
+```
+
+常见情况传 `platform=` / `device_id=`；需要 `block_dim` / `aicpu_thread_num` 等
+精细控制时传完整的 `RunConfig`（通过 `config=`）——两者不能同时给。聚合指标同时
+以 `device_wall_us_*` 和更短的 `device_us_*` 两套命名暴露，`samples` 是原始
+`device_wall_us` 列表的别名。
+
+`benchmark` 从 `[STRACE]` 标记读取计时（simpler PR #1177）：它在 worker 生命周期内
+将 runtime 日志级别提升到 `v9`，并在测量循环期间以 fd 级别捕获 `stderr`，因此循环
+期间产生的 stderr 会被转存到临时文件，而非实时打印。`device_wall_us` 在 L2 单芯片
+运行时是真实的 NPU 墙钟（分布式见下方 L3 说明）；在未开启 `SIMPLER_PROFILING` 的
+runtime 上或 `*sim` 平台上为 `0`（用 `stats.all_zero_device` 判断）。
+
+除聚合值外，每次测量 launch 的完整 `[STRACE]` span 树保存在 `stats.invocations`
+（`TraceInvocation` 列表，已排除 warmup）。可用分支连接符渲染——单次 launch，或跨所有
+launch 求均值并标注每个节点的离散度（`spread` 取 `"stdev"`（默认）、`"minmax"`、
+`"both"` 或 `"none"`）：
+
+```python
+stats.print_tree(launch=0)            # 某次 launch 的嵌套 span 树
+stats.print_mean_tree(spread="both")  # 每节点均值 + ±stdev + [min..max]
+```
+
+```text
+mean of 20 launches (warmup 5 excluded); each node: mean ±stdev [min..max]:
+simpler_run                71784.1us  ±6797.5  [66482.4..89832.6]
+|- bind                    27943.6us  ±4163.7  [24836.7..37713.3]
+|- runner_run               3030.8us   ±184.4    [2822.3..3694.7]
+|  `- device_wall [dev]     2005.2us    ±74.6    [1875.1..2173.2]
+|     `- graph_build [dev]  1634.8us    ±64.6    [1490.2..1777.6]
+`- validate                40697.7us  ±3063.5  [38606.3..48200.6]
+```
+
+嵌套关系由点分 span 名重建,因此设备域 span（`...device_wall.*`,标 `[dev]`）会正确挂在
+其 host 父节点下。每个节点是一段**墙钟窗口而非时间划分**:子节点可能并发重叠（如 `orch`/
+`sched` 并行）或处于不同时钟域（`runner_run` 是 host 墙钟、`device_wall` 是 NPU 墙钟）,
+故子节点时长之和不必等于父节点。要取原始 span 用
+`stats.invocations[i].by_name()[<name>].dur_us`。
+
+`benchmark` 也接受 L3 的 `DistributedCompiledProgram`（经 `compiled.prepare()`
+打开）：传共享内存 host 张量（或 `DeviceTensor`），并省略 `platform=` / `device_id=`
+（设备集在编译期由 `distributed_config` 固定）。L3 没有单一的 DAG 级 device 墙钟，
+因此计时由各 rank 的 chip 子进程标记折叠成逐轮样本——headline `device_wall_us[k]`
+是各卡该轮 dispatch device 墙钟之和再跨卡取 max。四个指标统一查询：
+
+```python
+stats.per_round("device" | "host" | "effective" | "union")  # -> 每轮一个值
+stats.per_rank("device" | "host" | "effective")             # -> {pid: 每轮一个值}
+```
+
+这两个视图都是**按 rank 按轮**聚合的：每个值是该 rank 该轮内多次 dispatch 的
+**求和**（一张卡串行执行它的多次 dispatch），因此是"每 rank 每轮"的量，**不是**逐
+dispatch 的量。当某 rank 每轮恰好只有 1 次 dispatch 时，求和即那唯一一次 dispatch 的值；
+无论哪种情况，要看逐次 dispatch 明细都读 `stats.rounds_dispatches[k][pid]`（见下）。
+
+`effective` 是 orch∪sched 的设备执行窗口（每卡 L2 Effective）；`union` 是跨卡 host
+时间轴并集窗口（能反映起跑错位——host 域，含派发开销）。可导航的
+`round -> rank -> [dispatch]` 网格是 `stats.rounds_dispatches`，每个
+`TraceInvocation` 暴露 `.task`（callable 标识）、`.device_wall_us`、`.host_wall_us`、
+`.effective_us`。纯 device 的跨卡端到端墙钟目前无法从标记恢复。若 dispatch 形状非
+确定，则 `stats.fallback_flattened` 被置位，per-rank / `union` 视图为空。
+
 ### 分布式（L3+）程序
 
 `ir.compile` 对 L3+ 分布式程序返回的 `DistributedCompiledProgram` 与 `CompiledProgram`
@@ -325,6 +408,55 @@ with compiled.prepare() as rt:                  # setup 只跑一次
     rt.free_tensor(weight)
 # 退出时自动 rt.close()
 ```
+
+#### 把权重按卡切分常驻（`alloc_stacked_tensor`）
+
+当 HOST orchestrator 把一个 `[B, N, M]` 权重按首维切片并分发到每张卡——即规范写法
+`for r in range(world_size): child(x[r], device=r)`——直接传整块 host 张量会在**每次**
+dispatch 都把 `x[r]` 切片重新上传到对应卡。要让每个分片**只上传一次**并常驻在自己那张卡上,
+用 `rt.alloc_stacked_tensor` 构造一个 `StackedDeviceTensor`:
+
+```python
+host_w = load_weight().share_memory_()           # [B, N, M],B == world_size
+host_a = torch.zeros((B, N, M), dtype=...).share_memory_()
+host_out = torch.zeros((B, N, M), dtype=...).share_memory_()
+
+with compiled.prepare() as rt:
+    w = rt.alloc_stacked_tensor(host_w)          # 第 i 片上传到第 i 张卡,只传一次
+    for step in steps:
+        host_a.copy_(next_input(step))
+        rt(host_a, w, host_out)                  # x[r] 解析到常驻的第 r 片
+        consume(host_out)
+    rt.free_stacked_tensor(w)
+```
+
+内部每个分片 `host_w[i]` 都成为一个 worker 常驻的 `DeviceTensor`,因此生成代码里的
+`x[r]` 取下标会跳过 H2D 上传(`child_memory`)。分片在 `close()` 时自动释放,也可提前用
+`free_stacked_tensor` 释放。
+
+和单个 `DeviceTensor` 一样,`StackedDeviceTensor` 也不会被自动拷回。若要一次把每个分片
+当前的设备内容读回主机——例如某一步结束时读回常驻的 KV cache——可用
+`rt.copy_stacked_from(w, host_out)`,即 `alloc_stacked_tensor` 的对称读回接口。`host_out`
+原地填充(`host_out[i]` 接收第 `i` 片);与上传源一样,它必须是形状和 dtype 与该 stack
+匹配、且在 `prepare()` **之前**分配的 CPU、连续、**共享内存** `[B, *tail]` 张量
+(调用 `.share_memory_()`):D2H 拷贝在 fork 出的 chip worker 中执行,只能写它在 fork
+时继承的主机内存。
+
+首维就是分片维,`B` 必须等于程序分发到的卡数。默认第 `i` 片落在第 `i` 个 worker 上
+(对应 `device=r`)。如果程序用的是**非恒等**放置——置换或子集卡(如 `device=2*r`,或字面量
+`device=1` / `device=0`)——就要传匹配的 `worker_ids`,其中 `worker_ids[i]` 是程序提交
+`x[i]` 那次任务所用的 worker:
+
+```python
+# orchestrator 把 x[0] 分发到卡 1、x[1] 分发到卡 0
+w = rt.alloc_stacked_tensor(host_w, worker_ids=[1, 0])
+```
+
+`worker_ids` 必须互不相同且落在 `[0, world_size)` 内;与程序的 `device=` 不匹配会把分片放到
+错误的卡上、读到垃圾数据。
+
+`rt.alloc_tensor(..., worker_id=r)` 同样接受非默认的 `worker_id`,可把单个常驻
+`DeviceTensor` 放到任意卡(`free_tensor` 时传相同的 `worker_id`)。
 
 #### 在同一个 worker 上调度多个程序（multi-program）
 

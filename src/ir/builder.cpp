@@ -95,15 +95,14 @@ FunctionPtr IRBuilder::EndFunction(const Span& end_span) {
 
 void IRBuilder::BeginForLoop(const VarPtr& loop_var, const ExprPtr& start, const ExprPtr& stop,
                              const ExprPtr& step, const Span& span, ForKind kind,
-                             std::optional<ChunkConfig> chunk_config,
                              std::vector<std::pair<std::string, std::any>> attrs) {
   if (context_stack_.empty()) {
     throw pypto::RuntimeError("Cannot begin for loop: not inside a function or another valid context at " +
                               span.to_string());
   }
 
-  context_stack_.push_back(std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind,
-                                                            std::move(chunk_config), std::move(attrs)));
+  context_stack_.push_back(
+      std::make_unique<ForLoopContext>(loop_var, start, stop, step, span, kind, std::move(attrs)));
 }
 
 void IRBuilder::AddIterArg(const IterArgPtr& iter_arg) {
@@ -142,10 +141,10 @@ StmtPtr IRBuilder::EndForLoop(const Span& end_span) {
                      end_span.begin_line_, end_span.begin_column_);
 
   // Create for statement
-  auto for_stmt = std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
-                                            loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body,
-                                            loop_ctx->GetReturnVars(), combined_span, loop_ctx->GetKind(),
-                                            loop_ctx->GetChunkConfig(), loop_ctx->GetAttrs());
+  auto for_stmt =
+      std::make_shared<ForStmt>(loop_ctx->GetLoopVar(), loop_ctx->GetStart(), loop_ctx->GetStop(),
+                                loop_ctx->GetStep(), loop_ctx->GetIterArgs(), body, loop_ctx->GetReturnVars(),
+                                combined_span, loop_ctx->GetKind(), loop_ctx->GetAttrs());
 
   // Pop context
   context_stack_.pop_back();
@@ -301,6 +300,8 @@ void IRBuilder::BeginScope(ScopeKind scope_kind, const Span& span, std::optional
       << "Hierarchy scope requires a level at " << span.to_string();
   CHECK(scope_kind != ScopeKind::Runtime || manual.has_value())
       << "Runtime scope requires manual flag at " << span.to_string();
+  CHECK(scope_kind != ScopeKind::SplitAiv || split.has_value())
+      << "SplitAiv scope requires a split mode at " << span.to_string();
   context_stack_.push_back(std::make_unique<ScopeContext>(scope_kind, span, level, role, split,
                                                           std::move(name_hint), std::move(core_num),
                                                           sync_start, manual, std::move(attrs)));
@@ -340,10 +341,6 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
       scope_stmt = std::make_shared<const InCoreScopeStmt>(split, std::move(name_hint), body, combined_span,
                                                            std::vector<std::string>{}, std::move(attrs));
       break;
-    case ScopeKind::AutoInCore:
-      scope_stmt = std::make_shared<const AutoInCoreScopeStmt>(
-          split, std::move(name_hint), body, combined_span, std::vector<std::string>{}, std::move(attrs));
-      break;
     case ScopeKind::Cluster:
       scope_stmt = std::make_shared<const ClusterScopeStmt>(std::move(name_hint), body, combined_span,
                                                             std::vector<std::string>{}, std::move(attrs));
@@ -359,6 +356,13 @@ StmtPtr IRBuilder::EndScope(const Span& end_span) {
       scope_stmt = std::make_shared<const SpmdScopeStmt>(core_num, sync_start.value_or(false),
                                                          std::move(name_hint), body, combined_span,
                                                          std::vector<std::string>{}, std::move(attrs));
+      break;
+    case ScopeKind::SplitAiv:
+      CHECK(split.has_value()) << "SplitAiv scope requires a split mode (pl.split_aiv(..., mode=...)) at "
+                               << combined_span.to_string();
+      scope_stmt = std::make_shared<const SplitAivScopeStmt>(*split, /*count=*/2, std::move(name_hint), body,
+                                                             combined_span, std::vector<std::string>{},
+                                                             std::move(attrs));
       break;
     case ScopeKind::Runtime:
       CHECK(manual.has_value()) << "Runtime scope requires manual flag";

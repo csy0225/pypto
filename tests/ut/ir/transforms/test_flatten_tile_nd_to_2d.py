@@ -656,7 +656,7 @@ class TestFlattenTileNdTo2DChainedOps:
                 out_0: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 x_tile: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 a_tile = pl.tile.exp(x_tile)
                 b_tile = pl.tile.add(a_tile, x_tile)
@@ -705,7 +705,7 @@ class TestFlattenTileNdTo2DChainedOps:
                 out_0: pl.Out[pl.Tensor[[2, 3, 1], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 1], pl.FP32]:
                 x_tile: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 s_tile: pl.Tile[[6, 1], pl.FP32, pl.Mem.Vec, pl.TileView(blayout=pl.TileLayout.row_major)] = (
                     pl.tile.sum(x_tile, axis=1, keepdim=True)
@@ -856,12 +856,12 @@ class TestFlattenTileNdTo2DMultiOutput:
                 out_1: pl.Out[pl.Tensor[[32, 64], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 x_tile: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 a_tile = pl.tile.exp(x_tile)
                 out_0_1 = pl.tile.store(a_tile, [0, 0, 0], out_0, [2, 3, 4])
                 y_tile: pl.Tile[[32, 64], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    y, [0, 0], [32, 64], [32, 64], target_memory=pl.Mem.Vec, transpose=False
+                    y, [0, 0], [32, 64], [32, 64], target_memory=pl.Mem.Vec
                 )
                 b_tile = pl.tile.add(y_tile, y_tile)
                 out_1_1 = pl.tile.store(b_tile, [0, 0], out_1)
@@ -917,7 +917,7 @@ class TestFlattenTileNdTo2DMultiOutput:
                 out_1: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 x_tile: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 a_tile = pl.tile.add(x_tile, x_tile)
                 out_0_1 = pl.tile.store(a_tile, [0, 0, 0], out_0, [2, 3, 4])
@@ -983,7 +983,7 @@ class TestFlattenTileNdTo2DMultiOutput:
                 out_0: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 x_tile: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 y_tile = pl.tile.add(x_tile, x_tile)
                 out_0_1 = pl.tile.store(y_tile, [0, 0, 0], out_0, [2, 3, 4])
@@ -996,7 +996,7 @@ class TestFlattenTileNdTo2DMultiOutput:
                 out_0: pl.Out[pl.Tensor[[3, 4, 5], pl.FP32]],
             ) -> pl.Tensor[[3, 4, 5], pl.FP32]:
                 x_tile: pl.Tile[[12, 5], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [3, 4, 5], [3, 4, 5], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [3, 4, 5], [3, 4, 5], target_memory=pl.Mem.Vec
                 )
                 y_tile = pl.tile.mul(x_tile, x_tile)
                 out_0_1 = pl.tile.store(y_tile, [0, 0, 0], out_0, [3, 4, 5])
@@ -1066,7 +1066,7 @@ class TestFlattenTileNdTo2DReshapedStore:
                 out_0: pl.Out[pl.Tensor[[B, S, D], pl.FP32]],
             ) -> pl.Tensor[[B, S, D], pl.FP32]:
                 # 2D tile.load is unchanged by the pass.
-                x_tile = pl.tile.load(x, [0, 0], [B, D], [B, D], target_memory=pl.Mem.Vec, transpose=False)
+                x_tile = pl.tile.load(x, [0, 0], [B, D], [B, D], target_memory=pl.Mem.Vec)
                 # The user's explicit rank-raising reshape is preserved.
                 r3 = pl.tile.reshape(x_tile, [B, 1, D])
                 # The pass-inserted ``tile.reshape`` flattens the >2D tile operand of
@@ -1231,7 +1231,7 @@ class TestFlattenTileNdTo2DControlFlow:
                 out_0: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 t: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 for _i, (acc,) in pl.range(4, init_values=(t,)):
                     r = pl.tile.add(acc, acc)
@@ -1294,7 +1294,7 @@ class TestFlattenTileNdTo2DControlFlow:
                 out_0: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 t: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 count: pl.Scalar[pl.INDEX] = 0
                 for acc, count_iter in pl.while_(init_values=(t, count)):
@@ -1356,7 +1356,7 @@ class TestFlattenTileNdTo2DControlFlow:
                 out_0: pl.Out[pl.Tensor[[2, 3, 4], pl.FP32]],
             ) -> pl.Tensor[[2, 3, 4], pl.FP32]:
                 t: pl.Tile[[6, 4], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec, transpose=False
+                    x, [0, 0, 0], [2, 3, 4], [2, 3, 4], target_memory=pl.Mem.Vec
                 )
                 if cond:
                     a = pl.tile.add(t, t)
@@ -1414,7 +1414,12 @@ class TestFlattenTileNdTo2DBatchMatmul:
         return [cast(ir.ConstInt, elem).value for elem in tup.elements]
 
     def test_batch_matmul_broadcasts_and_unrolls(self):
-        """Broadcasted ``[2,1,M,K] x [1,3,K,N]`` expands to 6 per-batch 2D ``tile.matmul``."""
+        """Broadcasted ``[2,1,M,K] x [1,3,K,N]`` expands to 6 per-batch 2D ``tile.matmul``.
+
+        Both operands keep their whole 2D-collapsed load (lhs ``[B*M,K]=[32,128]``,
+        rhs ``[B*N,K]=[384,64]``) and are row-sliced per batch: lhs at ``[b_lhs*M,0]``
+        (reused across the 3 broadcast N-batches) and rhs at ``[n*N,0]``.
+        """
 
         @pl.program
         class Before:
@@ -1454,58 +1459,72 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 rhs: pl.Tensor[[1, 3, 128, 64], pl.FP16],
                 out_0: pl.Out[pl.Tensor[[2, 3, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 3, 16, 64], pl.FP16]:
-                lhs_load_0: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [0, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_tile: pl.Tile[[32, 128], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs,
+                    [0, 0, 0, 0],
+                    [2, 1, 16, 128],
+                    [2, 1, 16, 128],
+                    target_memory=pl.Mem.Mat,
                 )
-                rhs_load_0: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 0, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_tile: pl.Tile[[384, 64], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs,
+                    [0, 0, 0, 0],
+                    [1, 3, 128, 64],
+                    [1, 3, 128, 64],
+                    target_memory=pl.Mem.Mat,
                 )
-                matmul_0 = pl.tile.matmul(lhs_load_0, rhs_load_0)
+                lhs_slice_0: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [0, 0]
+                )
+                rhs_slice_0: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [0, 0]
+                )
+                matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_slice_0)
                 out_0_0 = pl.store(matmul_0, [0, 0, 0, 0], out_0, shapes=[1, 1, 16, 64])
 
-                lhs_load_1: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [0, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_slice_0_1: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [0, 0]
                 )
-                rhs_load_1: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 1, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_slice_1: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [128, 0]
                 )
-                matmul_1 = pl.tile.matmul(lhs_load_1, rhs_load_1)
+                matmul_1 = pl.tile.matmul(lhs_slice_0_1, rhs_slice_1)
                 out_0_1 = pl.store(matmul_1, [0, 1, 0, 0], out_0_0, shapes=[1, 1, 16, 64])
 
-                lhs_load_2: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [0, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_slice_0_2: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [0, 0]
                 )
-                rhs_load_2: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 2, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_slice_2: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [256, 0]
                 )
-                matmul_2 = pl.tile.matmul(lhs_load_2, rhs_load_2)
+                matmul_2 = pl.tile.matmul(lhs_slice_0_2, rhs_slice_2)
                 out_0_2 = pl.store(matmul_2, [0, 2, 0, 0], out_0_1, shapes=[1, 1, 16, 64])
 
-                lhs_load_3: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [1, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_slice_1: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [16, 0]
                 )
-                rhs_load_3: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 0, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_slice_0_1: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [0, 0]
                 )
-                matmul_3 = pl.tile.matmul(lhs_load_3, rhs_load_3)
+                matmul_3 = pl.tile.matmul(lhs_slice_1, rhs_slice_0_1)
                 out_0_3 = pl.store(matmul_3, [1, 0, 0, 0], out_0_2, shapes=[1, 1, 16, 64])
 
-                lhs_load_4: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [1, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_slice_1_1: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [16, 0]
                 )
-                rhs_load_4: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 1, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_slice_1_1: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [128, 0]
                 )
-                matmul_4 = pl.tile.matmul(lhs_load_4, rhs_load_4)
+                matmul_4 = pl.tile.matmul(lhs_slice_1_1, rhs_slice_1_1)
                 out_0_4 = pl.store(matmul_4, [1, 1, 0, 0], out_0_3, shapes=[1, 1, 16, 64])
 
-                lhs_load_5: pl.Tile[[16, 128], pl.FP16] = pl.load(
-                    lhs, [1, 0, 0, 0], [1, 1, 16, 128], target_memory=pl.MemorySpace.Mat
+                lhs_slice_1_2: pl.Tile[[16, 128], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    lhs_tile, [16, 128], [16, 0]
                 )
-                rhs_load_5: pl.Tile[[128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 2, 0, 0], [1, 1, 128, 64], target_memory=pl.MemorySpace.Mat
+                rhs_slice_2_1: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [256, 0]
                 )
-                matmul_5 = pl.tile.matmul(lhs_load_5, rhs_load_5)
+                matmul_5 = pl.tile.matmul(lhs_slice_1_2, rhs_slice_2_1)
                 out_0_5 = pl.store(matmul_5, [1, 2, 0, 0], out_0_4, shapes=[1, 1, 16, 64])
                 return out_0_5
 
@@ -1524,8 +1543,101 @@ class TestFlattenTileNdTo2DBatchMatmul:
         assert expected_func is not None
         ir.assert_structural_equal(after_func, expected_func)
 
-    def test_batch_matmul_with_both_operands_load_transpose_unrolls_per_batch(self):
-        """Both operands use ``load(transpose=True)``: per-batch transpose load, no extra transpose op."""
+    def test_batch_matmul_noncontiguous_operand_reemits_per_batch_load(self):
+        """A multi-batch operand whose load also cuts the matrix-row dim is
+        non-contiguous when flattened, so it is re-emitted per batch (a ``[1, X, Y]``
+        window per batch) rather than kept as one non-collapsible whole load.
+
+        ``rhs`` loads ``[2, 2, 5]`` (K=2) from ``rhs_src [2, 4, 5]`` (K_full=4): batch=2
+        and the middle K dim is partially sliced, so the flattened rows are not
+        contiguous (a ``[2*K, N]`` whole load would read across the K gap). It must
+        become two per-batch ``[1, 2, 5]`` loads at offsets ``[0,0,0]`` / ``[1,0,0]``;
+        the contiguous ``lhs`` (``[2, 3, 2]``, full) stays a single whole load.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                lhs_tile: pl.Tile[[2, 3, 2], pl.FP16] = pl.load(
+                    lhs, [0, 0, 0], [2, 3, 2], target_memory=pl.MemorySpace.Mat
+                )
+                rhs_tile: pl.Tile[[2, 2, 5], pl.FP16] = pl.load(
+                    rhs_src, [0, 0, 0], [2, 2, 5], target_memory=pl.MemorySpace.Mat
+                )
+                out_tile: pl.Tile[[2, 3, 5], pl.FP32] = pl.tile.batch_matmul(lhs_tile, rhs_tile)
+                out_0 = pl.store(out_tile, [0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs_src, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 3, 5], pl.FP16]],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                # lhs (contiguous, [2,3,2] -> [6,2]) kept whole and row-sliced per batch;
+                # rhs (non-contiguous: B=2 + partial K) re-emitted as per-batch [1,2,5] loads.
+                lhs_tile: pl.Tile[[6, 2], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs, [0, 0, 0], [2, 3, 2], [2, 3, 2], target_memory=pl.Mem.Mat
+                )
+                lhs_slice_0: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [0, 0])
+                rhs_pbload_0: pl.Tile[[2, 5], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs_src, [0, 0, 0], [1, 2, 5], [1, 2, 5], target_memory=pl.Mem.Mat
+                )
+                matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_pbload_0)
+                out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 3, 5])
+
+                lhs_slice_1: pl.Tile[[3, 2], pl.FP16, pl.Mem.Mat] = pl.tile.slice(lhs_tile, [3, 2], [3, 0])
+                rhs_pbload_1: pl.Tile[[2, 5], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs_src, [1, 0, 0], [1, 2, 5], [1, 2, 5], target_memory=pl.Mem.Mat
+                )
+                matmul_1 = pl.tile.matmul(lhs_slice_1, rhs_pbload_1)
+                out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 3, 5])
+                return out_0_1
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 3, 2], pl.FP16],
+                rhs_src: pl.Tensor[[2, 4, 5], pl.FP16],
+            ) -> pl.Tensor[[2, 3, 5], pl.FP16]:
+                out_0 = pl.create_tensor([2, 3, 5], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs_src, out_0)
+                return y
+
+        after_func = self._flattened_incore(Before)
+        expected_func = Expected.get_function("main_incore_0")
+        assert expected_func is not None
+        ir.assert_structural_equal(after_func, expected_func)
+
+    def test_batch_matmul_both_operands_trans_view_unrolls_per_batch_column_slice(self):
+        """Both operands transposed (natural load + ``tile.transpose_view``) unroll per
+        batch via column slices of each kept whole-batch view — no per-batch transpose op.
+
+        The lhs whole-load ``[2, 128, 16]`` collapses to 2D ``[B*K, M] = [256, 16]`` and
+        its view ``[16, 256]`` column-slices at ``[0, b*K]`` -> ``[M, K] = [16, 128]``;
+        the rhs whole-load ``[2, 64, 128]`` collapses to ``[B*N, K] = [128, 128]`` and its
+        view column-slices at ``[0, b*N]`` -> ``[K, N] = [128, 64]``. Both feed the
+        per-batch ``tile.matmul`` (issue #1776 / ND extension).
+        """
 
         @pl.program
         class Before:
@@ -1536,13 +1648,25 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 rhs: pl.Tensor[[2, 64, 128], pl.FP16],
                 out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
-                lhs_tile: pl.Tile[[2, 16, 128], pl.FP16] = pl.load(
-                    lhs, [0, 0, 0], [2, 128, 16], target_memory=pl.MemorySpace.Mat, transpose=True
+                lhs_tile: pl.Tile[[2, 128, 16], pl.FP16] = pl.load(
+                    lhs, [0, 0, 0], [2, 128, 16], target_memory=pl.MemorySpace.Mat
                 )
-                rhs_tile: pl.Tile[[2, 128, 64], pl.FP16] = pl.load(
-                    rhs, [0, 0, 0], [2, 64, 128], target_memory=pl.MemorySpace.Mat, transpose=True
+                lhs_view: pl.Tile[
+                    [2, 16, 128],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(lhs_tile)
+                rhs_tile: pl.Tile[[2, 64, 128], pl.FP16] = pl.load(
+                    rhs, [0, 0, 0], [2, 64, 128], target_memory=pl.MemorySpace.Mat
                 )
-                out_tile: pl.Tile[[2, 16, 64], pl.FP32] = pl.tile.batch_matmul(lhs_tile, rhs_tile)
+                rhs_view: pl.Tile[
+                    [2, 128, 64],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(rhs_tile)
+                out_tile: pl.Tile[[2, 16, 64], pl.FP32] = pl.tile.batch_matmul(lhs_view, rhs_view)
                 out_0 = pl.store(out_tile, [0, 0, 0], out_0)
                 return out_0
 
@@ -1565,50 +1689,52 @@ class TestFlattenTileNdTo2DBatchMatmul:
                 rhs: pl.Tensor[[2, 64, 128], pl.FP16],
                 out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
             ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
-                lhs_load_0: pl.Tile[
+                lhs_tile: pl.Tile[[256, 16], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs, [0, 0, 0], [2, 128, 16], [2, 128, 16], target_memory=pl.Mem.Mat
+                )
+                lhs_view: pl.Tile[
+                    [16, 256],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(lhs_tile)
+                rhs_tile: pl.Tile[[128, 128], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs, [0, 0, 0], [2, 64, 128], [2, 64, 128], target_memory=pl.Mem.Mat
+                )
+                rhs_view: pl.Tile[
+                    [128, 128],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(rhs_tile)
+                lhs_slice_0: pl.Tile[
                     [16, 128],
                     pl.FP16,
-                    pl.MemorySpace.Mat,
-                    pl.TileView(
-                        valid_shape=[16, 128],
-                        blayout=pl.TileLayout.row_major,
-                        slayout=pl.TileLayout.col_major,
-                    ),
-                ] = pl.load(lhs, [0, 0, 0], [1, 128, 16], target_memory=pl.MemorySpace.Mat, transpose=True)
-                rhs_load_0: pl.Tile[
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(lhs_view, [16, 128], [0, 0])
+                rhs_slice_0: pl.Tile[
                     [128, 64],
                     pl.FP16,
-                    pl.MemorySpace.Mat,
-                    pl.TileView(
-                        valid_shape=[128, 64],
-                        blayout=pl.TileLayout.row_major,
-                        slayout=pl.TileLayout.col_major,
-                    ),
-                ] = pl.load(rhs, [0, 0, 0], [1, 64, 128], target_memory=pl.MemorySpace.Mat, transpose=True)
-                matmul_0 = pl.tile.matmul(lhs_load_0, rhs_load_0)
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(rhs_view, [128, 64], [0, 0])
+                matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_slice_0)
                 out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 16, 64])
 
-                lhs_load_1: pl.Tile[
+                lhs_slice_1: pl.Tile[
                     [16, 128],
                     pl.FP16,
-                    pl.MemorySpace.Mat,
-                    pl.TileView(
-                        valid_shape=[16, 128],
-                        blayout=pl.TileLayout.row_major,
-                        slayout=pl.TileLayout.col_major,
-                    ),
-                ] = pl.load(lhs, [1, 0, 0], [1, 128, 16], target_memory=pl.MemorySpace.Mat, transpose=True)
-                rhs_load_1: pl.Tile[
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(lhs_view, [16, 128], [0, 128])
+                rhs_slice_1: pl.Tile[
                     [128, 64],
                     pl.FP16,
-                    pl.MemorySpace.Mat,
-                    pl.TileView(
-                        valid_shape=[128, 64],
-                        blayout=pl.TileLayout.row_major,
-                        slayout=pl.TileLayout.col_major,
-                    ),
-                ] = pl.load(rhs, [1, 0, 0], [1, 64, 128], target_memory=pl.MemorySpace.Mat, transpose=True)
-                matmul_1 = pl.tile.matmul(lhs_load_1, rhs_load_1)
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(rhs_view, [128, 64], [0, 64])
+                matmul_1 = pl.tile.matmul(lhs_slice_1, rhs_slice_1)
                 out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 16, 64])
                 return out_0_1
 
@@ -1630,59 +1756,61 @@ class TestFlattenTileNdTo2DBatchMatmul:
     @pytest.mark.parametrize(
         "case",
         [
-            # 3D no transpose, 2 batches
+            # 3D no transpose, 2 batches. Each operand keeps ONE whole 2D load
+            # (lhs [B*M,K]=[32,128], rhs [B*N,K]=[256,64]); per-batch operands
+            # are recovered by row slices of those whole loads.
             {
                 "lhs_shape": [2, 16, 128],
                 "rhs_shape": [2, 128, 64],
                 "out_shape": [2, 16, 64],
                 "lhs_transpose": False,
                 "rhs_transpose": False,
-                "expected_op_seq": ["tile.load", "tile.load", "tile.matmul", "tile.store"] * 2,
-                "expected_lhs_offsets": [[0, 0, 0], [1, 0, 0]],
-                "expected_rhs_offsets": [[0, 0, 0], [1, 0, 0]],
-                "expected_lhs_shapes": [[1, 16, 128], [1, 16, 128]],
-                "expected_rhs_shapes": [[1, 128, 64], [1, 128, 64]],
+                "expected_op_seq": ["tile.load", "tile.load"]
+                + ["tile.slice", "tile.slice", "tile.matmul", "tile.store"] * 2,
+                "expected_lhs_load_offsets": [[0, 0, 0]],
+                "expected_rhs_load_offsets": [[0, 0, 0]],
+                "expected_lhs_load_shapes": [[2, 16, 128]],
+                "expected_rhs_load_shapes": [[2, 128, 64]],
+                "expected_lhs_slice_offsets": [[0, 0], [16, 0]],
+                "expected_rhs_slice_offsets": [[0, 0], [128, 0]],
+                "expected_lhs_slice_shapes": [[16, 128], [16, 128]],
+                "expected_rhs_slice_shapes": [[128, 64], [128, 64]],
                 "expected_store_offsets": [[0, 0, 0], [1, 0, 0]],
                 "expected_store_shapes": [[1, 16, 64], [1, 16, 64]],
-                "expected_lhs_t_seq": [False, False],
-                "expected_rhs_t_seq": [False, False],
+                "expected_lhs_t_seq": [False],
+                "expected_rhs_t_seq": [False],
             },
-            # 3D, single batch
+            # 3D, single batch. The single batch dim collapses away, so the whole
+            # loads are already [M,K] / [K,N] and each is sliced once at [0,0].
             {
                 "lhs_shape": [1, 16, 128],
                 "rhs_shape": [1, 128, 64],
                 "out_shape": [1, 16, 64],
                 "lhs_transpose": False,
                 "rhs_transpose": False,
-                "expected_op_seq": ["tile.load", "tile.load", "tile.matmul", "tile.store"],
-                "expected_lhs_offsets": [[0, 0, 0]],
-                "expected_rhs_offsets": [[0, 0, 0]],
-                "expected_lhs_shapes": [[1, 16, 128]],
-                "expected_rhs_shapes": [[1, 128, 64]],
+                "expected_op_seq": [
+                    "tile.load",
+                    "tile.load",
+                    "tile.slice",
+                    "tile.slice",
+                    "tile.matmul",
+                    "tile.store",
+                ],
+                "expected_lhs_load_offsets": [[0, 0, 0]],
+                "expected_rhs_load_offsets": [[0, 0, 0]],
+                "expected_lhs_load_shapes": [[1, 16, 128]],
+                "expected_rhs_load_shapes": [[1, 128, 64]],
+                "expected_lhs_slice_offsets": [[0, 0]],
+                "expected_rhs_slice_offsets": [[0, 0]],
+                "expected_lhs_slice_shapes": [[16, 128]],
+                "expected_rhs_slice_shapes": [[128, 64]],
                 "expected_store_offsets": [[0, 0, 0]],
                 "expected_store_shapes": [[1, 16, 64]],
                 "expected_lhs_t_seq": [False],
                 "expected_rhs_t_seq": [False],
             },
-            # lhs uses load(transpose=True), rhs does not
-            {
-                "lhs_shape": [2, 128, 16],
-                "rhs_shape": [2, 128, 64],
-                "out_shape": [2, 16, 64],
-                "lhs_transpose": True,
-                "rhs_transpose": False,
-                "expected_op_seq": ["tile.load", "tile.load", "tile.matmul", "tile.store"] * 2,
-                "expected_lhs_offsets": [[0, 0, 0], [1, 0, 0]],
-                "expected_rhs_offsets": [[0, 0, 0], [1, 0, 0]],
-                "expected_lhs_shapes": [[1, 128, 16], [1, 128, 16]],
-                "expected_rhs_shapes": [[1, 128, 64], [1, 128, 64]],
-                "expected_store_offsets": [[0, 0, 0], [1, 0, 0]],
-                "expected_store_shapes": [[1, 16, 64], [1, 16, 64]],
-                "expected_lhs_t_seq": [True, True],
-                "expected_rhs_t_seq": [False, False],
-            },
         ],
-        ids=["3d_no_transpose", "single_batch", "lhs_load_transpose"],
+        ids=["3d_no_transpose", "single_batch"],
     )
     def test_batch_matmul_unrolls_kwargs(self, case):
         """Per-batch ``tile.load``/``tile.store`` kwargs match the broadcast/transpose plan."""
@@ -1723,14 +1851,13 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     [0] * len(lhs_shape),
                     lhs_shape,
                     target_memory=ir.MemorySpace.Mat,
-                    transpose=lhs_transpose,
                     span=span,
                 )
                 lhs_call = ir.Call(
                     lhs_load.op,
                     list(lhs_load.args),
                     lhs_load.kwargs,
-                    ir.TileType(lhs_tile_shape, DataType.FP16),
+                    ir.TileType(lhs_tile_shape, DataType.FP16, memory_space=ir.MemorySpace.Mat),
                     lhs_load.span,
                 )
                 lhs_tile = ib.let("lhs_tile", lhs_call)
@@ -1740,14 +1867,13 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     [0] * len(rhs_shape),
                     rhs_shape,
                     target_memory=ir.MemorySpace.Mat,
-                    transpose=rhs_transpose,
                     span=span,
                 )
                 rhs_call = ir.Call(
                     rhs_load.op,
                     list(rhs_load.args),
                     rhs_load.kwargs,
-                    ir.TileType(rhs_tile_shape, DataType.FP16),
+                    ir.TileType(rhs_tile_shape, DataType.FP16, memory_space=ir.MemorySpace.Mat),
                     rhs_load.span,
                 )
                 rhs_tile = ib.let("rhs_tile", rhs_call)
@@ -1775,20 +1901,35 @@ class TestFlattenTileNdTo2DBatchMatmul:
         calls = self._top_level_calls(func)
         assert [call.op.name for call in calls] == case["expected_op_seq"]
 
+        # Each operand keeps ONE whole 2D-collapsed load; per-batch operands are
+        # recovered by row slices of those whole loads. The two whole loads
+        # appear first (lhs then rhs), then the per-batch slices alternate
+        # lhs, rhs, lhs, rhs, ...
         load_calls = [call for call in calls if call.op.name == "tile.load"]
-        # Loads alternate lhs, rhs, lhs, rhs, ...
-        actual_lhs_offsets = [self._tuple_const_values(call.args[1]) for call in load_calls[0::2]]
-        actual_rhs_offsets = [self._tuple_const_values(call.args[1]) for call in load_calls[1::2]]
-        actual_lhs_shapes = [self._tuple_const_values(call.args[2]) for call in load_calls[0::2]]
-        actual_rhs_shapes = [self._tuple_const_values(call.args[2]) for call in load_calls[1::2]]
-        actual_lhs_t = [call.kwargs.get("transpose", False) for call in load_calls[0::2]]
-        actual_rhs_t = [call.kwargs.get("transpose", False) for call in load_calls[1::2]]
-        assert actual_lhs_offsets == case["expected_lhs_offsets"]
-        assert actual_rhs_offsets == case["expected_rhs_offsets"]
-        assert actual_lhs_shapes == case["expected_lhs_shapes"]
-        assert actual_rhs_shapes == case["expected_rhs_shapes"]
+        slice_calls = [call for call in calls if call.op.name == "tile.slice"]
+        lhs_load, rhs_load = load_calls[0], load_calls[1]
+        actual_lhs_load_offsets = [self._tuple_const_values(lhs_load.args[1])]
+        actual_rhs_load_offsets = [self._tuple_const_values(rhs_load.args[1])]
+        actual_lhs_load_shapes = [self._tuple_const_values(lhs_load.args[2])]
+        actual_rhs_load_shapes = [self._tuple_const_values(rhs_load.args[2])]
+        actual_lhs_t = [lhs_load.kwargs.get("transpose", False)]
+        actual_rhs_t = [rhs_load.kwargs.get("transpose", False)]
+        assert actual_lhs_load_offsets == case["expected_lhs_load_offsets"]
+        assert actual_rhs_load_offsets == case["expected_rhs_load_offsets"]
+        assert actual_lhs_load_shapes == case["expected_lhs_load_shapes"]
+        assert actual_rhs_load_shapes == case["expected_rhs_load_shapes"]
         assert actual_lhs_t == case["expected_lhs_t_seq"]
         assert actual_rhs_t == case["expected_rhs_t_seq"]
+
+        # tile.slice args: (src, shape, offset). Slices alternate lhs, rhs, ...
+        actual_lhs_slice_shapes = [self._tuple_const_values(call.args[1]) for call in slice_calls[0::2]]
+        actual_rhs_slice_shapes = [self._tuple_const_values(call.args[1]) for call in slice_calls[1::2]]
+        actual_lhs_slice_offsets = [self._tuple_const_values(call.args[2]) for call in slice_calls[0::2]]
+        actual_rhs_slice_offsets = [self._tuple_const_values(call.args[2]) for call in slice_calls[1::2]]
+        assert actual_lhs_slice_offsets == case["expected_lhs_slice_offsets"]
+        assert actual_rhs_slice_offsets == case["expected_rhs_slice_offsets"]
+        assert actual_lhs_slice_shapes == case["expected_lhs_slice_shapes"]
+        assert actual_rhs_slice_shapes == case["expected_rhs_slice_shapes"]
 
         store_calls = [call for call in calls if call.op.name == "tile.store"]
         assert [self._tuple_const_values(call.args[1]) for call in store_calls] == case[
@@ -1797,6 +1938,116 @@ class TestFlattenTileNdTo2DBatchMatmul:
         assert [self._tuple_const_values(call.args[3]) for call in store_calls] == case[
             "expected_store_shapes"
         ]
+
+    def test_batch_matmul_a_trans_view_unrolls_per_batch_column_slice(self):
+        """An a_trans lhs (natural load + ``tile.transpose_view``) unrolls per batch via
+        column slices of the kept whole-batch view, while the natural rhs unrolls via
+        row slices of its kept whole-batch load.
+
+        Mirrors the b_trans column-slice case for the a_trans operand: the lhs
+        whole-load of ``[2, 128, 16]`` collapses to 2D ``[B*K, M] = [256, 16]``, the
+        ``tile.transpose_view`` is kept once as ``[16, 256]``, and each batch
+        COLUMN-slices it at offset ``[0, b*K]`` to recover the ``[M, K] = [16, 128]``
+        operand. The natural rhs whole-load collapses to ``[B*K, N] = [256, 64]`` and
+        each batch ROW-slices it at ``[b*K, 0]`` to recover ``[K, N] = [128, 64]``. Both
+        feed the per-batch ``tile.matmul``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 128, 16], pl.FP16],
+                rhs: pl.Tensor[[2, 128, 64], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
+            ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
+                lhs_tile: pl.Tile[[2, 128, 16], pl.FP16] = pl.load(
+                    lhs, [0, 0, 0], [2, 128, 16], target_memory=pl.MemorySpace.Mat
+                )
+                lhs_view: pl.Tile[
+                    [2, 16, 128],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(lhs_tile)
+                rhs_tile: pl.Tile[[2, 128, 64], pl.FP16] = pl.load(
+                    rhs, [0, 0, 0], [2, 128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                out_tile: pl.Tile[[2, 16, 64], pl.FP32] = pl.tile.batch_matmul(lhs_view, rhs_tile)
+                out_0 = pl.store(out_tile, [0, 0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 128, 16], pl.FP16],
+                rhs: pl.Tensor[[2, 128, 64], pl.FP16],
+            ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
+                out_0 = pl.create_tensor([2, 16, 64], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs, out_0)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[2, 128, 16], pl.FP16],
+                rhs: pl.Tensor[[2, 128, 64], pl.FP16],
+                out_0: pl.Out[pl.Tensor[[2, 16, 64], pl.FP16]],
+            ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
+                lhs_tile: pl.Tile[[256, 16], pl.FP16, pl.Mem.Mat] = pl.load(
+                    lhs, [0, 0, 0], [2, 128, 16], [2, 128, 16], target_memory=pl.Mem.Mat
+                )
+                lhs_view: pl.Tile[
+                    [16, 256],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.transpose_view(lhs_tile)
+                rhs_tile: pl.Tile[[256, 64], pl.FP16, pl.Mem.Mat] = pl.load(
+                    rhs, [0, 0, 0], [2, 128, 64], [2, 128, 64], target_memory=pl.Mem.Mat
+                )
+                lhs_slice_0: pl.Tile[
+                    [16, 128],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(lhs_view, [16, 128], [0, 0])
+                rhs_slice_0: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [0, 0]
+                )
+                matmul_0 = pl.tile.matmul(lhs_slice_0, rhs_slice_0)
+                out_0_0 = pl.store(matmul_0, [0, 0, 0], out_0, shapes=[1, 16, 64])
+
+                lhs_slice_1: pl.Tile[
+                    [16, 128],
+                    pl.FP16,
+                    pl.Mem.Mat,
+                    pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
+                ] = pl.tile.slice(lhs_view, [16, 128], [0, 128])
+                rhs_slice_1: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat] = pl.tile.slice(
+                    rhs_tile, [128, 64], [128, 0]
+                )
+                matmul_1 = pl.tile.matmul(lhs_slice_1, rhs_slice_1)
+                out_0_1 = pl.store(matmul_1, [1, 0, 0], out_0_0, shapes=[1, 16, 64])
+                return out_0_1
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[2, 128, 16], pl.FP16],
+                rhs: pl.Tensor[[2, 128, 64], pl.FP16],
+            ) -> pl.Tensor[[2, 16, 64], pl.FP16]:
+                out_0 = pl.create_tensor([2, 16, 64], dtype=pl.FP16)
+                y = self.main_incore_0(lhs, rhs, out_0)
+                return y
+
+        after_func = self._flattened_incore(Before)
+        expected_func = Expected.get_function("main_incore_0")
+        assert expected_func is not None
+        ir.assert_structural_equal(after_func, expected_func)
 
     def test_batch_matmul_peels_safe_batch_only_reshape(self):
         """Regression for #1233: peel a `tile.reshape` that only reinterprets
@@ -1838,10 +2089,20 @@ class TestFlattenTileNdTo2DBatchMatmul:
 
         after_func = self._flattened_incore(Before)
         op_names = [call.op.name for call in self._top_level_calls(after_func)]
-        # Peeling drops the upstream `tile.reshape` and the per-batch slice +
-        # reshape chain. The result is just the per-batch load + matmul + store
-        # that Strategy 1 produces.
-        assert op_names == ["tile.load", "tile.load", "tile.matmul", "tile.store"]
+        # Peeling drops the upstream `tile.reshape` (and the degenerate per-batch
+        # reshape chain). The single batch then unrolls into the unified
+        # whole-load + per-batch-slice form: both operands keep their whole 2D
+        # load and are sliced once at [0, 0] before the matmul + store. No
+        # `tile.reshape` survives.
+        assert op_names == [
+            "tile.load",
+            "tile.load",
+            "tile.slice",
+            "tile.slice",
+            "tile.matmul",
+            "tile.store",
+        ]
+        assert "tile.reshape" not in op_names
 
     def test_rank3_mat_load_under_if_preserves_explicit_tile_view(self):
         """Regression for #1540: a rank>2 ``tile.load`` whose downstream
@@ -1854,10 +2115,9 @@ class TestFlattenTileNdTo2DBatchMatmul:
         load is not added to ``batch_matmul_only_vars`` and Strategy 1 cannot
         re-emit per-batch loads. The load instead takes the fallback rewrite
         path. Before #1540 that path computed a fresh implicit ``TileView``
-        from (shape, memory_space), clobbering the upstream NZ-layout
-        annotation that ``LowerCompositeOps`` set on transposed-load Mat rhs
-        operands. Downstream codegen then emitted ``pto.tload DN→ND``, which
-        ``pto-isa`` rejects.
+        from (shape, memory_space), clobbering the ZN-layout annotation on a
+        DN-source Mat load. Downstream codegen then emitted ``pto.tload
+        DN→ND``, which ``pto-isa`` rejects.
         """
         T, K, N = 16, 128, 64
 
@@ -1867,17 +2127,16 @@ class TestFlattenTileNdTo2DBatchMatmul:
             def main_incore_0(
                 self,
                 h: pl.Tensor[[T, K], pl.BF16],
-                w: pl.Tensor[[1, N, K], pl.BF16],
+                # DN-source weight: a natural Mat load of a DN tensor yields a
+                # ZN (blayout=row_major, slayout=col_major) tile — the layout a
+                # transposed matmul rhs operand carries.
+                w: pl.Tensor[[1, K, N], pl.BF16, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)],
                 cond: pl.Scalar[pl.INDEX],
                 out_0: pl.Out[pl.Tensor[[1, T, N], pl.FP32]],
             ) -> pl.Tensor[[1, T, N], pl.FP32]:
                 lhs: pl.Tile[[T, K], pl.BF16, pl.Mem.Mat] = pl.tile.load(
                     h, [0, 0], [T, K], target_memory=pl.Mem.Mat
                 )
-                # Explicit NZ-layout annotation — matches what LowerCompositeOps
-                # emits for transposed-load Mat rhs operands of pl.matmul.
-                # transpose=True swaps the last two dims: source slice [1, N, K]
-                # becomes tile [1, K, N].
                 rhs: pl.Tile[
                     [1, K, N],
                     pl.BF16,
@@ -1886,7 +2145,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
                         blayout=pl.TileLayout.row_major,
                         slayout=pl.TileLayout.col_major,
                     ),
-                ] = pl.tile.load(w, [0, 0, 0], [1, N, K], target_memory=pl.Mem.Mat, transpose=True)
+                ] = pl.tile.load(w, [0, 0, 0], [1, K, N], target_memory=pl.Mem.Mat)
                 # The use lives inside an if/else; the pre-scan does not see it,
                 # so the fallback rewrite path runs on ``rhs``.
                 if cond == 0:
@@ -1902,7 +2161,7 @@ class TestFlattenTileNdTo2DBatchMatmul:
             def main(
                 self,
                 h: pl.Tensor[[T, K], pl.BF16],
-                w: pl.Tensor[[1, N, K], pl.BF16],
+                w: pl.Tensor[[1, K, N], pl.BF16, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)],
                 cond: pl.Scalar[pl.INDEX],
             ) -> pl.Tensor[[1, T, N], pl.FP32]:
                 out_0 = pl.create_tensor([1, T, N], dtype=pl.FP32)
@@ -1912,17 +2171,18 @@ class TestFlattenTileNdTo2DBatchMatmul:
         after_func = After.get_function("main_incore_0")
         assert after_func is not None
 
-        # Locate the rhs load — the only ``tile.load`` with ``transpose=True``.
+        # Locate the rhs load — the ZN (slayout=col_major) Mat ``tile.load``.
         rhs_loads = [
             stmt
             for stmt in cast(ir.SeqStmts, after_func.body).stmts
             if isinstance(stmt, ir.AssignStmt)
             and isinstance(stmt.value, ir.Call)
             and stmt.value.op.name == "tile.load"
-            and stmt.value.kwargs.get("transpose") is True
+            and cast(ir.TileType, stmt.value.type).get_effective_tile_view().slayout
+            == ir.TileLayout.col_major
         ]
         assert len(rhs_loads) == 1, (
-            f"expected exactly one transposed rhs tile.load after flatten, got {len(rhs_loads)}"
+            f"expected exactly one ZN rhs tile.load after flatten, got {len(rhs_loads)}"
         )
         rhs_load = rhs_loads[0]
         result_type = cast(ir.TileType, rhs_load.value.type)
@@ -1970,25 +2230,27 @@ class TestFlattenTileNdTo2DBatchMatmul:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
                 self,
-                w: pl.Tensor[[1, 64, 128], pl.BF16],
+                # DN-source weight: a natural Mat load yields a ZN tile
+                # (blayout=row_major, slayout=col_major) without a swap.
+                w: pl.Tensor[[1, 128, 64], pl.BF16, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)],
                 out_0: pl.Out[pl.Tensor[[1, 128, 64], pl.BF16]],
             ) -> pl.Tensor[[1, 128, 64], pl.BF16]:
-                # Explicit NZ-layout annotation, as LowerCompositeOps emits for a
-                # transposed-load Mat operand. transpose=True swaps the last two
-                # source dims: slice [1, 64, 128] becomes tile [1, 128, 64].
                 rhs: pl.Tile[
                     [1, 128, 64],
                     pl.BF16,
                     pl.Mem.Mat,
                     pl.TileView(blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major),
-                ] = pl.tile.load(w, [0, 0, 0], [1, 64, 128], target_memory=pl.Mem.Mat, transpose=True)
+                ] = pl.tile.load(w, [0, 0, 0], [1, 128, 64], target_memory=pl.Mem.Mat)
                 # tile.move (not batch_matmul) keeps `rhs` on the fallback path.
                 moved = pl.tile.move(rhs, target_memory=pl.Mem.Left)
                 out_0 = pl.tile.store(moved, [0, 0, 0], out_0)
                 return out_0
 
             @pl.function
-            def main(self, w: pl.Tensor[[1, 64, 128], pl.BF16]) -> pl.Tensor[[1, 128, 64], pl.BF16]:
+            def main(
+                self,
+                w: pl.Tensor[[1, 128, 64], pl.BF16, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)],
+            ) -> pl.Tensor[[1, 128, 64], pl.BF16]:
                 out_0 = pl.create_tensor([1, 128, 64], dtype=pl.BF16)
                 return self.main_incore_0(w, out_0)
 
@@ -2232,7 +2494,8 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
                 acc_init = pl.tile.create([1, T, N], dtype=pl.FP32)
                 for _, (acc,) in pl.range(2, init_values=(acc_init,)):
                     lhs = pl.tile.load(h, [0, 0], [T, K], target_memory=pl.Mem.Mat)
-                    rhs = pl.tile.load(w, [0, 0, 0], [1, N, K], target_memory=pl.Mem.Mat, transpose=True)
+                    rhs_load = pl.tile.load(w, [0, 0, 0], [1, N, K], target_memory=pl.Mem.Mat)
+                    rhs = pl.tile.transpose_view(rhs_load)
                     acc_next = pl.tile.batch_matmul_acc(acc, lhs, rhs)
                     acc_final = pl.yield_(acc_next)
                 out_0 = pl.tile.store(acc_final, [0, 0, 0], out_0)
@@ -2281,7 +2544,8 @@ class TestFlattenTileNdTo2DBatchMatmulAcc:
                 acc_init = pl.tile.create([1, T, N], dtype=pl.FP32)
                 for _, (acc,) in pl.range(2, init_values=(acc_init,)):
                     lhs = pl.tile.load(h, [0, 0], [T, K], target_memory=pl.Mem.Mat)
-                    rhs = pl.tile.load(w, [0, 0, 0], [1, N, K], target_memory=pl.Mem.Mat, transpose=True)
+                    rhs_load = pl.tile.load(w, [0, 0, 0], [1, N, K], target_memory=pl.Mem.Mat)
+                    rhs = pl.tile.transpose_view(rhs_load)
                     acc_next = pl.tile.batch_matmul_acc(acc, lhs, rhs)
                     acc_final = pl.yield_(acc_next)
                 out_0 = pl.tile.store(acc_final, [0, 0, 0], out_0)
@@ -2707,6 +2971,235 @@ class TestFlattenTileNdTo2DStandaloneTranspose:
 
         with pytest.raises(ValueError, match=r"only last-two-axes tile\.transpose"):
             passes.flatten_tile_nd_to_2d()(Before)
+
+
+def _collect_def_use(fn) -> tuple[set[int], set[int], list[tuple[ir.Var, str]]]:
+    """Collect def/use sets and tile.load bindings of a function body.
+
+    Uses the stable ``Var.unique_id`` as identity (NOT ``name_hint``, which this
+    pass can repeat across distinct SSA values, e.g. ``lhs_load_0``). Returns:
+
+    - ``defined``: ``unique_id`` of every bound Var — params, ``AssignStmt`` LHS,
+      loop vars, iter-arg vars, and loop/if return vars (recursively).
+    - ``used``: ``unique_id`` of every Var referenced in an expression position
+      (call args, yields, returns, conditions, loop bounds, iter-arg inits),
+      recursing into nested ``ScopeStmt``/``ForStmt``/``WhileStmt``/``IfStmt`` bodies.
+    - ``loads``: ``(bound_var, source_tensor_name)`` for each ``tile.load``.
+    """
+    defined: set[int] = set()
+    used: set[int] = set()
+    loads: list[tuple[ir.Var, str]] = []
+
+    def use_expr(expr) -> None:
+        if isinstance(expr, ir.Var):
+            used.add(expr.unique_id)
+        elif isinstance(expr, ir.MakeTuple):
+            for e in expr.elements:
+                use_expr(e)
+        elif isinstance(expr, ir.Call):
+            for a in expr.args:
+                use_expr(a)
+
+    def walk_loop(node) -> None:
+        # ForStmt / WhileStmt: bind the loop var (for) + iter-arg vars + return
+        # vars; collect bound / init / condition uses; recurse into the body.
+        if isinstance(node, ir.ForStmt):
+            defined.add(node.loop_var.unique_id)
+            use_expr(node.start)
+            use_expr(node.stop)
+            use_expr(node.step)
+        else:
+            use_expr(node.condition)
+        for ia in node.iter_args:
+            defined.add(ia.unique_id)
+            use_expr(ia.initValue)
+        for rv in node.return_vars:
+            defined.add(rv.unique_id)
+        walk(node.body)
+
+    def walk_leaf(node) -> None:
+        # AssignStmt / ReturnStmt / YieldStmt / EvalStmt.
+        if isinstance(node, ir.AssignStmt):
+            defined.add(node.var.unique_id)
+            if isinstance(node.value, ir.Call) and node.value.op.name == "tile.load":
+                src = node.value.args[0]
+                loads.append((node.var, src.name_hint if isinstance(src, ir.Var) else "<expr>"))
+            use_expr(node.value)
+        elif isinstance(node, (ir.ReturnStmt, ir.YieldStmt)):
+            for v in node.value:
+                use_expr(v)
+        elif isinstance(node, ir.EvalStmt):
+            use_expr(node.expr)
+
+    def walk(node) -> None:
+        if node is None:
+            return
+        if isinstance(node, ir.SeqStmts):
+            for s in node.stmts:
+                walk(s)
+        elif isinstance(node, ir.ScopeStmt):
+            walk(node.body)
+        elif isinstance(node, (ir.ForStmt, ir.WhileStmt)):
+            walk_loop(node)
+        elif isinstance(node, ir.IfStmt):
+            for rv in node.return_vars:
+                defined.add(rv.unique_id)
+            use_expr(node.condition)
+            walk(node.then_body)
+            walk(node.else_body)
+        else:
+            walk_leaf(node)
+
+    for p in fn.params:
+        defined.add(p.unique_id)
+    walk(fn.body)
+    return defined, used, loads
+
+
+class TestFlattenTileNdTo2DSharedBatchMatmulOperand:
+    """A ``tile.batch_matmul`` operand shared by multiple matmuls must not be
+    left behind as a dead ``tile.load`` once Strategy 1 re-emits per-matmul loads,
+    and a shared operand also consumed inside a nested block must NOT be dropped.
+
+    Regression for the SwiGLU / gate-up FFN pattern: the activation ``X`` is the
+    common LHS of both the gate (``X@W1``) and up (``X@W3``) matmuls, so its load
+    has ``use_count == 2``. The skip-load pre-scan previously only dropped
+    single-use operands, leaving the shared ``X`` load dangling as dead code — a
+    wasted MTE2 load that survives into the generated matmul kernel and reuses a
+    live weight buffer, serializing it on the load pipeline.
+    """
+
+    def test_shared_lhs_load_not_left_dead(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[1, 16, 128], pl.INT8],
+                w1: pl.Tensor[[1, 64, 128], pl.INT8],
+                w3: pl.Tensor[[1, 64, 128], pl.INT8],
+                gate__out: pl.Out[pl.Tensor[[1, 16, 64], pl.INT32]],
+                up__out: pl.Out[pl.Tensor[[1, 16, 64], pl.INT32]],
+            ) -> tuple[pl.Tensor[[1, 16, 64], pl.INT32], pl.Tensor[[1, 16, 64], pl.INT32]]:
+                # x_mat is the SHARED LHS of both matmuls (use_count == 2).
+                x_mat: pl.Tile[[1, 16, 128], pl.INT8, pl.Mem.Mat] = pl.load(
+                    x, [0, 0, 0], [1, 16, 128], [1, 16, 128], target_memory=pl.Mem.Mat
+                )
+                w1_load: pl.Tile[[1, 64, 128], pl.INT8, pl.Mem.Mat] = pl.load(
+                    w1, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat
+                )
+                w1_mat = pl.tile.transpose_view(w1_load)
+                w3_load: pl.Tile[[1, 64, 128], pl.INT8, pl.Mem.Mat] = pl.load(
+                    w3, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat
+                )
+                w3_mat = pl.tile.transpose_view(w3_load)
+                gate__tile = pl.tile.batch_matmul(x_mat, w1_mat)
+                up__tile = pl.tile.batch_matmul(x_mat, w3_mat)
+                gate__store = pl.store(gate__tile, [0, 0, 0], gate__out)
+                up__store = pl.store(up__tile, [0, 0, 0], up__out)
+                return gate__store, up__store
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[1, 16, 128], pl.INT8],
+                w1: pl.Tensor[[1, 64, 128], pl.INT8],
+                w3: pl.Tensor[[1, 64, 128], pl.INT8],
+            ) -> tuple[pl.Tensor[[1, 16, 64], pl.INT32], pl.Tensor[[1, 16, 64], pl.INT32]]:
+                gate__out = pl.create_tensor([1, 16, 64], dtype=pl.INT32, layout=pl.TensorLayout.ND)
+                up__out = pl.create_tensor([1, 16, 64], dtype=pl.INT32, layout=pl.TensorLayout.ND)
+                return self.main_incore_0(x, w1, w3, gate__out, up__out)
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        fn = after.get_function("main_incore_0")
+        assert fn is not None
+
+        _defined, used, loads = _collect_def_use(fn)
+
+        # 1. No tile.load result is dead: every load is consumed downstream. Under
+        #    the unified whole-load + per-batch-slice model the shared `x_mat`
+        #    load is consumed by the per-matmul `tile.slice`s, so it must not be
+        #    left dead. Identity is by Var.unique_id.
+        dead = [v.name_hint for v, _ in loads if v.unique_id not in used]
+        assert not dead, f"dead tile.load(s) left after flatten: {dead}"
+
+        # 2. The shared activation X keeps a SINGLE whole load that is consumed by
+        #    both matmuls via `tile.slice` (one slice each) — NOT re-emitted per
+        #    matmul, and NOT left as a dead extra load.
+        x_loads = [v for v, src in loads if src == "x"]
+        assert len(x_loads) == 1, (
+            f"expected 1 shared x load, got {len(x_loads)}: {[v.name_hint for v in x_loads]}"
+        )
+        assert x_loads[0].unique_id in used, "shared x load is not consumed (left dead)"
+
+        # 3. Every tile op is flattened to 2D.
+        for call in _tile_calls(fn.body):
+            assert len(cast(ir.TileType, call.type).shape) == 2
+
+    def test_shared_operand_with_nested_use_not_dropped(self):
+        """A batch_matmul operand also used inside a nested loop must NOT be skipped.
+
+        The skip pre-scan counts only top-level uses; if it ignored nested uses,
+        the new shared-operand rule would drop ``x_mat``'s load even though the
+        nested ``tile.batch_matmul`` (lowered via Strategy 2 -> ``tile.slice(x_mat)``)
+        still references it, leaving a dangling Var. The fix counts uses
+        recursively and only skips a load with no nested use.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[1, 16, 128], pl.INT8],
+                w1: pl.Tensor[[1, 64, 128], pl.INT8],
+                gate__out: pl.Out[pl.Tensor[[1, 16, 64], pl.INT32]],
+            ) -> pl.Tensor[[1, 16, 64], pl.INT32]:
+                # x_mat is a top-level batch_matmul operand AND reused inside the loop.
+                x_mat: pl.Tile[[1, 16, 128], pl.INT8, pl.Mem.Mat] = pl.load(
+                    x, [0, 0, 0], [1, 16, 128], [1, 16, 128], target_memory=pl.Mem.Mat
+                )
+                w1_load: pl.Tile[[1, 64, 128], pl.INT8, pl.Mem.Mat] = pl.load(
+                    w1, [0, 0, 0], [1, 64, 128], [1, 64, 128], target_memory=pl.Mem.Mat
+                )
+                w1_mat = pl.tile.transpose_view(w1_load)
+                acc_init = pl.tile.batch_matmul(x_mat, w1_mat)  # top-level use
+                for _i, (acc,) in pl.range(2, init_values=(acc_init,)):
+                    # Nested use of x_mat / w1_mat: accumulate into the carried Acc tile.
+                    acc2 = pl.tile.batch_matmul_acc(acc, x_mat, w1_mat)
+                    acc = pl.yield_(acc2)
+                return pl.store(acc, [0, 0, 0], gate__out)
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[1, 16, 128], pl.INT8],
+                w1: pl.Tensor[[1, 64, 128], pl.INT8],
+            ) -> pl.Tensor[[1, 16, 64], pl.INT32]:
+                gate__out = pl.create_tensor([1, 16, 64], dtype=pl.INT32, layout=pl.TensorLayout.ND)
+                return self.main_incore_0(x, w1, gate__out)
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        fn = after.get_function("main_incore_0")
+        assert fn is not None
+
+        defined, used, loads = _collect_def_use(fn)
+
+        # No dangling Var: every used Var is defined. If the pre-scan ignored the
+        # nested use of x_mat/w1_mat, their loads would be dropped while the
+        # nested tile.slice still referenced them.
+        dangling = used - defined
+        assert not dangling, f"dangling Var unique_ids after flatten: {sorted(dangling)}"
+
+        # The shared operand load survives because of its nested consumer.
+        assert any(src == "x" and v.unique_id in used for v, src in loads), (
+            "x_mat load was dropped despite a nested use"
+        )
+
+        # The pass still produces only 2D tile ops.
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.TileOps2D)
+        passes.verify_properties(props, after, "test_shared_operand_with_nested_use_not_dropped")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,19 @@ std::string FormatConstFloatValue(const ir::ConstFloatPtr& c, const std::string&
 int GetOrCreateFuncId(const std::string& func_name, std::map<std::string, int>* func_name_to_id,
                       int* next_func_id);
 
+/// Constant-evaluate ``expr`` if it is a ``ConstInt``; returns ``nullopt``
+/// otherwise. Used to size TaskId carry arrays at codegen time.
+std::optional<int64_t> EvalConstInt(const ir::ExprPtr& expr);
+/// Return the const trip count of ``for_stmt`` if start/stop/step are all
+/// ``ConstInt`` and step is positive; 0 otherwise. We only support array carry
+/// for Parallel loops with statically-known trip counts.
+int64_t EvalConstTripCount(const ir::ForStmtPtr& for_stmt);
+
+/// Compute total GM-pipe workspace elements required by a root orchestration
+/// function by walking reachable statements/callees and summing
+/// ``initialize_pipe`` slot_count * slot_size.
+int64_t ComputeGMPipeWorkspaceElements(const ir::ProgramPtr& program, const ir::FunctionPtr& root_func);
+
 // ---------------------------------------------------------------------------
 // Supporting types
 // ---------------------------------------------------------------------------
@@ -214,6 +227,23 @@ struct BodyAliases {
 /// those inside nested control flow). Does not compute alias equivalence —
 /// callers run the fixpoint over ``assigns`` / ``nested_fors``.
 BodyAliases CollectBodyAliases(const ir::StmtPtr& body);
+
+/// Peek through a leading AUTO ``RuntimeScopeStmt`` so structural analyses
+/// reach the original statements.
+///
+/// ``MaterializeRuntimeScopes`` wraps the orchestration function body and
+/// each ForStmt / IfStmt branch body in an AUTO ``RuntimeScopeStmt`` so
+/// codegen emits ``PTO2_SCOPE()`` 1:1 from the IR. The structural analyses
+/// (``GetLastYieldStmt``, ``FlattenToStmts``) do not descend through a scope
+/// node. ``UnwrapAutoScope`` peeks through leading compiler-inserted scopes
+/// so those analyses see the original statements. User ``pl.manual_scope``
+/// scopes are intentionally left opaque — they were never auto-wrapped.
+///
+/// A user-written ``with pl.auto_scope():`` body may arrive as a
+/// single-statement ``SeqStmts`` wrapper (before ``NormalizeStmtStructure``
+/// collapses it); peek through it (and any nested AUTO scopes) so the
+/// analyses still reach the real statements.
+ir::StmtPtr UnwrapAutoScope(const ir::StmtPtr& stmt);
 
 }  // namespace codegen
 }  // namespace pypto

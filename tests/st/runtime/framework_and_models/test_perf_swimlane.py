@@ -129,7 +129,7 @@ class TestSwimlaneOutput:
 
         pypto does not use simpler's SceneTest harness, so it synthesises the
         name map from ``kernel_config.py``. Without it the profiling tools
-        (``swimlane_converter --func-names`` / ``deps_to_graph`` sibling
+        (``swimlane_converter --func-names`` / ``deps_viewer`` sibling
         auto-load) render anonymous ``task(rXtY)`` labels instead of real
         kernel names.
         """
