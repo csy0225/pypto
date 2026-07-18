@@ -195,6 +195,19 @@ Pass AllocateMemoryAddr();
 Pass InlineFunctions();
 
 /**
+ * @brief Expand CHIP Orchestration helpers marked with
+ *        ``attrs={"inline_orchestration": true}``.
+ *
+ * Runs after InCore/Cluster outlining and before tensor-to-tile conversion, so
+ * the pass only splices orchestration control flow and calls to already
+ * independent InCore / Group / Spmd functions. It never crosses the HOST ->
+ * CHIP hierarchy edge. The cloned helper body receives an equivalent
+ * compiler-generated AUTO runtime-scope boundary; no second SSA conversion is
+ * used to hide malformed substitutions.
+ */
+Pass InlineOrchestrationHelpers();
+
+/**
  * @brief Synthesize private signal windows for host-level allreduce calls that omit signal.
  *
  * Rewrites host orchestration ``pld.tensor.allreduce(target, op=...)`` calls to

@@ -36,6 +36,74 @@ def _run_normalize_direct(program):
 class TestNormalizeReturnOrder:
     """Tests for the NormalizeReturnOrder pass."""
 
+    def test_heterogeneous_call_reorders_tuple_types_with_indices(self):
+        """Native W8A8 data/scale returns must reorder values, tuple types, and projections together."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                i8_tile: pl.Tile[[512], pl.INT8] = pl.load(x_i8, [0], [512])
+                scale_tile: pl.Tile[[128], pl.FP32] = pl.load(x_scale, [0], [128])
+                scale_store: pl.Tensor[[128], pl.FP32] = pl.store(scale_tile, [0], out_scale)
+                i8_store: pl.Tensor[[512], pl.INT8] = pl.store(i8_tile, [0], out_i8)
+                return (scale_store, i8_store)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                ret: tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]] = self.kernel(
+                    x_i8, x_scale, out_i8, out_scale
+                )
+                scale: pl.Tensor[[128], pl.FP32] = ret[0]
+                data: pl.Tensor[[512], pl.INT8] = ret[1]
+                return (scale, data)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[512], pl.INT8], pl.Tensor[[128], pl.FP32]]:
+                i8_tile: pl.Tile[[512], pl.INT8] = pl.load(x_i8, [0], [512])
+                scale_tile: pl.Tile[[128], pl.FP32] = pl.load(x_scale, [0], [128])
+                scale_store: pl.Tensor[[128], pl.FP32] = pl.store(scale_tile, [0], out_scale)  # noqa: F841
+                i8_store: pl.Tensor[[512], pl.INT8] = pl.store(i8_tile, [0], out_i8)  # noqa: F841
+                return (out_i8, out_scale)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                ret: tuple[pl.Tensor[[512], pl.INT8], pl.Tensor[[128], pl.FP32]] = self.kernel(
+                    x_i8, x_scale, out_i8, out_scale
+                )
+                scale: pl.Tensor[[128], pl.FP32] = ret[1]
+                data: pl.Tensor[[512], pl.INT8] = ret[0]
+                return (scale, data)
+
+        After = _run_normalize(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_swapped_returns_reordered(self):
         """Two Out params with returns in wrong order → reordered + canonicalized to param Vars
         + call site TupleGetItem updated."""
@@ -444,6 +512,73 @@ class TestNormalizeReturnOrderSubmit:
     ``24-normalize_return_order.md`` §"Step B"; pass principle in
     ``.claude/rules/pass-submit-awareness.md``).
     """
+
+    def test_heterogeneous_submit_reorders_tuple_types_and_preserves_task_id(self):
+        """Submit keeps native W8A8 data/scale dtypes aligned while leaving trailing TASK_ID untouched."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                i8_tile: pl.Tile[[512], pl.INT8] = pl.load(x_i8, [0], [512])
+                scale_tile: pl.Tile[[128], pl.FP32] = pl.load(x_scale, [0], [128])
+                scale_store: pl.Tensor[[128], pl.FP32] = pl.store(scale_tile, [0], out_scale)
+                i8_store: pl.Tensor[[512], pl.INT8] = pl.store(i8_tile, [0], out_i8)
+                return (scale_store, i8_store)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                with pl.manual_scope():
+                    (scale, data), tid = pl.submit(
+                        self.kernel, x_i8, x_scale, out_i8, out_scale
+                    )  # noqa: F841
+                return (scale, data)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[512], pl.INT8], pl.Tensor[[128], pl.FP32]]:
+                i8_tile: pl.Tile[[512], pl.INT8] = pl.load(x_i8, [0], [512])
+                scale_tile: pl.Tile[[128], pl.FP32] = pl.load(x_scale, [0], [128])
+                scale_store: pl.Tensor[[128], pl.FP32] = pl.store(scale_tile, [0], out_scale)  # noqa: F841
+                i8_store: pl.Tensor[[512], pl.INT8] = pl.store(i8_tile, [0], out_i8)  # noqa: F841
+                return (out_i8, out_scale)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x_i8: pl.Tensor[[512], pl.INT8],
+                x_scale: pl.Tensor[[128], pl.FP32],
+                out_i8: pl.Out[pl.Tensor[[512], pl.INT8]],
+                out_scale: pl.Out[pl.Tensor[[128], pl.FP32]],
+            ) -> tuple[pl.Tensor[[128], pl.FP32], pl.Tensor[[512], pl.INT8]]:
+                with pl.manual_scope():
+                    _submit_tmp = pl.submit(self.kernel, x_i8, x_scale, out_i8, out_scale)
+                    scale: pl.Tensor[[128], pl.FP32] = _submit_tmp[1]
+                    data: pl.Tensor[[512], pl.INT8] = _submit_tmp[0]
+                    tid: pl.Scalar[pl.TASK_ID] = _submit_tmp[2]  # noqa: F841
+                return (scale, data)
+
+        After = _run_normalize_direct(Before)
+        ir.assert_structural_equal(After, Expected)
 
     def test_submit_swapped_returns_remapped(self):
         """InCore kernel returns swapped + result consumed via ``pl.submit`` →

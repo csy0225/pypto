@@ -117,6 +117,19 @@ def _view_var_types(func: ir.Function) -> list[ir.DistributedTensorType]:
     ]
 
 
+def _assert_window_assignments_type_symmetric(func: ir.Function) -> None:
+    """Every materialized window definition carries one shared WindowBuffer on both sides."""
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AssignTypeSymmetry)
+    assert passes.PropertyVerifierRegistry.verify(props, ir.Program([func], "window_symmetry", ir.Span.unknown())) == []
+
+    for stmt in _find_window_calls(func):
+        assert isinstance(stmt.var.type, ir.DistributedTensorType)
+        assert isinstance(stmt.value.type, ir.DistributedTensorType)
+        assert stmt.var.type.window_buffer is not None
+        assert stmt.value.type.window_buffer is stmt.var.type.window_buffer
+
+
 def _get_comm_domain_scopes(func: ir.Function) -> list[ir.CommDomainScopeStmt]:
     """Walk ``func.body`` and return every ``CommDomainScopeStmt`` it carries,
     in nesting order (outermost first, innermost last)."""
@@ -237,6 +250,7 @@ def test_single_alloc_all_devices_world_size_loop():
     view_types = _view_var_types(host)
     assert len(view_types) == 1
     assert view_types[0].window_buffer is wb
+    _assert_window_assignments_type_symmetric(host)
 
 
 def test_allreduce_signal_inherits_data_comm_domain():

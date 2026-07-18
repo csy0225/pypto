@@ -35,8 +35,8 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
-#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -406,6 +406,40 @@ class DispatchAnalyzer : public IRVisitor {
   return std::make_shared<Var>(old_var->name_hint_, new_type, old_var->span_);
 }
 
+/// Substitute every window-view Var with its type-updated copy and keep the
+/// defining ``pld.tensor.window`` Call type in lockstep with the assignment
+/// LHS.
+///
+/// A plain Var substitution is insufficient here: IRMutator rewrites the LHS
+/// and downstream uses, but a Call's result type is not re-deduced from its
+/// arguments. The old Call would therefore remain a DistributedTensorType
+/// without ``window_buffer_`` while its new LHS carries the materialized
+/// WindowBuffer. Besides violating AssignTypeSymmetry, that splits the
+/// communication-domain ownership evidence across two incompatible types.
+class WindowViewSubstituter : public IRMutator {
+ public:
+  explicit WindowViewSubstituter(const std::unordered_map<const Var*, VarPtr>& view_subst) {
+    for (const auto& [old_var, new_var] : view_subst) {
+      var_remap_[old_var] = new_var;
+    }
+  }
+
+ protected:
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto base = IRMutator::VisitStmt_(op);
+    auto assign = As<AssignStmt>(base);
+    if (!assign || !assign->var_) return base;
+
+    auto call = As<Call>(assign->value_);
+    if (!call || !call->op_ || !IsOp(call, "pld.tensor.window")) return base;
+    if (structural_equal(assign->var_->GetType(), call->GetType())) return base;
+
+    auto new_call = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, call->attrs_,
+                                           assign->var_->GetType(), call->span_);
+    return std::make_shared<AssignStmt>(assign->var_, std::move(new_call), assign->span_);
+  }
+};
+
 /// Process one host_orch function: identify allocs/windows/dispatches,
 /// construct WindowBuffer instances, rewrite the body to substitute view Vars
 /// with type-updated copies, and wrap the body in a chain of
@@ -521,10 +555,14 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   }
 
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
-  // Var picks up the type-updated copy. The base IRMutator handles all uses;
-  // Substitute is the wrapper that does exactly this transformation.
-  StmtPtr new_body = view_subst.empty() ? materialization_body
-                                        : transform_utils::Substitute(materialization_body, view_subst);
+  // Var picks up the type-updated copy. Also rewrite each defining window
+  // Call's result type so the assignment remains type-symmetric and both sides
+  // carry the exact same WindowBuffer identity.
+  StmtPtr new_body = materialization_body;
+  if (!view_subst.empty()) {
+    WindowViewSubstituter substituter(view_subst);
+    new_body = substituter.VisitStmt(materialization_body);
+  }
 
   // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
   // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so

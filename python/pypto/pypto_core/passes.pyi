@@ -599,6 +599,15 @@ def inline_functions() -> Pass:
     ``LHS = MakeTuple([rets...])`` at the call site.
     """
 
+def inline_orchestration_helpers() -> Pass:
+    """Expand CHIP Orchestration helpers marked with
+    ``attrs={"inline_orchestration": True}``.
+
+    Runs after InCore/Cluster outlining and never crosses the HOST -> CHIP
+    hierarchy boundary. The pass preserves the already-outlined kernel
+    functions, so each task keeps its own memory-planning boundary.
+    """
+
 def normalize_stmt_structure() -> Pass:
     """Create a pass that normalizes statement structure."""
 
@@ -848,6 +857,7 @@ __all__ = [
     "materialize_dist_tensor_ctx",
     "flatten_call_expr",
     "inline_functions",
+    "inline_orchestration_helpers",
     "normalize_stmt_structure",
     "derive_call_directions",
     "auto_derive_task_dependencies",

@@ -369,5 +369,44 @@ REGISTER_DISTRIBUTED_OP(tensor_slice, "tensor.slice") {
   return "";
 }
 
+// ============================================================================
+// tensor.reshape — emit a metadata-only reshape of a host/runtime tensor view.
+//
+// The whole-network host orchestrator first selects one rank's contiguous
+// weight slab, then flattens its layer dimensions before the unique CHIP
+// dispatch.  The selected object can be either a torch.Tensor or a
+// worker-resident DeviceTensor; both expose ``reshape(shape)`` with
+// metadata-only semantics for contiguous storage.
+//
+// Use the result TensorType as the source of truth for the complete target
+// shape.  Falling back to generic op printing would stringify the shape
+// MakeTuple incorrectly (historically emitting only the trailing dimension)
+// and would also produce an undefined ``tensor.reshape(...)`` symbol in the
+// generated Python module.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(tensor_reshape, "tensor.reshape") {
+  auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);
+
+  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+      << "tensor.reshape host_orch codegen expects 2 or 3 args "
+         "(input, shape[, valid_shape]), got "
+      << op->args_.size();
+
+  const std::string input_name = codegen.GetExprAsCode(op->args_[0]);
+  CHECK(!input_name.empty()) << "tensor.reshape input must resolve to a non-empty Python name";
+
+  const std::string lhs = codegen.GetCurrentResultTarget();
+  CHECK(!lhs.empty()) << "tensor.reshape in host_orch must have an assignment target";
+
+  auto result_type = ir::AsTensorTypeLike(op->GetType());
+  INTERNAL_CHECK_SPAN(result_type, op->span_)
+      << "tensor.reshape host_orch result must be TensorType-like";
+  const std::string shape = dist_codegen.FormatShapeTuple(result_type->shape_);
+
+  codegen.Emit("tensors[\"" + lhs + "\"] = tensors[\"" + input_name + "\"].reshape(" + shape + ")");
+  dist_codegen.MarkDeclared(lhs);
+  return "";
+}
+
 }  // namespace codegen
 }  // namespace pypto

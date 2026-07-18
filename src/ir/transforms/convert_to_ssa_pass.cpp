@@ -486,7 +486,20 @@ class SSAConverter {
   StmtPtr ConvertAssign(const AssignStmtPtr& op) {
     auto val = SubstExpr(op->value_);
     auto key = op->var_.get();
-    auto var = AllocVersion(key, op->var_->GetType(), op->var_->span_);
+    // For shaped values the RHS is the authoritative post-substitution type.
+    // Its TensorView/TileView and dynamic shape expressions have already gone
+    // through SubstExpr; rebuilding the LHS from the pre-SSA annotation can
+    // otherwise retain stale Var identities in valid_shape/stride fields.
+    //
+    // Do not apply this rule to scalars. A scalar assignment may carry an
+    // explicit declaration dtype that is intentionally wider than the
+    // literal/expression dtype (for example ``INT64 x = 0``). Replacing that
+    // declaration with the RHS type breaks loop-carried dtype consistency.
+    TypePtr definition_type = op->var_->GetType();
+    if (val && (AsTensorTypeLike(definition_type) || As<TileType>(definition_type))) {
+      definition_type = val->GetType();
+    }
+    auto var = AllocVersion(key, definition_type, op->var_->span_);
     auto result = MutableCopy(op);
     result->var_ = var;
     result->value_ = val;

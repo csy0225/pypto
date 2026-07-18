@@ -130,10 +130,8 @@ class DistParamAliasCollector : public IRVisitor {
  protected:
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (op && op->var_ && As<DistributedTensorType>(op->var_->GetType())) {
-      if (auto src = AsVarLike(op->value_)) {
-        if (auto ctx = LookupCtx(src.get())) {
-          alias_to_ctx[op->var_.get()] = ctx;
-        }
+      if (auto ctx = LookupCtxExpr(op->value_)) {
+        alias_to_ctx[op->var_.get()] = ctx;
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -147,6 +145,22 @@ class DistParamAliasCollector : public IRVisitor {
     auto alias_it = alias_to_ctx.find(var);
     if (alias_it != alias_to_ctx.end()) return alias_it->second;
     return nullptr;
+  }
+
+  VarPtr LookupCtxExpr(const ExprPtr& expr) const {
+    if (!expr) return nullptr;
+    if (auto src = AsVarLike(expr)) return LookupCtx(src.get());
+
+    // ``tensor.slice`` preserves DistributedTensorType and the source
+    // window's physical CommCtx, but it is represented as a Call rather than
+    // an AsVarLike alias. Follow only this view operation in the first
+    // implementation; arbitrary expressions are deliberately not treated as
+    // CommCtx-preserving aliases.
+    auto call = As<Call>(expr);
+    if (!call || !call->op_ || call->op_->name_ != "tensor.slice" || call->args_.empty()) {
+      return nullptr;
+    }
+    return LookupCtxExpr(call->args_[0]);
   }
 
   const FunctionCtxPlan* plan_;
@@ -322,12 +336,14 @@ class MaterializeDistTensorCtxMutator : public IRMutator {
   ExprPtr GetCtxForArg(const ExprPtr& arg, const Span& span) {
     if (!IsDistTensor(arg)) return nullptr;
     if (current_plan_) {
-      auto var = AsVarLike(arg);
-      if (var) {
+      if (auto var = AsVarLike(arg)) {
         auto it = current_plan_->param_to_ctx.find(var.get());
         if (it != current_plan_->param_to_ctx.end()) return it->second;
         auto alias_it = current_alias_to_ctx_.find(var.get());
         if (alias_it != current_alias_to_ctx_.end()) return alias_it->second;
+      } else if (auto call = As<Call>(arg);
+                 call && call->op_ && call->op_->name_ == "tensor.slice" && !call->args_.empty()) {
+        return GetCtxForArg(call->args_[0], span);
       }
     }
     INTERNAL_CHECK_SPAN(can_emit_prefix_, span)

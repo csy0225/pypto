@@ -511,6 +511,12 @@ void BindPass(nb::module_& m) {
              "Detects cycles in the Inline → Inline call graph and raises ValueError.\n"
              "Supports multi-return inline (emits MakeTuple at call site) and nested\n"
              "Inline-calls-Inline (iterates to fixpoint).");
+  passes.def("inline_orchestration_helpers", &pass::InlineOrchestrationHelpers,
+             "Expand CHIP Orchestration helpers marked with "
+             "attrs={'inline_orchestration': True} into CHIP orchestration callers. "
+             "This pass runs after InCore/Cluster outlining so it preserves the "
+             "already-independent kernel and memory-planning boundaries; it never "
+             "crosses the HOST -> CHIP hierarchy edge.");
   passes.def("synthesize_allreduce_signals", &pass::SynthesizeAllReduceSignals,
              "Synthesize private signal windows for host-level pld.tensor.allreduce calls that omit "
              "the signal argument. Existing explicit-signal calls are preserved.");

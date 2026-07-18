@@ -21,6 +21,7 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -30,10 +31,18 @@ namespace pass {
 namespace {
 
 /// Returns true if @p assign is `lhs = tile.reshape(src, shape)` where the
-/// LHS and the source share the same MemRef root and produce identical
-/// `TileBufSignature`s. In that case the reshape is a pure no-op at the PTO
-/// level (the per-var alloc model already pre-declared LHS with the same
-/// shape and addr) and we can replace the call with a Var-to-Var assignment.
+/// LHS and the source have structurally identical types, share the same
+/// MemRef root, and produce identical `TileBufSignature`s. In that case the
+/// reshape is a pure no-op at both the typed IR and PTO levels, so it can be
+/// replaced with a Var-to-Var assignment.
+///
+/// A TileBufSignature canonicalizes a rank-1 `[N]` tile to the same PTO buffer
+/// declaration as `[1, N]`. That does *not* make the typed values
+/// interchangeable: downstream shape inference still observes rank. Folding
+/// such a reshape would produce `lhs: Tile[1,N] = src: Tile[N]`, violate
+/// AssignTypeSymmetry, and silently erase the layer's logical view boundary.
+/// Keep rank-/shape-changing reshapes explicit even when they need no distinct
+/// allocation.
 bool IsNoOpReshape(const AssignStmtPtr& assign) {
   if (!assign || !assign->var_) return false;
   auto call = As<Call>(assign->value_);
@@ -49,6 +58,12 @@ bool IsNoOpReshape(const AssignStmtPtr& assign) {
   auto lhs_tile = As<TileType>(assign->var_->GetType());
   auto rhs_tile = As<TileType>(src_var->GetType());
   if (!lhs_tile || !rhs_tile) return false;
+
+  // Replacing the Call with src_var is legal only if the resulting assignment
+  // remains type-symmetric. MemRef is intentionally excluded by the IR's
+  // structural type equality, so the allocation-root check below remains
+  // necessary.
+  if (!structural_equal(assign->var_->GetType(), src_var->GetType())) return false;
 
   // Both sides must be backed by the same MemRef. MemoryReuse makes this
   // decision; if it didn't, the reshape is a real shape change and PTO must

@@ -459,15 +459,33 @@ class SimplifyMutator : public arith::IRMutatorWithAnalyzer {
       return LiftBodyToReturnVars(kept, op->return_vars_);
     }
 
+    // IfStmt::return_vars_ are definition sites for branch-merged values.
+    // Their types may embed scalar expressions that were constant-folded while
+    // visiting the branches (for example a loop-carried Tile shape containing
+    // ``ar_chunk``). Rebuild them after both branches so:
+    //   1. the defining return-var type is simplified consistently with the
+    //      Yield values, and
+    //   2. downstream uses are redirected through var_remap_ to the rebuilt
+    //      identity.
+    //
+    // Omitting this leaves the old scalar Var in the If return type. Scalar
+    // DCE then legally removes the folded binding, producing a dangling
+    // type-expression even though every ordinary expression use was replaced.
+    bool return_vars_changed = false;
+    auto new_return_vars = RebuildVec(
+        op->return_vars_, [this](const auto& v) { return MaybeRebuildVar(v); }, &return_vars_changed);
+
     bool changed = (new_condition.get() != op->condition_.get()) ||
                    (new_then.get() != op->then_body_.get()) ||
                    (new_else.has_value() != op->else_body_.has_value()) ||
-                   (new_else.has_value() && new_else->get() != op->else_body_->get());
+                   (new_else.has_value() && new_else->get() != op->else_body_->get()) ||
+                   return_vars_changed;
     if (!changed) return op;
     auto result = MutableCopy(op);
     result->condition_ = new_condition;
     result->then_body_ = new_then;
     result->else_body_ = new_else;
+    result->return_vars_ = std::move(new_return_vars);
     return result;
   }
 

@@ -124,6 +124,29 @@ class TestFoldNoOpReshape:
         ExpectedIR = _run_prereqs_only(Before)
         ir.assert_structural_equal(After, ExpectedIR)
 
+    def test_rank_changing_same_buffer_signature_reshape_kept(self):
+        """`[N] -> [1,N]` shares a PTO buffer signature but remains a typed view boundary."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                input_a: pl.Tensor[[128], pl.FP32],
+                output: pl.Out[pl.Tensor[[1, 128], pl.FP32]],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                tile_a: pl.Tile[[128], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_a, [0], [128])
+                tile_b: pl.Tile[[1, 128], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(tile_a, [1, 128])
+                result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_b, [0, 0], output)
+                return result
+
+        # TileBufSignature canonicalizes both tiles to a 1x128 PTO buffer, but
+        # replacing the reshape with `tile_b = tile_a` would mismatch rank and
+        # invalidate downstream shape inference. The reshape must remain.
+        After = _run_prereqs_and_fold(Before)
+        ExpectedIR = _run_prereqs_only(Before)
+        ir.assert_structural_equal(After, ExpectedIR)
+
     def test_pass_runs_without_error_on_simple_kernel(self):
         """Smoke test: pass should not crash on a kernel without trivial reshapes."""
 

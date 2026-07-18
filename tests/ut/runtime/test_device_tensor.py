@@ -94,6 +94,30 @@ class TestDeviceTensorImmutability:
         assert {t1, t2} == {t1}
 
 
+class TestDeviceTensorReshape:
+    def test_metadata_only_reshape_preserves_storage(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float16)
+        view = t.reshape((6, 4))
+        assert view.data_ptr == t.data_ptr
+        assert view.shape == (6, 4)
+        assert view.dtype is t.dtype
+        assert view.nbytes == t.nbytes
+
+    def test_element_count_mismatch_raises(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float32)
+        with pytest.raises(ValueError, match="preserve element count"):
+            t.reshape((5, 5))
+
+    def test_invalid_shape_rejected(self):
+        t = DeviceTensor(0x1000, (2, 3, 4), torch.float32)
+        with pytest.raises(ValueError, match="non-empty"):
+            t.reshape(())
+        with pytest.raises(TypeError, match="contain ints"):
+            t.reshape((6.0, 4))  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="all positive"):
+            t.reshape((6, 0))
+
+
 class TestDeviceTensorRepr:
     def test_repr_hex(self):
         t = DeviceTensor(0xABCD, [2, 3], torch.int8)

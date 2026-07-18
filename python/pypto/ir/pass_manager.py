@@ -135,6 +135,13 @@ class PassManager:
             ("OutlineHierarchyScopes", lambda: passes.outline_hierarchy_scopes()),
             ("OutlineIncoreScopes", lambda: passes.outline_incore_scopes()),
             ("OutlineClusterScopes", lambda: passes.outline_cluster_scopes()),
+            # Some whole-network builders keep a layer-level CHIP
+            # Orchestration helper as an explicit call boundary. Expand only
+            # helpers marked inline_orchestration *after* InCore/Cluster
+            # outlining and before tensor-to-tile conversion, so each task kernel
+            # retains its own memory-planning boundary while the enclosing chip
+            # callable remains one graph.
+            ("InlineOrchestrationHelpers", lambda: passes.inline_orchestration_helpers()),
             ("ConvertTensorToTileOps", lambda: passes.convert_tensor_to_tile_ops()),
             ("OptimizeOrchTensors", lambda: passes.optimize_orch_tensors()),
         ]

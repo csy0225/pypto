@@ -28,6 +28,23 @@ namespace pass {
 
 inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::InlineFunctionsEliminated}};
 
+// Runs after InCore/Cluster outlining and before tensor-to-tile conversion. It only
+// splices CHIP Orchestration control flow; the already-outlined kernel
+// functions and their independent memory-planning boundaries remain intact.
+// DeepClone alpha-renames every local definition and substitutes already-SSA
+// formals positionally, so the pass preserves the surrounding SSA form.
+inline const PassProperties kInlineOrchestrationHelpersProperties{
+    .required = {IRProperty::SSAForm, IRProperty::NoNestedCalls,
+                 IRProperty::NormalizedStmtStructure,
+                 IRProperty::SplitIncoreOrch,
+                 IRProperty::ClusterOutlined,
+                 IRProperty::OrchestrationReferencesResolved},
+    .produced = {IRProperty::SSAForm, IRProperty::NoNestedCalls,
+                 IRProperty::NormalizedStmtStructure,
+                 IRProperty::SplitIncoreOrch,
+                 IRProperty::ClusterOutlined,
+                 IRProperty::OrchestrationReferencesResolved}};
+
 // -- SynthesizeAllReduceSignals and MaterializeCommDomainScopes passes (run
 //    late in the pipeline, after phase-fence expansion and immediately before
 //    LowerHostTensorCollectives).

@@ -76,6 +76,41 @@ class DeviceTensor:
             n *= d
         return n * elem
 
+    def reshape(self, shape: Sequence[int]) -> "DeviceTensor":
+        """Return a metadata-only contiguous view with ``shape``.
+
+        ``DeviceTensor`` carries no strides, so every instance represents one
+        packed contiguous region. Reshaping therefore keeps ``data_ptr`` and
+        ``dtype`` unchanged and is legal exactly when the element count is
+        preserved. No host/device copy or allocation is performed.
+
+        This mirrors ``torch.Tensor.reshape`` for the contiguous host tensors
+        used by generated distributed orchestrators and lets the same generated
+        code handle worker-resident IPC weights.
+        """
+        raw_shape = tuple(shape)
+        if not raw_shape:
+            raise ValueError("DeviceTensor.reshape shape must be non-empty")
+        for d in raw_shape:
+            if isinstance(d, bool) or not isinstance(d, int):
+                raise TypeError(f"DeviceTensor.reshape shape must contain ints, got {raw_shape!r}")
+        if any(d <= 0 for d in raw_shape):
+            raise ValueError(f"DeviceTensor.reshape shape must be all positive, got {raw_shape}")
+
+        old_elems = 1
+        for d in self.shape:
+            old_elems *= d
+        new_elems = 1
+        for d in raw_shape:
+            new_elems *= d
+        if new_elems != old_elems:
+            raise ValueError(
+                "DeviceTensor.reshape must preserve element count: "
+                f"source shape {self.shape} has {old_elems} elements, "
+                f"target shape {raw_shape} has {new_elems}"
+            )
+        return DeviceTensor(self.data_ptr, raw_shape, self.dtype)
+
     def __getitem__(self, index: "int | slice | tuple[int | slice, ...]") -> "DeviceTensor":
         """Return a contiguous sub-view as a new :class:`DeviceTensor`.
 
