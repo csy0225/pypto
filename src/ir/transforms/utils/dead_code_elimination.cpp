@@ -183,6 +183,15 @@ void FindLiveRootsRecursiveImpl(const std::vector<StmtPtr>& stmts, const Removab
           }
         } else if (k == kAttrTaskIdVar) {
           if (const auto* var = std::any_cast<VarPtr>(&v)) add_var(*var);
+        } else if (k == kAttrPredicate) {
+          // ``with pl.spmd(..., predicate=(t[i] > 0)):`` — an Expr, so collect
+          // every Var it references (the operand tensor and its indices)
+          // rather than remapping a single Var. DCE runs at pass 5, well
+          // before OutlineSpmdScopes moves this onto Submit::predicate_, so
+          // the attr is live IR here: without this the operand's feeding
+          // assignment looks dead and its removal leaves a dangling reference
+          // — the same failure mode as issue #1456 above.
+          if (const auto* pred = std::any_cast<ExprPtr>(&v)) collect_expr_refs(*pred);
         }
       }
       if (auto spmd = std::dynamic_pointer_cast<const SpmdScopeStmt>(scope_stmt)) {
@@ -482,9 +491,13 @@ std::vector<StmtPtr> RewriteDeadIfPhisOnce(const std::vector<StmtPtr>& stmts,
       auto new_then = RewriteDeadIfPhisOnce(then_stmts, live_uses, changed);
       std::optional<std::vector<StmtPtr>> else_stmts;
       std::optional<std::vector<StmtPtr>> new_else;
+      // Both optionals are engaged together, so compare them here: a branch with
+      // no else body is trivially unchanged.
+      bool else_unchanged = true;
       if (if_stmt->else_body_.has_value()) {
         else_stmts = FlattenBody(if_stmt->else_body_.value());
         new_else = RewriteDeadIfPhisOnce(*else_stmts, live_uses, changed);
+        else_unchanged = SameFlattenedBody(*new_else, *else_stmts);
       }
 
       // Identify which return_vars are dead at this level.
@@ -501,7 +514,6 @@ std::vector<StmtPtr> RewriteDeadIfPhisOnce(const std::vector<StmtPtr>& stmts,
       const bool dropped_any = kept_indices.size() < if_stmt->return_vars_.size();
 
       const bool then_unchanged = SameFlattenedBody(new_then, then_stmts);
-      const bool else_unchanged = !new_else.has_value() || SameFlattenedBody(*new_else, *else_stmts);
 
       if (!dropped_any && then_unchanged && else_unchanged) {
         result.push_back(stmt);

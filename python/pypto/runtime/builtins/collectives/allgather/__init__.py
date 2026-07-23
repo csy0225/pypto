@@ -6,7 +6,4 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# NOT YET WIRED: this template package is reserved for future concurrent-dispatch
-# allgather lowering. The HOST allgather path currently emits builtin.tensor.barrier
-# instead. Keep this package as a placeholder until the concurrent-dispatch path lands.
 """Allgather builtin source templates."""

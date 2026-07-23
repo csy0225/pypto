@@ -399,6 +399,8 @@ bool CanonicalSimplifier::Impl::TrySumFloorDiv(const SumExpr& sum, int64_t divis
   // Case 2: Single SplitExpr with base == 0.
   if (sum.args.size() == 1 && sum.base == 0) {
     const auto& split = sum.args[0];
+    INTERNAL_CHECK_SPAN(split.lower_factor > 0, split.index->span_)
+        << "Internal error: TrySumFloorDiv split lower factor must be positive, got " << split.lower_factor;
 
     // Sub-case 2a: scale is divisible by divisor.
     // e.g., (x * 4) // 2 = x * 2
@@ -416,6 +418,8 @@ bool CanonicalSimplifier::Impl::TrySumFloorDiv(const SumExpr& sum, int64_t divis
       int64_t k = divisor / split.scale;
       if (MulWouldOverflow(split.lower_factor, k)) return false;
       int64_t new_lower = split.lower_factor * k;
+      INTERNAL_CHECK_SPAN(new_lower > 0, split.index->span_)
+          << "Internal error: TrySumFloorDiv computed non-positive lower factor " << new_lower;
       // Validity: new_lower must divide upper_factor (or upper == kPosInf)
       if (split.upper_factor != ConstIntBound::kPosInf && split.upper_factor % new_lower != 0) {
         return false;

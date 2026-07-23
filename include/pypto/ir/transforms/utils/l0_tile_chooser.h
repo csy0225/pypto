@@ -98,12 +98,18 @@ struct L0TileConfig {
   // chooser scores wall-clock directly: wall ~= max(C_load, C_mad) + C_drain.
   // Defaults are Ascend a2a3 (910B) for the common BF16 x BF16 -> FP32 GEMM, so
   // standalone callers (tests) get a sane model without wiring a backend.
-  double bw_a = 200.0;                // L1->L0A bytes/cycle (op-sim work-fit; datasheet 238).
-  double bw_b = 132.0;                // L1->L0B bytes/cycle (op-sim work-fit; ~1.5:1 vs L0A, not 2:1).
-  double bw_drain = 118.0;            // FIXPIPE L0C drain bytes/cycle (op-sim work-fit; per-drain slope).
-  double drain_fixed_cycles = 245.0;  // Per-FIXPIPE-drain fixed overhead (penalizes M/N-split, not K-split).
-  int mad_head = 6;                   // Fixed per-TMATMUL issue overhead.
-  int mad_k_fractal_bytes = 32;       // Cube K-fractal width (kt = this / bytes_a).
+  double bw_a = 129.7;                // L1->L0A bytes/cycle (on-device MTE1 sweep, R^2 0.993).
+  double bw_b = 85.4;                 // L1->L0B bytes/cycle (on-device MTE1 sweep; ~1.52:1 vs L0A).
+  double bw_drain = 118.0;            // FIXPIPE per-row byte throughput, L0C bytes/cycle (dominates wide N).
+  double drain_fixed_cycles = 164.0;  // Per-FIXPIPE-drain fixed issue overhead, m-independent (sweep).
+  double drain_row_cycles =
+      4.45;  // Per-M-row FLOOR (burst-issue setup); per-row = max(floor, bytes_c*n/bw_drain).
+  double drain_penalty_cycles =
+      2.6;                       // Misalignment: cycles per M-row per extra serial burst pass (odd(N1)-1).
+  int drain_c0_bytes = 32;       // NZ fractal C0 in bytes (N0 = C0 / bytes_c; 8 fp32).
+  int mad_head = 21;             // Fixed per-TMATMUL issue overhead.
+  int mad_k_fractal_bytes = 32;  // Cube K-fractal width (kt = this / bytes_a).
+  int mad_fp32_passes = 2;       // Cube passes/K-fractal for full fp32 MMAD (arch-specific; a2a3=2, a5=8).
 
   // Whether the chooser may pick a tile dimension larger than the problem
   // dimension (i.e. pad M / N / K up to reach `min_m` / `min_n` / `min_k`).
@@ -150,7 +156,9 @@ struct L0TileResult {
   // Estimated wall-clock for the chosen tile in core cycles (the roofline
   // objective the chooser ranks by; lower is better):
   //   double_buffer_c == false : max(C_load, C_mad) + C_drain  (drain exposed)
-  //   double_buffer_c == true  : max(C_load, C_mad, C_drain)   (drain hidden)
+  //   double_buffer_c == true  : max(C_load, C_mad, C_drain)
+  //                              + min(compute, C_drain)/T      (drain hidden except
+  //                              the one-tile pipeline fill/drain bubble; T = tiles)
   int64_t estimated_cost_cycles = 0;
 
   // Padded compute volume = ceil(M/m)*m * ceil(N/n)*n * ceil(K/k)*k.
@@ -221,9 +229,13 @@ struct L0TileResult {
  *                 (ceil(K/k)*mad_head + cpr*ceil(m/16)*Kfrac*ceil(n/16))
  *          Kfrac = floor(K/k)*ceil(k/kt) + ceil((K - floor(K/k)*k)/kt)
  *                  (the K-peel tail is scored at its own width, not rounded to k)
- *        C_drain = ceil(M/m)*ceil(N/n) * (drain_fixed + gamma_c*bytes_c*m*n/BW_drain)
- *                  (per output tile: fixed issue overhead + its bytes at BW_drain;
- *                   M/N-split adds drains, K-split does not)
+ *        C_drain = ceil(M/m)*ceil(N/n) *
+ *                  (drain_fixed + m*(max(drain_row, bytes_c*n/BW_drain) + drain_penalty*(odd(N1)-1)))
+ *                  (per output tile: m-independent fixed issue overhead + a PER-M-ROW
+ *                   cost = max(floor, throughput) [floor drain_row for narrow N,
+ *                   byte throughput for wide N] plus the misalignment residual
+ *                   odd(N1)-1 -- N1 = ceil(n/N0), N0 = drain_c0_bytes/bytes_c = 8
+ *                   (fp32 L0C); M/N-split adds drains, K-split does not)
  *        C_load (BW-weighted, by stationarity):
  *          OS full-K : min(held-A, held-B) route (hoist the cheaper operand; the
  *                      recorded os_holds_a drives the emit) — held-A / held-B as below

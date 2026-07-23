@@ -196,6 +196,7 @@ class PTOTestCase(ABC):
         backend_type: BackendType | None = None,
         strategy: OptimizationStrategy | None = None,
         memory_planner: MemoryPlanner | None = None,
+        enable_pypto_l0c_double_buffer: bool | None = None,
     ):
         """Initialize test case.
 
@@ -221,6 +222,7 @@ class PTOTestCase(ABC):
         self._override_backend = backend_type
         self._override_strategy = strategy
         self._override_memory_planner = memory_planner
+        self._override_enable_pypto_l0c_double_buffer = enable_pypto_l0c_double_buffer
         self._tensor_specs: list[TensorSpec] | None = None
         self._scalar_specs: list[ScalarSpec] | None = None
 
@@ -272,6 +274,16 @@ class PTOTestCase(ABC):
         address assignment at ``--pto-level=level2``).
         """
         return self._override_memory_planner
+
+    def get_enable_pypto_l0c_double_buffer(self) -> bool | None:
+        """Whether to opt in to L0C double-buffering (dbC=2) under the PyPTO planner.
+
+        If passed to the constructor, that value takes precedence. Otherwise None,
+        deferring to ir.compile's default (off). Subclasses may override to opt a
+        PyPTO-planner test case into the experimental dbC=2 ping-pong. No effect
+        under ``MemoryPlanner.PTOAS`` (which already emits dbC=2).
+        """
+        return self._override_enable_pypto_l0c_double_buffer
 
     def get_platform(self) -> str | None:
         """Return the target platform string ("a2a3"/"a5"/"a2a3sim"/"a5sim").

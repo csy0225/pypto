@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-把组合 (composite) tile / distributed 算子降级 (lower) 为一组基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）和分布式原语的组合，使代码生成 (codegen) 不再需要发射高层 (high-level) 指令。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。新的组合算子只需在 Pass 文件内部的分发表 (dispatch table) 里加一条降级规则，无需改动分发器本身。
+把组合 (composite) tile / distributed 算子降级 (lower) 为一组基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）和分布式原语的组合，使代码生成 (codegen) 不再需要发射高层 (high-level) 指令。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh allreduce 还可能创建 shape-only 的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。新的组合算子只需在 Pass 文件内部的分发表 (dispatch table) 里加一条降级规则，无需改动分发器本身。
 
 ## 概览 (Overview)
 
@@ -18,7 +18,7 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 **失效 (Invalidates)**：无。
 
-空的 `PassProperties` 契约（`include/pypto/ir/transforms/pass_properties.h` 中的 `kLowerCompositeOpsProperties`）反映了这一事实：本 Pass 的降级完全在已有 tile 算子词汇（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）内进行，既不建立任何 `IRProperty`，也不破坏任何 `IRProperty`。
+空的 `PassProperties` 契约（`include/pypto/ir/transforms/pass_properties.h` 中的 `kLowerCompositeOpsProperties`）反映了这一事实：本 Pass 的降级在已有 tile/distributed 词汇以及用于暴露规范展平窗口的 shape-only `tensor.view` 内进行，既不建立任何 `IRProperty`，也不破坏任何 `IRProperty`。
 
 ## 运行时机 (When It Runs)
 
@@ -43,7 +43,7 @@ src/ir/transforms/lower_composite_ops_pass.cpp
 
 新增一个组合算子的步骤（改动都留在 `lower_composite_ops_pass.cpp` 内）：
 
-1. 写一个 `Lower<Op>Rule(call, args, builder)` 函数。它接收原始 `CallPtr`（按需用 `call->span_`、`call->kwargs_`、`call->op_->name_`）、已 visit 过的参数表达式（已应用 var-remap）以及一个 `LoweringBuilder`，其 `Bind` 助手会为每个中间临时变量追加一条 `AssignStmt`。需要控制流的规则可以用 `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr`——每个都接收一个 body 回调，回调里收到的嵌套 builder 与外层共享同一个 temp 计数器，因此发射的临时变量名跨任意嵌套深度都唯一。`LowerTensorAllReduceRule` 是含控制流规则的范例（4 阶段 notify / wait / remote_load+accumulate / store）。
+1. 写一个 `Lower<Op>Rule(call, args, builder)` 函数。它接收原始 `CallPtr`（按需用 `call->span_`、`call->kwargs_`、`call->op_->name_`）、已 visit 过的参数表达式（已应用 var-remap）以及一个 `LoweringBuilder`，其 `Bind` 助手会为每个中间临时变量追加一条 `AssignStmt`。需要控制流的规则可以用 `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr`——每个都接收一个 body 回调，回调里收到的嵌套 builder 与外层共享同一个 temp 计数器，因此发射的临时变量名跨任意嵌套深度都唯一。`LowerTensorAllReduceRule` 是含控制流规则的范例（4 阶段 notify / wait / remote_load+accumulate / store，用于 mesh；`LowerTensorRingAllReduceRule` 则通过 `mode` kwarg 分发，增加分块 RS+AG ring 调度）。
 2. 在 `LookupCompositeRule` 的 `kRules` 里加一条 `{"<op>", &Lower<Op>Rule}`。
 
 无需修改 mutator。当分发表条目增多——或某条规则需要独立的翻译单元时——再把它拆回 `src/ir/transforms/composite_ops/` 下的独立注册表。
@@ -187,9 +187,14 @@ sin 与 cos 共用同一组多项式系数：cos 路径只在区间归约阶段�
 
 ## `pld.tensor.*` 分布式集合通信算子
 
-本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列。数据搬运原语因算子而异：`allgather` 与 `broadcast` 用 `pld.tile.get` 搬运窗口数据（经 VEC staging tile 的 GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile 并用 `tile.add` 累加。这些规则共享同一套 signal buffer 约定：使用窗口绑定的 INT32 `signal` 矩阵作为跨卡屏障，且**每次调用都需要新分配的 buffer**。
+本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列。数据搬运原语因算子而异：`allgather` 使用 `pld.tile.put`（基于 TPUT 的推送，经 VEC staging tile 自动分块），`broadcast` 用 `pld.tile.get` 搬运窗口数据（GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile 并用 `tile.add` 累加。这些规则共享同一套 signal buffer 约定：使用窗口绑定的 INT32 `signal` 矩阵作为跨卡屏障，且**每次调用都需要新分配的 buffer**。
 
 ### `pld.tensor.allreduce`
+
+mesh 降级会把 packed 目标折叠成 `[前导维度乘积, 最后一维]`。完全有效的目标使用
+shape-only 视图；如果 ND 目标带有 partial `TensorView.valid_shape`，Pass 会在能够
+通过折叠 leading dimensions 表示成单个 2D 矩形时保留该元数据并且只归约这个矩形。
+strided 目标、DN partial view 和无法按该方式表示的 partial 区域会被明确拒绝。
 
 allreduce 规则把单个组合 Call 展开成两道跨卡屏障，复用同一组 `signal` cell:Phase 2a `Set 1` + Phase 2b `wait ≥1`,然后 Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`。调用返回时每个 cell 停在 `2`,而不是初始的 `0`。
 
@@ -201,15 +206,15 @@ allreduce 规则把单个组合 Call 展开成两道跨卡屏障，复用同一�
 
 ### `pld.tensor.allgather`
 
-签名：`allgather(local_data, target, signal, out)`。`local_data` 是本 rank 的 chunk（`Tensor` 或 `Tile` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区，`signal` 是 INT32 屏障，`out` 是接收结果的普通 `Tensor[1, NR*SIZE]`。展开序列对齐 simpler allgather 参考实现 (`simpler/examples/workers/l3/allgather_distributed/`)：
+签名：`allgather(local_data, target, signal)`。`local_data` 是本 rank 的 chunk（`Tensor` 或 `Tile` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区同时又是结果，`signal` 是 INT32 屏障。基于推送 (push-based) 的展开：
 
-- Phase 0：`tile.load(local_data, [0, 0], [1, SIZE])` — 当 `local_data` 是 `Tensor` 时从普通输入发射一个 Tile；已是 Tile 时跳过
-- Phase 1：`tile.store(stage_tile, [0, 0], target)` — 将本 rank 的 chunk 写入私有 HCCL 窗口的本地行 0
+- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。``pld.tile.put`` 直接从 ``local_data`` Tensor（或 Tile）源读取 — 不发射显式的 ``tile.load``。
+- Phase 1：对 `peer` 从 `0` 到 `NR-1`，`pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — 将本 rank 的 chunk 推送到每个 peer 窗口的第 `my_rank` 行。自推送 (`peer == my_rank`) 通过 HCCL 恒等映射实现。`pld.tile.put` 在 SIZE 超过 staging tile 容量时自动分块
 - Phase 2a：notify-all（`Set 1`）
 - Phase 2b：wait-all（`Ge 1`）
-- Phase 3：对 `r` 从 `0` 到 `NR-1`，`pld.tile.get(out, peer=r, target, stage, dst_offsets=[0, r*SIZE], src_offsets=[0, 0], shape=[1, SIZE])` — 经一个共享的 `[1, SIZE]` VEC staging tile 把每个 peer 的 chunk 直接搬到 `out` 的列偏移 `[0, r*SIZE]`。无 `tile.concat`；每次搬运都是 `[1, SIZE]`，对任意 `NR`/`SIZE` 都能放进 UB。返回 `out` **Tensor** `[1, NR*SIZE]`。
+- 返回 `target` — 窗口本身就是汇聚后的 `[NR, SIZE]` 结果（窗口即结果，`DistributedTensor`）
 
-自读通过同一个 `pld.tile.get` 路径的 HCCL 恒等映射实现（`CommRemotePtr` 在 `peer == my_rank` 时返回本地指针）。每个 rank 在 `out` 中产生相同的 rank 顺序拼接结果。
+与原始基于拉取 (pull-based) 的 allgather（4 参数带独立 `out` 张量）相比，该推送版本去掉了 `out` 参数和每 peer 的 `pld.tile.get` 汇聚循环。总 HBM 从 `(NR+1)×SIZE` 降至 `NR×SIZE`，代价是窗口在调用方消费结果之前一直处于占用状态。
 
 ### `pld.tensor.reduce_scatter`
 

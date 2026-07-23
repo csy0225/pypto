@@ -738,11 +738,11 @@ class TileType(ShapedType):
     def get_effective_tile_view(self) -> TileView:
         """Return the effective TileView for this tile.
 
-        If ``tile_view`` is set explicitly, returns that. Otherwise returns the
-        implicit view derived from ``(shape, memory_space)``. Under canonicalization
-        an implicit view is stored as ``None``, so callers that need to inspect
-        layout fields should use this method rather than reading ``tile_view``
-        directly.
+        Returns a copy of an explicit view with an empty ``valid_shape`` expanded
+        to ``shape`` while preserving all other metadata. If ``tile_view`` is
+        absent, returns the implicit view derived from ``(shape, memory_space)``.
+        Callers needing semantic fields should use this method rather than reading
+        the canonical sparse ``tile_view`` storage directly.
         """
 
 class ArrayType(ShapedType):
@@ -1395,6 +1395,17 @@ class Submit(Expr):
     ``pl.submit`` and on ``pl.spmd_submit``. Lowers to
     ``Arg::set_allow_early_resolve(true)`` in orchestration codegen."""
 
+    predicate: Final[Expr | None]
+    """Dispatch predicate (``pl.spmd_submit(..., predicate=(t[i] > 0))``) — an
+    ordinary comparison Expr, e.g. ``Gt(Cast(tensor.read(rc, [0, 0])), 0)``. The
+    scheduler evaluates it at the dispatch point; a false result retires the task
+    inline (never dispatched to a core) while still settling fanin/fanout.
+    ``None`` for an unconditional dispatch.
+
+    Stored as a plain Expr rather than a decomposed bundle: the IR already has the
+    comparison kinds and ``tensor.read``, so decomposition into the runtime's
+    ``operand OP target`` triple is orchestration-codegen's job."""
+
     @property
     def arg_directions(self) -> Sequence[ArgDirection]:
         """Resolved per-argument call-site directions (see :attr:`Call.arg_directions`)."""
@@ -1439,6 +1450,7 @@ class Submit(Expr):
         core_num: Expr | None = None,
         sync_start: bool = False,
         allow_early_resolve: bool = False,
+        predicate: Expr | None = None,
     ) -> None:
         """Create a Submit expression with kwargs and explicit attrs and type.
 
@@ -1457,6 +1469,9 @@ class Submit(Expr):
                 ``core_num`` to be set.
             allow_early_resolve: Opt this task in as a speculative early-dispatch
                 producer (independent of the SPMD launch spec).
+            predicate: Optional dispatch-predicate comparison Expr (e.g.
+                ``Gt(tensor.read(t, [i]), 0)``); omit for an unconditional
+                dispatch.
         """
         ...
 
@@ -3473,7 +3488,13 @@ class ProgramBuilder:
         """
 
 # ========== Python Printer ==========
-def python_print(node: IRNode, prefix: str = "pl", concise: bool = False, format: bool = True) -> str:
+def python_print(
+    node: IRNode,
+    prefix: str = "pl",
+    concise: bool = False,
+    format: bool = True,
+    explicit_layout: bool = False,
+) -> str:
     """Print an IR node as a Python string.
 
     Args:
@@ -3481,18 +3502,24 @@ def python_print(node: IRNode, prefix: str = "pl", concise: bool = False, format
         prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
         concise: If true, omit intermediate type annotations (default false)
         format: If true, apply registered format callback (default true)
+        explicit_layout: If true, print every tile's fully-resolved
+            blayout/slayout/fractal (including tiles whose canonical view is
+            absent) so the output is self-describing for layouts (default false)
 
     Returns:
         String representation of the IR node
     """
 
-def python_print_type(type: Type, prefix: str = "pl", format: bool = True) -> str:
+def python_print_type(
+    type: Type, prefix: str = "pl", format: bool = True, explicit_layout: bool = False
+) -> str:
     """Print a Type object as a Python string.
 
     Args:
         type: Type object to print
         prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
         format: If true, apply registered format callback (default true)
+        explicit_layout: If true, print fully-resolved tile layouts (default false)
 
     Returns:
         String representation of the Type

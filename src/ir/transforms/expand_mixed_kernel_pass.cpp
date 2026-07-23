@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -22,12 +23,14 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/any_cast.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
@@ -35,7 +38,6 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
-#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
@@ -53,6 +55,7 @@
 #include "pypto/ir/transforms/utils/tpop_tfree_finalizer.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
+#include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -189,7 +192,7 @@ TpopDefs CollectTpopDefs(const std::vector<StmtPtr>& stmts) {
       if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
         if (auto call = std::dynamic_pointer_cast<const Call>(assign->value_)) {
           // Treat explicit split-reshape results like tpop results: a follow-on
-          // tile.move that places an aic_gather result for the cube (Vec -> Left)
+          // tile.move that places an aic_gather result for the cube (Mat -> Left)
           // must NOT be re-detected as a second cross-core boundary — the data
           // already crosses via the gather's own tpush/tpop, so the move is just
           // internal cube placement on the consuming lane.
@@ -697,10 +700,11 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
       {
         const auto& bm = bm_it->second;
         // The cross-core transfer memory FOR THIS SIDE: AIC drains into Mat,
-        // AIV into Vec. Op-driven boundaries (aiv_shard / aic_gather) keep the
-        // input memory on both sides, so the fractal view and tpop type must
-        // key off this transfer memory rather than the op's inherited result
-        // memory (which is Vec on both lanes).
+        // AIV into Vec. An op-driven boundary (aiv_shard / aic_gather) declares
+        // only its CONSUMING lane's space (Vec / Mat respectively, see
+        // cross_core.cpp), so each side's fractal view and tpop type must key
+        // off this transfer memory rather than the op's result memory — which
+        // names the other lane whenever this side is the producer.
         const MemorySpace xfer_ms = GetBoundaryTpopMemory(side);
         const int op_split = bm.op_driven ? bm.split : 0;
         if (bm.direction == push_direction) {
@@ -1458,6 +1462,357 @@ bool FunctionCallsFunction(const FunctionPtr& func, const std::string& callee_na
   return false;
 }
 
+// ============================================================================
+// Hand-written Group ABI normalization
+// ============================================================================
+
+/// Runtime MixedKernels subslots share one L0TaskArgs payload. Auto-expanded
+/// Groups already satisfy that contract because both member calls forward the
+/// complete Group signature. A hand-written Group may call AIC/AIV functions
+/// with different subsets, however, so normalize both members to the Group ABI
+/// before orchestration codegen (#2097).
+
+class KernelCallCounter : public IRVisitor {
+ public:
+  [[nodiscard]] size_t Count(const std::string& name) const {
+    auto it = counts_.find(name);
+    return it == counts_.end() ? 0 : it->second;
+  }
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    CountCallee(op->op_);
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitExpr_(const SubmitPtr& op) override {
+    CountCallee(op->op_);
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  void CountCallee(const OpPtr& op) {
+    if (auto gv = std::dynamic_pointer_cast<const GlobalVar>(op)) ++counts_[gv->name_];
+  }
+
+  std::unordered_map<std::string, size_t> counts_;
+};
+
+/// Ascend910B no-split cross-core pipes need both AIV sub-lanes to execute:
+/// lane 0 performs the real work while SplitVectorKernel synthesizes a
+/// zero-valid-shape replay on lane 1 so every hardware pipe handshake is
+/// balanced. Auto-expanded mixed kernels are stamped in ExpandMixedFunction;
+/// hand-written AIC/AIV Groups need the same inference here.
+class NoSplitCrossCoreTransportCollector : public IRVisitor {
+ public:
+  [[nodiscard]] bool UsesNoSplitTransportOnly() const { return uses_transport_ && !uses_split_transport_; }
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    if (op_predicates::IsTPush(op) || op_predicates::IsTPop(op) || op_predicates::IsTFree(op)) {
+      uses_transport_ = true;
+      uses_split_transport_ = uses_split_transport_ || op->GetKwarg<int>("split", 0) != 0;
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+
+ private:
+  bool uses_transport_ = false;
+  bool uses_split_transport_ = false;
+};
+
+bool NeedsInferredNoSplitDualAivDispatch(const FunctionPtr& func) {
+  if (!func || func->func_type_ != FunctionType::AIV || !pypto::backend::BackendConfig::IsConfigured()) {
+    return false;
+  }
+  const auto* pass_context = PassContext::Current();
+  const auto* backend_handler = pass_context ? pass_context->GetBackendHandler()
+                                             : pypto::backend::BackendConfig::GetBackend()->GetHandler();
+  if (!backend_handler->RequiresNoSplitDualAivDispatch() ||
+      func->GetAttr<bool>(kDualAivDispatchAttr, false) || func->HasAttr("external_source") ||
+      func->requires_runtime_binding_) {
+    return false;
+  }
+  if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
+    return false;
+  }
+
+  NoSplitCrossCoreTransportCollector collector;
+  collector.VisitStmt(func->body_);
+  return collector.UsesNoSplitTransportOnly();
+}
+
+FunctionPtr WithDualAivDispatch(const FunctionPtr& func) {
+  auto result = MutableCopy(func);
+  auto attrs = result->attrs_;
+  attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
+                             [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+              attrs.end());
+  attrs.emplace_back(kDualAivDispatchAttr, true);
+  result->attrs_ = std::move(attrs);
+  return result;
+}
+
+bool IsCanonicalGroupMemberCall(const CallPtr& call, const FunctionPtr& callee, const FunctionPtr& group) {
+  if (!call || !callee || !group) return false;
+  if (call->args_.size() != group->params_.size() || callee->params_.size() != group->params_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < group->params_.size(); ++i) {
+    auto arg = AsVarLike(call->args_[i]);
+    if (!arg || arg.get() != group->params_[i].get()) return false;
+  }
+  return true;
+}
+
+/// Rewrite import_peer_buffer(peer_func=...) when a reused pair receives
+/// Group-private adapter names.
+class PeerFuncRewriter : public IRMutator {
+ public:
+  explicit PeerFuncRewriter(std::unordered_map<std::string, std::string> rename_map)
+      : rename_map_(std::move(rename_map)) {}
+
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto visited = As<Call>(IRMutator::VisitExpr_(op));
+    INTERNAL_CHECK_SPAN(visited != nullptr, op->span_) << "Call mutation produced a non-Call expression";
+
+    auto builtin = As<Op>(visited->op_);
+    if (!builtin || !IsOp(builtin, "system.import_peer_buffer")) return visited;
+
+    auto kwargs = visited->kwargs_;
+    bool changed = false;
+    for (auto& [key, value] : kwargs) {
+      if (key != "peer_func") continue;
+      auto peer = std::any_cast<std::string>(&value);
+      if (!peer) continue;
+      auto it = rename_map_.find(*peer);
+      if (it == rename_map_.end()) continue;
+      value = it->second;
+      changed = true;
+    }
+    if (!changed) return visited;
+    return std::make_shared<Call>(visited->op_, visited->args_, std::move(kwargs), visited->attrs_,
+                                  visited->GetType(), visited->span_);
+  }
+
+ private:
+  std::unordered_map<std::string, std::string> rename_map_;
+};
+
+FunctionPtr BuildGroupAbiAdapter(const FunctionPtr& group, const WrapperCallInfo& member,
+                                 const std::string& adapter_name,
+                                 const std::unordered_map<std::string, std::string>& peer_renames) {
+  const auto& callee = member.inner_callee;
+  const auto& call = member.inner_call;
+  INTERNAL_CHECK(group != nullptr && callee != nullptr && call != nullptr)
+      << "Internal error: incomplete Group member while normalizing its shared ABI";
+  CHECK_SPAN(call->args_.size() == callee->params_.size(), call->span_)
+      << "Group '" << group->name_ << "' calls member '" << callee->name_ << "' with " << call->args_.size()
+      << " arguments, but its signature has " << callee->params_.size();
+
+  std::vector<VarPtr> adapter_params;
+  adapter_params.reserve(group->params_.size());
+  std::unordered_map<const Var*, VarPtr> group_to_adapter;
+  for (const auto& param : group->params_) {
+    auto fresh = std::make_shared<Var>(param->name_hint_, param->GetType(), param->span_);
+    adapter_params.push_back(fresh);
+    group_to_adapter.emplace(param.get(), fresh);
+  }
+
+  // Bind every original member parameter to the corresponding Group call-site
+  // expression, rewritten onto the adapter's fresh canonical parameters.
+  std::unordered_map<const Var*, ExprPtr> member_to_adapter;
+  for (size_t i = 0; i < callee->params_.size(); ++i) {
+    member_to_adapter.emplace(callee->params_[i].get(),
+                              transform_utils::Substitute(call->args_[i], group_to_adapter));
+  }
+  auto cloned = DeepClone(callee->body_, member_to_adapter);
+  StmtPtr adapter_body = cloned.cloned_body;
+  if (!peer_renames.empty()) {
+    adapter_body = PeerFuncRewriter(peer_renames).VisitStmt(adapter_body);
+  }
+
+  return std::make_shared<Function>(adapter_name, std::move(adapter_params), group->param_directions_,
+                                    callee->return_types_, std::move(adapter_body), callee->span_,
+                                    callee->func_type_, callee->level_, callee->role_, callee->attrs_,
+                                    callee->requires_runtime_binding_);
+}
+
+class GroupMemberCallRewriter : public IRMutator {
+ public:
+  GroupMemberCallRewriter(std::unordered_map<std::string, std::string> callee_renames,
+                          std::vector<VarPtr> canonical_args)
+      : callee_renames_(std::move(callee_renames)), canonical_args_(std::move(canonical_args)) {
+    for (size_t i = 0; i < canonical_args_.size(); ++i) {
+      canonical_arg_indices_.emplace(canonical_args_[i].get(), static_cast<int32_t>(i));
+    }
+  }
+
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto gv = As<GlobalVar>(op->op_);
+    auto it = gv ? callee_renames_.find(gv->name_) : callee_renames_.end();
+    if (it == callee_renames_.end()) return IRMutator::VisitExpr_(op);
+    std::vector<ExprPtr> args(canonical_args_.begin(), canonical_args_.end());
+    return std::make_shared<Call>(std::make_shared<GlobalVar>(it->second), std::move(args), op->kwargs_,
+                                  RemapPositionalAttrs(op->attrs_, op->args_, op->op_, op->span_),
+                                  op->GetType(), op->span_);
+  }
+
+  ExprPtr VisitExpr_(const SubmitPtr& op) override {
+    auto gv = As<GlobalVar>(op->op_);
+    auto it = gv ? callee_renames_.find(gv->name_) : callee_renames_.end();
+    if (it == callee_renames_.end()) return IRMutator::VisitExpr_(op);
+    std::vector<ExprPtr> args(canonical_args_.begin(), canonical_args_.end());
+    return std::make_shared<Submit>(
+        std::make_shared<GlobalVar>(it->second), std::move(args), op->deps_, op->kwargs_,
+        RemapPositionalAttrs(op->attrs_, op->args_, op->op_, op->span_), op->GetType(), op->span_,
+        op->core_num_, op->sync_start_, op->allow_early_resolve_, op->predicate_);
+  }
+
+ private:
+  std::vector<std::pair<std::string, std::any>> RemapPositionalAttrs(
+      const std::vector<std::pair<std::string, std::any>>& source_attrs,
+      const std::vector<ExprPtr>& source_args, const OpPtr& source_op, const Span& source_span) const {
+    std::vector<std::pair<std::string, std::any>> attrs;
+    attrs.reserve(source_attrs.size());
+    for (const auto& [key, value] : source_attrs) {
+      // These directions describe the old member argument list. The standard
+      // pipeline derives them again after ExpandMixedKernel, so retaining the
+      // vector would make the widened Call/Submit fail constructor validation.
+      if (key == kAttrArgDirections) continue;
+      if (key != kAttrArgDirectionOverrides) {
+        attrs.emplace_back(key, value);
+        continue;
+      }
+
+      const auto* old_indices = std::any_cast<std::vector<int32_t>>(&value);
+      INTERNAL_CHECK_SPAN(old_indices != nullptr, source_span)
+          << "Internal error: " << kAttrArgDirectionOverrides << " attr must hold std::vector<int32_t>";
+      std::vector<int32_t> remapped_indices;
+      remapped_indices.reserve(old_indices->size());
+      for (int32_t old_index : *old_indices) {
+        INTERNAL_CHECK_SPAN(old_index >= 0 && static_cast<size_t>(old_index) < source_args.size(),
+                            source_span)
+            << "Internal error: " << kAttrArgDirectionOverrides << " index " << old_index
+            << " is out of range for Group member call to '" << source_op->name_ << "'";
+        auto old_arg = AsVarLike(source_args[static_cast<size_t>(old_index)]);
+        CHECK_SPAN(old_arg != nullptr, source_span)
+            << "Cannot preserve pl.no_dep on non-variable argument " << old_index << " of Group member '"
+            << source_op->name_ << "' while normalizing its shared ABI";
+        auto canonical_it = canonical_arg_indices_.find(old_arg.get());
+        CHECK_SPAN(canonical_it != canonical_arg_indices_.end(), source_span)
+            << "Cannot map pl.no_dep argument " << old_index << " of Group member '" << source_op->name_
+            << "' to a canonical Group parameter";
+        remapped_indices.push_back(canonical_it->second);
+      }
+      attrs.emplace_back(key, std::move(remapped_indices));
+    }
+    return attrs;
+  }
+
+  std::unordered_map<std::string, std::string> callee_renames_;
+  std::vector<VarPtr> canonical_args_;
+  std::unordered_map<const Var*, int32_t> canonical_arg_indices_;
+};
+
+std::string ReserveAdapterName(const std::string& base, std::unordered_set<std::string>& used_names) {
+  if (used_names.insert(base).second) return base;
+  for (size_t suffix = 1;; ++suffix) {
+    std::string candidate = base + "_" + std::to_string(suffix);
+    if (used_names.insert(candidate).second) return candidate;
+  }
+}
+
+struct NormalizedGroups {
+  std::vector<FunctionPtr> functions;
+};
+
+NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
+                                               const std::vector<FunctionPtr>& functions) {
+  KernelCallCounter call_counter;
+  for (const auto& func : functions) {
+    if (func && func->body_) call_counter.VisitStmt(func->body_);
+  }
+
+  std::unordered_set<std::string> used_names;
+  std::unordered_map<std::string, FunctionPtr> replacements;
+  std::vector<FunctionPtr> adapters;
+  for (const auto& func : functions) used_names.insert(func->name_);
+
+  for (const auto& group : functions) {
+    if (!group || group->func_type_ != FunctionType::Group) continue;
+
+    WrapperCallInfo aic;
+    WrapperCallInfo aiv;
+    for (const auto& member : CollectInnerCalls(group, program)) {
+      if (member.inner_callee->func_type_ == FunctionType::AIC && !aic.inner_call) {
+        aic = member;
+      } else if (member.inner_callee->func_type_ == FunctionType::AIV && !aiv.inner_call) {
+        aiv = member;
+      }
+    }
+    // AIV-only Groups and pre-expansion Groups are handled by their existing
+    // dispatch paths. A mixed Group needs exactly the shared AIC/AIV ABI here.
+    if (!aic.inner_call || !aiv.inner_call) continue;
+    const bool needs_abi_normalization =
+        !IsCanonicalGroupMemberCall(aic.inner_call, aic.inner_callee, group) ||
+        !IsCanonicalGroupMemberCall(aiv.inner_call, aiv.inner_callee, group);
+    const bool needs_dual_aiv_dispatch = NeedsInferredNoSplitDualAivDispatch(aiv.inner_callee);
+    if (!needs_abi_normalization && !needs_dual_aiv_dispatch) continue;
+
+    if (needs_abi_normalization) {
+      CHECK_SPAN(
+          !aic.inner_callee->HasAttr("external_source") && !aiv.inner_callee->HasAttr("external_source") &&
+              !aic.inner_callee->requires_runtime_binding_ && !aiv.inner_callee->requires_runtime_binding_,
+          group->span_)
+          << "Mixed Group '" << group->name_
+          << "' has AIC/AIV members with different argument layouts. External or runtime-bound members "
+             "cannot be adapted; declare both members with the same signature and forward the Group's full "
+             "parameter list.";
+    }
+
+    const bool exclusive_pair =
+        call_counter.Count(aic.inner_callee->name_) == 1 && call_counter.Count(aiv.inner_callee->name_) == 1;
+    const std::string aic_name = exclusive_pair
+                                     ? aic.inner_callee->name_
+                                     : ReserveAdapterName(group->name_ + "_aic_adapter", used_names);
+    const std::string aiv_name = exclusive_pair
+                                     ? aiv.inner_callee->name_
+                                     : ReserveAdapterName(group->name_ + "_aiv_adapter", used_names);
+    const std::unordered_map<std::string, std::string> peer_renames = {{aic.inner_callee->name_, aic_name},
+                                                                       {aiv.inner_callee->name_, aiv_name}};
+
+    auto normalized_aic = BuildGroupAbiAdapter(group, aic, aic_name, peer_renames);
+    auto normalized_aiv = BuildGroupAbiAdapter(group, aiv, aiv_name, peer_renames);
+    if (needs_dual_aiv_dispatch) normalized_aiv = WithDualAivDispatch(normalized_aiv);
+    if (exclusive_pair) {
+      replacements[aic_name] = normalized_aic;
+      replacements[aiv_name] = normalized_aiv;
+    } else {
+      adapters.push_back(normalized_aic);
+      adapters.push_back(normalized_aiv);
+    }
+
+    std::unordered_map<std::string, std::string> callee_renames = {{aic.inner_callee->name_, aic_name},
+                                                                   {aiv.inner_callee->name_, aiv_name}};
+    auto mutable_group = MutableCopy(group);
+    mutable_group->body_ =
+        GroupMemberCallRewriter(std::move(callee_renames), group->params_).VisitStmt(group->body_);
+    replacements[group->name_] = mutable_group;
+  }
+
+  std::vector<FunctionPtr> result;
+  result.reserve(functions.size() + adapters.size());
+  result.insert(result.end(), adapters.begin(), adapters.end());
+  for (const auto& func : functions) {
+    auto it = replacements.find(func->name_);
+    result.push_back(it == replacements.end() ? func : it->second);
+  }
+  return {std::move(result)};
+}
+
 }  // namespace
 
 namespace pass {
@@ -1559,6 +1914,12 @@ Pass ExpandMixedKernel() {
         }
       }
     }
+
+    // Phase 4: normalize hand-written mixed Groups to the runtime's one-shared-
+    // payload ABI. Rebuild a lookup program after the Phase 3 rewrites so the
+    // callee scan sees the final AIC/AIV functions.
+    auto rewritten_program = std::make_shared<Program>(new_functions, program->name_, program->span_);
+    new_functions = NormalizeHandWrittenGroupAbis(rewritten_program, new_functions).functions;
 
     return std::make_shared<Program>(new_functions, program->name_, program->span_);
   };

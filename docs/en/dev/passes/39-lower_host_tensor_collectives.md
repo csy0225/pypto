@@ -4,7 +4,8 @@
 
 `LowerHostTensorCollectives` rewrites host-orchestrator calls to
 `pld.tensor.allreduce`, `pld.tensor.barrier`, `pld.tensor.broadcast`,
-`pld.tensor.reduce_scatter`, and `pld.tensor.allgather` into compiler-internal
+`pld.tensor.reduce_scatter`, `pld.tensor.allgather`, and
+`pld.tensor.all_to_all` into compiler-internal
 builtin chip dispatches. It runs
 after [`MaterializeCommDomainScopes`](38-materialize_comm_domain_scopes.md), so
 each window-bound data tensor and explicit or synthesized signal tensor already has a
@@ -31,9 +32,15 @@ data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
 signal = pld.tensor.barrier(signal)
 data = pld.tensor.broadcast(data, signal, root=0)
 data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
-data = pld.tensor.allgather(data, signal)
+data = pld.tensor.allgather(stage, data, signal)
+data = pld.tensor.all_to_all(stage, data, signal)
 ```
 
+For `allgather` / `all_to_all`, `stage` (TPUT source) and `data` (result)
+must be two distinct windows. For `allgather` the `stage` window holds only
+this rank's single chunk and is `[1, SIZE]`; for `all_to_all` it carries one
+per-destination chunk per row and is `[NR, SIZE]`. In both cases `data` is the
+`[NR, SIZE]` result window peers push into.
 the pass emits the corresponding `builtin.tensor.*` dispatch per participating
 device.  When the surrounding comm-domain scope has an explicit device list,
 the pass emits a `SeqStmts`; otherwise it emits a sequential `for r in

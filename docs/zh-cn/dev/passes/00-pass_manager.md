@@ -92,6 +92,7 @@ struct PassProperties {
 | MaterializeDistTensorCtx | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
+| ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
 
 > **注意**：VerifySSA 和 TypeCheck 是**属性验证器 (PropertyVerifier)**（验证规则），不是 Pass。它们通过 `VerificationInstrument` 或 `run_verifier()` 工具函数运行——参见[验证器](99-verifier.md)。
 
@@ -176,6 +177,24 @@ with passes.PassContext([passes.CallbackInstrument(after_pass=after_pass)]):
 ```
 
 `run_passes(dump_ir=True)` 内部使用 `CallbackInstrument` 在每个 Pass 后转储 IR，将验证委托给 C++ 流水线。在已有 `PassContext` 内调用时，转储模式会保留外层上下文的插桩（如用户提供的 `VerificationInstrument`）和验证级别，将转储插桩追加到组合列表中。
+
+**转储详细级别（`PassDumpLevel`）。** `dump_passes` 开关（位于 `ir.compile`、`RunConfig` 以及 `run_passes` 的 `dump_ir`）接受一个 `PassDumpLevel` 枚举——为向后兼容也接受 `bool`（`True` → `CONCISE`，`False` → `NONE`）：
+
+| 级别 | 含义 |
+| ---- | ---- |
+| `NONE` | 不进行逐 Pass 转储。 |
+| `CONCISE` | 简洁规范 IR（默认）；最利于逐 Pass 对比 diff。 |
+| `EXPLICIT` | 完全解析的转储——对布局自描述（issue #2088）。 |
+
+默认（`CONCISE`）下，转储的 `pl.Tile` 注解在其 `blayout`/`slayout`/`fractal` 与所属内存空间的*隐式*视图相同时会将其省略，而规范 IR 将隐式视图存储为 `nullopt`——因此即便某个 tile 的真实布局并不平凡，它也可能完全不打印 `TileView`（例如一个 `pl.Mem.Acc` tile 实际上是 `blayout=col_major, slayout=row_major, fractal=1024`）。`EXPLICIT` 让每个转储的 tile 从 `GetEffectiveTileView` 打印其完全解析的布局，并展示 `pld.DistributedTensor` 携带、但简洁形式会丢弃的 `window_buffer` 反向引用——从而仅凭打印出的 IR 即可定位布局/别名缺陷。`EXPLICIT` 转储仍能重新解析为完全相同的 IR：tile 布局会规范化回 `nullopt`（与隐式视图相同的显式视图），而 window buffer 标记是一个信息性的尾随字符串,解析器在重新加载时会将其剥离(真实引用会从 `pld.tensor.window` 重新推导)。这样 `compiled.validate_ir()`(会重新加载每个转储)仍能正常工作。以编程方式使用时，向 `python_print(...)` 传入 `explicit_layout=True`。
+
+```python
+from pypto.ir import PassDumpLevel
+from pypto.runtime import RunConfig
+
+RunConfig(dump_passes=PassDumpLevel.EXPLICIT)   # 完全解析的转储
+RunConfig(dump_passes=True)                     # == PassDumpLevel.CONCISE
+```
 
 ### ReportInstrument
 
@@ -296,10 +315,11 @@ class PassPipeline {
   void AddPass(Pass pass);
   ProgramPtr Run(const ProgramPtr& program) const;  // executes passes in order
   std::vector<std::string> GetPassNames() const;
+  std::vector<Pass> GetPasses() const;
 };
 ```
 
-`PassPipeline` 是简单的有序 Pass 列表。每个 Pass 的 `operator()` 检查活跃的 `PassContext` 以获取插桩。
+`PassPipeline` 是有序 Pass 对象及其名称的单一事实来源。`GetPasses()` 返回轻量的 Pass 句柄副本，用于检查或组合新的 pipeline。每个 Pass 的 `operator()` 检查活跃的 `PassContext` 以获取插桩。
 
 ### 自动验证
 
@@ -356,6 +376,7 @@ ir.compile(program, verification_level=ir.VerificationLevel.NONE)
 | `get_strategy(strategy)` | 获取按策略配置的 PassManager |
 | `run_passes(program, dump_ir, output_dir, prefix)` | 通过 PassPipeline 执行 Pass |
 | `get_pass_names()` | 获取所有 Pass 的名称 |
+| `passes` / `pass_names` | 从底层 PassPipeline 派生的只读快照 |
 
 ### 用法
 
@@ -407,6 +428,7 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 29. [`MaterializeDistTensorCtx`](40-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
 30. `Simplify`
 31. [`MaterializeRuntimeScopes`](41-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
+32. [`ClassifyIterArgCarry`](42-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
 
 `DebugTileOptimization` 只是用于排查 PTO tile 阶段的调试策略，会跳过
 tensor-only 前缀 pass。正常编译和非 strategy 专项测试都应优先使用

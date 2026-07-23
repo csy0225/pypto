@@ -560,6 +560,20 @@ class ASTParser:
         # ``deps=[var]`` kwarg recognition on kernel calls.
         self._manual_scope_depth: int = 0
 
+        # Maps a Var bound from a ``pl.submit(...)`` result tuple, by
+        # ``unique_id``, to the producer TaskId Var bound by that same submit.
+        # Lets ``_validate_predicate_deps`` enforce the "predicate operand's
+        # producer must be one of deps=" contract at the parser boundary.
+        self._submit_producer_tid: dict[int, tuple[ir.Var, int]] = {}
+        # How many times each TaskId Var object has been bound by a submit.
+        # Strict SSA reuses one ``ir.Var`` object across same-named rebindings
+        # (``_, tid = ...`` twice yields the same object), so object identity
+        # alone cannot tell *which* task a later ``deps=[tid]`` refers to.
+        # Recording the generation at producer time lets the contract check
+        # detect that the name was rebound in between, instead of matching on
+        # identity and falsely certifying the submit as compliant.
+        self._tid_binding_generation: dict[int, int] = {}
+
         # Forward-sticky ``pl.dump_tag`` set (per function, reset at function
         # entry). Holds the bound Vars whose subsequent kernel-call uses get a
         # per-call ``dump_vars`` entry. See ``_handle_dump_tag``.
@@ -590,6 +604,11 @@ class ASTParser:
         # whose validity is scoped to a specific function type — e.g.
         # ``pl.dump_tag`` only makes sense in Orchestration functions.
         self._func_type: ir.FunctionType = ir.FunctionType.Opaque
+
+        # Dyn-dim symbols (``pl.dynamic()`` Vars) the current signature declares as a
+        # bare extent of a tensor param, keyed by ``Var.unique_id`` (see
+        # ``_fold_tensor_dim``). Per-function; reset in parse_function.
+        self._param_dim_symbols: set[int] = set()
 
         # Current function's auto_scope flag (set during parse_function). When
         # True (default) the compiler owns AUTO scope placement, so a hand-placed
@@ -717,6 +736,7 @@ class ASTParser:
         # auto_scope rides in func_attrs (key "auto_scope"); absent ⇒ default True.
         self._func_auto_scope = bool((func_attrs or {}).get("auto_scope", True))
         self._func_type = func_type
+        self._param_dim_symbols = set()
         func_span = self.span_tracker.get_span(func_def)
 
         # Enter function scope
@@ -765,6 +785,15 @@ class ASTParser:
 
                 # Add parameter to function with direction
                 param_var = f.param(param_name, param_type, param_span, direction=param_direction)
+
+                # A bare ``pl.dynamic()`` Var in a tensor param's shape names that
+                # argument's runtime extent. Orchestration codegen defines exactly
+                # these symbols from the task-arg descriptors, which is what makes
+                # them usable as values — and what ``_fold_tensor_dim`` folds onto.
+                if isinstance(param_type, ir.TensorType):
+                    for extent in param_type.shape:
+                        if isinstance(extent, ir.Var):
+                            self._param_dim_symbols.add(extent.unique_id)
 
                 # Register in scope
                 self.scope_manager.define_var(param_name, param_var, allow_redef=True)
@@ -1319,8 +1348,17 @@ class ASTParser:
                 or not _types_match(value_expr.type, override_type)
             )
         ):
+            # Carry attrs through the rebuild: a forward-referenced callee has no
+            # known return type, so the annotation always overrides it and every
+            # call attr (arg_directions, arg_direction_overrides, dump_vars, ...)
+            # would otherwise be silently dropped.
             value_expr = ir.Call(
-                value_expr.op, value_expr.args, value_expr.kwargs, override_type, value_expr.span
+                value_expr.op,
+                value_expr.args,
+                value_expr.kwargs,
+                value_expr.attrs,
+                override_type,
+                value_expr.span,
             )
 
         # Reuse existing Var on reassignment (override_type is intentionally
@@ -1344,6 +1382,32 @@ class ASTParser:
     ) -> ir.Var:
         """Assign to existing Var if possible, otherwise create a new let binding."""
         existing_var = self.scope_manager.lookup_var(var_name)
+
+        # ``n = pl.tensor.dim(x, 0)`` folded to a dyn-dim symbol (see
+        # ``_fold_tensor_dim``): bind the Python name straight to the symbol. A Let
+        # would copy it, and every shape later built from ``n`` would then carry the
+        # copy rather than the symbol — the aliasing the fold exists to remove.
+        # Both guards test the Var the name is bound to, never a parallel set of
+        # names: scopes are a stack, so a name-keyed alias set desyncs the moment a
+        # non-leaking scope rebinds the name and exits.
+        # An LHS annotation that simply restates the symbol's own type (``n:
+        # pl.Scalar[pl.INDEX] = pl.tensor.dim(x, 0)`` — the form the printer emits)
+        # must not defeat the alias; only an annotation asking for a *different*
+        # type falls through to a Let of its own.
+        if (
+            self._func_type == ir.FunctionType.Orchestration
+            and self._is_param_dim_symbol(value_expr)
+            and (existing_var is None or self._is_param_dim_symbol(existing_var))
+            and (override_type is None or _types_match(override_type, value_expr.type))
+        ):
+            return value_expr
+
+        # The name is bound to a symbol, which is immutable — it names an argument's
+        # extent. Rebind the name to a fresh let rather than assigning *through* the
+        # alias into the symbol itself.
+        if self._is_param_dim_symbol(existing_var):
+            return self.builder.let(var_name, value_expr, type=override_type, span=span)
+
         if existing_var is not None and type(existing_var) is ir.Var and not self.scope_manager.strict_ssa:
             # Reject reassignment with a different type (#642).  Same Python
             # variable maps to the same Var node, so the type must match.
@@ -1487,22 +1551,25 @@ class ASTParser:
             hint="Use simple variable assignments or tuple unpacking with pl.yield_()",
         )
 
-    def _bind_unpack_target(self, target: ast.expr, value_expr: ir.Expr, span: ir.Span) -> None:
+    def _bind_unpack_target(self, target: ast.expr, value_expr: ir.Expr, span: ir.Span) -> list[ir.Var]:
         """Bind a tuple-unpacking target (a Name or a nested Tuple) to an IR expr.
 
         Used by the ``pl.submit(...)`` desugaring so a multi-output kernel can
         be unpacked as ``(a, b), tid = pl.submit(...)``.
+
+        Returns the Vars bound, in binding order (flattened across nesting).
         """
         if isinstance(target, ast.Name):
             var = self._assign_or_let(target.id, value_expr, span)
             self.scope_manager.define_var(target.id, var, span=span)
-            return
+            return [var]
         if isinstance(target, ast.Tuple):
             tuple_var = self.builder.let("_tuple_tmp", value_expr, span=span)
+            bound: list[ir.Var] = []
             for i, elt in enumerate(target.elts):
                 item_expr = ir.TupleGetItemExpr(tuple_var, i, span)
-                self._bind_unpack_target(elt, item_expr, span)
-            return
+                bound.extend(self._bind_unpack_target(elt, item_expr, span))
+            return bound
         raise ParserSyntaxError(
             f"Tuple unpacking target must be a variable name or nested tuple, got {ast.unparse(target)}",
             span=span,
@@ -1607,11 +1674,18 @@ class ASTParser:
         # Bind the flat tuple: elements 0..N-1 -> kernel results, element N ->
         # the producer TaskId.
         submit_var = self.builder.let("_submit_tmp", call_expr, span=span)
+        produced: list[ir.Var] = []
         for i, elt in enumerate(out_names):
-            self._bind_unpack_target(elt, ir.TupleGetItemExpr(submit_var, i, span), span)
+            produced.extend(self._bind_unpack_target(elt, ir.TupleGetItemExpr(submit_var, i, span), span))
         task_id_expr = ir.TupleGetItemExpr(submit_var, n_outs, span)
         tid_var = self._assign_or_let(tid_target.id, task_id_expr, span)
         self.scope_manager.define_var(tid_target.id, tid_var, span=span)
+        # Record this submit's result Vars against its producer TaskId so a
+        # later submit's predicate= operand can be checked against its deps=.
+        gen = self._tid_binding_generation.get(tid_var.unique_id, 0) + 1
+        self._tid_binding_generation[tid_var.unique_id] = gen
+        for out_var in produced:
+            self._submit_producer_tid[out_var.unique_id] = (tid_var, gen)
 
     def _build_submit_single_lhs_expr(self, call: ast.Call, *, is_spmd: bool = False) -> ir.Expr:
         """Build the ``ir.Submit`` expression for the single-LHS form
@@ -3409,9 +3483,10 @@ class ASTParser:
             return
         self._parse_spmd_scope(stmt, context_expr, scope_kind_map, optional_vars=optional_vars)
 
-    # Integer dtypes accepted for an SPMD ``core_num`` (block count). Shared by
-    # the ``pl.spmd`` scope path and the ``pl.spmd_submit`` task-launch path.
-    _CORE_NUM_INTEGER_DTYPES = frozenset(
+    # Integer dtypes accepted wherever the DSL requires an integer-typed scalar
+    # expression: an SPMD ``core_num`` (block count, via ``pl.spmd`` and
+    # ``pl.spmd_submit``) and the ``predicate=`` element indices.
+    _INTEGER_DTYPES = frozenset(
         {
             DataType.INT4,
             DataType.INT8,
@@ -3441,7 +3516,7 @@ class ASTParser:
         # here, but cast for mypy's sake.
         expr = self.parse_expression(cast("ast.expr", value_node))
         expr_type = expr.type
-        is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in self._CORE_NUM_INTEGER_DTYPES
+        is_integer = isinstance(expr_type, ir.ScalarType) and expr_type.dtype in self._INTEGER_DTYPES
         if not is_integer:
             raise ParserSyntaxError(
                 f"core_num must be an integer expression, got {python_print(expr_type, format=False)}",
@@ -3512,6 +3587,55 @@ class ASTParser:
             )
         return kw.value.value
 
+    # ``pl.spmd()`` keywords whose *value* the caller interprets. ``deps`` is
+    # conditionally legal (see _validate_spmd_kwarg_name).
+    _SPMD_KWARGS = frozenset(
+        {"core_num", "sync_start", "name_hint", "optimizations", "allow_early_resolve", "predicate"}
+    )
+
+    def _validate_spmd_kwarg_name(
+        self, kw: ast.keyword, anchor: ast.AST, *, usage_hint: str, allow_deps: bool
+    ) -> None:
+        """Reject a ``pl.spmd()`` keyword that is not legal in this context.
+
+        Split out of :meth:`_parse_spmd_kwargs` so that method handles only what
+        each keyword's *value* means, while "is this keyword name accepted here"
+        lives in one place. Covers three rejections:
+
+        * ``**kwargs`` unpacking (``kw.arg is None``) — the parser must see each
+          keyword literally.
+        * ``deps=`` outside the ``as tid`` capture form, where there is no TaskId
+          to hang the edges on.
+        * any unrecognised name, whose hint lists the keywords valid *here*.
+        """
+        if kw.arg is None:
+            # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
+            raise ParserSyntaxError(
+                "pl.spmd() does not accept **kwargs; pass core_num (positional) "
+                "and sync_start=/name_hint=/optimizations= explicitly",
+                span=self.span_tracker.get_span(kw.value),
+                hint=usage_hint,
+            )
+        if kw.arg == "deps" and not allow_deps:
+            raise ParserSyntaxError(
+                "pl.spmd() does not accept 'deps=' here",
+                span=self.span_tracker.get_span(kw.value),
+                hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
+                "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
+                "deps=[...])` for the single-call form.",
+            )
+        if kw.arg == "deps" or kw.arg in self._SPMD_KWARGS:
+            return
+        supported = "'sync_start', 'name_hint', 'optimizations', "
+        if allow_deps:
+            supported += "'deps', "
+        supported += "'allow_early_resolve', 'predicate'"
+        raise ParserSyntaxError(
+            f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
+            span=self.span_tracker.get_span(anchor),
+            hint=f"Supported keywords: {supported}",
+        )
+
     def _parse_spmd_kwargs(
         self,
         anchor: ast.AST,
@@ -3519,15 +3643,18 @@ class ASTParser:
         *,
         usage_hint: str,
         allow_deps: bool = False,
-    ) -> tuple["ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool]:
+    ) -> tuple[
+        "ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool, "ir.Expr | None"
+    ]:
         """Parse the ``pl.spmd(core_num, *, sync_start=, name_hint=, optimizations=, deps=, ...)`` arguments.
 
         Also accepts ``allow_early_resolve=`` (the speculative early-dispatch
-        hint). The first positional argument is ``core_num`` (range-like). Returns
+        hint) and ``predicate=`` (the dispatch predicate). The first positional
+        argument is ``core_num`` (range-like). Returns
         ``(core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars,
-        allow_early_resolve)`` with ``sync_start`` / ``allow_early_resolve``
-        defaulting to ``False``, ``split_mode`` / ``split_slot_num`` to ``None``,
-        and ``dep_vars`` to ``[]``.
+        allow_early_resolve, predicate)`` with ``sync_start`` /
+        ``allow_early_resolve`` defaulting to ``False``, ``split_mode`` /
+        ``split_slot_num`` / ``predicate`` to ``None``, and ``dep_vars`` to ``[]``.
 
         ``optimizations=[...]`` accepts only ``pl.split(MODE)`` — see
         :meth:`_parse_spmd_optimizations_list`.
@@ -3542,6 +3669,15 @@ class ASTParser:
         (same as ``pl.submit`` / ``pl.at``); it is always accepted here (it needs
         no ``as tid``), and a cluster-nesting guard at the call site rejects it
         when the dispatch would be unwrapped into a Group function.
+
+        ``predicate=(t[i] > 0)`` is a dispatch predicate — the same surface and
+        the same validation as ``pl.spmd_submit(..., predicate=)``, shared via
+        :meth:`_parse_submit_predicate_kwarg`. It rides on the ``SpmdScopeStmt``
+        until ``OutlineSpmdScopes`` moves it onto the synthesised ``Submit``.
+        Like ``allow_early_resolve`` it needs no ``as tid`` (the outliner
+        synthesises a TaskId Var when the scope has none) and is rejected by the
+        same cluster-nesting guard. The producer-in-``deps=`` contract is checked
+        below, once ``dep_vars`` is resolved.
         """
         if len(call.args) > 1:
             raise ParserSyntaxError(
@@ -3558,15 +3694,9 @@ class ASTParser:
         split_slot_num: int | None = None
         deps_kw: ast.keyword | None = None
         allow_early_resolve: bool = False
+        predicate: ir.Expr | None = None
         for kw in call.keywords:
-            if kw.arg is None:
-                # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
-                raise ParserSyntaxError(
-                    "pl.spmd() does not accept **kwargs; pass core_num (positional) "
-                    "and sync_start=/name_hint=/optimizations= explicitly",
-                    span=self.span_tracker.get_span(kw.value),
-                    hint=usage_hint,
-                )
+            self._validate_spmd_kwarg_name(kw, anchor, usage_hint=usage_hint, allow_deps=allow_deps)
             if kw.arg == "name_hint":
                 name_hint = self._parse_scope_name_hint(kw.value, "pl.spmd()")
             elif kw.arg == "core_num":
@@ -3582,30 +3712,13 @@ class ASTParser:
             elif kw.arg == "optimizations":
                 split_mode, split_slot_num = self._parse_spmd_optimizations_list(kw.value)
             elif kw.arg == "deps":
-                if not allow_deps:
-                    raise ParserSyntaxError(
-                        "pl.spmd() does not accept 'deps=' here",
-                        span=self.span_tracker.get_span(kw.value),
-                        hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
-                        "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
-                        "deps=[...])` for the single-call form.",
-                    )
                 deps_kw = kw
             elif kw.arg == "allow_early_resolve":
                 allow_early_resolve = self._parse_spmd_bool_literal_kwarg(kw, usage_hint)
-            else:
-                supported = (
-                    "Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps', "
-                    "'allow_early_resolve'"
-                    if allow_deps
-                    else "Supported keywords: 'sync_start', 'name_hint', 'optimizations', "
-                    "'allow_early_resolve'"
-                )
-                raise ParserSyntaxError(
-                    f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
-                    span=self.span_tracker.get_span(anchor),
-                    hint=supported,
-                )
+            elif kw.arg == "predicate":
+                # Not a bool literal — parsed as an ordinary expression and
+                # shape-validated, exactly as on pl.spmd_submit.
+                predicate = self._parse_submit_predicate_kwarg("pl.spmd()", [kw])
         if core_num is None:
             raise ParserSyntaxError(
                 "pl.spmd() requires core_num (first positional argument)",
@@ -3616,26 +3729,107 @@ class ASTParser:
         if deps_kw is not None:
             anchor_span = self.span_tracker.get_span(anchor)
             dep_vars = self._parse_submit_deps_kwarg("pl.spmd()", [deps_kw], anchor_span)
-        return core_num, sync_start, name_hint, split_mode, split_slot_num, dep_vars, allow_early_resolve
-
-    def _reject_spmd_early_resolve_in_cluster(self, allow_early_resolve: bool, span: "ir.Span") -> None:
-        """Reject ``allow_early_resolve=True`` on a ``pl.cluster()``-nested ``pl.spmd``.
-
-        A cluster-nested Spmd scope is unwrapped into the Group function by
-        ``OutlineClusterScopes`` (``UnwrapNestedSpmd``) and never lowers to a
-        ``Submit``, so the early-dispatch hint would be silently dropped. Raise a
-        clear parse-time error instead, mirroring the ``as tid`` cluster rejection
-        in :meth:`_parse_spmd_scope_with_tid`.
-        """
-        if allow_early_resolve and self._is_inside_scope(ir.ScopeKind.Cluster):
-            raise ParserSyntaxError(
-                "`pl.spmd(..., allow_early_resolve=True)` cannot be nested inside `pl.cluster()` — "
-                "a cluster-nested pl.spmd is unwrapped into the Group function and never produces a "
-                "Submit, so the early-dispatch hint would be lost.",
-                span=span,
-                hint="Use a standalone `with pl.spmd(..., allow_early_resolve=True):` (implicit "
-                "cluster) to keep the hint.",
+        # Producer-in-deps contract, checked once dep_vars is known. Same
+        # best-effort spot check as pl.spmd_submit: the scheduler reads the
+        # operand at the dispatch point, so its producing task must be a
+        # dependency or the read may observe a stale value. On the plain /
+        # for-forms deps= is unavailable, so a tracked producer reports here and
+        # the error steers the author to the ``as tid`` form.
+        if predicate is not None:
+            self._validate_predicate_deps(
+                "pl.spmd()",
+                predicate,
+                dep_vars,
+                self.span_tracker.get_span(anchor),
+                # allow_deps is False on the plain / for-forms, where deps= is
+                # rejected outright — the hint must not tell the author to add one.
+                deps_accepted=allow_deps,
             )
+        return (
+            core_num,
+            sync_start,
+            name_hint,
+            split_mode,
+            split_slot_num,
+            dep_vars,
+            allow_early_resolve,
+            predicate,
+        )
+
+    def _reject_spmd_submit_only_kwargs_in_cluster(
+        self, allow_early_resolve: bool, predicate: "ir.Expr | None", span: "ir.Span"
+    ) -> None:
+        """Reject Submit-only ``pl.spmd()`` kwargs on a ``pl.cluster()``-nested scope.
+
+        Covers ``allow_early_resolve=True`` and ``predicate=(...)``: both are
+        carried by ``Submit`` fields with no plain-``Call`` equivalent. A
+        cluster-nested Spmd scope is unwrapped into the Group function by
+        ``OutlineClusterScopes`` (``UnwrapNestedSpmd``) and never lowers to a
+        ``Submit``, so either would be silently dropped. Raise a clear parse-time
+        error instead, mirroring the ``as tid`` cluster rejection in
+        :meth:`_parse_spmd_scope_with_tid`. ``UnwrapNestedSpmd`` re-asserts this
+        for hand-built / deserialized IR.
+        """
+        if not self._is_inside_scope(ir.ScopeKind.Cluster):
+            return
+        # Report the kwarg the user actually wrote, so the message names it.
+        if allow_early_resolve:
+            kwarg, lost = "allow_early_resolve=True", "the early-dispatch hint"
+        elif predicate is not None:
+            kwarg, lost = "predicate=(...)", "the dispatch predicate"
+        else:
+            return
+        raise ParserSyntaxError(
+            f"`pl.spmd(..., {kwarg})` cannot be nested inside `pl.cluster()` — "
+            "a cluster-nested pl.spmd is unwrapped into the Group function and never produces a "
+            f"Submit, so {lost} would be lost.",
+            span=span,
+            hint=f"Use a standalone `with pl.spmd(..., {kwarg}):` (implicit cluster) to keep it.",
+        )
+
+    def _reject_submit_dispatch_metadata_in_cluster(
+        self,
+        *,
+        user_dep_vars: list["ir.Var"],
+        core_num: "ir.Expr | None",
+        sync_start: bool,
+        allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
+        span: "ir.Span",
+    ) -> None:
+        """Reject per-task metadata on a Submit nested inside ``pl.cluster()``.
+
+        A cluster body is outlined into one Group task. Calls or plain Submit
+        nodes inside that body identify the Group's AIC/AIV callees, but they
+        are not dispatched independently, so their task-level controls have no
+        runtime carrier and would otherwise be silently ignored.
+        """
+        if not self._is_inside_scope(ir.ScopeKind.Cluster):
+            return
+
+        metadata_fields: list[str] = []
+        if user_dep_vars:
+            metadata_fields.append("deps")
+        if core_num is not None:
+            metadata_fields.append("core_num")
+        if sync_start:
+            metadata_fields.append("sync_start")
+        if allow_early_resolve:
+            metadata_fields.append("allow_early_resolve")
+        if predicate is not None:
+            metadata_fields.append("predicate")
+        if not metadata_fields:
+            return
+
+        construct = "pl.spmd_submit" if core_num is not None else "pl.submit"
+        raise ParserSyntaxError(
+            f"`{construct}(...)` inside `pl.cluster()` cannot carry per-task dispatch metadata "
+            f"({', '.join(metadata_fields)}) — the cluster is dispatched as one Group task, so metadata on "
+            "an inner Submit would be ignored",
+            span=span,
+            hint="Move the dependency or launch control to the dispatch surrounding the cluster, "
+            "or omit it from the inner Submit.",
+        )
 
     @staticmethod
     def _spmd_body_reads_block_idx(body: "list[ast.stmt]") -> bool:
@@ -3804,6 +3998,7 @@ class ASTParser:
             split_slot_num,
             dep_vars,
             allow_early_resolve,
+            predicate,
         ) = self._parse_spmd_kwargs(
             stmt, context_expr, usage_hint=with_hint, allow_deps=optional_vars is not None
         )
@@ -3822,18 +4017,25 @@ class ASTParser:
                 split_slot_num,
                 dep_vars,
                 allow_early_resolve,
+                predicate,
                 optional_vars,
             )
             return
 
         # ``allow_early_resolve`` opts the grid dispatch into speculative
-        # early-dispatch (mirrors pl.submit / pl.at). A cluster-nested pl.spmd is
+        # early-dispatch and ``predicate`` gates it at the dispatch point (both
+        # mirror pl.submit / pl.spmd_submit). A cluster-nested pl.spmd is
         # unwrapped into the Group function by OutlineClusterScopes and never
-        # lowers to a Submit, so the hint would be silently dropped — reject it
+        # lowers to a Submit, so either would be silently dropped — reject them
         # here (mirrors the ``as tid`` cluster rejection in
         # _parse_spmd_scope_with_tid).
-        self._reject_spmd_early_resolve_in_cluster(allow_early_resolve, span)
+        self._reject_spmd_submit_only_kwargs_in_cluster(allow_early_resolve, predicate, span)
         spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
+        # Canonical attr order: allow_early_resolve then predicate (matches the
+        # ``as tid`` form) so a print -> reparse compares equal under
+        # structural_equal's positional attr check.
+        if predicate is not None:
+            spmd_attrs.append(("predicate", predicate))
 
         # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
         # (allow_deps=False), so dep_vars is empty here. The shared helper keeps the
@@ -3864,6 +4066,7 @@ class ASTParser:
         split_slot_num: "int | None",
         dep_vars: "list[ir.Var]",
         allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
         optional_vars: "ast.expr",
     ) -> None:
         """Parse ``with pl.spmd(n, deps=[...]) as tid:`` capturing the dispatch TaskId.
@@ -3901,9 +4104,9 @@ class ASTParser:
                 hint="Use `with pl.spmd(...) as tid:` (single name; nested tuples are not allowed).",
             )
 
-        # Canonical attr order (deps, task_id_var, allow_early_resolve) mirrors
-        # _parse_at_meta so a print -> reparse cycle compares equal under
-        # structural_equal's positional attr check.
+        # Canonical attr order (deps, task_id_var, allow_early_resolve,
+        # predicate) mirrors _parse_at_meta so a print -> reparse cycle compares
+        # equal under structural_equal's positional attr check.
         scope_attrs: list[tuple[str, Any]] = []
         if dep_vars:
             scope_attrs.append(("manual_dep_edges", dep_vars))
@@ -3915,6 +4118,12 @@ class ASTParser:
         # _parse_at_meta does for pl.at scopes.
         if allow_early_resolve:
             scope_attrs.append(("allow_early_resolve", True))
+        # ``predicate`` after it — an Expr (not a flag), read off the scope by the
+        # Spmd outliner and moved onto ``Submit.predicate``. It carries live SSA
+        # Vars (the operand tensor and its indices), which ConvertToSSA versions
+        # via SubstScopeAttrs.
+        if predicate is not None:
+            scope_attrs.append(("predicate", predicate))
 
         # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
         # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
@@ -3943,6 +4152,48 @@ class ASTParser:
             split_slot_num,
             scope_attrs,
         )
+        self._record_scope_producer(stmt.body, tid_var)
+
+    def _record_scope_producer(self, body: "list[ast.stmt]", tid_var: "ir.Var") -> None:
+        """Record ``body``'s assigned Vars as produced by the scope's ``tid_var``.
+
+        The scope-form counterpart of the tracking ``_parse_submit_tuple_lhs``
+        does for ``out, tid = pl.submit(...)``. Without it a
+        ``with pl.spmd(...) as tid:`` that writes a tensor leaves no producer
+        record, so :meth:`_validate_predicate_deps` silently certifies a later
+        ``predicate=`` over that tensor even when the scope is absent from
+        ``deps=`` — the exact stale-read the contract exists to prevent, in the
+        form most natural to write.
+
+        Same best-effort scope as the call form: only names bound by a
+        top-level assignment in the scope body are tracked (aliases, writes
+        through ``pl.Out`` arguments, and rebinds via an intervening call are
+        not). The generation counter mirrors the submit path so a ``tid`` name
+        rebound by a later scope cannot match by Var identity alone.
+        """
+        names: list[str] = []
+
+        def collect(target: ast.expr) -> None:
+            if isinstance(target, ast.Name):
+                names.append(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    collect(elt)
+
+        for node in body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    collect(target)
+            elif isinstance(node, ast.AnnAssign):
+                collect(node.target)
+        if not names:
+            return
+        gen = self._tid_binding_generation.get(tid_var.unique_id, 0) + 1
+        self._tid_binding_generation[tid_var.unique_id] = gen
+        for name in names:
+            produced = self.scope_manager.lookup_var(name)
+            if isinstance(produced, ir.Var):
+                self._submit_producer_tid[produced.unique_id] = (tid_var, gen)
 
     def _parse_spmd_for_loop(self, stmt: ast.For, iter_call: ast.Call) -> None:
         """Parse ``for i in pl.spmd(N, ...): body`` into
@@ -3986,16 +4237,20 @@ class ASTParser:
             split_slot_num,
             _,
             allow_early_resolve,
+            predicate,
         ) = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
 
         span = self.span_tracker.get_span(stmt)
-        # ``allow_early_resolve`` rides on the SpmdScopeStmt (read by the Spmd
-        # outliner onto the synthesised Submit). A cluster-nested pl.spmd is
-        # unwrapped into the Group and never produces a Submit, so reject the hint
-        # there (mirrors the with-form / as-tid guards).
-        self._reject_spmd_early_resolve_in_cluster(allow_early_resolve, span)
+        # ``allow_early_resolve`` / ``predicate`` ride on the SpmdScopeStmt (read
+        # by the Spmd outliner onto the synthesised Submit). A cluster-nested
+        # pl.spmd is unwrapped into the Group and never produces a Submit, so
+        # reject them there (mirrors the with-form / as-tid guards).
+        self._reject_spmd_submit_only_kwargs_in_cluster(allow_early_resolve, predicate, span)
         spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
+        # Canonical attr order — see the with-form.
+        if predicate is not None:
+            spmd_attrs.append(("predicate", predicate))
         # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
         # scope — the kernel the loop body lowers to. The with-form (pl.at /
         # pl.spmd / pl.cluster) routes through _parse_scope_body for this; the
@@ -5286,6 +5541,14 @@ class ASTParser:
         if len(attrs) >= 2 and attrs[0] == "pl" and attrs[1] == "const":
             return self._parse_typed_constant(call)
 
+        # pl.<DataType>.get_byte() — fold into compile-time int constant.
+        # e.g. ``pl.FP32.get_byte()`` → 4, ``pl.INT32.get_byte()`` → 4.
+        # The call has no side effects (GetByte is a pure accessor) so folding
+        # at parse time is safe and lets it work directly inside traced bodies
+        # without a separate import of the _window_byte_constants module.
+        if len(attrs) == 3 and attrs[0] == "pl" and attrs[-1] == "get_byte":
+            return self._parse_dtype_get_byte(attrs[1], call)
+
         # pl.{operation} (2-segment, unified dispatch or promoted ops)
         if len(attrs) >= 2 and attrs[0] == "pl" and attrs[1] not in ("tensor", "tile", "system", "array"):
             op_name = attrs[1]
@@ -5462,6 +5725,7 @@ class ASTParser:
             allowed_kwargs.add("deps")
             allowed_kwargs.add("dumps")
             allowed_kwargs.add("allow_early_resolve")
+            allowed_kwargs.add("predicate")
         if as_spmd:
             allowed_kwargs.update({"core_num", "sync_start"})
         if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
@@ -5661,8 +5925,20 @@ class ASTParser:
         # early-dispatch producer. Accepted on both pl.submit and pl.spmd_submit
         # (recorded on the Submit; no-op for a plain self.kernel(...) call).
         allow_early_resolve = False
+        predicate: ir.Expr | None = None
         if as_submit:
             allow_early_resolve = self._parse_submit_allow_early_resolve_kwarg(method_name, keywords)
+            predicate = self._parse_submit_predicate_kwarg(method_name, keywords)
+            if predicate is not None:
+                self._validate_predicate_deps(method_name, predicate, user_dep_vars, span)
+            self._reject_submit_dispatch_metadata_in_cluster(
+                user_dep_vars=user_dep_vars,
+                core_num=core_num_expr,
+                sync_start=sync_start,
+                allow_early_resolve=allow_early_resolve,
+                predicate=predicate,
+                span=span,
+            )
         return_types = func_obj.return_types if func_obj else []
         # A callee that declares no ``-> `` annotation has empty ``return_types``
         # but may ``return <value>`` (e.g. an InCore kernel returning its
@@ -5699,6 +5975,7 @@ class ASTParser:
             core_num=core_num_expr,
             sync_start=sync_start,
             allow_early_resolve=allow_early_resolve,
+            predicate=predicate,
             extra_attrs=extra_attrs,
         )
 
@@ -6062,6 +6339,247 @@ class ASTParser:
             )
         return kw.value.value
 
+    def _parse_submit_predicate_kwarg(self, method_name: str, keywords: list[ast.keyword]) -> ir.Expr | None:
+        """Extract the optional ``predicate=(<tensor>[<indices>] <op> <int>)`` kwarg.
+
+        Accepted on ``pl.submit(...)``, ``pl.spmd_submit(...)`` and the
+        ``with pl.spmd(...)`` scope form (``method_name`` names the caller in
+        error messages). Encodes a
+        dispatch predicate the scheduler evaluates at the dispatch point; a
+        false result retires the task inline without dispatching to a core,
+        while still settling fanin/fanout. Returns the comparison
+        :class:`ir.Expr` (e.g. ``Gt(Cast(tensor.read(rc, [0, 0])), 0)``) or
+        ``None`` when absent.
+
+        The kwarg is parsed as an **ordinary expression** — ``rc[0, 0]`` is the
+        DSL's usual sugar for ``pl.read``, so it lowers to ``tensor.read`` and
+        the comparison to a ``Gt``/``Lt``/... node. No bespoke syntax and no
+        private representation: the predicate rides on ``Submit.predicate`` as
+        plain IR, and orchestration codegen decomposes it into the runtime's
+        ``operand OP target`` triple.
+
+        Note the Expr is stored on the Submit, never in a statement position, so
+        the ``tensor.read`` is never executed in orchestration — reading the
+        value there is exactly the ``wait_for_tensor_ready`` stall the predicate
+        exists to avoid.
+
+        Only what the runtime can express is accepted: a single comparison
+        between a tensor element and an integer literal. That shape is checked by
+        :meth:`_validate_predicate_shape`; the operand's producer must also be in
+        ``deps=`` (:meth:`_validate_predicate_deps`).
+        """
+        kw = next((k for k in keywords if k.arg == "predicate"), None)
+        if kw is None:
+            return None
+        predicate = self.parse_expression(kw.value)
+        self._validate_predicate_shape(method_name, predicate, kw.value)
+        return predicate
+
+    # Comparison IR node kinds the runtime's single-comparison DispatchPredicate
+    # can express. Reuses the IR's own comparison nodes — the runtime PredicateOp
+    # mapping lives in orchestration codegen, not here.
+    _PREDICATE_CMP_TYPES = (ir.Eq, ir.Ne, ir.Gt, ir.Lt, ir.Ge, ir.Le)
+
+    @staticmethod
+    def _predicate_read(predicate: ir.BinaryExpr) -> "ir.Call | None":
+        """Return the ``tensor.read`` Call of a well-shaped predicate, else None.
+
+        Accepts either operand order (``t[i] > 0`` / ``0 < t[i]``) and sees
+        through the Cast the DSL inserts when the read's dtype differs from the
+        compared literal's.
+        """
+
+        def strip_cast(e: ir.Expr) -> ir.Expr:
+            while isinstance(e, ir.Cast):
+                e = e.operand
+            return e
+
+        def is_read(e: ir.Expr) -> bool:
+            return isinstance(e, ir.Call) and e.op.name == ir.get_op("tensor.read").name
+
+        lhs, rhs = strip_cast(predicate.left), strip_cast(predicate.right)
+        if isinstance(lhs, ir.Call) and is_read(lhs) and isinstance(rhs, ir.ConstInt):
+            return lhs
+        if isinstance(rhs, ir.Call) and is_read(rhs) and isinstance(lhs, ir.ConstInt):
+            return rhs
+        return None
+
+    @staticmethod
+    def _read_indices(read: ir.Call) -> list[ir.Expr]:
+        """Per-axis indices of a ``tensor.read``.
+
+        The op takes ``(tensor, indices)`` where ``indices`` is a ``MakeTuple``
+        for a multi-axis read and a bare expression for a single axis.
+        """
+        if len(read.args) < 2:
+            return []
+        idx = read.args[1]
+        return list(idx.elements) if isinstance(idx, ir.MakeTuple) else [idx]
+
+    @classmethod
+    def _predicate_operand_tensor(cls, predicate: ir.BinaryExpr) -> "ir.Expr | None":
+        """Return the tensor a predicate reads, or None when not well-shaped."""
+        read = cls._predicate_read(predicate)
+        return read.args[0] if read is not None and read.args else None
+
+    def _validate_predicate_shape(self, method_name: str, predicate: ir.Expr, node: ast.expr) -> None:
+        """Reject predicates the runtime cannot express.
+
+        The runtime evaluates one comparison of one tensor element against one
+        constant, so only ``tensor[indices] OP int-literal`` (in either operand
+        order) is accepted. Chained comparisons, arithmetic on the element,
+        boolean combination, and non-literal right-hand sides are all rejected
+        here rather than surfacing as an opaque codegen failure.
+        """
+        hint = "Use predicate=(tensor[i0, ...] > 0) — one comparison against an integer literal."
+        span = self.span_tracker.get_span(node)
+        if not isinstance(predicate, self._PREDICATE_CMP_TYPES):
+            got = type(predicate).__name__
+            extra = (
+                " (to dispatch unconditionally, omit predicate= entirely)"
+                if isinstance(predicate, ir.Call) and predicate.op.name == "system.task_invalid"
+                else ""
+            )
+            raise ParserSyntaxError(
+                f"'{method_name}' predicate must be a single comparison (==, !=, >, <, >=, <=); "
+                f"got {got}{extra}",
+                span=span,
+                hint=hint,
+            )
+
+        read = self._predicate_read(predicate)
+        if read is None:
+            raise ParserSyntaxError(
+                f"'{method_name}' predicate must compare one tensor element (e.g. t[i]) against an "
+                "integer literal; the runtime evaluates a single element-vs-constant comparison",
+                span=span,
+                hint=hint,
+            )
+        # tensor.read(tensor, indices): arg 0 is the tensor, arg 1 the index list.
+        operand_type = read.args[0].type if read.args else None
+        if not isinstance(operand_type, ir.TensorType):
+            got = python_print(operand_type, format=False) if operand_type is not None else "nothing"
+            raise ParserTypeError(
+                f"predicate operand must be a tensor, got {got}",
+                span=span,
+                hint=hint,
+            )
+        # The runtime reads `elem_size` bytes at the operand address and
+        # sign-extends to int64 before comparing. An unsigned operand whose top
+        # bit is set therefore compares as negative and silently inverts the
+        # dispatch decision (a UINT32 count of 3_000_000_000 reads as
+        # -1_294_967_296, so `count[e] > 0` is false and the task is skipped with
+        # no diagnostic). Sub-byte dtypes have no addressable single-element
+        # read. Reject both here for a source-level message; orchestration
+        # codegen re-checks as the backstop for IR built outside the DSL.
+        operand_dtype = operand_type.dtype
+        if not (operand_dtype.is_signed_int() and operand_dtype.get_bit() in (8, 16, 32, 64)):
+            raise ParserTypeError(
+                f"predicate operand must be a signed 8/16/32/64-bit integer tensor, got "
+                f"{operand_dtype}. The runtime sign-extends the value it reads, so an unsigned "
+                f"operand can compare as negative and silently invert the dispatch decision",
+                span=span,
+                hint=hint,
+            )
+        # Each index renders as a scalar C++ expression into the runtime predicate
+        # index array, so it must be an integer scalar — not, e.g., a tensor.
+        indices = self._read_indices(read)
+        for idx_expr in indices:
+            if not (isinstance(idx_expr.type, ir.ScalarType) and idx_expr.type.dtype in self._INTEGER_DTYPES):
+                raise ParserTypeError(
+                    "predicate indices must be integer scalars, got "
+                    f"{python_print(idx_expr.type, format=False)}",
+                    span=span,
+                    hint=hint,
+                )
+            # The runtime index array is uint32_t, so a negative constant wraps
+            # to a huge value and yields an out-of-bounds GM address.
+            if isinstance(idx_expr, ir.ConstInt) and idx_expr.value < 0:
+                raise ParserTypeError(
+                    f"predicate index must be non-negative, got {idx_expr.value}; the runtime stores "
+                    f"indices as uint32_t, so a negative value wraps to an out-of-bounds address",
+                    span=span,
+                    hint=hint,
+                )
+        # The indices must locate exactly one element, so their count has to
+        # match the operand tensor's rank.
+        rank = len(operand_type.shape)
+        if len(indices) != rank:
+            raise ParserTypeError(
+                f"predicate needs {rank} index(es) to locate a single element of a rank-{rank} tensor, "
+                f"got {len(indices)}",
+                span=span,
+                hint=hint,
+            )
+
+    def _validate_predicate_deps(
+        self,
+        method_name: str,
+        predicate: ir.Expr,
+        dep_vars: list[ir.Var],
+        span: ir.Span,
+        *,
+        deps_accepted: bool = True,
+    ) -> None:
+        """Enforce that a ``predicate=`` operand's producer is one of ``deps=``.
+
+        The scheduler evaluates the predicate at the dispatch point. If the task
+        that writes the operand tensor is not a dependency, the predicate may be
+        evaluated before that producer has completed and the dispatch decision
+        is made from stale data. The contract is therefore that the operand's
+        producer appears in ``deps=``.
+
+        Only violations that are statically provable here are reported: the
+        check applies when the operand is a Var bound from a prior
+        ``pl.submit(...)`` result. An operand from any other source (a function
+        parameter, say) has no tracked producer, and an ``Array[N, TASK_ID]``
+        dep entry does not name its producers individually — both are skipped
+        rather than risk rejecting a correct program.
+
+        ``deps_accepted`` tailors the remediation hint. The plain
+        ``with pl.spmd(...):`` and ``for i in pl.spmd(...):`` forms do not take
+        ``deps=`` at all, so telling their author to add one would send them
+        into a second, different error; there the fix is to switch to the
+        ``as tid`` capture form.
+        """
+        if not isinstance(predicate, self._PREDICATE_CMP_TYPES):
+            return
+        operand = self._predicate_operand_tensor(predicate)
+        if not isinstance(operand, ir.Var):
+            return
+        recorded = self._submit_producer_tid.get(operand.unique_id)
+        if recorded is None:
+            return
+        producer_tid, producer_gen = recorded
+        if any(isinstance(d.type, ir.ArrayType) for d in dep_vars):
+            return
+        # Identity match is necessary but not sufficient: if the TaskId name was
+        # rebound by a later submit, the same Var object now denotes a different
+        # task, so the dep does not actually order this submit after the
+        # producer.
+        current_gen = self._tid_binding_generation.get(producer_tid.unique_id, producer_gen)
+        if any(d is producer_tid for d in dep_vars) and current_gen == producer_gen:
+            return
+        tid_name = producer_tid.name_hint
+        why = (
+            "Without it the scheduler may evaluate the predicate before the producing task has "
+            "written the tensor."
+        )
+        hint = (
+            f"Add the producer to the dependency list: deps=[{tid_name}]. {why}"
+            if deps_accepted
+            else (
+                f"This form does not accept deps=. Capture the TaskId instead: "
+                f"`with pl.spmd(n, deps=[{tid_name}], predicate=...) as tid:`. {why}"
+            )
+        )
+        raise ParserSyntaxError(
+            f"'{method_name}' predicate reads '{operand.name_hint}', which is produced by the task "
+            f"bound to '{tid_name}', but '{tid_name}' is not in deps=",
+            span=span,
+            hint=hint,
+        )
+
     def _parse_dispatch_device_kwarg(
         self,
         keywords: list[ast.keyword],
@@ -6132,6 +6650,7 @@ class ASTParser:
         core_num: ir.Expr | None = None,
         sync_start: bool = False,
         allow_early_resolve: bool = False,
+        predicate: ir.Expr | None = None,
         extra_attrs: dict[str, Any] | None = None,
     ) -> ir.Expr:
         """Create an ir.Call, attaching the return type, optional call-site directions
@@ -6240,7 +6759,12 @@ class ASTParser:
             # opt-in; either requires the full ctor form even when there are no
             # attrs. A plain pl.submit with no attrs / hints keeps the minimal
             # form so existing golden output is byte-identical.
-            if submit_attrs is not None or core_num is not None or allow_early_resolve:
+            if (
+                submit_attrs is not None
+                or core_num is not None
+                or allow_early_resolve
+                or predicate is not None
+            ):
                 return ir.Submit(
                     gvar,
                     args,
@@ -6252,6 +6776,7 @@ class ASTParser:
                     core_num=core_num,
                     sync_start=sync_start,
                     allow_early_resolve=allow_early_resolve,
+                    predicate=predicate,
                 )
             return ir.Submit(gvar, args, deps_list, return_type, span)
 
@@ -7010,12 +7535,96 @@ class ASTParser:
         """Parse tensor operation."""
         if op_name == "alloc":
             return self._parse_printed_alloc_call(call)
+        if op_name == "dim":
+            folded = self._fold_tensor_dim(call)
+            if folded is not None:
+                return folded
         # Prefer the DSL wrapper (owns type-checking + dispatch); fall back to
         # the IR-builder layer for pass-internal ops like ``gather_mask``
         # that are emitted by the printer but have no DSL wrapper.
         if hasattr(_dsl_tensor, op_name):
             return self._dispatch_op(_dsl_tensor, "pl.tensor", op_name, call)
         return self._dispatch_ir_builder_op(ir_op.tensor, "pl.tensor", op_name, call)
+
+    @staticmethod
+    def _static_int(node: ast.expr) -> int | None:
+        """Return the value of an integer literal AST node (``0``, ``-1``), else None."""
+        if isinstance(node, ast.Constant):
+            value = node.value
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            inner = ASTParser._static_int(node.operand)
+            return None if inner is None else -inner
+        return None
+
+    def _is_param_dim_symbol(self, expr: Any) -> TypeGuard[ir.Var]:
+        """Whether ``expr`` is a dyn-dim symbol this signature declares (see __init__).
+
+        Takes ``Any``: a scope lookup can yield ``None`` or a ``str`` placeholder
+        (loop yields), and both must simply answer "no".
+        """
+        return isinstance(expr, ir.Var) and expr.unique_id in self._param_dim_symbols
+
+    def _fold_tensor_dim(self, call: ast.Call) -> ir.Expr | None:
+        """Fold ``pl.tensor.dim(x, i)`` onto the extent ``x``'s type already names.
+
+        A tensor's declared extent *is* its runtime extent, so reading it back
+        mints a *second* scalar for the same quantity, which nothing downstream can
+        prove equal to the symbol the tensor types carry. Shapes built from the copy
+        then disagree structurally with shapes built from the symbol — breaking, for
+        one, calls into a callee that declares that same symbol. Fold instead: one
+        runtime extent, one IR name.
+
+        Orchestration bodies only. That is where the symbol is a value: codegen
+        defines it there from the declaring param's task-arg descriptor. An
+        Inline/InCore callee's placeholder is not the caller's (``InlineFunctions``
+        does not substitute callee symbols, and the callee may be reached with a
+        statically-shaped actual), so there ``tensor.dim`` stays a runtime read.
+
+        Returns the folded extent, or None to emit ``tensor.dim`` as usual.
+        """
+        if self._func_type != ir.FunctionType.Orchestration:
+            return None
+        # Every spelling the DSL accepts must fold. The printer normalizes them all
+        # to ``dim(x, 0)``, so a spelling that did not fold here would fold on
+        # reparse — breaking the round-trip, and leaving the original source with
+        # the second-name-for-one-extent bug this fold exists to remove.
+        by_keyword = {kw.arg: kw.value for kw in call.keywords}
+        if set(by_keyword) - {"tensor", "axis"}:
+            return None
+        positional = list(call.args)
+        tensor_arg = by_keyword.get("tensor") or (positional.pop(0) if positional else None)
+        axis_arg = by_keyword.get("axis") or (positional.pop(0) if positional else None)
+        if tensor_arg is None or axis_arg is None or positional:
+            return None
+        # The *tensor* argument must be a bare name: the generic dispatch re-parses
+        # the AST, so parsing a non-trivial argument here would emit its statements
+        # twice. The axis is under no such constraint — resolving it parses nothing.
+        if not isinstance(tensor_arg, ast.Name):
+            return None
+        axis = self._static_int(axis_arg)
+        if axis is None:
+            # A named constant (``pl.tensor.dim(x, ROWS)``) is still a static axis.
+            evaluated, value = self.expr_evaluator.try_eval_expr(axis_arg)
+            if not evaluated or not isinstance(value, int) or isinstance(value, bool):
+                return None
+            axis = value
+        tensor_var = self.scope_manager.lookup_var(tensor_arg.id)
+        tensor_type = getattr(tensor_var, "type", None)
+        if not isinstance(tensor_type, ir.TensorType):
+            return None
+        shape = tensor_type.shape
+        if axis < 0:
+            axis += len(shape)
+        # An out-of-range axis is the op's error to raise, not ours to fold.
+        if not 0 <= axis < len(shape):
+            return None
+        # Only a symbol this signature declares: those are the extents codegen
+        # materializes, so the folded value is sure to have a definition in the
+        # emitted host code. A local scalar in the shape may since have been
+        # reassigned, so it is left alone.
+        extent = shape[axis]
+        return extent if self._is_param_dim_symbol(extent) else None
 
     def _parse_tile_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse tile operation."""
@@ -7279,6 +7888,50 @@ class ASTParser:
             return ir.ConstFloat(value, dtype, span)
         else:
             return ir.ConstInt(value, dtype, span)
+
+    def _parse_dtype_get_byte(self, dtype_name: str, call: ast.Call) -> ir.Expr:
+        """Parse ``pl.<DataType>.get_byte()`` as a compile-time int constant.
+
+        ``DataType.get_byte()`` is a pure accessor returning ``ceil(bit_width / 8)``
+        with no side effects, so folding at parse time is safe. This lets traced
+        ``@pl.function`` / ``@pl.jit.host`` bodies use the canonical API directly:
+        ``pld.alloc_window_buffer(256 * pl.FP32.get_byte())`` works without an
+        external import.
+
+        Args:
+            dtype_name: The DataType attribute name (e.g. "FP32", "INT32", "BF16").
+            call: The Call AST node (for span tracking).
+
+        Returns:
+            ``ir.ConstInt(nbytes, INDEX)`` with the byte-size of the data type.
+        """
+        span = self.span_tracker.get_span(call)
+
+        # Lazily build the mapping from dtype attribute name → get_byte() value.
+        # Module-level caching via a class attribute avoids re-scanning on every
+        # call site within a single parser instance (a function body may contain
+        # many alloc_window_buffer calls).
+        try:
+            cache = ASTParser._dtype_byte_cache  # type: ignore[attr-defined]
+        except AttributeError:
+            import pypto.language as _pl  # noqa: PLC0415 (lazy import of DataType constants)
+
+            cache: dict[str, int] = {}
+            for attr_name in dir(_pl):
+                val = getattr(_pl, attr_name)
+                if isinstance(val, DataType):
+                    cache[attr_name] = val.get_byte()
+            ASTParser._dtype_byte_cache = cache  # type: ignore[attr-defined]
+
+        if dtype_name not in cache:
+            known = ", ".join(sorted(cache.keys()))
+            raise ParserTypeError(
+                f"Unknown DataType '{dtype_name}' in pl.{dtype_name}.get_byte()",
+                span=span,
+                hint=f"Valid DataType names: {known}",
+            )
+
+        return ir.ConstInt(cache[dtype_name], DataType.INDEX, span)
 
     def parse_attribute(self, attr: ast.Attribute) -> ir.Expr:
         """Parse attribute access.

@@ -17,7 +17,7 @@ from _orchestration_codegen_common import (
     _generate_orch_code,
     _generate_orch_result,
 )
-from pypto import backend, passes
+from pypto import backend, codegen, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 from pypto.pypto_core import ir
@@ -942,6 +942,93 @@ class TestTensorReadWriteOffsetCodegen:
             "Expected per-callee GM workspace shapes (small=512*8*1 side / f32, "
             f"large=(1024*8+2048*8) / f32), got {shape_values}. Generated code:\n{code}"
         )
+
+    def test_submit_dispatched_pipe_group_sizes_workspace_and_resolves_callees(self):
+        """Submitted pipe kernels with different signatures share one Group ABI (#2097)."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class SubmitPipeProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube_side(
+                self,
+                q: pl.Tensor[[16, 16], pl.FP32],
+                sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                task: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c_buf = pl.reserve_buffer(name="submit_v2c", size=4096, base=pl.AUTO)
+                c2v_peer = pl.import_peer_buffer(name="submit_c2v", peer_func="vec_side")
+                pl.aic_initialize_pipe(c2v_peer, v2c_buf, dir_mask=3, slot_size=512)
+                tile = pl.load(q, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                pl.tpush_to_aiv(tile, split=0)
+                return sink
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def vec_side(
+                self,
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                task: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                c2v_buf = pl.reserve_buffer(name="submit_c2v", size=4096, base=pl.AUTO)
+                v2c_peer = pl.import_peer_buffer(name="submit_v2c", peer_func="cube_side")
+                pl.aiv_initialize_pipe(c2v_buf, v2c_peer, dir_mask=3, slot_size=512)
+                tile = pl.tpop_from_aic(shape=[16, 16], dtype=pl.FP32, split=0)
+                pl.tfree_to_aic(tile, split=0)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                q: pl.Tensor[[16, 16], pl.FP32],
+                sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                task: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                with pl.cluster():
+                    _cube_out, _cube_tid = pl.submit(self.cube_side, q, sink, task)
+                    vec_out, _vec_tid = pl.submit(self.vec_side, out, task)
+                return vec_out
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SubmitPipeProgram)
+        transformed_text = transformed.as_python()
+        assert transformed_text.count("pl.submit(") == 2, transformed_text
+        assert "self.cube_side" in transformed_text, transformed_text
+        assert "self.vec_side" in transformed_text, transformed_text
+        cube = transformed.get_function("cube_side")
+        vec = transformed.get_function("vec_side")
+        assert cube is not None
+        assert vec is not None
+        assert vec.attrs.get("dual_aiv_dispatch") is True
+        canonical_names = [param.name_hint for param in cube.params]
+        assert canonical_names == [param.name_hint for param in vec.params]
+        assert canonical_names[-1] == "__gm_pipe_buffer"
+        orch_func = next(
+            func for func in transformed.functions.values() if func.func_type == ir.FunctionType.Orchestration
+        )
+        result = codegen.generate_orchestration(transformed, orch_func)
+        code = result.code
+
+        shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
+        assert shape_values == ["512"], code
+        assert "rt_submit_task" in code, code
+        assert result.func_name_to_signature["cube_side"] == result.func_name_to_signature["vec_side"]
+        expected_mixed = (
+            result.func_name_to_id["cube_side"],
+            result.func_name_to_id["vec_side"],
+            result.func_name_to_id["vec_side"],
+        )
+        assert (
+            f"MixedKernels mixed_0 = {{{expected_mixed[0]}, {expected_mixed[1]}, {expected_mixed[2]}}};"
+            in code
+        )
+        # The one shared task payload must contain all three Group tensors plus
+        # the injected workspace; pre-fix it was built only from cube_side and
+        # omitted ext_out, so vec_side unpacked q as its output/workspace.
+        task_add_lines = [line for line in code.splitlines() if "params_t0.add_" in line]
+        task_add_text = "\n".join(task_add_lines)
+        for expected in ("ext_q", "ext_sink", "ext_out", "gm_pipe_buffer_0", "task"):
+            assert expected in task_add_text, code
 
 
 if __name__ == "__main__":

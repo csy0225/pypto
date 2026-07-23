@@ -91,6 +91,8 @@ class NoNestedCallVerifier : public IRVisitor {
   void VisitExpr_(const NotPtr& op) override { VisitUnaryExpr(op); }
   void VisitExpr_(const BitNotPtr& op) override { VisitUnaryExpr(op); }
   void VisitExpr_(const CastPtr& op) override { VisitUnaryExpr(op); }
+  void VisitExpr_(const SubmitPtr& op) override;
+  [[nodiscard]] bool ShouldVisitScopeAttr(const std::string& key) const override;
   void VisitStmt_(const IfStmtPtr& op) override;
   void VisitStmt_(const ForStmtPtr& op) override;
   void VisitStmt_(const WhileStmtPtr& op) override;
@@ -152,6 +154,53 @@ void NoNestedCallVerifier::VisitExpr_(const CallPtr& op) {
     // Continue visiting to check deeper nesting
     VisitExpr(arg);
   }
+}
+
+// A Submit's dispatch predicate is exempt from the three-address-code
+// invariant. ``predicate=(t[i] > 0)`` is a *declarative spec* the scheduler
+// evaluates at the dispatch point, not an expression this program evaluates, so
+// it is inherently nested: ``Gt(Cast(tensor.read(t, [i])), 0)``.
+//
+// The invariant exists so evaluated expressions are flattened into temporaries.
+// Flattening this one would be actively wrong: hoisting the ``tensor.read``
+// into an orchestration statement turns it into a real load that stalls on
+// ``wait_for_tensor_ready`` — precisely the stall the predicate exists to avoid
+// — and strips the operand/indices that orchestration codegen decomposes.
+// FlattenCallExpr likewise leaves the field alone (it only walks ``args_``).
+//
+// Everything else on the Submit is still checked. NOTE: this walk is written by
+// hand rather than delegating to the base, so it enumerates args_/deps_/core_num_
+// explicitly — a new SSA-bearing field added to Submit would be walked by the
+// base visitor but silently skipped here. Extend this list when that happens.
+void NoNestedCallVerifier::VisitExpr_(const SubmitPtr& op) {
+  if (!op) return;
+  for (const auto& arg : op->args_) {
+    if (As<Call>(arg)) {
+      RecordError(nested_call::ErrorType::CALL_IN_CALL_ARGS, "Submit expression has nested call in arguments",
+                  arg->span_);
+    }
+    VisitExpr(arg);
+  }
+  for (const auto& dep : op->deps_) {
+    if (dep) VisitExpr(dep);
+  }
+  if (op->core_num_.has_value() && *op->core_num_) {
+    VisitExpr(*op->core_num_);
+  }
+}
+
+// Same exemption, one stage earlier in the pipeline: a
+// ``with pl.spmd(..., predicate=(t[i] > 0)):`` scope carries the predicate on
+// ``ScopeStmt::attrs_`` until OutlineSpmdScopes moves it onto the synthesised
+// ``Submit::predicate_`` (exempted above). Between parse and that outline the
+// base ``VisitScopeAttrs`` walks the attr Expr — deliberately, so SSA and
+// use-def analyses see the operand Vars — which would otherwise report the
+// declarative ``Gt(Cast(tensor.read(..)), 0)`` as an illegal nested call.
+//
+// Opting out per key (rather than overriding the whole walk) keeps the base
+// the single source of truth: a scope attr added there stays covered here.
+bool NoNestedCallVerifier::ShouldVisitScopeAttr(const std::string& key) const {
+  return key != kAttrPredicate;
 }
 
 void NoNestedCallVerifier::VisitStmt_(const IfStmtPtr& op) {

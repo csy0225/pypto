@@ -55,6 +55,29 @@ inline constexpr const char* kPipelineStagesAttr = "pipeline_stages";
 /// ``pipeline_stages``.
 inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stores";
 
+/// Optional ``bool`` policy attr on a ``ForKind::Pipeline`` ``ForStmt`` (absent ⇒
+/// ``false``): when ``true``, ``CanonicalizeIOOrder`` floats the Acc-draining ops
+/// into a tier *above all compute* in the loop body, so every sibling-iteration
+/// drain sorts after every matmul — ``matmul_i, matmul_{i+1}, drain_i, drain_{i+1}``
+/// instead of ``matmul_i, drain_i, matmul_{i+1}, drain_{i+1}``. The drain op is
+/// ``tile.store`` on the direct-store (Acc→GM) path and ``tile.assemble`` on the
+/// Mat-scratch (Acc→Mat) path.
+///
+/// This is a *stronger* float than ``pipeline_overlap_stores`` (which only orders
+/// store-after-compute *within* a stage — the compute/store tier is shared and
+/// sorted by stage, so a stage-i store still precedes the stage-{i+1} matmul).
+/// It keeps the two iterations' L0C accumulators genuinely co-live, which is the
+/// dbC=2 (double-buffered L0C) ping-pong: overlapping their live ranges forces any
+/// correct allocator to give them distinct L0C offsets, so tile i's FIXPIPE drain
+/// overlaps tile i+1's MAD.  The co-live pair only survives under
+/// ``memory_planner=PTOAS``, which skips MemoryReuse (whose opportunistic reuse
+/// over-coalesces the pair into one buffer); InitMemRef then keeps the two buffers
+/// distinct and ptoas places them.  AutoTileMatmulL0 sets it only when the chooser
+/// picked ``double_buffer_c`` (ptoas planner + accumulator budgeted at L0C/2);
+/// under the pypto planner it stays absent (⇒ ``false``).  Consumed (stripped) by
+/// ``CanonicalizeIOOrder`` alongside ``pipeline_stages`` and ``pipeline_overlap_stores``.
+inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffer_c";
+
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
 /// membership(s) of the tile it defines. ``LowerPipelineLoops`` sets it when it
 /// replicates a ``pl.pipeline`` body: every clone of a replicated region is one
@@ -155,6 +178,41 @@ inline std::vector<std::pair<std::string, std::any>> StripAttr(
     out.emplace_back(k, v);
   }
   return out;
+}
+
+/// ``bool`` attr on a MANUAL ``RuntimeScopeStmt`` marking it as a scope that the
+/// compiler synthesised (``AutoDeriveTaskDependencies`` / ``MaterializeRuntimeScopes``)
+/// rather than one the user wrote with ``pl.manual_scope()``. Structural analyses
+/// peek through such a scope as if it were AUTO (see ``transform_utils::UnwrapAutoScope``).
+inline constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
+
+// ---------------------------------------------------------------------------
+// ForStmt iter_arg carry classification (produced by ``ClassifyIterArgCarry``)
+// ---------------------------------------------------------------------------
+//
+// ``ClassifyIterArgCarry`` stamps one ``bool`` attr per iter_arg naming its
+// lowering (trivial alias vs. materialised rebind carry), plus an optional
+// ``int`` attr sizing a TaskId array-carry. Keys are index-suffixed because
+// ``ForStmt::attrs_`` is a flat string→scalar map whose printer/parser codec
+// only round-trips scalar values.
+//
+//   attrs={"iter_arg_rebind_0": True, "iter_arg_array_size_0": 4}
+//
+// The rebind attr is stamped for **every** iter_arg (even when false) so its
+// presence proves the pass ran; the array-size attr is stamped only when
+// positive. See ``docs/en/dev/passes/42-classify_iter_arg_carry.md``.
+
+/// Prefix of the per-iter_arg ``bool`` "needs a materialised carry" attr.
+inline constexpr const char* kIterArgRebindAttrPrefix = "iter_arg_rebind_";
+/// Prefix of the per-iter_arg ``int`` TaskId array-carry extent attr.
+inline constexpr const char* kIterArgArraySizeAttrPrefix = "iter_arg_array_size_";
+
+inline std::string IterArgRebindAttrKey(size_t idx) {
+  return std::string(kIterArgRebindAttrPrefix) + std::to_string(idx);
+}
+
+inline std::string IterArgArraySizeAttrKey(size_t idx) {
+  return std::string(kIterArgArraySizeAttrPrefix) + std::to_string(idx);
 }
 
 }  // namespace ir

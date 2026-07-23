@@ -64,6 +64,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "MaterializeDistTensorCtx",
     "Simplify",
     "MaterializeRuntimeScopes",
+    "ClassifyIterArgCarry",
 ]
 
 DEBUG_TILE_OPTIMIZATION_PASSES = [
@@ -105,6 +106,7 @@ DEBUG_TILE_OPTIMIZATION_PASSES = [
     "MaterializeDistTensorCtx",
     "Simplify",
     "MaterializeRuntimeScopes",
+    "ClassifyIterArgCarry",
 ]
 
 
@@ -181,6 +183,27 @@ class TestPassManagerBasics:
         )
 
         assert captured == [False, True]
+
+    def test_pipeline_is_single_source_of_passes_and_names(self):
+        """PassManager views follow the C++ pipeline and cannot drift independently."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        original_names = pm.pass_names
+
+        names_snapshot = pm.pass_names
+        names_snapshot.pop()
+        assert pm.pass_names == original_names
+
+        shortened_pipeline = passes.PassPipeline()
+        for pass_obj in pm.passes[:2]:
+            shortened_pipeline.add_pass(pass_obj)
+        pm._pipeline = shortened_pipeline
+
+        assert pm.pass_names == original_names[:2]
+        assert [pass_obj.get_name() for pass_obj in pm.passes] == original_names[:2]
+        with pytest.raises(AttributeError):
+            setattr(pm, "pass_names", original_names)
+        with pytest.raises(AttributeError):
+            setattr(pm, "passes", ())
 
 
 class TestPassManagerExecution:
@@ -294,6 +317,52 @@ class TestPassManagerWithProgram:
         assert "single_func" in func_names
 
 
+class TestPassManagerPlannerGate:
+    """The dbC=2 planner gate.
+
+    The pass LIST is fixed at construction (``MemoryReuse`` / ``AllocateMemoryAddr``
+    are dropped only when the construction-time context selects PTOAS), while dbC=2 is
+    selected from the *run-time* planner inside ``AutoTileMatmulL0``. If the two
+    disagree, a pipeline that still contains ``MemoryReuse`` would run while the chooser
+    picks dbC=2 -> the two co-live L0C accumulators get coalesced. ``run_passes`` must
+    fail loud instead.
+    """
+
+    @staticmethod
+    def _trivial_program():
+        span = ir.Span.unknown()
+        dt = DataType.INT64
+        x = ir.Var("x", ir.ScalarType(dt), span)
+        z = ir.Var("z", ir.ScalarType(dt), span)
+        func = ir.Function("f", [x], [ir.ScalarType(dt)], ir.AssignStmt(z, x, span), span)
+        return ir.Program([func], "p", span)
+
+    def test_construct_pypto_run_ptoas_raises(self):
+        """Built outside PTOAS (default PYPTO, so MemoryReuse is IN the pipeline), then
+        run inside a PTOAS context -> the mismatch must raise, not silently mis-schedule."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            with pytest.raises(RuntimeError, match="memory_planner"):
+                pm.run_passes(self._trivial_program())
+
+    def test_construct_ptoas_run_pypto_raises(self):
+        """The converse: built under PTOAS (MemoryReuse dropped) then run under the
+        default PYPTO planner leaves no memory planning at all -> also a mismatch."""
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(RuntimeError, match="memory_planner"):
+            pm.run_passes(self._trivial_program())
+
+    def test_construct_and_run_same_planner_ok(self):
+        """Matched planner at construction and run -> the guard does not fire (both the
+        default PYPTO and an explicit PTOAS context)."""
+        pm_pypto = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        pm_pypto._check_planner_consistency()  # PYPTO == PYPTO, no raise
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            pm_ptoas = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm_ptoas._check_planner_consistency()  # PTOAS == PTOAS, no raise
+
+
 class TestPassManagerDumpIR:
     """Test dump_ir mode in PassManager."""
 
@@ -362,6 +431,60 @@ class TestPassManagerDumpIR:
 
         # Outer instrument's before callback should have fired for each pass
         assert len(log) == len(pm.pass_names)
+
+    @staticmethod
+    def _acc_tile_program():
+        """A program whose signature carries an Acc tile (implicit boxed view).
+
+        ``Mem.Acc``'s implicit view is ``blayout=col_major, slayout=row_major,
+        fractal=1024`` yet the canonical ``tile_view_`` is ``nullopt``, so the
+        concise dump prints no ``TileView`` at all — the exact omission issue
+        #2088 addresses. The frontend dump (written before any pass) is a stable
+        place to observe whether the resolved layout is printed.
+        """
+        span = ir.Span.unknown()
+        dims = [ir.ConstInt(128, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+        acc = ir.TileType(dims, DataType.FP32, None, None, ir.MemorySpace.Acc)
+        t = ir.Var("t", acc, span)
+        z = ir.Var("z", acc, span)
+        body = ir.SeqStmts([ir.AssignStmt(z, t, span), ir.ReturnStmt([z], span)], span)
+        func = ir.Function("main", [t], [acc], body, span)
+        return ir.Program([func], "acc_dump_test", span)
+
+    @pytest.mark.parametrize("dump_arg", [True, ir.PassDumpLevel.CONCISE])
+    def test_dump_ir_concise_omits_implicit_tile_layout(self, tmp_path, dump_arg):
+        """CONCISE (and bool ``True``) keep the concise form (no TileView on Acc)."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+
+        # VerificationLevel.NONE: the intentionally-minimal Acc-tile passthrough is
+        # not a valid post-pass pipeline state, so the autouse RoundtripInstrument
+        # would reject it — irrelevant to what the frontend dump (written before any
+        # pass) records here.
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            pm.run_passes(self._acc_tile_program(), dump_ir=dump_arg, output_dir=output_dir)
+
+        frontend = (tmp_path / "dump_output" / "00_frontend.py").read_text()
+        assert "pl.Mem.Acc" in frontend
+        assert "TileView" not in frontend
+
+    def test_dump_ir_explicit_level_resolves_tile_layout(self, tmp_path):
+        """PassDumpLevel.EXPLICIT makes dumps state the resolved tile layout."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        output_dir = str(tmp_path / "dump_output")
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            pm.run_passes(
+                self._acc_tile_program(),
+                dump_ir=ir.PassDumpLevel.EXPLICIT,
+                output_dir=output_dir,
+            )
+
+        frontend = (tmp_path / "dump_output" / "00_frontend.py").read_text()
+        assert (
+            "pl.Mem.Acc, pl.TileView(blayout=pl.TileLayout.col_major, "
+            "slayout=pl.TileLayout.row_major, fractal=1024)" in frontend
+        )
 
 
 if __name__ == "__main__":

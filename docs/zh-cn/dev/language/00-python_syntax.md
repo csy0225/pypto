@@ -365,10 +365,10 @@ DSL 暴露**两套正交的机制**，用户可任意组合：
 
 | 表层语法 | producer 形态 | 备注 |
 | -------- | ------------- | ---- |
-| `result, tid = pl.submit(kernel, *args, deps=[...], allow_early_resolve=False)` | 单个 kernel 调用 | 尾部 `tid` 是 producer `pl.Scalar[pl.TASK_ID]`。它是 parser construct（类似 `pl.range`），不是 runtime 函数。`allow_early_resolve=True` 将该 task 标记为推测式 early-dispatch producer（让调度器提前预置其 consumer；lower 为 `Arg::set_allow_early_resolve(true)`）。 |
-| `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | 单个 SPMD task launch | `pl.submit` 的 SPMD 版本：将 kernel 在 `N` 个 block 上分发（一个 orchestration task → 一个 `tid`）。`core_num` 是必填关键字参数（正整数表达式）；`sync_start=True` 强制所有 block 原子启动。callee 可以是 InCore / AIC / AIV / Group。launch spec 记录在 `Submit.core_num` / `Submit.sync_start` 上。同样接受 `allow_early_resolve=True`（与 `pl.submit` 相同的 early-dispatch 选项）。 |
+| `result, tid = pl.submit(kernel, *args, deps=[...], allow_early_resolve=False)` | 单个 kernel 调用 | 尾部 `tid` 是 producer `pl.Scalar[pl.TASK_ID]`。它是 parser construct（类似 `pl.range`），不是 runtime 函数。`allow_early_resolve=True` 将该 task 标记为推测式 early-dispatch producer（让调度器提前预置其 consumer；lower 为 `Arg::set_allow_early_resolve(true)`）。同样接受 `predicate=(t[i] > 0)` —— 调度器在 dispatch 点求值的调度谓词（参见[调度谓词](#调度谓词predicate)）。 |
+| `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | 单个 SPMD task launch | `pl.submit` 的 SPMD 版本：将 kernel 在 `N` 个 block 上分发（一个 orchestration task → 一个 `tid`）。`core_num` 是必填关键字参数（正整数表达式）；`sync_start=True` 强制所有 block 原子启动。callee 可以是 InCore / AIC / AIV / Group。launch spec 记录在 `Submit.core_num` / `Submit.sync_start` 上。同样接受 `allow_early_resolve=True`（与 `pl.submit` 相同的 early-dispatch 选项）和 `predicate=(t[i] > 0)`（参见[调度谓词](#调度谓词predicate)）。 |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-块 | 整块被 outline 成 InCore kernel + `Submit`；`tid` 捕获被合成的 Submit 的 TaskId，可作为后续 `pl.submit` / `pl.at` 的 dep。不写 `as tid` 时 outliner 会合成一个未使用的 TaskId Var——deps 始终走 `Submit::deps_`。同样接受 `allow_early_resolve=True`（与 `pl.submit` 相同的 early-dispatch 选项）；即使不写 `as tid` 也会强制走 `Submit` 形态，并 lower 为 `Arg::set_allow_early_resolve(true)`。 |
-| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD 分发 | `pl.at ... as tid` 形式的 SPMD 版本。内联 body 自动外包成 InCore kernel 并在 `N` 个 block 上分发；`tid` 捕获 grid 级 producer TaskId。`deps=` 仅在带 `as tid` 时可用。`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上（lower 出的 `Submit.core_num` 为 `None`）；codegen 通过 launch-function 回退读取。同样接受 `allow_early_resolve=True`（与 `pl.submit` / `pl.at` 相同的 early-dispatch 选项；`pl.spmd` 三种形式均可用，即使不写 `as tid` 也会强制走 `Submit` 形态）。不能嵌套在 `pl.cluster()` 内。 |
+| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD 分发 | `pl.at ... as tid` 形式的 SPMD 版本。内联 body 自动外包成 InCore kernel 并在 `N` 个 block 上分发；`tid` 捕获 grid 级 producer TaskId。`deps=` 仅在带 `as tid` 时可用。`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上（lower 出的 `Submit.core_num` 为 `None`）；codegen 通过 launch-function 回退读取。同样接受 `allow_early_resolve=True`（与 `pl.submit` / `pl.at` 相同的 early-dispatch 选项；`pl.spmd` 三种形式均可用，即使不写 `as tid` 也会强制走 `Submit` 形态）和 `predicate=(t[i] > 0)`（参见[调度谓词](#调度谓词predicate)；同样三种形式均可用，同样强制走 `Submit` 形态）。不能嵌套在 `pl.cluster()` 内。 |
 | `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | 不提交 kernel。返回的 TaskId 是一个紧凑的 fan-in 点，可供后续 `deps=[barrier]` 使用。 |
 | `None`（Python 字面量） | 种子 / dep 条目 | "暂无 producer" 的哨兵。`prev_tid = None` 用作 TaskId 循环 iter_arg 的种子；`deps=[None]` 中的 `None` 被丢弃（不贡献任何边）。下沉为 `system.task_invalid` → `PTO2TaskId::invalid()`。 |
 
@@ -449,6 +449,110 @@ runtime 的 `Arg::set_dependencies(ptr, count)` 直接接收调用者持有的�
 
 `pl.no_dep(arg)` 是 auto scope 原语；在 `pl.manual_scope` 内不起作用
 （整个 scope 已经退出自动跟踪了）。
+
+#### 调度谓词（`predicate=`）
+
+`pl.submit` / `pl.spmd_submit` 接受可选的
+`predicate=(tensor[indices] <op> target)`。调度器在 **dispatch 点**
+求值该比较 —— 此时该 task 的依赖已满足，值一定是最新的，
+无需 orchestration 阶段 `wait_for_tensor_ready` 的阻塞。当比较结果为 **假** 时，该 task
+被 **inline 退休**（根本不下发到 core），但仍结算 fanin/fanout，下游 consumer 照常解锁
+—— 它不会从 task 图中消失。为 **真** 时正常下发。
+
+典型用途是 MoE“跳过空专家”：所有专家静态 submit，每个带 `predicate=(row_count[e] > 0)`
+并依赖 gather producer —— 调度器只下发非空专家，且无需阻塞 orchestration 去读每个专家的
+行数。
+
+> **该比较按普通表达式解析，但永不求值。** `rc[0, 0]` 就是 `pl.read` 的常规语法糖，
+> 因此该 kwarg 下降为普通 IR —— `Gt(Cast(tensor.read(rc, [0, 0])), 0)` —— 复用 IR 已有的
+> 比较节点，而非任何私有编码。它存放在 `Submit.predicate` 上，**不在语句位置**，所以这个
+> `tensor.read` **不会**在 orchestration 中执行：执行它就会阻塞在 `wait_for_tensor_ready`，
+> 正是谓词要消灭的事情。orchestration codegen 负责把该 Expr 分解成运行时的
+> `operand OP target` 三元组，因此只接受下述形状。
+
+| 组成 | 含义 | 约束 |
+| ---- | ---- | ---- |
+| `tensor` | dispatch 点读取的操作数张量 | 必须是具名 tensor（函数参数，或绑定到 tensor 的变量），且下标定位到单个元素 |
+| `indices` | 定位 `tensor` 中一个元素的下标 | 每个下标是整数标量（`ConstInt` 或 int/index `Var`）；每个维度一个下标 |
+| `<op>` | 比较算子 | 取 `==` `!=` `>` `<` `>=` `<=` 之一（单个、非链式比较） |
+| `target` | 右侧比较值 | **整数字面量**（可负） |
+
+镜像写法也被接受 —— `0 < rc[e]` 与 `rc[e] > 0` 含义相同。IR 按书写原样保留该比较；
+orchestration codegen 会翻转算子，使 tensor 始终是运行时的操作数。
+
+在 orchestration codegen 中 lower 为运行时 `L0TaskPredicate` + `Arg::set_predicate(...)`
+（operand → 其 `ext_<name>` 引用，`op` → `PredicateOp::*`，`target` 原样；`elem_size`
+由运行时从张量 dtype 推导）。
+
+**契约：** 谓词操作数张量的 producer **必须**是该 submit 的 `deps=` 之一，这样 dispatch
+点读到的才是最新值。若遗漏，调度器可能在 producer 尚未写入张量前就求值谓词，从而基于过期
+数据做出 dispatch 决策。
+
+parser 只做**尽力而为的抽查**，不是保证:它记录 `pl.submit(...)` 通过元组解包绑定的结果变量，
+当谓词操作数是其中之一、而对应 producer TaskId 未出现在 `deps=` 时报错。解析通过应理解为
+"未发现明显错误"，而非"已证明正确"。
+
+以下情况它**看不穿**，因而会静默接受:
+
+| 未覆盖 | 原因 |
+| ------ | ---- |
+| `rc2 = rc` 后使用 `rc2[0, 0]` | 别名是新变量，没有记录的 producer |
+| 张量作 `pl.Out` 实参传入、结果绑到新名字 | 只跟踪返回绑定，不跟踪实参别名 |
+| `rc3 = self.helper(rc)` | 任何中间调用都会洗掉关联 |
+| `res = pl.spmd_submit(...)` 单左值形式 | 该路径根本不记录 |
+| `deps=` 中含 `Array[N, TASK_ID]` 条目——包括常见的 `deps=[tids[i]]` 写法 | 数组条目未逐个列出 producer，该 submit 的检查整体跳过 |
+| producer 写在源码**后面**，例如循环携带的 `rc` 由上一轮迭代写入 | 查表发生在解析谓词的那一刻，其后的 producer 尚未记录 |
+
+因此 `deps=` 写对仍然是作者的责任。
+
+**表达力**固定为 `tensor[indices] OP const` —— 单个比较，与运行时单比较的
+`DispatchPredicate` 对齐。链式比较（`0 < t[i] < 8`）、算术（`t[i] % 8 == 0`）、布尔组合
+（`a[0] > 0 and b[0] > 0`）、以及非字面量的右侧（`t[i] > u[i]`）都会在解析期被拒绝；
+请在前序 kernel 里把它们归约成一个 gate 值，再对该值做谓词。
+
+```python
+with pl.manual_scope():
+    rc, g_tid = pl.spmd_submit(self.gate, rc, core_num=1)       # rc 的 producer
+    out, _ = pl.spmd_submit(
+        self.expert, x, out, core_num=1,
+        deps=[g_tid],                                           # producer 是依赖
+        predicate=(rc[0, 0] > 0),
+    )
+```
+
+**范围：** `predicate=` 可用于 `pl.submit` / `pl.spmd_submit`（直接产 `Submit` 的形式），
+以及 `with pl.spmd(...)` 作用域形式的全部三种写法（普通 `with`、`with ... as tid`、
+`for i in pl.spmd(...)`）。`pl.at(...)` 不接受该参数。
+
+##### 作用域形式
+
+作用域形式使用相同的表达式与相同的校验，区别只在于谓词进入 IR 的路径：它先挂在
+`SpmdScopeStmt.attrs` 上，直到该作用域被 outline 时才移动到 `Submit.predicate`。
+因此 lowering、codegen 产物与契约都完全一致。
+
+```python
+with pl.spmd(1) as g_tid:                                        # rc 的 producer
+    rc = self.gate(rc)
+
+with pl.spmd(4, deps=[g_tid], predicate=(rc[0, 0] > 0)) as tid:  # producer 是依赖
+    out = self.expert(x, out)
+```
+
+由这条路径引出两点：
+
+- **`deps=` 需要 `as tid` 形式。** `deps=` 只在 `with pl.spmd(...) as tid:` 上被接受。
+  因此，若谓词读取的张量由同一函数内的其他任务产出，就必须用该形式；普通 `with` 与
+  `for` 形式只能对没有函数内 producer 的张量（通常是函数参数）加谓词——这种情况契约
+  检查会放行。
+- **其余情况不要求 `as tid`。** 与 `allow_early_resolve=True` 一样，谓词会强制该作用域
+  lower 为 `Submit`；当作用域没有 `as tid` 时，outliner 会合成一个未被使用的 TaskId Var。
+
+嵌套在 `pl.cluster()` 内的 `pl.spmd` 会被展开进 Group 函数、永远不会产生 `Submit`，
+因此 `predicate=`（与 `allow_early_resolve=` 一样）会在解析期被拒绝，而不是被静默丢弃。
+
+契约检查同样覆盖作用域 producer：在 `with pl.spmd(...) as tid:` 体内被赋值的张量会被记录
+为该作用域的产物，所以后续 `deps=` 漏写它会被拒绝。上表中列出的 best-effort 限制
+（别名、中间调用、`Array[N, TASK_ID]` 依赖）依然适用。
 
 #### Manual scope 下的 `pl.parallel`：array-carry fence
 
@@ -649,6 +753,60 @@ for i, (sum,) in pl.range(10, init_values=(sum_init,)):
     sum = pl.yield_(sum + i)
 sum_final: pl.INT64 = sum  # captures final value
 ```
+
+## 跨模块函数复用
+
+在 `@pl.program` 类之外定义的函数可通过两种机制复用。
+
+### 外部 `@pl.function` 调用
+
+在 `@pl.program` 内部可按名称调用外部定义的 `@pl.function`。该函数会自动加入 Program，
+并生成 `ir.Call(GlobalVar, args)`。
+
+```python
+@pl.function
+def softmax(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+    ...
+
+@pl.program
+class MyModel:
+    @pl.function
+    def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        y: pl.Tensor[[64], pl.FP32] = softmax(x)   # ir.Call(GlobalVar("softmax"), [x])
+        return y
+```
+
+**规则：**
+
+- 使用函数的 `.name` 作为 GlobalVar（别名透明）
+- 外部与内部函数名不得冲突
+- 两个不同的外部函数具有相同 `.name` 是错误
+- 同一外部函数从多个 method 调用时只加入一次
+
+### `@pl.inline` 装饰器
+
+`@pl.inline` 捕获函数以便在语句级内联。不会向 Program 添加函数——每次调用点展开函数体。
+
+```python
+@pl.inline
+def normalize(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+    result: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
+    return result
+
+@pl.program
+class MyModel:
+    @pl.function
+    def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+        y: pl.Tensor[[64], pl.FP32] = normalize(x)  # statements inlined in-place
+        return y
+```
+
+**规则：**
+
+- 实参个数必须与形参列表完全一致
+- 内联定义处的闭包变量可用
+- 内联函数可多次调用（每次展开相互独立）
+- 支持嵌套内联调用
 
 ## 打印 IR 节点
 

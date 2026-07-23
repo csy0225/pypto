@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/codegen/orchestration/orchestration_analysis.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -30,6 +30,10 @@
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/buffer_root_collector.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
+#include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -37,9 +41,9 @@ namespace ir {
 
 namespace {
 
-using ::pypto::codegen::BufferRootCollector;
-using ::pypto::codegen::ComputeGroupEffectiveDirections;
-using ::pypto::codegen::IsBuiltinOp;
+using ::pypto::ir::buffer_root::AmbiguousRootPolicy;
+using ::pypto::ir::buffer_root::BufferRootCollector;
+using ::pypto::ir::op_predicates::IsBuiltinOp;
 
 /// Decide whether an argument expression refers to a tensor (not a scalar/index).
 bool IsTensorTypedArg(const ExprPtr& arg) {
@@ -50,14 +54,46 @@ bool IsTensorTypedArg(const ExprPtr& arg) {
   return false;
 }
 
-/// Compute the per-position ParamDirection vector for a callee, expanding Group/Spmd
-/// callees whose effective directions depend on inner-task call sites.
-std::vector<ParamDirection> ResolveCalleeDirections(const ProgramPtr& program, const CallPtr& call,
-                                                    const FunctionPtr& callee) {
-  if (callee->func_type_ == FunctionType::Group || callee->func_type_ == FunctionType::Spmd) {
-    return ComputeGroupEffectiveDirections(callee, program);
+/// Phase 0 — write each Group/Spmd wrapper's *effective* param directions back
+/// into its own signature.
+///
+/// A wrapper forwards its params 1:1 to an inner kernel call, but its own
+/// ``param_directions_`` can still read ``In`` for a param the inner kernel
+/// writes: the scope outliners infer directions from the body they extract,
+/// and later passes (``ExpandMixedKernel``, ``SplitVectorKernel``) rebuild
+/// wrapper bodies around freshly split callees without revisiting the
+/// signature.
+///
+/// Recovering the true direction used to be an on-the-fly recomputation
+/// duplicated across four consumers — this pass, ``AutoDeriveTaskDependencies``,
+/// the ``CallDirectionsResolved`` verifier, and orchestration codegen. Doing it
+/// once here and storing the result in the IR keeps codegen a strict 1-to-1
+/// translation and gives every downstream consumer one source of truth:
+/// ``callee->param_directions_``.
+ProgramPtr MaterializeWrapperDirections(const ProgramPtr& program) {
+  // Resolved against the *original* program in one shot: every wrapper is
+  // rewritten from the same declared snapshot, and the helper's recursion
+  // propagates through nested Group→Group chains, so the result does not
+  // depend on function map iteration order.
+  auto effective_by_func = ComputeWrapperEffectiveDirections(program);
+
+  // Wrapper signatures are normally already effective (ConvertTensorToTileOps
+  // propagates directions when it splits kernels), so check before paying for
+  // a copy of the function map.
+  const bool stale = std::any_of(effective_by_func.begin(), effective_by_func.end(),
+                                 [](const auto& kv) { return kv.second != kv.first->param_directions_; });
+  if (!stale) return program;
+
+  auto new_functions = program->functions_;
+  for (auto& [gvar, func] : new_functions) {
+    auto it = effective_by_func.find(func.get());
+    if (it == effective_by_func.end()) continue;  // not a wrapper
+    if (it->second == func->param_directions_) continue;
+    auto new_func = MutableCopy(func);
+    new_func->param_directions_ = it->second;
+    func = new_func;
   }
-  return callee->param_directions_;
+  return std::make_shared<Program>(std::move(new_functions), program->name_, program->span_);
 }
 
 /// Uniform view of a call-like expression's positional args for direction
@@ -184,7 +220,7 @@ class PriorWriterCollector {
     auto callee = program_ ? program_->GetFunction(cl->op->name_) : nullptr;
     if (!callee) return;
 
-    auto dirs = ResolveCalleeDirections(program_, /*call=*/{}, callee);
+    const auto& dirs = callee->param_directions_;
     for (size_t i = 0; i < cl->args.size() && i < dirs.size(); ++i) {
       if (dirs[i] != ParamDirection::Out && dirs[i] != ParamDirection::InOut) continue;
       if (const Var* root = ResolveAnyRoot(cl->args[i], buffer_roots_)) {
@@ -251,7 +287,7 @@ class PriorWriterCollector {
     auto callee = program_ ? program_->GetFunction(cl->op->name_) : nullptr;
     if (!callee) return;
 
-    auto dirs = ResolveCalleeDirections(program_, /*call=*/{}, callee);
+    const auto& dirs = callee->param_directions_;
     std::unordered_set<const Var*> roots_this_call;
     for (size_t i = 0; i < cl->args.size() && i < dirs.size(); ++i) {
       // Only Out is decision-relevant for promotion (InOut is already InOut).
@@ -368,7 +404,7 @@ class CallDirectionMutator : public IRMutator {
     auto new_attrs = WithArgDirectionsAttr(submit->attrs_, std::move(*dirs));
     return std::make_shared<Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
                                     std::move(new_attrs), submit->GetType(), submit->span_, submit->core_num_,
-                                    submit->sync_start_, submit->allow_early_resolve_);
+                                    submit->sync_start_, submit->allow_early_resolve_, submit->predicate_);
   }
 
   /// Shared core that derives the ArgDirection vector for a Call-shaped node.
@@ -400,7 +436,10 @@ class CallDirectionMutator : public IRMutator {
       return std::nullopt;
     }
 
-    auto effective = ResolveCalleeDirections(program_, call, callee);
+    // Group/Spmd wrappers already carry their effective directions: Phase 0
+    // (MaterializeWrapperDirections) wrote them into the signature before this
+    // mutator ran, so a plain field read is correct for every callee kind.
+    const auto& effective = callee->param_directions_;
     // Submit: prefix coverage allowed (args.size() <= effective.size()).
     // Call: full coverage required (args.size() == effective.size()).
     const bool size_ok =
@@ -514,8 +553,12 @@ class CallDirectionMutator : public IRMutator {
 namespace pass {
 
 Pass DeriveCallDirections() {
-  auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
-    if (!program) return program;
+  auto pass_func = [](const ProgramPtr& input_program) -> ProgramPtr {
+    if (!input_program) return input_program;
+
+    // Phase 0: recover Group/Spmd wrapper signatures. Every later phase — and
+    // every downstream consumer — reads ``callee->param_directions_`` directly.
+    ProgramPtr program = MaterializeWrapperDirections(input_program);
 
     // We need a non-const handle to rewrite functions with new bodies.
     auto new_functions = program->functions_;
@@ -523,7 +566,11 @@ Pass DeriveCallDirections() {
     for (auto& [gvar, func] : new_functions) {
       if (!func || !func->body_) continue;
 
-      BufferRootCollector br_collector(program);
+      // kFirstOutput: direction derivation must keep *some* root for an
+      // ambiguous single-return call, else a later write to the returned var
+      // skips the R-prior / enclosing-param InOut promotion and silently drops
+      // the WAW/InOut dependency. Preserves the naive pre-dedup behavior.
+      BufferRootCollector br_collector(program, AmbiguousRootPolicy::kFirstOutput);
       br_collector.Initialize(func->params_);
       br_collector.VisitStmt(func->body_);
 

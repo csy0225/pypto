@@ -563,7 +563,7 @@ def test_allreduce_in_host_orchestrator_is_left_for_host_collective_lowering():
 
 
 def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_lowering():
-    """barrier/broadcast/allgather/reduce_scatter skipped by LowerCompositeOps in HOST orch."""
+    """HOST collectives are skipped by LowerCompositeOps (left for host lower)."""
     SIZE = 64
     NR = 2
 
@@ -572,12 +572,15 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
         def host_orch(
             self,
+            ag_stage: pld.DistributedTensor[[1, SIZE], pl.FP32],
+            stage: pld.DistributedTensor[[NR, SIZE], pl.FP32],
             data: pld.DistributedTensor[[NR, SIZE], pl.FP32],
             signal: pld.DistributedTensor[[NR, 1], pl.INT32],
         ):
             pld.tensor.barrier(signal)
             data = pld.tensor.broadcast(data, signal, root=0)
-            pld.tensor.allgather(data, signal)
+            data = pld.tensor.allgather(ag_stage, data, signal)
+            data = pld.tensor.all_to_all(stage, data, signal)
             data = pld.tensor.reduce_scatter(data, signal)
             return 0
 
@@ -588,6 +591,7 @@ def test_new_host_collectives_in_host_orchestrator_are_left_for_host_collective_
         "pld.tensor.barrier",
         "pld.tensor.broadcast",
         "pld.tensor.allgather",
+        "pld.tensor.all_to_all",
         "pld.tensor.reduce_scatter",
     ):
         assert op_name in op_names, f"HOST collective {op_name!r} should survive LowerCompositeOps"
@@ -723,6 +727,240 @@ def test_allreduce_emits_for_and_if_control_flow():
         f"expected 5 ForStmts (notify, wait, reduce, re-notify, re-wait), got {collector.for_count}"
     )
     assert collector.if_count == 5, f"expected 5 IfStmts (one per ForStmt body), got {collector.if_count}"
+
+
+def test_allreduce_flattens_target_to_2d_view_for_mesh_lowering():
+    """Mesh allreduce uses a 2D target view for tile load/remote/store codegen."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[2, 3, 4], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[2, 3, 4], pl.FP32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    op_names = _collect_op_names(After)
+    assert "pld.tensor.allreduce" not in op_names
+    assert "tensor.view" in op_names
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    body = func.body
+    assert isinstance(body, ir.SeqStmts)
+    view_stmt = next(
+        stmt
+        for stmt in body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    view_type = view_stmt.var.type
+    assert isinstance(view_type, ir.DistributedTensorType)
+    assert view_type.shape == [6, 4]
+
+
+def test_allreduce_mesh_lowering_preserves_partial_valid_shape():
+    """Mesh allreduce operates only on the target's representable valid rectangle."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    func = After.get_function("reduce_step")
+    assert func is not None
+    assert isinstance(func.body, ir.SeqStmts)
+
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    view_type = view_stmt.var.type
+    assert isinstance(view_stmt.value, ir.Call)
+    assert len(view_stmt.value.args) == 3
+    assert isinstance(view_type, ir.DistributedTensorType)
+    assert view_type.shape == [6, 4]
+    assert view_type.tensor_view is not None
+    assert view_type.tensor_view.valid_shape == [3, 2]
+
+    class CallCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[ir.Call] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            self.calls.append(op)
+            super().visit_call(op)
+
+    collector = CallCollector()
+    collector.visit_program(After)
+    load = next(call for call in collector.calls if call.op.name == "tile.load")
+    remote_load = next(call for call in collector.calls if call.op.name == "pld.tile.remote_load")
+    load_shape = load.args[2]
+    load_valid_shape = load.args[3]
+    remote_shape = remote_load.args[3]
+    assert isinstance(load_shape, ir.MakeTuple)
+    assert isinstance(load_valid_shape, ir.MakeTuple)
+    assert isinstance(remote_shape, ir.MakeTuple)
+    assert load_shape.elements == [3, 2]
+    assert load_valid_shape.elements == [3, 2]
+    assert remote_shape.elements == [3, 2]
+
+
+def test_allreduce_mesh_lowering_rejects_noncontiguous_partial_valid_shape():
+    """A partial box spanning disjoint flattened row ranges cannot use one 2D view."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[2, 2, 4], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[2, 2, 4], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="valid_shape cannot be represented by a single 2D view"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_mesh_lowering_rejects_strided_target_collapse():
+    """Flattening must not replace a legal strided-family view with packed storage."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(stride=[100, 10, 1], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="requires a packed source"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_mesh_lowering_rejects_partial_dn_target_collapse():
+    """The row-major partial-valid collapse is not valid for DN addresses."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[12, 1, 3], layout=pl.TensorLayout.DN),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="only supports ND layout"):
+        passes.lower_composite_ops()(Before)
+
+
+def test_allreduce_flattened_mesh_lowering_reaches_pto_codegen(default_pass_manager, ascend_backend):
+    """Default pipeline codegens the three-arg partial-valid target view."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[
+                pld.DistributedTensor[
+                    [2, 3, 4],
+                    pl.FP32,
+                    pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+                ]
+            ],
+            signal: pl.InOut[pld.DistributedTensor[[2, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[
+            [2, 3, 4],
+            pl.FP32,
+            pl.TensorView(valid_shape=[1, 3, 2], stride=[], layout=pl.TensorLayout.ND),
+        ]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    from pypto import codegen  # noqa: PLC0415
+
+    optimized = default_pass_manager.run_passes(Before)
+    func = optimized.get_function("reduce_step")
+    assert func is not None
+    view_stmt = next(
+        stmt
+        for stmt in func.body.stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tensor.view"
+    )
+    assert isinstance(view_stmt.value, ir.Call)
+    assert len(view_stmt.value.args) == 3
+    assert isinstance(view_stmt.var.type, ir.DistributedTensorType)
+    assert view_stmt.var.type.shape == [6, 4]
+    assert view_stmt.var.type.tensor_view is not None
+    assert view_stmt.var.type.tensor_view.valid_shape == [3, 2]
+    single = ir.Program([func], func.name, optimized.span)
+    mlir = codegen.PTOCodegen().generate(single)
+    assert "tile.store tile valid_shape must be 2D" not in mlir
 
 
 def test_allreduce_lowering_is_idempotent():
@@ -947,10 +1185,8 @@ _ALLGATHER_REQUIRED_OPS = {
     "pld.system.rank",
     "pld.system.notify",
     "pld.system.wait",
+    "pld.tile.put",
     "tile.create",
-    "pld.tile.get",
-    "tile.store",
-    "tile.load",
 }
 
 
@@ -965,11 +1201,10 @@ def _build_allgather_before():
         def gather_step(
             self,
             inp: pl.Tensor[[1, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
             data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
             signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
-            result = pld.tensor.allgather(inp, data, signal, out)
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            result = pld.tensor.allgather(inp, data, signal)
             return result
 
     return Before
@@ -990,20 +1225,17 @@ def test_allgather_is_decomposed_to_primitives():
 
 
 def test_allgather_emits_for_and_if_control_flow():
-    """Allgather emits 3 ForStmts + 2 IfStmts: notify-all, wait-all, gather.
+    """Push-based allgather emits 3 ForStmts + 2 IfStmts: push loop, notify-all, wait-all.
 
-    Phase 3 (gather) now uses a runtime ForStmt over nranks_idx (matching
-    the barrier phases) instead of a compile-time unrolled loop — this
-    keeps the gather consistent with the notify/wait bounds regardless of
-    the actual comm-group size.  The gather ForStmt body emits pld.tile.get
-    for every peer (self-read via HCCL identity mapping), so there is no
-    per-rank IfStmt inside the gather loop."""
+    Phase 1 (push) uses a runtime ForStmt over nranks_idx — every peer gets a
+    pld.tile.put (self-store via HCCL identity mapping, no per-rank IfStmt).
+    Phase 2a/2b are the standard notify-all/wait-all loops with per-peer IfStmts."""
     Before = _build_allgather_before()
     After = passes.lower_composite_ops()(Before)
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 3, f"expected 3 ForStmts (notify, wait, gather), got {collector.for_count}"
+    assert collector.for_count == 3, f"expected 3 ForStmts (push, notify, wait), got {collector.for_count}"
     assert collector.if_count == 2, f"expected 2 IfStmts (notify-all + wait-all), got {collector.if_count}"
 
 
@@ -1106,6 +1338,165 @@ def test_reduce_scatter_deducer_rejects_unsupported_reduce_op():
                 signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
             ) -> pl.Tensor[[nr, SIZE], pl.FP32]:
                 data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Max)
+                return data
+
+
+# ============================================================================
+# pld.tensor.allreduce ring mode lowering
+#
+# Ring allreduce decomposes ``pld.tensor.allreduce(data, signal, mode="ring")``
+# into an NCCL-style chunked reduce-scatter + allgather schedule with 2(P−1)
+# per-round barriers.  The signal shape is [2*(NR−1), NR] (one row per ring
+# round, one cell per rank).  These tests pin the ring-specific invariants
+# without hand-mirroring every temp name.
+# ============================================================================
+
+_RING_ALLREDUCE_SIZE = 16
+_RING_ALLREDUCE_NRANKS = 2
+
+# Ops the ring decomposition must emit.
+_RING_ALLREDUCE_REQUIRED_OPS = {
+    "pld.system.get_comm_ctx",
+    "pld.system.nranks",
+    "pld.system.rank",
+    "pld.system.notify",  # per-round barrier (2(P−1) rounds)
+    "pld.system.wait",  # per-round barrier
+    "pld.tile.remote_load",  # per-ring-step chunk receive
+    "tile.add",  # reduce-scatter accumulation
+    "tile.load",  # reduce-scatter local accumulation
+    "tile.store",  # reduce-scatter + allgather chunk writes
+}
+
+
+def _build_ring_allreduce_before():
+    """Build a minimal Before program that calls allreduce(mode="ring")."""
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+    total_rounds = 2 * (nr - 1)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
+        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+            local = pl.load(inp, [0, 0], [1, SIZE])
+            data = pl.store(local, [0, 0], data)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            acc = pl.load(data, [0, 0], [1, SIZE])
+            return pl.store(acc, [0, 0], out)
+
+    return Before
+
+
+def test_ring_allreduce_is_decomposed_to_primitives():
+    """The composite ring allreduce Call is replaced by the ring primitive
+    tree; no ``pld.tensor.allreduce`` survives."""
+    Before = _build_ring_allreduce_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.allreduce" not in op_names, (
+        "lower_composite_ops must remove the composite allreduce call entirely"
+    )
+    missing = _RING_ALLREDUCE_REQUIRED_OPS - op_names
+    assert not missing, f"ring-lowered IR missing expected ops: {missing}"
+
+
+def test_ring_allreduce_emits_ring_control_flow():
+    """Ring lowering emits 2 ForStmts (reduce-scatter, allgather) with
+    4 IfStmts (notify+wait per phase step).  For P=2 the inner
+    notify/wait ForStmts are fused into the phase body as direct
+    IfStmts — the EmitFor creates a per-peer loop whose body is a single
+    IfStmt, which LoweringBuilder fuses into the parent body."""
+    Before = _build_ring_allreduce_before()
+    After = passes.lower_composite_ops()(Before)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+
+    # P=2 → 1 RS step + 1 AG step = 2 ForStmts.
+    # Each step has notify (IfStmt) + wait (IfStmt) = 4 IfStmts total.
+    assert collector.for_count == 2, (
+        f"expected 2 ForStmts for P=2 ring (RS body + AG body), got {collector.for_count}"
+    )
+    assert collector.if_count == 4, (
+        f"expected 4 IfStmts (RS notify+wait + AG notify+wait), got {collector.if_count}"
+    )
+
+
+def test_ring_allreduce_lowering_is_idempotent():
+    """Running the pass on already-lowered ring IR is a no-op."""
+    Before = _build_ring_allreduce_before()
+    once = passes.lower_composite_ops()(Before)
+    twice = passes.lower_composite_ops()(once)
+    ir.assert_structural_equal(twice, once)
+
+
+def test_ring_allreduce_invalid_signal_shape_is_rejected():
+    """Ring mode validates signal type — rejects non-DistributedTensor or
+    non-INT32 signals at lowering time.  The exact shape [2*(NR−1), NR]
+    is checked for dimensionality (must be 2D) but exact dimension values
+    are validated at runtime when NR is dynamic."""
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+
+    # Wrong dtype: signal must be INT32 for notify/wait counters.
+    with pytest.raises((ValueError, TypeError, ParserError)):
+
+        @pl.program
+        class BadDtype:
+            @pl.function(type=pl.FunctionType.InCore)
+            def reduce_step(
+                self,
+                data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[2 * (nr - 1), nr], pl.FP32]],
+            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+                return data
+
+        passes.lower_composite_ops()(BadDtype)
+
+
+def test_ring_allreduce_mesh_default_unchanged():
+    """Existing mesh allreduce (mode omitted) still decomposes to the mesh
+    recipe — no ring primitives leak in."""
+    Before = _build_allreduce_before()
+    After = passes.lower_composite_ops()(Before)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.allreduce" not in op_names
+    missing = _ALLREDUCE_REQUIRED_OPS - op_names
+    assert not missing, f"mesh-lowered IR missing expected ops: {missing}"
+
+    # Mesh-specific: exactly 5 ForStmts (notify, wait, reduce, re-notify, re-wait)
+    collector = _StmtKindCollector()
+    collector.visit_program(After)
+    assert collector.for_count == 5, (
+        f"mesh allreduce must still produce 5 ForStmts, got {collector.for_count}"
+    )
+
+
+def test_ring_allreduce_deducer_rejects_unsupported_reduce_op():
+    """Ring mode inherits the kSum-only restriction from mesh."""
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+    total_rounds = 2 * (nr - 1)
+
+    with pytest.raises((ValueError, TypeError, ParserError)):
+
+        @pl.program
+        class BadRingOp:
+            @pl.function(type=pl.FunctionType.InCore)
+            def f(
+                self,
+                data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+                signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
+            ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+                data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Max, mode="ring")
                 return data
 
 

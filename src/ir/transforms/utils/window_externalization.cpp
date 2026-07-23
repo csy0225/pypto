@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <any>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -26,7 +28,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/codegen/orchestration/orchestration_analysis.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/arith/analyzer.h"
@@ -43,6 +44,7 @@
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -53,12 +55,97 @@ namespace ir {
 
 using transform_utils::FlattenToStmts;
 
-namespace {
+namespace window_externalization {
 
 std::string GetCallFuncName(const CallPtr& call) {
   auto gvar = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
   return gvar ? gvar->name_ : "";
 }
+
+std::vector<OutParamReturnMapping> BuildOutParamReturnMappings(const FunctionPtr& func, bool include_inout) {
+  // Collect output param vars and their indices.
+  std::unordered_map<const Var*, size_t> out_var_to_param_idx;
+  for (size_t i = 0; i < func->params_.size(); ++i) {
+    const bool is_output = i < func->param_directions_.size() &&
+                           (func->param_directions_[i] == ParamDirection::Out ||
+                            (include_inout && func->param_directions_[i] == ParamDirection::InOut));
+    if (is_output) {
+      out_var_to_param_idx[func->params_[i].get()] = i;
+    }
+  }
+  if (out_var_to_param_idx.empty()) return {};
+
+  auto body_stmts = FlattenToStmts(func->body_);
+
+  // Build var->assign map for quick lookup.
+  std::unordered_map<const Var*, AssignStmtPtr> var_def;
+  for (const auto& stmt : body_stmts) {
+    if (auto assign = As<AssignStmt>(stmt)) {
+      var_def[assign->var_.get()] = assign;
+    }
+  }
+
+  std::unordered_map<const Var*, ExprPtr> loop_return_to_init;
+  for (const auto& stmt : body_stmts) {
+    if (auto loop = As<ForStmt>(stmt)) {
+      for (size_t i = 0; i < loop->return_vars_.size() && i < loop->iter_args_.size(); ++i) {
+        loop_return_to_init[loop->return_vars_[i].get()] = loop->iter_args_[i]->initValue_;
+      }
+    } else if (auto loop = As<WhileStmt>(stmt)) {
+      for (size_t i = 0; i < loop->return_vars_.size() && i < loop->iter_args_.size(); ++i) {
+        loop_return_to_init[loop->return_vars_[i].get()] = loop->iter_args_[i]->initValue_;
+      }
+    }
+  }
+
+  ReturnStmtPtr return_stmt;
+  for (const auto& stmt : body_stmts) {
+    if (auto ret = As<ReturnStmt>(stmt)) {
+      return_stmt = ret;
+      break;
+    }
+  }
+  if (!return_stmt) return {};
+
+  std::vector<OutParamReturnMapping> result;
+  for (size_t ret_i = 0; ret_i < return_stmt->value_.size(); ++ret_i) {
+    auto ret_var = As<Var>(return_stmt->value_[ret_i]);
+    if (!ret_var) continue;
+
+    auto def_it = var_def.find(ret_var.get());
+    if (def_it == var_def.end()) {
+      auto loop_it = loop_return_to_init.find(ret_var.get());
+      if (loop_it == loop_return_to_init.end()) continue;
+      auto init_var = AsVarLike(loop_it->second);
+      if (!init_var) continue;
+      auto param_it = out_var_to_param_idx.find(init_var.get());
+      if (param_it == out_var_to_param_idx.end()) continue;
+      result.push_back({param_it->second, ret_i, func->params_[param_it->second]});
+      continue;
+    }
+
+    auto call = As<Call>(def_it->second->value_);
+    if (!call || !IsOp(call, "tile.store")) continue;
+    if (call->args_.size() < 3) continue;
+
+    auto out_tensor = As<Var>(call->args_[2]);
+    if (!out_tensor) continue;
+    auto param_it = out_var_to_param_idx.find(out_tensor.get());
+    if (param_it == out_var_to_param_idx.end()) continue;
+
+    result.push_back({param_it->second, ret_i, func->params_[param_it->second]});
+  }
+
+  return result;
+}
+
+}  // namespace window_externalization
+
+namespace {
+
+using window_externalization::BuildOutParamReturnMappings;
+using window_externalization::GetCallFuncName;
+using window_externalization::OutParamReturnMapping;
 
 std::string MakeUniqueFunctionName(const ProgramPtr& program, const std::string& base_name) {
   if (!program || !program->GetFunction(base_name)) return base_name;
@@ -191,7 +278,7 @@ bool IsAllZeroOffsets(const std::vector<ExprPtr>& offsets) {
 
 bool IsTensorAllocationOp(const CallPtr& call) {
   if (!call || std::dynamic_pointer_cast<const GlobalVar>(call->op_)) return false;
-  return call->op_->name_ == "tensor.create" || call->op_->name_ == "tensor.full";
+  return IsOp(call, "tensor.create") || IsOp(call, "tensor.full");
 }
 
 bool IsOutputDirection(ParamDirection direction, bool include_inout) {
@@ -230,94 +317,6 @@ std::vector<size_t> CollectOutParamIndices(const FunctionPtr& func) {
       result.push_back(i);
     }
   }
-  return result;
-}
-
-struct OutParamReturnMapping {
-  size_t param_index;   ///< Position in param list
-  size_t return_index;  ///< Which return value stores to this Out param
-  VarPtr param_var;     ///< The Out param variable
-};
-
-/// Build the mapping from Out params to return indices for an InCore function.
-/// Scans tile.store calls before the ReturnStmt to find which Out param
-/// each return value stores to.
-
-std::vector<OutParamReturnMapping> BuildOutParamReturnMappings(const FunctionPtr& func,
-                                                               bool include_inout = false) {
-  // Collect output param vars and their indices.
-  std::unordered_map<const Var*, size_t> out_var_to_param_idx;
-  for (size_t i = 0; i < func->params_.size(); ++i) {
-    if (i < func->param_directions_.size() && IsOutputDirection(func->param_directions_[i], include_inout)) {
-      out_var_to_param_idx[func->params_[i].get()] = i;
-    }
-  }
-  if (out_var_to_param_idx.empty()) return {};
-
-  auto body_stmts = FlattenToStmts(func->body_);
-
-  // Build var->assign map for quick lookup
-  std::unordered_map<const Var*, AssignStmtPtr> var_def;
-  for (const auto& stmt : body_stmts) {
-    if (auto assign = As<AssignStmt>(stmt)) {
-      var_def[assign->var_.get()] = assign;
-    }
-  }
-
-  std::unordered_map<const Var*, ExprPtr> loop_return_to_init;
-  for (const auto& stmt : body_stmts) {
-    if (auto loop = As<ForStmt>(stmt)) {
-      for (size_t i = 0; i < loop->return_vars_.size() && i < loop->iter_args_.size(); ++i) {
-        loop_return_to_init[loop->return_vars_[i].get()] = loop->iter_args_[i]->initValue_;
-      }
-    } else if (auto loop = As<WhileStmt>(stmt)) {
-      for (size_t i = 0; i < loop->return_vars_.size() && i < loop->iter_args_.size(); ++i) {
-        loop_return_to_init[loop->return_vars_[i].get()] = loop->iter_args_[i]->initValue_;
-      }
-    }
-  }
-
-  // Find return statement
-  ReturnStmtPtr return_stmt;
-  for (const auto& stmt : body_stmts) {
-    if (auto ret = As<ReturnStmt>(stmt)) {
-      return_stmt = ret;
-      break;
-    }
-  }
-  if (!return_stmt) return {};
-
-  std::vector<OutParamReturnMapping> result;
-
-  for (size_t ret_i = 0; ret_i < return_stmt->value_.size(); ++ret_i) {
-    auto ret_var = As<Var>(return_stmt->value_[ret_i]);
-    if (!ret_var) continue;
-
-    auto def_it = var_def.find(ret_var.get());
-    if (def_it == var_def.end()) {
-      auto loop_it = loop_return_to_init.find(ret_var.get());
-      if (loop_it == loop_return_to_init.end()) continue;
-      auto init_var = AsVarLike(loop_it->second);
-      if (!init_var) continue;
-      auto param_it = out_var_to_param_idx.find(init_var.get());
-      if (param_it == out_var_to_param_idx.end()) continue;
-      result.push_back({param_it->second, ret_i, func->params_[param_it->second]});
-      continue;
-    }
-
-    auto call = As<Call>(def_it->second->value_);
-    if (!call || call->op_->name_ != "tile.store") continue;
-
-    if (call->args_.size() < 3) continue;
-    auto out_tensor = As<Var>(call->args_[2]);
-    if (!out_tensor) continue;
-
-    auto param_it = out_var_to_param_idx.find(out_tensor.get());
-    if (param_it == out_var_to_param_idx.end()) continue;
-
-    result.push_back({param_it->second, ret_i, func->params_[param_it->second]});
-  }
-
   return result;
 }
 
@@ -714,6 +713,9 @@ class OutWindowExternalizer {
 
     if (!body_rebuilt_param_subst.empty()) {
       *body = transform_utils::Substitute(*body, body_rebuilt_param_subst);
+      // Visit order does not escape: keys are unique, so copying the entries
+      // into `subst` yields the same map for any traversal order.
+      // NOLINTNEXTLINE(bugprone-nondeterministic-pointer-iteration-order)
       for (const auto& [old_param, new_param] : body_rebuilt_param_subst) {
         (*subst)[old_param] = new_param;
       }
@@ -1123,7 +1125,7 @@ class OutWindowExternalizer {
       size_t offset_arg_index = SIZE_MAX;
       size_t target_arg_index = SIZE_MAX;
 
-      if (call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+      if (IsOp(call, "tile.store") && call->args_.size() >= 3) {
         rewritten_target_expr = call->args_[2];
         auto out_var = AsVarLike(rewritten_target_expr);
         if (!out_var) return assign;
@@ -1131,7 +1133,7 @@ class OutWindowExternalizer {
         offsets = As<MakeTuple>(call->args_[1]);
         offset_arg_index = 1;
         target_arg_index = 2;
-      } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() >= 3) {
+      } else if (IsOp(call, "tensor.assemble") && call->args_.size() >= 3) {
         rewritten_target_expr = call->args_[0];
         auto parent_var = AsVarLike(rewritten_target_expr);
         if (!parent_var) return assign;
@@ -1139,7 +1141,7 @@ class OutWindowExternalizer {
         offsets = As<MakeTuple>(call->args_[2]);
         offset_arg_index = 2;
         target_arg_index = 0;
-      } else if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
+      } else if (IsOp(call, "tile.load") && call->args_.size() >= 3) {
         rewritten_target_expr = call->args_[0];
         auto parent_var = AsVarLike(rewritten_target_expr);
         if (!parent_var) return assign;
@@ -1147,7 +1149,7 @@ class OutWindowExternalizer {
         offsets = As<MakeTuple>(call->args_[1]);
         offset_arg_index = 1;
         target_arg_index = 0;
-      } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+      } else if (IsOp(call, "tensor.slice") && call->args_.size() >= 3) {
         rewritten_target_expr = call->args_[0];
         auto parent_var = AsVarLike(rewritten_target_expr);
         if (!parent_var) return assign;
@@ -1186,7 +1188,7 @@ class OutWindowExternalizer {
       new_args[offset_arg_index] = new_offset_tuple;
       auto new_out_it = new_out_vars_.find(target_var);
       if (new_out_it != new_out_vars_.end()) new_args[target_arg_index] = new_out_it->second;
-      auto new_type = (call->op_->name_ == "tile.store" || call->op_->name_ == "tensor.assemble")
+      auto new_type = (IsOp(call, "tile.store") || IsOp(call, "tensor.assemble"))
                           ? new_args[target_arg_index]->GetType()
                           : call->GetType();
       auto new_call =
@@ -1315,9 +1317,9 @@ class OutWindowExternalizer {
       if (!call || call->args_.empty()) return assign;
 
       size_t offset_arg_index = SIZE_MAX;
-      if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
+      if (IsOp(call, "tile.load") && call->args_.size() >= 3) {
         offset_arg_index = 1;
-      } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+      } else if (IsOp(call, "tensor.slice") && call->args_.size() >= 3) {
         // Keep the localizer aligned with AnalyzeInputWindows(): only window
         // reads that are already proven as a fixed tile.load/tensor.slice are
         // rewritten, and tensor.slice only localizes the matched offset.
@@ -1629,7 +1631,7 @@ class OutWindowExternalizer {
       for (size_t i = 0; i < sibling_stmts.size(); ++i) {
         auto assign = As<AssignStmt>(sibling_stmts[i]);
         auto call = assign ? As<Call>(assign->value_) : nullptr;
-        if (!call || call->op_->name_ != "tensor.assemble" || call->args_.size() < 2) continue;
+        if (!call || !IsOp(call, "tensor.assemble") || call->args_.size() < 2) continue;
         auto source = AsVarLike(call->args_[1]);
         if (source) result[source.get()] = i;
       }
@@ -1715,16 +1717,14 @@ class OutWindowExternalizer {
           const auto& piece = pieces[piece_index];
           std::vector<ExprPtr> shape_exprs;
           shape_exprs.reserve(piece.window_shape.size());
-          for (size_t dim_i = 0; dim_i < piece.window_shape.size(); ++dim_i) {
-            const auto& dim = piece.window_shape[dim_i];
+          for (const auto& dim : piece.window_shape) {
             auto shape_expr = transform_utils::Substitute(dim, callsite_subst);
             shape_exprs.push_back(
                 FlattenGeneratedScalarExpr(shape_expr, in_arg->name_hint_, call_assign->span_, &stmts));
           }
           std::vector<ExprPtr> offset_exprs;
           offset_exprs.reserve(piece.callsite_offsets.size());
-          for (size_t offset_i = 0; offset_i < piece.callsite_offsets.size(); ++offset_i) {
-            const auto& offset = piece.callsite_offsets[offset_i];
+          for (const auto& offset : piece.callsite_offsets) {
             auto offset_expr =
                 input_offset_analyzer.Simplify(transform_utils::Substitute(offset, callsite_subst));
             offset_exprs.push_back(
@@ -1874,14 +1874,32 @@ class OutWindowExternalizer {
         // Preserve Submit-ness and deps_ (the canonical encoding); drop the
         // view's synthesised manual_dep_edges attr so deps aren't duplicated.
         // new_return_type already carries the trailing TASK_ID (is_submit_call).
+        // Drop the keys SubmitToCallView *synthesises* from first-class Submit
+        // fields. RewriteCallAttrs copies every attr off the transient Call
+        // view, so without this filter the rebuilt Submit would carry both the
+        // real field and a stale attr copy of it — duplicated state that the
+        // printer emits twice and that structural_hash silently ignores (its
+        // attr codec skips Var-/Expr-valued entries). The fields themselves are
+        // threaded explicitly through the constructor below.
+        static const std::array<const char*, 4> kViewSynthesizedKeys = {kAttrPredicate, "core_num",
+                                                                        "sync_start", "allow_early_resolve"};
         std::vector<std::pair<std::string, std::any>> submit_attrs;
         submit_attrs.reserve(new_attrs.size());
-        for (const auto& [k, v] : new_attrs) {
-          if (k != kAttrManualDepEdges) submit_attrs.emplace_back(k, v);
+        for (const auto& attr : new_attrs) {
+          // Bind the key to a plain local: capturing a structured binding in the
+          // lambda below is a C++20 extension and this target builds as C++17.
+          const std::string& key = attr.first;
+          if (key == kAttrManualDepEdges) continue;
+          if (std::any_of(kViewSynthesizedKeys.begin(), kViewSynthesizedKeys.end(),
+                          [&key](const char* synth) { return key == synth; })) {
+            continue;
+          }
+          submit_attrs.emplace_back(attr.first, attr.second);
         }
-        new_call = std::make_shared<Submit>(
-            cloned_gvar, new_args, submit->deps_, submit->kwargs_, std::move(submit_attrs), new_return_type,
-            submit->span_, submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+        new_call = std::make_shared<Submit>(cloned_gvar, new_args, submit->deps_, submit->kwargs_,
+                                            std::move(submit_attrs), new_return_type, submit->span_,
+                                            submit->core_num_, submit->sync_start_,
+                                            submit->allow_early_resolve_, submit->predicate_);
       } else {
         new_call = std::make_shared<Call>(cloned_gvar, new_args, call->kwargs_, new_attrs, new_return_type,
                                           call->span_);
@@ -2026,7 +2044,7 @@ class OutWindowExternalizer {
       int add_output = 0;
       int add_scalar = 0;
 
-      int Total() const { return add_inout + add_input + add_output + add_scalar; }
+      [[nodiscard]] int Total() const { return add_inout + add_input + add_output + add_scalar; }
     };
 
     static ArgDirection ParamDirectionToArgDirection(ParamDirection direction) {
@@ -2251,21 +2269,21 @@ class OutWindowExternalizer {
             }
           }
 
-          if (call && call->op_ && call->op_->name_ == "tensor.slice" && !call->args_.empty() &&
+          if (call && call->op_ && IsOp(call, "tensor.slice") && !call->args_.empty() &&
               AsTensorTypeLike(op->var_->GetType())) {
             if (const Var* parent_root = rewriter_->ResolveCarrierParentRoot(call->args_[0])) {
               rewriter_->RecordSiblingCarrierAliasRoot(op->var_.get(), parent_root);
             }
           }
 
-          if (call && call->op_ && call->op_->name_ == "tensor.assemble" && call->args_.size() >= 2) {
+          if (call && call->op_ && IsOp(call, "tensor.assemble") && call->args_.size() >= 2) {
             auto source_root_expr = rewriter_->ResolveLoopReturnInitExpr(call->args_[1]);
             auto source_root = AsVarLike(source_root_expr);
             const Var* parent_root = rewriter_->ResolveCarrierParentRoot(call->args_[0]);
             if (source_root) rewriter_->RecordSiblingCarrierAliasRoot(source_root.get(), parent_root);
           }
 
-          if (!call || pypto::codegen::IsBuiltinOp(call->op_->name_)) {
+          if (!call || !call->op_ || op_predicates::IsBuiltinOp(call->op_->name_)) {
             IRVisitor::VisitStmt_(op);
             return;
           }
@@ -2811,7 +2829,7 @@ class OutWindowExternalizer {
   };
 
   static std::optional<FixedTileLoadAccess> MatchFixedTileLoadAccess(const CallPtr& call, const Var* param) {
-    if (!call || !param || call->op_->name_ != "tile.load" || call->args_.size() < 3) return std::nullopt;
+    if (!call || !param || !IsOp(call, "tile.load") || call->args_.size() < 3) return std::nullopt;
 
     auto parent = AsVarLike(call->args_[0]);
     auto offsets = As<MakeTuple>(call->args_[1]);
@@ -2845,12 +2863,12 @@ class OutWindowExternalizer {
 
     std::vector<ExprPtr> window_shape;
     MakeTuplePtr offsets;
-    if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
+    if (IsOp(call, "tile.load") && call->args_.size() >= 3) {
       auto access = MatchFixedTileLoadAccess(call, param);
       if (!access.has_value()) return std::nullopt;
       window_shape = access->window_shape;
       offsets = access->offsets;
-    } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+    } else if (IsOp(call, "tensor.slice") && call->args_.size() >= 3) {
       auto parent = AsVarLike(call->args_[0]);
       offsets = As<MakeTuple>(call->args_[2]);
       auto tensor_type = As<TensorType>(call->GetType());
@@ -2953,15 +2971,13 @@ class OutWindowExternalizer {
     if (!ret_stmt) return std::nullopt;
 
     size_t total_out_refs = CountVarRefsInStmt(func->body_, func->params_[out_param_index].get());
-    std::optional<FinalStoreInfo> result;
-    size_t matched_refs = 0;
     for (size_t ret_i = 0; ret_i < ret_stmt->value_.size(); ++ret_i) {
       auto ret_var = AsVarLike(ret_stmt->value_[ret_i]);
       if (!ret_var) continue;
       auto def_it = var_defs.find(ret_var.get());
       if (def_it == var_defs.end()) continue;
       auto store_call = As<Call>(def_it->second->value_);
-      if (!store_call || store_call->op_->name_ != "tile.store" || store_call->args_.size() < 3) continue;
+      if (!store_call || !IsOp(store_call, "tile.store") || store_call->args_.size() < 3) continue;
 
       auto out_target = AsVarLike(store_call->args_[2]);
       if (!out_target || out_target.get() != func->params_[out_param_index].get()) continue;
@@ -2969,17 +2985,15 @@ class OutWindowExternalizer {
       auto tile_type = As<TileType>(store_call->args_[0]->GetType());
       if (!offset_tuple || !tile_type) return std::nullopt;
 
-      matched_refs = CountVarRefsInStmt(def_it->second, func->params_[out_param_index].get());
+      size_t matched_refs = CountVarRefsInStmt(def_it->second, func->params_[out_param_index].get());
       if (total_out_refs != matched_refs &&
           !IsProvenSameRegionInOutAccess(func, out_param_index, def_it->second, tile_type->shape_,
                                          offset_tuple->elements_)) {
         return std::nullopt;
       }
 
-      result = FinalStoreInfo{ret_i, tile_type->shape_, offset_tuple->elements_};
-      break;
+      return FinalStoreInfo{ret_i, tile_type->shape_, offset_tuple->elements_};
     }
-    if (result.has_value()) return result;
 
     auto direct_return_index = FindReturnIndexForOutParam(func, out_param_index);
     if (!direct_return_index.has_value()) return std::nullopt;
@@ -2987,7 +3001,7 @@ class OutWindowExternalizer {
       auto assign = As<AssignStmt>(stmt);
       if (!assign) continue;
       auto store_call = As<Call>(assign->value_);
-      if (!store_call || store_call->op_->name_ != "tile.store" || store_call->args_.size() < 3) continue;
+      if (!store_call || !IsOp(store_call, "tile.store") || store_call->args_.size() < 3) continue;
       auto out_target = AsVarLike(store_call->args_[2]);
       if (!out_target || out_target.get() != func->params_[out_param_index].get()) continue;
       auto offset_tuple = As<MakeTuple>(store_call->args_[1]);
@@ -2997,10 +3011,9 @@ class OutWindowExternalizer {
                                                    offset_tuple->elements_, ret_stmt)) {
         continue;
       }
-      result = FinalStoreInfo{*direct_return_index, tile_type->shape_, offset_tuple->elements_};
-      break;
+      return FinalStoreInfo{*direct_return_index, tile_type->shape_, offset_tuple->elements_};
     }
-    return result;
+    return std::nullopt;
   }
 
   static bool HasOnlyFullShapeZeroOffsetReturnOutputs(const FunctionPtr& func,
@@ -3027,12 +3040,12 @@ class OutWindowExternalizer {
 
     std::vector<ExprPtr> window_shape;
     MakeTuplePtr offsets;
-    if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
+    if (IsOp(call, "tile.load") && call->args_.size() >= 3) {
       auto access = MatchFixedTileLoadAccess(call, param);
       if (!access.has_value()) return std::nullopt;
       window_shape = access->window_shape;
       offsets = access->offsets;
-    } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+    } else if (IsOp(call, "tensor.slice") && call->args_.size() >= 3) {
       auto parent = AsVarLike(call->args_[0]);
       offsets = As<MakeTuple>(call->args_[2]);
       auto tensor_type = As<TensorType>(call->GetType());
@@ -3608,7 +3621,7 @@ class OutWindowExternalizer {
           const Var* read_tail = nullptr;
           std::vector<ExprPtr> window_shape;
           std::vector<ExprPtr> offsets;
-          if (call->op_->name_ == "tile.store" && call->args_.size() >= 3) {
+          if (IsOp(call, "tile.store") && call->args_.size() >= 3) {
             auto out_arg = AsVarLike(call->args_[2]);
             auto offset_tuple = As<MakeTuple>(call->args_[1]);
             auto tile_type = As<TileType>(call->args_[0]->GetType());
@@ -3617,7 +3630,7 @@ class OutWindowExternalizer {
               window_shape = tile_type->shape_;
               offsets = offset_tuple->elements_;
             }
-          } else if (call->op_->name_ == "tensor.assemble" && call->args_.size() >= 3) {
+          } else if (IsOp(call, "tensor.assemble") && call->args_.size() >= 3) {
             auto parent_arg = AsVarLike(call->args_[0]);
             auto offset_tuple = As<MakeTuple>(call->args_[2]);
             auto source_type = As<TensorType>(call->args_[1]->GetType());
@@ -3626,7 +3639,7 @@ class OutWindowExternalizer {
               window_shape = source_type->shape_;
               offsets = offset_tuple->elements_;
             }
-          } else if (call->op_->name_ == "tile.load" && call->args_.size() >= 3) {
+          } else if (IsOp(call, "tile.load") && call->args_.size() >= 3) {
             auto parent_arg = AsVarLike(call->args_[0]);
             auto offset_tuple = As<MakeTuple>(call->args_[1]);
             auto tile_type = As<TileType>(call->GetType());
@@ -3635,7 +3648,7 @@ class OutWindowExternalizer {
               window_shape = tile_type->shape_;
               offsets = offset_tuple->elements_;
             }
-          } else if (call->op_->name_ == "tensor.slice" && call->args_.size() >= 3) {
+          } else if (IsOp(call, "tensor.slice") && call->args_.size() >= 3) {
             auto parent_arg = AsVarLike(call->args_[0]);
             auto offset_tuple = As<MakeTuple>(call->args_[2]);
             auto source_type = As<TensorType>(call->GetType());
@@ -3757,6 +3770,9 @@ class OutWindowExternalizer {
     const auto loop_use_index = BuildVarUseIndex(loop);
     const auto loop_body_use_index = BuildVarUseIndex(loop->body_);
     const auto return_use_index = BuildVarUseIndex(ret_stmt);
+    // Visit order does not escape: the loop bails out when *any* carrier has an
+    // unrecognized user, which is order-independent.
+    // NOLINTNEXTLINE(bugprone-nondeterministic-pointer-iteration-order)
     for (const auto* carrier_var : carrier_vars) {
       auto users_it = loop_body_use_index.assign_users.find(carrier_var);
       if (users_it == loop_body_use_index.assign_users.end()) continue;
@@ -4141,7 +4157,7 @@ class OutWindowExternalizer {
   AnalysisMap Analyze(const ProgramPtr& program) {
     AnalysisMap analyses;
     for (const auto& [gvar, func] : program->functions_) {
-      if (!func || pypto::codegen::IsBuiltinOp(func->name_) || !IsInCoreType(func->func_type_)) {
+      if (!func || op_predicates::IsBuiltinOp(func->name_) || !IsInCoreType(func->func_type_)) {
         continue;
       }
 
@@ -4468,7 +4484,6 @@ class OutWindowExternalizer {
        protected:
         StmtPtr VisitStmt_(const ForStmtPtr& op) override {
           std::vector<const Var*> old_iter_args_to_erase;
-          bool changed = false;
           for (size_t i = 0; i < op->return_vars_.size() && i < op->iter_args_.size(); ++i) {
             auto it = narrowed_return_vars_.find(op->return_vars_[i].get());
             if (it == narrowed_return_vars_.end()) continue;
@@ -4480,7 +4495,6 @@ class OutWindowExternalizer {
             var_remap_[old_iter.get()] = new_iter;
             var_remap_[old_ret.get()] = new_ret;
             old_iter_args_to_erase.push_back(old_iter.get());
-            changed = true;
           }
           auto new_stmt = IRMutator::VisitStmt_(op);
           for (const auto* old_iter : old_iter_args_to_erase) {

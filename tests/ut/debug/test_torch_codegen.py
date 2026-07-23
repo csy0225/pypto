@@ -85,6 +85,102 @@ def test_tensor_add():
     assert "torch.add(a, b)" in code
 
 
+def test_tensor_view_codegen_and_execution():
+    """tensor.view should preserve logical shape and layout semantics."""
+    src = _tensor_var("src", [2, 4])
+    reshaped = _tensor_var("reshaped", [4, 2])
+    transposed = ir.Var(
+        "transposed",
+        ir.op.tensor.view(src, layout=ir.TensorLayout.DN).type,
+        _span(),
+    )
+    shape_call = ir.op.tensor.view(src, [4, 2])
+    layout_call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(reshaped, shape_call, _span()),
+            ir.AssignStmt(transposed, layout_call, _span()),
+            ir.ReturnStmt([reshaped, transposed], _span()),
+        ],
+        _span(),
+    )
+    func = _simple_function("view_main", [src], body, [reshaped.type, transposed.type])
+
+    code = torch_codegen(func)
+    assert "_tensor_view(src, (4, 2), False)" in code
+    assert "src.mT" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    value = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    actual_reshape, actual_transpose = ns["view_main"](value)
+    assert torch.equal(actual_reshape, value.reshape(4, 2))
+    assert torch.equal(actual_transpose, value.mT)
+
+
+def test_tensor_view_shape_and_layout_uses_target_stride():
+    """A combined shape/layout view should use the target canonical stride."""
+    src = _tensor_var("src", [2, 4])
+    result = ir.op.tensor.view(src, [4, 2], layout=ir.TensorLayout.DN)
+    out = ir.Var("out", result.type, _span())
+    body = ir.SeqStmts(
+        [ir.AssignStmt(out, result, _span()), ir.ReturnStmt([out], _span())],
+        _span(),
+    )
+    func = _simple_function("combined_view", [src], body, [out.type])
+
+    code = torch_codegen(func)
+    assert "_tensor_view(src, (4, 2), True)" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    value = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    actual = ns["combined_view"](value)
+    expected = torch.as_strided(value, (4, 2), (1, 4))
+    assert torch.equal(actual, expected)
+    assert actual.stride() == (1, 4)
+
+
+def test_tensor_view_explicit_valid_shape_codegen_and_execution():
+    """A three-argument view should reshape and preserve target validity metadata."""
+    src_view = ir.TensorView(
+        [_int(2048), _int(128), _int(1)],
+        ir.TensorLayout.ND,
+        valid_shape=[_int(1), _int(16), _int(128)],
+    )
+    src = ir.Var("src", ir.TensorType([2, 16, 128], DataType.FP32, None, src_view), _span())
+    result = ir.op.tensor.view(src, [32, 128], [16, 128])
+    out = ir.Var("out", result.type, _span())
+    body = ir.SeqStmts(
+        [ir.AssignStmt(out, result, _span()), ir.ReturnStmt([out], _span())],
+        _span(),
+    )
+    func = _simple_function("partial_view", [src], body, [out.type])
+
+    code = torch_codegen(func)
+    assert "_tensor_view(src, (32, 128), False, (16, 128))" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    value = torch.arange(4096, dtype=torch.float32).reshape(2, 16, 128)
+    actual = ns["partial_view"](value)
+    assert actual.shape == (32, 128)
+    assert actual.stride() == (128, 1)
+    assert actual._pypto_valid_shape == (16, 128)
+    assert actual._pypto_full_shape == (32, 128)
+
+
+def test_tensor_view_same_layout_is_identity():
+    """A layout-only view targeting the current layout should be an identity."""
+    src = _tensor_var("src", [2, 4])
+    result = ir.op.tensor.view(src, layout=ir.TensorLayout.ND)
+    out = ir.Var("out", result.type, _span())
+    func = _simple_function("same_layout", [src], ir.AssignStmt(out, result, _span()))
+
+    code = torch_codegen(func)
+    assert "out = src" in code
+
+
 def test_tensor_scalar_add():
     """tensor.adds should emit (a + scalar)."""
     a = _tensor_var("a", [64])
@@ -268,18 +364,6 @@ def test_tile_cmp():
     assert "(a < b)" in code
 
 
-def test_tile_reduction_with_axis():
-    """tile.sum with axis kwarg should emit .sum(dim=axis)."""
-    a = _tile_var("a", [64, 128])
-    out = _tile_var("out", [64, 1])
-
-    call = _op_call("tile.sum", [a], {"axis": -1, "keepdim": True})
-    assign = ir.AssignStmt(out, call, _span())
-    func = _simple_function("f", [a], assign)
-    code = torch_codegen(func)
-    assert ".sum(dim=-1, keepdim=True)" in code
-
-
 def test_tile_get_block_idx():
     """tile.get_block_idx should emit 0."""
     out = _scalar("idx", DataType.UINT64)
@@ -393,13 +477,25 @@ def test_if_else_with_return_vars():
 # ---------------------------------------------------------------------------
 
 
-def test_system_ops_are_noops():
+@pytest.mark.parametrize(
+    "op_name",
+    ["system.sync_src", "system.sync_set", "system.sync_wait", "system.set_ffts"],
+)
+def test_system_ops_are_noops(op_name):
     """System ops should emit no-op comments."""
-    sync_call = _op_call("system.sync_src", [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
-    body = ir.EvalStmt(sync_call, _span())
-    func = _simple_function("f", [], body)
+    params = []
+    if op_name == "system.sync_src":
+        call = _op_call(op_name, [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
+    elif op_name in ("system.sync_set", "system.sync_wait"):
+        call = _op_call(op_name, [], {"pipe": ir.PipeType.MTE2, "event_id": 0})
+    else:
+        workspace = _tensor_var("workspace", [256], DataType.INT64)
+        params = [workspace]
+        call = _op_call(op_name, [workspace])
+    body = ir.EvalStmt(call, _span())
+    func = _simple_function("f", params, body)
     code = torch_codegen(func)
-    assert "# sync_src" in code
+    assert f"# {op_name.split('.')[-1]}" in code
 
 
 # ---------------------------------------------------------------------------
@@ -1074,12 +1170,17 @@ def test_tensor_assemble_writes_source():
 
 
 def test_tensor_slice_out_of_bounds_is_padded():
-    """tensor.slice should pad to requested shape when slicing out of bounds."""
+    """tensor.slice should pad to requested shape when slicing out of bounds.
+
+    The window (rows 64..128 of a 96-row source) deliberately overhangs the
+    source, so the slice must say so with clamp=True; its valid region is then
+    the 32 rows that actually exist and the tail is padded.
+    """
     src = _tensor_var("src", [96, 64], DataType.FP32)
     result = _tensor_var("result", [64, 64], DataType.FP32)
     shapes = _make_tuple(_int(64), _int(64))
     offsets = _make_tuple(_int(64), _int(0))
-    call = _op_call("tensor.slice", [src, shapes, offsets])
+    call = _op_call("tensor.slice", [src, shapes, offsets], {"clamp": True})
     assign = ir.AssignStmt(result, call, _span())
     ret = ir.ReturnStmt([result], _span())
     body = ir.SeqStmts([assign, ret], _span())

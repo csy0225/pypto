@@ -1067,20 +1067,22 @@ class TestAutoTileMatmulL0MNTiling:
         """The full-K OS emit must hoist the SAME operand the chooser scored the
         wall under — a bandwidth-weighted (not raw-byte) decision.
 
-        320×320 @ 64 BF16 on Ascend910B → output-stationary, square tile
-        (m = n = 160), a 2×2 grid. The two operand panels are byte-identical
-        (160×64 vs 64×160 BF16), so raw interior-extract traffic **ties**
-        (T_row == T_col). But L0A is faster than L0B (~200 vs ~132 B/cyc), so
-        streaming A across the grid is cheaper than streaming B: the chooser's
-        min-hoist load scores **hold B** (held_b ≈ 720 < held_a ≈ 825 cyc), and
-        records it in ``os_holds_a``. The emit therefore hoists B (column-outer).
+        384×512 @ 64 BF16 on Ascend910B → output-stationary full-K tile
+        (m = 128, n = 256), a 3×2 grid. L0A is faster than L0B (~200 vs ~132
+        B/cyc), so streaming A on the fast port while holding B is cheaper than the
+        reverse: the chooser's min-hoist load scores **hold B**, recorded in
+        ``os_holds_a = False``. The emit therefore hoists B (column-outer).
 
         This is a regression pin for the chooser/emit hoist-objective unification:
-        the previous emit re-derived the hoist from raw bytes, and on this tie it
-        picked ``T_row <= T_col`` → **A** — a loop order the wall was never scored
-        under (``estimated_cost_cycles`` assumed B). The single-source
-        ``os_holds_a`` makes the emitted hoist match the scored hoist by
-        construction, so this asserts **B**; it fails ("A") on the pre-fix code."""
+        the previous emit re-derived the hoist from raw interior-extract bytes,
+        which can disagree with the bandwidth-weighted min-hoist the wall was scored
+        under (``estimated_cost_cycles``). The single-source ``os_holds_a`` makes the
+        emitted hoist match the scored hoist by construction, so this asserts **B**.
+
+        (The original byte-*tie* square case — 320×320@64 → 160×160 — is no longer
+        reachable: n=160 has odd(ceil(160/8))=odd(20)=5, so the FIXPIPE
+        misalignment penalty now prices that tile drain-bound and the chooser
+        avoids it. This aligned-N asymmetric shape exercises the same hoist path.)"""
 
         _backend.reset_for_testing()
         _backend.set_backend_type(BackendType.Ascend910B)
@@ -1090,17 +1092,17 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[320, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 320], pl.BF16],
-                out: pl.Out[pl.Tensor[[320, 320], pl.FP32]],
-            ) -> pl.Tensor[[320, 320], pl.FP32]:
-                lhs_mat: pl.Tile[[320, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [320, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[384, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[384, 512], pl.FP32]],
+            ) -> pl.Tensor[[384, 512], pl.FP32]:
+                lhs_mat: pl.Tile[[384, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [384, 64], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 320], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 320], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[64, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 512], target_memory=pl.Mem.Mat
                 )
-                c: pl.Tile[[320, 320], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                c: pl.Tile[[384, 512], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
                 out = pl.store(c, [0, 0], out)
                 return out
 
@@ -1112,16 +1114,16 @@ class TestAutoTileMatmulL0MNTiling:
         # this was A — the assertion that pins the fix.
         assert _full_k_stationary_operand(After) == "B", (
             "OS full-K emit must obey the scored bandwidth-weighted hoist (hold B), "
-            "not the raw-byte tie (which held A)"
+            "not the raw-byte heuristic"
         )
 
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
-        a = torch.randn(320, 64, dtype=torch.bfloat16)
-        b = torch.randn(64, 320, dtype=torch.bfloat16)
-        out = torch.zeros(320, 320, dtype=torch.float32)
+        a = torch.randn(384, 64, dtype=torch.bfloat16)
+        b = torch.randn(64, 512, dtype=torch.bfloat16)
+        out = torch.zeros(384, 512, dtype=torch.float32)
         ns: dict = {}
         exec(torch_codegen(After), ns)  # noqa: S102
         ns["kernel"](a, b, out)
@@ -1182,13 +1184,12 @@ class TestAutoTileMatmulL0MNTiling:
         outer (M) loop carrying A's extract + a **pipelined** inner (N) loop — one
         pipeline, not the two nested pipelines of the output-stationary path.
 
-        496×544 @ 64 → A-stationary (m=496, n=64, k=64) under the drain-count model
-        (#1912): A = [496, 64] = 63.5 KB fits L0A single-buffered (≤ 64 KB) but would
-        overflow double-buffered, so the single-buffered Sequential outer is what
-        makes the tile legal. n=64 (not the pre-drain-count n=32) cuts the drain
-        count in half; 544 = 8*64 + 32, so the inner pipeline runs the 8 full 64-wide
-        blocks and a straight-line 32-wide N-peel follows. The full Default pipeline
-        must allocate cleanly. (Numerics: st suite.)"""
+        256×544 @ 128 → A-stationary (m=256, n=128, k=128) under the per-M-row drain
+        cost model: A = [256, 128] = 64 KB fits L0A single-buffered (= 64 KB) but
+        would overflow double-buffered, so the single-buffered Sequential outer is
+        what makes the tile legal. 544 = 4*128 + 32, so the inner pipeline runs the 4
+        full 128-wide blocks and a straight-line 32-wide N-peel follows. The full
+        Default pipeline must allocate cleanly. (Numerics: st suite.)"""
         from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
 
         _backend.reset_for_testing()
@@ -1199,17 +1200,17 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[496, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 544], pl.BF16],
-                out: pl.Out[pl.Tensor[[496, 544], pl.FP32]],
-            ) -> pl.Tensor[[496, 544], pl.FP32]:
-                lhs_mat: pl.Tile[[496, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [496, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[256, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 544], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 544], pl.FP32]],
+            ) -> pl.Tensor[[256, 544], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 128], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 544], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[128, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 544], target_memory=pl.Mem.Mat
                 )
-                c: pl.Tile[[496, 544], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                c: pl.Tile[[256, 544], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
                 out = pl.store(c, [0, 0], out)
                 return out
 
@@ -1218,57 +1219,57 @@ class TestAutoTileMatmulL0MNTiling:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                lhs: pl.Tensor[[496, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 544], pl.BF16],
-                out: pl.Out[pl.Tensor[[496, 544], pl.FP32]],
-            ) -> pl.Tensor[[496, 544], pl.FP32]:
-                lhs_mat: pl.Tile[[496, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [496, 64], target_memory=pl.Mem.Mat
+                lhs: pl.Tensor[[256, 128], pl.BF16],
+                rhs: pl.Tensor[[128, 544], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 544], pl.FP32]],
+            ) -> pl.Tensor[[256, 544], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 128], target_memory=pl.Mem.Mat
                 )
-                rhs_mat: pl.Tile[[64, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 544], target_memory=pl.Mem.Mat
+                rhs_mat: pl.Tile[[128, 544], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [128, 544], target_memory=pl.Mem.Mat
                 )
                 # Sequential outer (M) loop holds the single-buffered A panel (full L0A).
-                for mo, (out_o,) in pl.range(0, 496, 496, init_values=(out,)):
-                    a_held: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
-                        lhs_mat, mo, 0, [496, 64], target_memory=pl.Mem.Left
+                for mo, (out_o,) in pl.range(0, 256, 256, init_values=(out,)):
+                    a_held: pl.Tile[[256, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, mo, 0, [256, 128], target_memory=pl.Mem.Left
                     )
-                    # Pipelined inner (N) loop over the 8 full 64-wide blocks; B double-buffered.
+                    # Pipelined inner (N) loop over the 4 full 128-wide blocks; B double-buffered.
                     for ni, (out_i,) in pl.pipeline(
-                        0, 512, 64, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
+                        0, 512, 128, stage=2, init_values=(out_o,), attrs={"pipeline_overlap_stores": False}
                     ):
-                        b_mov: pl.Tile[[64, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                            rhs_mat, 0, ni, [64, 64], target_memory=pl.Mem.Right
+                        b_mov: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                            rhs_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
                         )
-                        c_sub: pl.Tile[[496, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
-                        out_s: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_sub, [mo, ni], out_i)
+                        c_sub: pl.Tile[[256, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_held, b_mov)
+                        out_s: pl.Tensor[[256, 544], pl.FP32] = pl.store(c_sub, [mo, ni], out_i)
                         out_iy = pl.yield_(out_s)
                     out_oy = pl.yield_(out_iy)
-                # N-boundary peel: the last 32-wide block (544 = 8*64 + 32), straight-line.
-                a_peel: pl.Tile[[496, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
-                    lhs_mat, 0, 0, [496, 64], target_memory=pl.Mem.Left
+                # N-boundary peel: the last 32-wide block (544 = 4*128 + 32), straight-line.
+                a_peel: pl.Tile[[256, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                    lhs_mat, 0, 0, [256, 128], target_memory=pl.Mem.Left
                 )
-                b_peel: pl.Tile[[64, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
-                    rhs_mat, 0, 512, [64, 32], target_memory=pl.Mem.Right
+                b_peel: pl.Tile[[128, 32], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                    rhs_mat, 0, 512, [128, 32], target_memory=pl.Mem.Right
                 )
-                c_peel: pl.Tile[[496, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_peel, b_peel)
-                out_peel: pl.Tensor[[496, 544], pl.FP32] = pl.store(c_peel, [0, 512], out_oy)
+                c_peel: pl.Tile[[256, 32], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_peel, b_peel)
+                out_peel: pl.Tensor[[256, 544], pl.FP32] = pl.store(c_peel, [0, 512], out_oy)
                 return out_peel
 
         After = passes.auto_tile_matmul_l0()(Before)
         ir.assert_structural_equal(After, Expected)
         # The chooser's single-buffered A tile must also allocate without an L0A
-        # overflow through the full pipeline (A = 63.5 KB single-buffered; double-
-        # buffering it, 127 KB, would exceed the 64 KB L0A).
+        # overflow through the full pipeline (A = 64 KB single-buffered; double-
+        # buffering it, 128 KB, would exceed the 64 KB L0A).
         assert PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before) is not None
 
         torch = pytest.importorskip("torch")
         from pypto.debug import torch_codegen  # noqa: PLC0415
 
         torch.manual_seed(0)
-        a = torch.randn(496, 64, dtype=torch.bfloat16)
-        b = torch.randn(64, 544, dtype=torch.bfloat16)
-        out = torch.zeros(496, 544, dtype=torch.float32)
+        a = torch.randn(256, 128, dtype=torch.bfloat16)
+        b = torch.randn(128, 544, dtype=torch.bfloat16)
+        out = torch.zeros(256, 544, dtype=torch.float32)
         ns: dict = {}
         exec(torch_codegen(After), ns)  # noqa: S102
         ns["kernel"](a, b, out)
@@ -1432,6 +1433,135 @@ class TestAutoTileMatmulL0MNTiling:
         for i in matmul_idxs:
             assert i + 1 < len(seq) and seq[i + 1] == "store", (
                 f"matmul at {i} not immediately followed by its store (two-accumulator schedule): {seq}"
+            )
+
+    def _colive_seq(self, program):
+        """Op sequence (extract/matmul/store) of the inner body after the tile sub-pipeline
+        (auto_tile -> infer_mem -> lower_pipeline -> canonicalize_io_order)."""
+        prog = passes.auto_tile_matmul_l0()(program)
+        prog = passes.infer_tile_memory_space()(prog)
+        prog = passes.lower_pipeline_loops()(prog)
+        prog = passes.canonicalize_io_order()(prog)
+        seq = []
+        for line in ir.python_print(prog).splitlines():
+            s = line.strip()
+            if ".extract(" in s and ("Left" in s or "Right" in s):
+                seq.append("matmul_extract")
+            elif "matmul" in s and "=" in s:
+                seq.append("matmul")
+            elif ".store(" in s and "=" in s:
+                seq.append("store")
+        return seq
+
+    def test_dbc2_ptoas_co_lives_two_l0c_accumulators(self):
+        """Golden co-live check for dbC=2 (companion to the dbC=1 test above).
+
+        Under ``memory_planner=PTOAS`` a dbC=2-eligible full-K grid emits the
+        two-accumulator ping-pong: ``CanonicalizeIOOrder`` floats **both** stores below
+        **both** matmuls (``matmul, matmul, store, store``), so two L0C accumulators are
+        live at once. Under the default PyPTO planner the *same shape* stays dbC=1 and
+        interleaves each store with its matmul (``matmul, store, …``). This pins the
+        co-live ordering (subtle -- the nested-context bug silently disabled it once) and
+        the planner gate in one test.
+
+        256x64x256 BF16: chooser picks a 2x2 dbC=2 grid; each accumulator (128x128 or
+        smaller, <= L0C/2) leaves room for two co-live buffers.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        # PTOAS: dbC=2 -> at least one adjacent matmul,matmul (two co-live accumulators),
+        # and the stores float below (a matmul,matmul,store,store window exists).
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            ptoas_seq = self._colive_seq(Before)
+        mm = [i for i, op in enumerate(ptoas_seq) if op == "matmul"]
+        assert mm, f"expected matmuls under PTOAS: {ptoas_seq}"
+        assert any(i + 1 < len(ptoas_seq) and ptoas_seq[i + 1] == "matmul" for i in mm), (
+            f"dbC=2 (PTOAS) must co-live two accumulators (adjacent matmul,matmul), got: {ptoas_seq}"
+        )
+        assert any(
+            ptoas_seq[i : i + 4] == ["matmul", "matmul", "store", "store"] for i in range(len(ptoas_seq) - 3)
+        ), f"dbC=2 (PTOAS) must float both stores below both matmuls (matmul,matmul,store,store): {ptoas_seq}"
+
+        # Default PyPTO planner: dbC=1 -> every matmul is immediately followed by its store
+        # (no two co-live accumulators), for the SAME shape.
+        pypto_seq = self._colive_seq(Before)
+        mm2 = [i for i, op in enumerate(pypto_seq) if op == "matmul"]
+        assert mm2, f"expected matmuls under PyPTO: {pypto_seq}"
+        for i in mm2:
+            assert i + 1 < len(pypto_seq) and pypto_seq[i + 1] == "store", (
+                f"dbC=1 (PyPTO) must interleave matmul,store (one accumulator), got: {pypto_seq}"
+            )
+
+    def test_dbc2_pypto_flag_allocates_ping_pong(self):
+        """The experimental ``enable_pypto_l0c_double_buffer`` opt-in makes the PyPTO
+        memory planner allocate the dbC=2 ping-pong: the pipeline-membership tagger gives
+        the accumulator a flat depth-2 membership, so MemoryReuse's capacity gate keeps
+        the two co-live L0C accumulators in distinct buffers. Default off: the same shape
+        coalesces to a single accumulator. Pins the opt-in gate + the end-to-end
+        allocation (the golden test above only pins the emit ordering)."""
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                return out
+
+        def acc_buffer_count() -> int:
+            """Distinct L0C (Acc) buffers after the full Default pipeline."""
+            prog = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+            bases = {
+                line.strip().split(":")[0]
+                for line in ir.python_print(prog).splitlines()
+                if "tile.alloc(pl.Mem.Acc" in line
+            }
+            return len(bases)
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+            assert acc_buffer_count() == 1, "PyPTO default must keep a single L0C accumulator (dbC=1)"
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        with passes.PassContext(
+            [], memory_planner=passes.MemoryPlanner.PYPTO, enable_pypto_l0c_double_buffer=True
+        ):
+            assert acc_buffer_count() == 2, (
+                "PyPTO + opt-in flag must allocate the dbC=2 ping-pong (two co-live L0C accumulators)"
             )
 
     @pytest.mark.parametrize(
@@ -1796,7 +1926,7 @@ class TestAutoTileMatmulL0MatScratch:
 
     def test_chained_mat_scratch_producer_forced_output_stationary(self):
         """#1908 guard: a chained Mat-scratch producer whose geometry standalone picks
-        B-stationary (128×272×64) is forced OUTPUT-STATIONARY when its result is consumed
+        B-stationary (128×512×128) is forced OUTPUT-STATIONARY when its result is consumed
         on-chip. The Mat-scratch offset-packing path can't yet pack an A/B-stationary
         producer's monolithic single-buffered L0 panel against the consumer's
         double-buffered operands (#1908), so the pass re-chooses OS (always legal) rather
@@ -1804,8 +1934,8 @@ class TestAutoTileMatmulL0MatScratch:
         standalone (``test_b_stationary_single_buffers_held_operand`` mirror) — as a
         chained producer it must not be.
 
-        128×272 FP32 output (136 KB) > L0c so the producer is tiled; the 128×272 bf16
-        Mat scratch (68 KB) fits Mat/L1, so it reaches the fold (not the capacity gate).
+        128×512 FP32 output (256 KB) > L0c so the producer is tiled; the 128×512 bf16
+        Mat scratch (128 KB) fits Mat/L1, so it reaches the fold (not the capacity gate).
         The consumer [128, 64] fits L0c (no loop), so any Sequential ``pl.range`` in the
         emitted kernel would be the producer's A/B-stationary held-operand loop."""
         _backend.reset_for_testing()
@@ -1816,12 +1946,12 @@ class TestAutoTileMatmulL0MatScratch:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                a: pl.Tensor[[128, 64], pl.BF16],
-                b: pl.Tensor[[64, 272], pl.BF16],
-                e: pl.Tensor[[272, 64], pl.BF16],
+                a: pl.Tensor[[128, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                e: pl.Tensor[[512, 64], pl.BF16],
                 out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
             ) -> pl.Tensor[[128, 64], pl.FP32]:
-                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 272] f32 > L0c → Mat scratch
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 512] f32 > L0c → Mat scratch
                 cb = pl.cast(c, pl.BF16, mode="rint")
                 d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumes the scratch as a matmul operand
                 out = pl.assemble(out, d, [0, 0])

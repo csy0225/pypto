@@ -29,6 +29,7 @@ __all__ = [
     "load",
     "store",
     "assemble",
+    "gather_row",
     "extract",
     "scatter_update",
     "concat",
@@ -105,11 +106,11 @@ __all__ = [
     "minimum",
     "cmp",
     "cmps",
-    "sum",
     "max",
     "min",
     "slice",
     "reshape",
+    "reinterpret_view",
     "transpose",
     "transpose_view",
     "set_validshape",
@@ -158,7 +159,7 @@ __all__ = [
 ]
 
 from pypto.ir.op import tile_ops as _ir_ops
-from pypto.ir.utils import _get_span_or_capture, _normalize_expr
+from pypto.ir.utils import _get_span_or_capture, _normalize_expr, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
@@ -261,41 +262,19 @@ def _normalize_intlike(seq: Sequence[IntLike]) -> list[int | Expr]:
 def _scalar_operand_to_expr(value: int | Scalar | Expr) -> Expr:
     """Coerce a scalar-binary operand to an ``Expr``.
 
-    Used by the scalar-pair branches of ``tile.min`` / ``tile.max``: ``Scalar``
-    is unwrapped to its inner ``Expr``, raw ``Expr`` is forwarded as-is, and a
-    bare ``int`` is materialized as ``ConstInt(.., INDEX)`` with the span
-    pinned by the parser if any (so error messages and dumps point at the
-    user's source line, not this wrapper). ``INDEX`` matches the dtype the
-    parser uses for plain int literals, so round-tripped programs don't
-    sprout spurious casts on otherwise-equivalent constants.
+    Used by ``min`` / ``max``: ``Scalar`` is unwrapped to its inner ``Expr``, raw
+    ``Expr`` is forwarded as-is, and a bare ``int`` is materialized as
+    ``ConstInt(.., INDEX)`` with the span pinned by the parser if any (so error
+    messages and dumps point at the user's source line, not this wrapper).
+    ``INDEX`` matches the dtype the parser uses for plain int literals, so
+    round-tripped programs don't sprout spurious casts on otherwise-equivalent
+    constants.
     """
     if isinstance(value, Scalar):
         return value.unwrap()
     if isinstance(value, Expr):
         return value
     return _ir_core.ConstInt(value, DataType.INDEX, _get_span_or_capture())
-
-
-def _axis_to_int(axis: int | Scalar | Expr) -> int:
-    """Coerce a compile-time axis argument to a Python ``int``.
-
-    The parser passes integer literals through as raw ``ConstInt`` (to
-    preserve dtype) — accept that shape and unwrap. Direct callers can
-    still pass a bare ``int``.
-    """
-    if isinstance(axis, bool):  # bool is an int subclass; reject explicitly
-        raise TypeError(f"axis must be int, got bool ({axis!r})")
-    if isinstance(axis, int):
-        return axis
-    if isinstance(axis, _ir_core.ConstInt):
-        return int(axis.value)
-    if isinstance(axis, Scalar):
-        inner = axis.unwrap()
-        if isinstance(inner, _ir_core.ConstInt):
-            return int(inner.value)
-    raise TypeError(
-        f"axis must be a compile-time int (or ConstInt/Scalar wrapping one), got {type(axis).__name__}"
-    )
 
 
 def create(
@@ -381,8 +360,14 @@ def load(
     shapes: Sequence[IntLike],
     valid_shapes: Sequence[IntLike] | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
+    clamp: bool = False,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
+
+    Only the valid extent is read, so the tile may be larger than the region that
+    exists in the source. The tile's valid region is the source's valid region,
+    shifted by ``offsets`` and cut to the tile — a load never reports source bytes
+    that do not exist as real data.
 
     Args:
         tensor: Source tensor
@@ -393,7 +378,12 @@ def load(
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
-            as valid_shape. Uses the same coordinate convention as shapes.
+            as valid_shape. Uses the same coordinate convention as shapes. Narrows
+            the tile; cannot widen it past what the source has.
+        clamp: Sanction a read that runs off the end of the source. By default a
+            load asserts ``offsets + valid_shapes`` stays inside the source and is
+            rejected when that provably fails; ``clamp=True`` cuts the request back
+            to the source edge instead.
 
     Returns:
         Tile wrapping the load operation
@@ -410,6 +400,7 @@ def load(
         _normalize_intlike(shapes),
         _normalize_intlike(valid_shapes),
         target_memory,
+        clamp=clamp,
     )
     return Tile(expr=call_expr)
 
@@ -472,6 +463,49 @@ def assemble(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile:
         Tile wrapping the assemble operation
     """
     call_expr = _ir_ops.assemble(target.unwrap(), source.unwrap(), _normalize_intlike(offset))
+    return Tile(expr=call_expr)
+
+
+def gather_row(
+    dst: Tile,
+    src: Tensor,
+    dst_offset: Sequence[IntLike],
+    src_offset: Sequence[IntLike],
+    shapes: Sequence[IntLike],
+    transpose: bool = False,
+) -> Tile:
+    """Load one GM row directly into a sub-region of an on-chip tile (DPS).
+
+    Per-row primitive of the paged-gather lowering: DMAs one GM row window
+    straight into ``dst`` at ``dst_offset`` (``pto.subview`` of ``dst`` +
+    ``pto.tload``, ``GM -> on-chip``, no ``pto.tmov``). The caller computes the
+    physical ``src_offset`` (block-table lookup + bias) and the ``dst_offset``
+    slot itself, so arbitrary gather logic stays in the kernel. Writes ``dst``
+    in place, so a loop-carried accumulator is filled row by row and feeds
+    ``pl.matmul`` directly — the tile-level counterpart of
+    :func:`pypto.language.op.tensor_ops.gather_row`.
+
+    Args:
+        dst: Destination on-chip accumulator tile (Mat/L1 or Vec/UB).
+        src: Source pool in GM (a ``Tensor``).
+        dst_offset: ``[row, col]`` slot within ``dst`` to write.
+        src_offset: ``[row, col]`` physical offset within the GM ``src``.
+        shapes: GM row window shape ``[r, c]`` (typically ``[1, size]``).
+        transpose: Place the GM row ``[r, c]`` as an on-chip column ``[c, r]`` —
+            fills a matmul ``b_trans`` B-operand without a GM round-trip
+            (Mat/L1 only).
+
+    Returns:
+        Tile aliasing ``dst`` (written in place).
+    """
+    call_expr = _ir_ops.gather_row(
+        dst.unwrap(),
+        src.unwrap(),
+        _normalize_intlike(dst_offset),
+        _normalize_intlike(src_offset),
+        _normalize_intlike(shapes),
+        transpose,
+    )
     return Tile(expr=call_expr)
 
 
@@ -1201,7 +1235,8 @@ def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_max operation
@@ -1215,7 +1250,8 @@ def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_sum operation
@@ -1229,7 +1265,8 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_min operation
@@ -1243,7 +1280,8 @@ def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_prod operation
@@ -1315,7 +1353,7 @@ def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the row_argmax operation
@@ -1329,7 +1367,7 @@ def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the row_argmin operation
@@ -1664,79 +1702,36 @@ def cmps(lhs: Tile, rhs: int | float | Expr | Scalar, cmp_type: int = 0) -> Tile
     return Tile(expr=call_expr)
 
 
-def sum(tile: Tile, axis: int, keepdim: bool = False) -> Tile:
-    """Sum reduction along specified axis.
+def max(lhs: Scalar | int | Expr, rhs: Scalar | int | Expr) -> Scalar:
+    """Scalar max of two values.
+
+    Tile reductions are direction-specific — use :func:`row_max` (collapses the
+    last axis) or :func:`col_max` (collapses axis 0).
 
     Args:
-        tile: Input tile
-        axis: Reduction axis (0 for rows, 1 for columns, -1 for last)
-        keepdim: Whether to keep the reduced dimension as 1
+        lhs: First scalar operand
+        rhs: Second scalar operand
 
     Returns:
-        Tile wrapping the sum operation
+        Scalar wrapping the max operation
     """
-    call_expr = _ir_ops.sum(tile.unwrap(), _axis_to_int(axis), keepdim)
-    return Tile(expr=call_expr)
+    return Scalar(expr=_ir_core.max_(_scalar_operand_to_expr(lhs), _scalar_operand_to_expr(rhs)))
 
 
-@overload
-def max(tile: Tile, axis: int, keepdim: bool = False) -> Tile: ...
+def min(lhs: Scalar | int | Expr, rhs: Scalar | int | Expr) -> Scalar:
+    """Scalar min of two values.
 
-
-@overload
-def max(tile: Scalar, axis: Scalar | int, keepdim: bool = False) -> Scalar: ...
-
-
-def max(tile: Tile | Scalar, axis: int | Scalar | Expr = 0, keepdim: bool = False) -> Tile | Scalar:
-    """Max reduction along specified axis, or scalar max of two values.
+    Tile reductions are direction-specific — use :func:`row_min` (collapses the
+    last axis) or :func:`col_min` (collapses axis 0).
 
     Args:
-        tile: Input tile or first scalar operand
-        axis: Reduction axis (for tiles) or second scalar operand
-        keepdim: Whether to keep the reduced dimension as 1 (tiles only)
+        lhs: First scalar operand
+        rhs: Second scalar operand
 
     Returns:
-        Tile or Scalar wrapping the max operation
+        Scalar wrapping the min operation
     """
-    if isinstance(tile, Scalar):
-        return Scalar(expr=_ir_core.max_(tile.unwrap(), _scalar_operand_to_expr(axis)))
-    call_expr = _ir_ops.max(tile.unwrap(), _axis_to_int(axis), keepdim)
-    return Tile(expr=call_expr)
-
-
-@overload
-def min(tile: Tile, axis: int, keepdim: bool = False) -> Tile: ...
-
-
-@overload
-def min(tile: Scalar, axis: Scalar | int, keepdim: bool = False) -> Scalar: ...
-
-
-@overload
-def min(tile: int, axis: Scalar | int, keepdim: bool = False) -> Scalar: ...
-
-
-def min(
-    tile: Tile | Scalar | int | Expr,
-    axis: int | Scalar | Expr = 0,
-    keepdim: bool = False,
-) -> Tile | Scalar:
-    """Min reduction along specified axis, or scalar min of two values.
-
-    Args:
-        tile: Input tile or first scalar operand
-        axis: Reduction axis (for tiles) or second scalar operand
-        keepdim: Whether to keep the reduced dimension as 1 (tiles only)
-
-    Returns:
-        Tile or Scalar wrapping the min operation
-    """
-    if isinstance(tile, (Scalar, int, Expr)):
-        lhs = _scalar_operand_to_expr(tile)
-        rhs = _scalar_operand_to_expr(axis)
-        return Scalar(expr=_ir_core.min_(lhs, rhs))
-    call_expr = _ir_ops.min(tile.unwrap(), _axis_to_int(axis), keepdim)
-    return Tile(expr=call_expr)
+    return Scalar(expr=_ir_core.min_(_scalar_operand_to_expr(lhs), _scalar_operand_to_expr(rhs)))
 
 
 def slice(
@@ -1749,31 +1744,50 @@ def slice(
 ) -> Tile:
     """Create a slice of a tile with static shape and optional valid shape.
 
+    The slice is never valid where the source tile is not: the source's valid
+    region, shifted by ``offset`` and cut to the window, bounds the result.
+
     Args:
         tile: Input tile
         shape: Static shape dimensions. Always full-rank — a scalar-indexed axis
             contributes a unit dim here and is listed in ``drop_dims``.
         offset: Offset dimensions for the slice
-        valid_shape: Valid shape dimensions. When omitted, shape is reused as the
-            logical valid shape.
+        valid_shape: Valid shape dimensions. When omitted, the source's validity
+            under the window is used. Narrows the result; cannot widen it.
         drop_dims: Optional axes to erase from the result type (numpy-style rank
-            reduction). Each listed axis must be a static unit dim of ``shape``.
+            reduction). Each listed axis must be a static unit dim of ``shape``
+            and must still be fully valid after the intersection above.
             Because tiles are physically 2D, the result is clamped back to 2D
             if reduction would take it below 2D. ``None`` / ``[]`` drops nothing.
         pad_value: Optional padding mode for out-of-valid-shape elements.
-            ``None`` or ``PadValue.null`` means no padding (the default).
+            ``None`` means the source's padding mode carries through.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
-            spelling as :func:`tile.fillpad`). Only meaningful when
-            ``valid_shape`` is smaller than ``shape``.
+            spelling as :func:`tile.fillpad`). Only meaningful when the
+            *effective* valid region is smaller than ``shape`` — which an explicit
+            ``valid_shape`` or a partially-valid source tile can each bring about.
 
     Returns:
         Tile wrapping the slice operation
+
+    Note:
+        Unlike :func:`pypto.language.op.tensor.slice`, there is no ``clamp``
+        option: an on-chip window has nothing that could clamp it, so
+        ``offset + shape`` must stay inside the source tile.
     """
-    if pad_value is not None and pad_value is not PadValue.null and valid_shape is None:
+    # pad_value paints whatever falls outside the *effective* valid region, and an
+    # explicit valid_shape is only one way to narrow it — a partially-valid source
+    # tile narrows it on its own. Warn only when neither can apply.
+    if (
+        pad_value is not None
+        and pad_value is not PadValue.null
+        and valid_shape is None
+        and not has_partial_valid_region(tile.unwrap())
+    ):
         warnings.warn(
-            f"tile.slice received pad_value={pad_value!r} but no valid_shape. "
-            f"pad_value has no effect unless valid_shape is smaller than shape. "
+            f"tile.slice received pad_value={pad_value!r} but no valid_shape and a "
+            f"fully-valid source. "
+            f"pad_value has no effect unless the valid region is smaller than shape. "
             f"If you intend to narrow the valid region later via "
             f"tile.set_validshape, you can ignore this warning; otherwise "
             f"pass valid_shape=... to tile.slice.",
@@ -1805,6 +1819,29 @@ def reshape(tile: Tile, shape: Sequence[IntLike]) -> Tile:
     """
     tile_expr = tile.unwrap()
     call_expr = _ir_ops.reshape(tile_expr, _normalize_intlike(shape))
+    return Tile(expr=call_expr)
+
+
+def reinterpret_view(
+    data: Tile,
+    dtype: DataType,
+    *,
+    shape: Sequence[IntLike] | None = None,
+) -> Tile:
+    """Reinterpret a tile over the same bytes with a different dtype.
+
+    Args:
+        data: Input tile.
+        dtype: Target element dtype, which must differ from the source dtype.
+        shape: Optional byte-equivalent target shape. When omitted, the
+            physically contiguous dimension is scaled according to the
+            source/target dtype byte ratio.
+
+    Returns:
+        Tile wrapping the zero-copy reinterpret-view operation.
+    """
+    normalized_shape = None if shape is None else _normalize_intlike(shape)
+    call_expr = _ir_ops.reinterpret_view(data.unwrap(), dtype, shape=normalized_shape)
     return Tile(expr=call_expr)
 
 
@@ -2404,8 +2441,10 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
 
     Args:
         src: Source tile (FP16, FP32, INT16, or INT32)
-        indices: Index tile (INT32) — selects which elements of ``src`` to gather
-        tmp: Temporary workspace tile (INT32) required by the hardware
+        indices: Index tile (INT32 with any src, or INT16 with a 16-bit src — FP16/INT16);
+            selects which elements of ``src`` to gather
+        tmp: Temporary workspace tile (any Vec dtype; required as an operand but
+            not constrained by the A5 index form — A2/A3 narrows this at PTOAS)
 
     Returns:
         Tile with gathered elements (same dtype as ``src``)

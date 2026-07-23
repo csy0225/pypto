@@ -19,6 +19,29 @@
 
 该 Pass 执行后，程序中不再存在 `FunctionType::InCore` 函数。
 
+### 手写 Group 的共享参数 ABI
+
+一次运行时 `MixedKernels` 提交会创建一个协同调度的 AIC/AIV task，其中所有
+active lane 共用同一份 `L0TaskArgs` payload。因此，两个已编译 kernel wrapper
+必须按完全相同的 tensors-first 参数布局解包。由 mixed-kernel 拆分器生成的 Group
+天然满足这一约束，因为两个成员调用都会转发完整的 Group 签名。
+
+手写 `pl.cluster()` 则可能提交源签名不同的成员，例如
+`cube(q, k, v, sink, task)` 与 `vec(out, task)`；outline 后的 Group 会捕获这些值的
+并集。本 Pass 会把两个 DSL 成员都归一化为该 Group 签名，并改写两个内层 `Call`
+或 `Submit`，使其转发完整参数列表。未使用的参数仍是合法的 wrapper 参数；克隆后的
+函数体依旧只引用原调用实际使用的值。
+
+当两个成员 kernel 都只属于该 Group 时，保留其原函数名。如果任一 kernel 还有其他
+调用点，Pass 会生成一对 Group 私有 adapter，并把
+`import_peer_buffer(peer_func=...)` 改写为 adapter 的 peer 名称，从而为其他调用者保留
+原 ABI。外部源码和 runtime-bound 成员无法安全克隆函数体；若它们的参数布局不同，
+Pass 会拒绝该 Group，并要求两个声明使用相同签名。
+
+归一化发生在 `InjectGMPipeBuffer` 之前，因此后端注入的 `__gm_pipe_buffer` 会追加到
+已经一致的两个成员签名末尾。该过程不需要 `sync_start`：AIC 与 AIV 是同一个 mixed
+task 的 subslot，而 `sync_start` 控制的是多 block SPMD 启动准入。
+
 ## 不可切分的转置：报错而非降级
 
 当内核含有一个**交换了切分轴**的 `tile.transpose` 时,**请求的向量切分会被以 `ValueError` 拒绝**。`tile.transpose` 交换两个轴,于是每个 lane 的切分数据迁移到了*另一个*维度,而 `SplitVectorKernel` 仍按*原*切分轴减半 —— 它无法正确定型这种转置,结果形状错误并会算错。这与切分模式(UP_DOWN dim 0 / LEFT_RIGHT dim 1)和 dtype 都无关。
@@ -30,7 +53,7 @@
 
 `split_axis::FindTransposeSplitHazard` 在 `ExpandMixedFunction` 开头检测:标记**第一个**在切分轴上非 singleton 的 `tile.transpose` 源(若源在切分轴上是 singleton,则不携带切分数据 —— 即广播 no-op 情形 —— 保持切分;动态的非 `ConstInt` extent 视为非 singleton,保守标记)。
 
-该整函数检查只读取**单个** `func->GetSplitMode()`,无法表达多模式函数。当 `ExpandMixedKernel` 运行时,任何一等公民 `SplitAivScopeStmt` 区域均已被 [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)(pass 20)消费并擦除,后者已用**每个区域**各自的切分轴校验其转置风险,并在函数上打 `split_aiv_region_validated`。因此本 pass 对携带 `split_aiv_region_validated` 的函数跳过单一函数级模式的转置检查(AUTO 整函数路径保持不变);作用域节点永不到达此处 —— 只剩逐算子的 `aiv_shard` / `aic_gather` 标记。
+该整函数检查只读取**单个** `func->GetSplitMode()`,无法表达多模式函数。当 `ExpandMixedKernel` 运行时,任何一等公民 `SplitAivScopeStmt` 区域均已被 [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md)(pass 18)消费并擦除,后者已用**每个区域**各自的切分轴校验其转置风险,并在函数上打 `split_aiv_region_validated`。因此本 pass 对携带 `split_aiv_region_validated` 的函数跳过单一函数级模式的转置检查(AUTO 整函数路径保持不变);作用域节点永不到达此处 —— 只剩逐算子的 `aiv_shard` / `aic_gather` 标记。
 
 CV 边界的跨核心数据传输通过将显式 `tile.move` 操作拆分为 `tpush`/`tpop` 对来处理：
 
@@ -138,8 +161,8 @@ replay 路径强制为 `valid_shape=[0, 0]`，同时屏蔽可见的 `tile.store`
 握手对称，同时让第二个同步 lane 避免真实 DMA/计算工作。
 
 此 replay 路径仅适用于**非 `split_aiv`** 的 mixed kernel。携带 `pl.split_aiv` 区域的函数——任意模式，包括任务并行的
-`pl.SplitMode.NONE`——会被 [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)（pass 20）标记 `split_aiv`，因此
-[`SplitVectorKernel`](23-split_vector_kernel.md) 会将其走 split 路径（两个 AIV lane 经由 `dual_aiv_dispatch` 派发），
+`pl.SplitMode.NONE`——会被 [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md)（pass 18）标记 `split_aiv`，因此
+[`SplitVectorKernel`](21-split_vector_kernel.md) 会将其走 split 路径（两个 AIV lane 经由 `dual_aiv_dispatch` 派发），
 而非上述 lane-0-only 的 replay。对 `NONE` 区域这正是所需：两个 lane 都运行**完整**函数体，处理由 `aiv_id` 分派的
 不相交工作——丢弃 lane-1 的 store 会导致误编译。
 
@@ -220,6 +243,11 @@ program_expanded = expand_pass(program)
 阶段 3 — 改写 Group 调用者：
   对于每个调用了已拆分 InCore 的 Group 函数，将 InCore 调用替换为
   AIC 调用 + AIV 调用序列（AIC 用 EvalStmt，AIV 用 AssignStmt）。
+
+阶段 4 — 归一化手写 mixed Group 的 ABI：
+  对于 AIC/AIV 调用未同时转发完整 Group 签名的 Group，把两个 DSL 成员函数体
+  重建到同一份 canonical 参数列表上，并改写两个 Call/Submit 以传入完整列表。
+  独占成员保留原函数名；否则创建 Group 私有 adapter，并同步重定向 peer_func。
 ```
 
 **亲和性分类**：

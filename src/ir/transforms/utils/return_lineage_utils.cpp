@@ -28,6 +28,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
@@ -37,10 +38,7 @@ namespace return_lineage {
 
 namespace {
 
-bool IsBuiltinOp(const std::string& op_name) {
-  return op_name.find("tile.") == 0 || op_name.find("tensor.") == 0 || op_name.find("system.") == 0 ||
-         op_name.find("array.") == 0;
-}
+using op_predicates::IsBuiltinOp;
 
 CallPtr AsCallOrSubmitView(const ExprPtr& expr) {
   if (auto call = As<Call>(expr)) return call;
@@ -213,6 +211,84 @@ std::vector<std::optional<size_t>> TraceExprsToParamIndices(const std::vector<Ex
   return result;
 }
 
+// Expand a return that forwards a multi-result call's *whole tuple*:
+//
+//     result = self.inner(...)   # TupleType, N results
+//     return result              # ONE return expr, but N return positions
+//
+// This is the shape a Group/Spmd wrapper takes when the inner kernel has more
+// than one result (the outliner emits the call, binds its tuple to one SSA var,
+// and returns that var). ``TraceVar`` cannot describe it: it resolves a var to a
+// *single* param root, and its user-call branch deliberately bails on a
+// multi-result callee (``ret_map.size() != 1``). Without this expansion the
+// wrapper's map comes back as a bogus ``[nullopt]``, every caller that
+// destructures the wrapper sees an imprecise map, and they all fall back to the
+// legacy tail-alignment heuristic -- which shifts each returned element onto the
+// wrong Out/InOut param whenever the callee writes an Out/InOut param it does
+// not return (accumulators, ``__gm_pipe_buffer``, an in-place-written KV cache).
+// That is issue #1573 resurfacing on exactly the Group/Spmd wrappers its fix
+// left on the heuristic.
+//
+// So resolve the tuple var's defining call, take the callee's own returned-param
+// map, and re-map each position through the call's args back onto ``params``.
+// Returns {} when the shape is not a recognisable forward; callers then keep
+// their previous behaviour.
+std::vector<std::optional<size_t>> ExpandForwardedTupleVar(const Var* tuple_var,
+                                                           const BodyIndexCollector& index,
+                                                           const std::vector<VarPtr>& params,
+                                                           const ProgramPtr& program) {
+  std::unordered_set<const Var*> param_set;
+  for (const auto& p : params) param_set.insert(p.get());
+
+  // Walk SSA var-to-var aliases down to the statement that defines the tuple.
+  const Var* var = tuple_var;
+  std::unordered_set<const Var*> seen;
+  CallPtr call;
+  while (var) {
+    if (!seen.insert(var).second) return {};
+    auto def_it = index.var_def.find(var);
+    if (def_it == index.var_def.end()) return {};
+    const auto& value = def_it->second->value_;
+    if (auto rhs_var = AsVarLike(value)) {
+      var = rhs_var.get();
+      continue;
+    }
+    // A literal tuple construction: each element traces on its own.
+    if (auto make_tuple = As<MakeTuple>(value)) {
+      return TraceExprsToParamIndices(make_tuple->elements_, index, params, program);
+    }
+    call = AsCallOrSubmitView(value);
+    break;
+  }
+  if (!call || IsBuiltinOp(call->op_->name_)) return {};
+
+  auto callee = program ? program->GetFunction(call->op_->name_) : nullptr;
+  if (!callee) return {};
+  auto inner_map = ReturnedParamIndicesImpl(callee, program);
+  if (inner_map.empty()) return {};
+
+  std::vector<std::optional<size_t>> result(inner_map.size());
+  for (size_t pos = 0; pos < inner_map.size(); ++pos) {
+    if (!inner_map[pos]) continue;
+    size_t mapped = inner_map[pos].value();  // NOLINT(bugprone-unchecked-optional-access)
+    if (mapped >= call->args_.size()) continue;
+    auto arg_var = AsVarLike(call->args_[mapped]);
+    if (!arg_var) continue;
+    // The arg need not be a param outright -- it may itself be an assemble /
+    // loop-carry chain rooted at one, so run it through the normal tracer.
+    std::unordered_set<const Var*> visited;
+    const Var* root = TraceVar(arg_var.get(), index, param_set, program, visited);
+    if (!root) continue;
+    for (size_t i = 0; i < params.size(); ++i) {
+      if (params[i].get() == root) {
+        result[pos] = i;
+        break;
+      }
+    }
+  }
+  return result;
+}
+
 // Group/Spmd wrappers may end in the inner kernel call with no top-level
 // ReturnStmt; their return values are the inner call's by construction. Map
 // each inner return position to the wrapper param passed as the matching arg.
@@ -280,15 +356,85 @@ std::vector<std::optional<size_t>> ReturnedParamIndicesImpl(const FunctionPtr& f
   BodyIndexCollector index;
   index.VisitStmt(func->body_);
   if (!index.first_return || index.first_return->value_.empty()) {
-    if (func->func_type_ == FunctionType::Group || func->func_type_ == FunctionType::Spmd) {
+    if (IsWrapperType(func->func_type_)) {
       return record(MapWrapperReturnToParams(func, program));
     }
     return record({});
   }
-  return record(TraceExprsToParamIndices(index.first_return->value_, index, func->params_, program));
+  // A wrapper whose single return value is the forwarded tuple of a multi-result
+  // inner call carries N return positions in ONE return expr. Expand it so the
+  // map stays precise; fall through to the per-expr tracer when it is not that
+  // shape, so this can only ever *add* precision.
+  //
+  // The expansion is only well-formed when the function really does declare N
+  // flat return positions (``return_types_.size() == N``). A function that
+  // declares a single ``pl.Tuple[T1, ..., TN]`` return has ONE return type -- a
+  // TupleType -- and returns the tuple as one value. Expanding that would hand
+  // every consumer an N-entry map for a 1-arity return, and CanonicalizeReturnValues
+  // would rewrite ``return t`` into N param returns that the one-entry
+  // ``return_types_`` cannot describe.
+  const auto& rets = index.first_return->value_;
+  const size_t declared_arity = func->return_types_.size();
+  if (rets.size() == 1 && declared_arity > 1) {
+    if (auto tuple_var = AsVarLike(rets[0])) {
+      if (auto tuple_ty = As<TupleType>(tuple_var->GetType());
+          tuple_ty && tuple_ty->types_.size() == declared_arity) {
+        auto expanded = ExpandForwardedTupleVar(tuple_var.get(), index, func->params_, program);
+        if (expanded.size() == declared_arity) return record(expanded);
+      }
+    }
+  }
+  return record(TraceExprsToParamIndices(rets, index, func->params_, program));
 }
 
 }  // namespace
+
+// Locate the topmost ReturnStmt. Fast path: a function body is normally a
+// SeqStmts whose last statement is the return. Split AIV kernels keep theirs
+// nested inside the split body, so fall back to a walk.
+ReturnStmtPtr FindFirstReturn(const StmtPtr& body) {
+  if (auto seq = As<SeqStmts>(body); seq && !seq->stmts_.empty()) {
+    if (auto ret = As<ReturnStmt>(seq->stmts_.back())) return ret;
+  }
+  class FirstReturnFinder : public IRVisitor {
+   public:
+    ReturnStmtPtr first_return;
+
+   protected:
+    void VisitStmt_(const ReturnStmtPtr& ret) override {
+      if (!first_return) first_return = ret;
+    }
+  };
+  FirstReturnFinder finder;
+  finder.VisitStmt(body);
+  return finder.first_return;
+}
+
+std::vector<std::optional<size_t>> ExplicitReturnedParamIndices(const FunctionPtr& func) {
+  if (!func || !func->body_) return {};
+  auto ret = FindFirstReturn(func->body_);
+  if (!ret || ret->value_.empty()) return {};
+
+  std::unordered_map<const Var*, size_t> param_to_index;
+  for (size_t i = 0; i < func->params_.size(); ++i) param_to_index.emplace(func->params_[i].get(), i);
+
+  std::vector<std::optional<size_t>> result;
+  result.reserve(ret->value_.size());
+  for (const auto& value : ret->value_) {
+    std::optional<size_t> idx;
+    if (auto var = AsVarLike(value)) {
+      auto it = param_to_index.find(var.get());
+      if (it != param_to_index.end()) idx = it->second;
+    }
+    result.push_back(idx);
+  }
+  return result;
+}
+
+std::optional<size_t> ExplicitReturnedParamIndex(const FunctionPtr& func) {
+  auto indices = ExplicitReturnedParamIndices(func);
+  return indices.empty() ? std::nullopt : indices[0];
+}
 
 std::optional<size_t> ReturnedParamIndex(const FunctionPtr& func, const ProgramPtr& program) {
   auto indices = ReturnedParamIndicesImpl(func, program);

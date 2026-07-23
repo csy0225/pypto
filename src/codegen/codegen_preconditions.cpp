@@ -13,6 +13,12 @@
 
 #include <string>
 
+#include "pypto/core/logging.h"
+#include "pypto/ir/expr.h"
+#include "pypto/ir/function.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/program.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/passes.h"
@@ -65,11 +71,25 @@ void VerifyOrchestrationCodegenPreconditions(const ProgramPtr& program, const Fu
   INTERNAL_CHECK(func != nullptr)
       << "Internal error: GenerateOrchestration preconditions — function must not be null";
 
-  // Codegen assumes hierarchy references resolved and explicit
-  // RuntimeScopeStmt materialization.
+  // Codegen assumes hierarchy references resolved, explicit RuntimeScopeStmt
+  // materialization, and a stamped iter_arg carry plan on every ForStmt.
+  //
+  // ReturnParamsExplicit is listed because codegen *reads the IR directly* for
+  // the return->param map: it takes each callee's returned param off the
+  // ReturnStmt by pointer identity (NormalizeReturnOrder establishes that form)
+  // instead of tracing SSA lineage. Without it, an SSA-aliased return would
+  // silently alias a result to the wrong buffer rather than raise.
+  //
+  // TODO(call-directions-precondition): CallDirectionsResolved belongs here
+  // too — codegen equally trusts `callee->param_directions_`, which
+  // DeriveCallDirections materializes on Group/Spmd wrappers. It is not listed
+  // yet because two existing tests feed orchestration codegen IR that
+  // deliberately violates it (an `Input` arg direction on an `Out` param, and a
+  // convert_to_ssa-only program), so wiring it needs those tests reworked.
   pass::VerifyProperties(
       IRPropertySet{IRProperty::SplitIncoreOrch, IRProperty::OrchestrationReferencesResolved,
-                    IRProperty::RuntimeScopesMaterialized},
+                    IRProperty::RuntimeScopesMaterialized, IRProperty::IterArgCarryClassified,
+                    IRProperty::ReturnParamsExplicit},
       program, "GenerateOrchestration preconditions");
 }
 

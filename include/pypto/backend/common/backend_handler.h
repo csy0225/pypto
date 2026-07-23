@@ -27,11 +27,43 @@ namespace backend {
  *
  * Bandwidths are in BYTES PER CORE CYCLE, so the chooser can weight L1->L0
  * traffic and the L0C drain directly in cycles. Defaults are Ascend a2a3 (910B),
- * op-sim work-calibrated: L1->L0A ~200, L1->L0B ~132 B/cyc (~1.5:1, not the
- * datasheet 2:1). The FIXPIPE L0C drain is PER-DRAIN: `drain_fixed_cycles` issue
- * overhead plus `bytes_c*m*n/bw_drain`, scaled by the output-tile count
- * `ceil(M/m)*ceil(N/n)` -- so splitting the OUTPUT (M/N) adds drains while
- * splitting K does not (accumulate in one L0C). Device-validated (op-sim).
+ * on-device sweep-calibrated: L1->L0A ~130, L1->L0B ~85 B/cyc (~1.52:1). The
+ * FIXPIPE L0C drain is PER-M-ROW, per output tile (scaled by the tile count
+ * `ceil(M/m)*ceil(N/n)`):
+ *   per_tile = drain_fixed_cycles                                              // fixed issue overhead
+ *            + m * ( max(drain_row_cycles, bytes_c*n/bw_drain)                 // per-row: floor OR
+ * throughput
+ *                    + drain_penalty_cycles*(odd(N1)-1) )                      // misalignment serialization
+ * with `N1 = ceil(n / N0)`, `N0 = drain_c0_bytes / bytes_c` (= 8 for the fp32
+ * L0C accumulator, output-dtype independent). Direct fit of an on-device FIXPIPE
+ * sweep. Per the writeback model (pto-isa fixpipe-model.md + nz-fractal-layout.md),
+ * FIXPIPE addresses one M-row of the `N1 M1 M0 N0` FRACTAL_NZ accumulator at a time
+ * (=> cost ∝ m), each row a grouped nburst/loop over the `N1 = ceil(n/N0)`
+ * N-fractals. The per-M-row cost is `max(floor, throughput)`: a fixed burst-issue
+ * FLOOR `drain_row_cycles` (row addressing/setup, N-independent) that dominates
+ * narrow N, OR the fractal THROUGHPUT `bytes_c*n/bw_drain` that dominates wide N
+ * (crossover ~n=131 fp32) -- the sweep confirmed both regimes (a flat base below
+ * the crossover, byte-throughput above). A non-pow2 fractal count adds the odd
+ * residual `odd(N1)-1` serial burst passes at `drain_penalty_cycles` per M-row
+ * (the non-pow2 N-fractal-count cliff -- n=80 -> odd(10)=5, and n=96 -> odd(12)=3 despite
+ * 96%32==0; it is NOT literally N%32). Splitting the OUTPUT (M/N) adds drains;
+ * splitting K does not (accumulate in one L0C). Device-validated (drain 0.93-1.09x,
+ * loads R^2 0.993).
+ *
+ * CALIBRATION SURFACE (a2a3, so the next backend / lowering path can tell when it
+ * has left the fitted envelope): forced-tile FIXPIPE + MTE1 sweep, direct-store
+ * (Acc->GM) and Mat-scratch (Acc->Mat) drains, bf16 and fp32; m in {16..256},
+ * n aligned {16..512}; N-fractal N1 sampled at power-of-2 and small non-pow2 counts
+ * (n up to 128 densely, plus n=320); FIXPIPE isolated via the dbc0-dbc1 difference.
+ * The odd(N1) FORM is op-sim-validated across odd-parts {1,3,5,7,9,11,13,15}
+ * (16-aligned n in {128..240}, camodel FIXP lane): R^2 0.968, and two engineered
+ * contradictions (n=192 oddPart 3 vs a bounded-remainder's 8; n=144 oddPart 9 vs 2)
+ * both track oddPart, decisively refuting a bounded 1-2-pass remainder form. So the
+ * penalty scales with the ODD PART of the fractal count, not a bounded remainder. The
+ * MAGNITUDE (drain_penalty=2.6) stays device-anchored (n=80 sweep) -- op-sim over-
+ * states absolute FIXP ~4x, so it is used for form discrimination only, not refit.
+ * Non-16-aligned n (e.g. 136/264, odd 17/33) can't be measured (ptoas rejects), so
+ * those exact points remain model-only, but the form holds out to oddPart 15.
  *
  * The MAD term mirrors the cube's per-TMATMUL cost
  * `mad_head_cycles + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16)`, where
@@ -39,14 +71,32 @@ namespace backend {
  * 4-byte) is derived from the operand byte width in the chooser.
  */
 struct L0CostModel {
-  double bw_l0a = 200.0;  ///< L1->L0A bytes/cycle (a2a3 op-sim work-fit; datasheet 441 GB/s/1.85 GHz = 238).
+  double bw_l0a = 129.7;  ///< L1->L0A bytes/cycle (a2a3 on-device MTE1 sweep, R^2 0.993; was op-sim 200).
   double bw_l0b =
-      132.0;  ///< L1->L0B bytes/cycle (a2a3 op-sim work-fit; ~1.5:1 vs L0A, not the datasheet 2:1).
-  double bw_drain = 118.0;  ///< FIXPIPE L0C drain bytes/cycle (a2a3 op-sim work-fit; per-drain byte slope).
-  double drain_fixed_cycles =
-      245.0;                ///< Per-FIXPIPE-drain fixed cycles (a2a3 op-sim work-fit; penalizes M/N-split).
-  int mad_head_cycles = 6;  ///< Fixed per-TMATMUL issue overhead.
+      85.4;  ///< L1->L0B bytes/cycle (a2a3 on-device MTE1 sweep; ~1.52:1 vs L0A, same ratio as before).
+  double bw_drain =
+      118.0;  ///< FIXPIPE per-row byte throughput, L0C bytes/cycle (a2a3 sweep; dominates wide N).
+  double drain_fixed_cycles = 164.0;  ///< Per-FIXPIPE-drain fixed issue overhead, m-independent (a2a3 sweep).
+  double drain_row_cycles = 4.45;  ///< FIXPIPE per-M-row FLOOR (burst-issue setup, N-independent); dominates
+                                   ///< narrow N below the bytes/bw crossover (~n=131 fp32). Per-row cost =
+                                   ///< max(floor, bytes_c*n/bw_drain) (a2a3 sweep).
+  double drain_penalty_cycles =
+      2.6;                  ///< Misalignment cost: FIXPIPE cycles per L0C M-row per extra
+                            ///< serial burst pass, charged (odd(N1)-1) times (a2a3 on-device sweep).
+  int drain_c0_bytes = 32;  ///< NZ fractal C0 constant in bytes (N0 = C0 / bytes_c; 8 for fp32, 16 for bf16).
+  int mad_head_cycles = 21;      ///< Fixed per-TMATMUL issue overhead, per K-block (a2a3 op-sim fit,
+                                 ///< device-confirmed within ~2%; was 6, +15/tile clean on device).
+                                 ///< Enters C_mad as `k_blocks*mad_head + cpr*ceil(m/16)*k_fractals*
+                                 ///< ceil(n/16)` (see MadCycles) -- NOT `mad_head + 16*K`.
+                                 ///< Backend-specific: a new backend should shallow-K device-spot-check
+                                 ///< it (it competes with the drain floor on shallow-K/small tiles).
   int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
+  int mad_fp32_passes = 2;       ///< Cube passes per K-fractal for FULL fp32 MMAD (the fp32
+                                 ///< mantissa is decomposed into partial products). ARCH-SPECIFIC:
+                                 ///< a2a3=2; a5=8 (a5-sim: fp32 MMAD is ~4x a2a3 per fractal -- a
+                                 ///< fuller decomposition; the fractal WIDTH kt is C0-derived and
+                                 ///< arch-invariant, so this pass count is the only fp32 cube knob).
+                                 ///< bf16 and other <=2-byte inputs are 1 pass (unaffected).
 };
 
 /**

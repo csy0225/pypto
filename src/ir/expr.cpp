@@ -66,6 +66,20 @@ bool AreExprsEqual(const ExprPtr& e1, const ExprPtr& e2) {
   if (b1 && b2 && e1->GetKind() == e2->GetKind()) {
     return AreExprsEqual(b1->left_, b2->left_) && AreExprsEqual(b1->right_, b2->right_);
   }
+  // Call nodes produced by different invocation sites have different pointer
+  // identities but may be structurally identical (e.g. two pld.world_size()
+  // calls). Compare by op name (per operator-identity-checks.md) plus
+  // recursive arg equality.  Avoids false negatives after deserialization
+  // where two Ops share a name but are distinct objects.
+  auto call1 = As<Call>(e1);
+  auto call2 = As<Call>(e2);
+  if (call1 && call2 && call1->op_ && call2->op_ && call1->op_->name_ == call2->op_->name_) {
+    if (call1->args_.size() != call2->args_.size()) return false;
+    for (size_t i = 0; i < call1->args_.size(); ++i) {
+      if (!AreExprsEqual(call1->args_[i], call2->args_[i])) return false;
+    }
+    return true;
+  }
   return false;
 }
 

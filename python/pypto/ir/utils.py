@@ -182,12 +182,47 @@ def resolve_cast_mode(mode: str | int) -> int:
     return mode_val
 
 
+def has_partial_valid_region(expr: _ir.Expr) -> bool:
+    """Whether a tensor/tile value already declares less valid data than it can hold.
+
+    An explicit ``valid_shape`` survives type canonicalization only when it really
+    differs from the physical shape, so a non-empty one means the value carries
+    padding that a reader has to respect.
+
+    Args:
+        expr: A tensor- or tile-typed expression
+
+    Returns:
+        True when the expression's view narrows it below its physical shape
+    """
+    expr_type = expr.type
+    view = getattr(expr_type, "tensor_view", None)
+    if view is None:
+        view = getattr(expr_type, "tile_view", None)
+    return view is not None and bool(view.valid_shape)
+
+
+def _to_int32_scalar(value: int | _ir.Expr, span: _ir.Span) -> _ir.Expr:
+    """Normalize a seed value to an INT32 scalar expression.
+
+    Shared by the counter-based ``random`` ops (tensor and tile), which coerce
+    every key/counter word to an INT32 scalar before building the call.
+    """
+    if isinstance(value, _ir.Expr):
+        if isinstance(value, _ir.ConstInt) and value.dtype != DataType.INT32:
+            return _ir.ConstInt(value.value, DataType.INT32, span)
+        return value
+    return _ir.ConstInt(value, DataType.INT32, span)
+
+
 __all__ = [
     "CAST_MODE_NAMES",
     "_get_span_or_capture",
     "_normalize_expr",
     "_normalize_shape",
+    "_to_int32_scalar",
     "_to_make_tuple",
+    "has_partial_valid_region",
     "resolve_cast_mode",
     "use_parser_span",
 ]

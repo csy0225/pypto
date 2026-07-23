@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -28,7 +27,11 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/transforms/printer.h"
+#include "pypto/ir/transforms/structural_comparison.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -235,6 +238,85 @@ bool DimensionsEqual(const ExprPtr& dim1, const ExprPtr& dim2) {
   return analyzer.CanProveEqual(dim1, dim2);
 }
 
+namespace {
+bool AreComparableIntegerScalarExprs(const ExprPtr& lhs, const ExprPtr& rhs) {
+  if (!lhs || !rhs) {
+    return false;
+  }
+  auto lhs_type = As<ScalarType>(lhs->GetType());
+  auto rhs_type = As<ScalarType>(rhs->GetType());
+  if (!lhs_type || !rhs_type || !lhs_type->dtype_.IsInt() || !rhs_type->dtype_.IsInt()) {
+    return false;
+  }
+  return lhs_type->dtype_.IsSignedInt() == rhs_type->dtype_.IsSignedInt();
+}
+
+// The zero extent every valid-shape bound is compared against. Cached because it is otherwise
+// rebuilt per dimension on a hot construction path; ConstInt is immutable, so sharing it is safe.
+const ExprPtr& ZeroExtent() {
+  static const ExprPtr zero = std::make_shared<ConstInt>(0, DataType::INDEX, Span::unknown());
+  return zero;
+}
+
+// True when `extent` is provably zero, i.e. the region it bounds is empty.
+//
+// A constant is compared by value rather than routed through ProveValidExtentEqual. That helper
+// only decides extents of matching signedness, so an *unsigned* zero -- e.g. a UINT64 valid_rows
+// from set_validshape -- against the signed INDEX zero comes back kUnknown, which would let exactly
+// the empty region this predicate exists to catch through. Symbolic extents are compared against a
+// zero of their own dtype so the analyzer can decide them at all.
+bool IsProvablyEmptyExtent(const ExprPtr& extent) {
+  if (!extent) {
+    return false;
+  }
+  if (const auto constant = GetConstantDimension(extent)) {
+    return *constant == 0;
+  }
+  auto scalar_type = As<ScalarType>(extent->GetType());
+  if (!scalar_type || !scalar_type->dtype_.IsInt()) {
+    return false;
+  }
+  const auto zero = std::make_shared<ConstInt>(0, scalar_type->dtype_, Span::unknown());
+  return ProveValidExtentEqual(extent, zero) == ProofResult::kTrue;
+}
+}  // namespace
+
+ProofResult ProveValidExtentEqual(const ExprPtr& lhs, const ExprPtr& rhs) {
+  if (!AreComparableIntegerScalarExprs(lhs, rhs)) {
+    return ProofResult::kUnknown;
+  }
+  if (AreExprsEqual(lhs, rhs)) {
+    return ProofResult::kTrue;
+  }
+
+  thread_local arith::Analyzer analyzer;
+  if (analyzer.CanProveEqual(lhs, rhs)) {
+    return ProofResult::kTrue;
+  }
+  if (analyzer.CanProve(MakeNe(lhs, rhs))) {
+    return ProofResult::kFalse;
+  }
+  return ProofResult::kUnknown;
+}
+
+ProofResult ProveValidExtentLessEqual(const ExprPtr& lhs, const ExprPtr& rhs) {
+  if (!AreComparableIntegerScalarExprs(lhs, rhs)) {
+    return ProofResult::kUnknown;
+  }
+  if (AreExprsEqual(lhs, rhs)) {
+    return ProofResult::kTrue;
+  }
+
+  thread_local arith::Analyzer analyzer;
+  if (analyzer.CanProve(MakeLe(lhs, rhs))) {
+    return ProofResult::kTrue;
+  }
+  if (analyzer.CanProve(MakeGt(lhs, rhs))) {
+    return ProofResult::kFalse;
+  }
+  return ProofResult::kUnknown;
+}
+
 bool IsBroadcastable(const ExprPtr& source_dim, const ExprPtr& target_dim) {
   // If dimensions are equal, they're broadcastable
   if (DimensionsEqual(source_dim, target_dim)) {
@@ -271,6 +353,287 @@ std::string FormatShape(const std::vector<ExprPtr>& shape) {
   }
   oss << "]";
   return oss.str();
+}
+
+std::vector<ValidShapeBoundsError> ValidateValidShapeBounds(const std::vector<ExprPtr>& valid,
+                                                            const std::vector<ExprPtr>& physical,
+                                                            const std::string& type_kind) {
+  if (valid.empty()) {
+    return {};
+  }
+
+  if (valid.size() != physical.size()) {
+    std::ostringstream msg;
+    msg << type_kind << " valid_shape rank mismatch: got rank " << valid.size() << " " << FormatShape(valid)
+        << ", but physical shape has rank " << physical.size() << " " << FormatShape(physical);
+    return {{ValidShapeBoundsViolation::kRankMismatch, std::nullopt, msg.str()}};
+  }
+
+  std::vector<ValidShapeBoundsError> errors;
+  const ExprPtr& zero = ZeroExtent();
+  for (size_t i = 0; i < valid.size(); ++i) {
+    if (ProveValidExtentLessEqual(zero, valid[i]) == ProofResult::kFalse) {
+      std::ostringstream msg;
+      msg << type_kind << " valid_shape dimension " << i << " has provably negative extent "
+          << PythonPrint(valid[i]) << "; expected 0 <= valid_shape[" << i << "] <= shape[" << i << "] ("
+          << PythonPrint(physical[i]) << ")";
+      errors.push_back({ValidShapeBoundsViolation::kNegativeExtent, i, msg.str()});
+    }
+    if (ProveValidExtentLessEqual(valid[i], physical[i]) == ProofResult::kFalse) {
+      std::ostringstream msg;
+      msg << type_kind << " valid_shape dimension " << i << " extent " << PythonPrint(valid[i])
+          << " provably exceeds physical shape extent " << PythonPrint(physical[i]);
+      errors.push_back({ValidShapeBoundsViolation::kExceedsPhysicalExtent, i, msg.str()});
+    }
+  }
+  return errors;
+}
+
+void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
+                                 const Span& span) {
+  for (size_t i = 0; i < valid.size(); ++i) {
+    // Only a *provable* zero rejects; an unproved symbolic extent is accepted.
+    CHECK_SPAN(!IsProvablyEmptyExtent(valid[i]), span)
+        << op_name << ": input valid extent on axis " << i << " is 0 (valid_shape " << FormatShape(valid)
+        << "), so the reduction has no real data to consume. The backend reduction kernels require a "
+           "non-empty valid region on every axis and assert on an empty one, and an empty region also "
+           "leaves max/min with no value to return. Widen the valid region, or guard the reduction so "
+           "it does not run when the axis can be empty.";
+  }
+}
+
+// ============================================================================
+// Tuple operand decoding
+// ============================================================================
+
+std::vector<ExprPtr> ExtractTupleElements(const ExprPtr& tuple_expr, size_t rank) {
+  if (auto make_tuple = As<MakeTuple>(tuple_expr)) {
+    return make_tuple->elements_;
+  }
+  std::vector<ExprPtr> elements;
+  elements.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    elements.emplace_back(
+        std::make_shared<TupleGetItemExpr>(tuple_expr, static_cast<int>(i), tuple_expr->span_));
+  }
+  return elements;
+}
+
+// ============================================================================
+// Window-read valid-region intersection
+// ============================================================================
+
+const std::vector<ExprPtr>& GetEffectiveTensorValidShape(const TensorType& type) {
+  if (type.tensor_view_ && !type.tensor_view_->valid_shape.empty()) {
+    return type.tensor_view_->valid_shape;
+  }
+  return type.shape_;
+}
+
+namespace {
+
+/// Zero, in the dtype the analyzer compares extents in.
+ExprPtr IndexZero() {
+  static const ExprPtr zero = std::make_shared<ConstInt>(0, DataType::INDEX, Span::unknown());
+  return zero;
+}
+
+/// Fold an expression through the arithmetic analyzer so constants collapse.
+ExprPtr FoldExtent(const ExprPtr& expr) {
+  thread_local arith::Analyzer analyzer;
+  return analyzer.Simplify(expr);
+}
+
+/// Return `lhs` when it is provably the smaller of the two, `rhs` when it is
+/// provably the smaller, and a folded `min` only when neither is settled.
+ExprPtr MinExtent(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span) {
+  if (ProveValidExtentLessEqual(lhs, rhs) == ProofResult::kTrue) {
+    return lhs;
+  }
+  if (ProveValidExtentLessEqual(rhs, lhs) == ProofResult::kTrue) {
+    return rhs;
+  }
+  return FoldExtent(MakeMin(lhs, rhs, span));
+}
+
+/// `max(extent, 0)`, elided whenever the sign of the extent is already settled: a
+/// non-negative extent is its own clamp, and a non-positive one clamps to a literal
+/// zero rather than a `max` node that only ever evaluates to zero.
+ExprPtr ClampNonNegative(const ExprPtr& extent, const Span& span) {
+  if (ProveValidExtentLessEqual(IndexZero(), extent) == ProofResult::kTrue) {
+    return extent;
+  }
+  if (ProveValidExtentLessEqual(extent, IndexZero()) == ProofResult::kTrue) {
+    return IndexZero();
+  }
+  return FoldExtent(MakeMax(extent, IndexZero(), span));
+}
+
+/// The extent of dimension `i` that a read must keep inside its source.
+///
+/// Under kExactWindow nothing trims the window, so all of it has to fit,
+/// however small an explicit valid_shape may be.
+///
+/// Under kClampedWindow the window is trimmed for us — codegen clamps a
+/// tensor.slice view to the parent, and a tile.load DMA fetches only the valid
+/// extent — so the window may deliberately overhang and what has to fit is the
+/// extent actually read: the explicit request when the caller made one (a padded
+/// fixed-width window with a declared valid_shape is the standard idiom), and the
+/// window itself when they did not, since then the read implicitly claims all of it.
+const ExprPtr& BoundsReach(const WindowReadValidShapeParams& p, size_t i) {
+  if (p.kind == WindowReadKind::kExactWindow || p.requested_valid.empty()) {
+    return p.window[i];
+  }
+  return p.requested_valid[i];
+}
+
+/// Whether the analyzer can do integer arithmetic on this expression at all.
+/// Extents reaching an operator are normally integer scalars, but an operand may
+/// be an arbitrary expression (a tuple, say) that no proof obligation is defined
+/// over; such a dimension is simply undecidable rather than a bounds violation.
+bool IsIntegerScalarExpr(const ExprPtr& expr) {
+  if (!expr) {
+    return false;
+  }
+  auto scalar_type = As<ScalarType>(expr->GetType());
+  return scalar_type && scalar_type->dtype_.IsInt();
+}
+
+void CheckWindowReadRanks(const WindowReadValidShapeParams& p) {
+  const size_t rank = p.window.size();
+  CHECK_SPAN(p.source_physical.size() == rank, p.span)
+      << p.op_name << " requires the window and the source to have the same rank, but got window rank "
+      << rank << " " << FormatShape(p.window) << " and source rank " << p.source_physical.size() << " "
+      << FormatShape(p.source_physical);
+  CHECK_SPAN(p.offsets.size() == rank, p.span)
+      << p.op_name << " requires one offset per window dimension, but got " << p.offsets.size()
+      << " offsets for window rank " << rank;
+  CHECK_SPAN(p.source_valid.size() == rank, p.span)
+      << p.op_name << " source valid_shape rank " << p.source_valid.size()
+      << " does not match its shape rank " << rank;
+  CHECK_SPAN(p.requested_valid.empty() || p.requested_valid.size() == rank, p.span)
+      << p.op_name << " requires valid_shape to have the same rank as the window, but got valid_shape rank "
+      << p.requested_valid.size() << " " << FormatShape(p.requested_valid) << " and window rank " << rank;
+}
+
+/// Enforce what a window read promises about dimension `i` before its valid
+/// region is derived: the window starts inside the source, the request fits in
+/// the window that holds it, and — unless the read clamps — the extent it touches
+/// also ends inside the source.
+void CheckWindowReadDimBounds(const WindowReadValidShapeParams& p, size_t i) {
+  const ExprPtr& offset = p.offsets[i];
+  const ExprPtr& source = p.source_physical[i];
+
+  CHECK_SPAN(ProveValidExtentLessEqual(IndexZero(), offset) != ProofResult::kFalse, p.span)
+      << p.op_name << " offset " << i << " is provably negative (" << PythonPrint(offset)
+      << "); a window must start inside its source";
+
+  // An explicit request also has to fit the window that holds it: `valid <= shape`
+  // is the standing bounds invariant of the type this read produces. The request
+  // is returned as the result whenever the source cannot be proven narrower, so
+  // an oversized one would otherwise walk straight into the result type. Reject
+  // what we can disprove and trust the rest, as everywhere else here.
+  if (!p.requested_valid.empty()) {
+    const ExprPtr& requested = p.requested_valid[i];
+    CHECK_SPAN(ProveValidExtentLessEqual(requested, p.window[i]) != ProofResult::kFalse, p.span)
+        << p.op_name << " valid_shape " << i << " is " << PythonPrint(requested)
+        << ", which exceeds the window extent " << PythonPrint(p.window[i])
+        << "; a valid region cannot be larger than the shape that holds it";
+  }
+
+  // A non-clamping read asserts that the extent it touches stays inside the
+  // source. Reject what we can disprove; trust what stays symbolic, because
+  // that inequality is the operator's precondition, not a guess.
+  const ExprPtr& reach = BoundsReach(p, i);
+  if (!p.clamp && IsIntegerScalarExpr(offset) && IsIntegerScalarExpr(reach) && IsIntegerScalarExpr(source)) {
+    const ExprPtr end = FoldExtent(MakeAdd(offset, reach, p.span));
+    CHECK_SPAN(ProveValidExtentLessEqual(end, source) != ProofResult::kFalse, p.span)
+        << p.op_name << " reads past the end of dimension " << i << ": offset " << PythonPrint(offset)
+        << " + extent " << PythonPrint(reach) << " exceeds the source extent " << PythonPrint(source) << ". "
+        << p.bounds_remedy;
+  }
+}
+
+}  // namespace
+
+std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams& params) {
+  CheckWindowReadRanks(params);
+
+  const size_t rank = params.window.size();
+  std::vector<ExprPtr> result;
+  result.reserve(rank);
+
+  for (size_t i = 0; i < rank; ++i) {
+    CheckWindowReadDimBounds(params, i);
+
+    const ExprPtr& offset = params.offsets[i];
+    const ExprPtr& window = params.window[i];
+    const ExprPtr& src_valid = params.source_valid[i];
+    const bool source_fully_valid = AreExprsEqual(src_valid, params.source_physical[i]);
+
+    // available = clamp(source_valid - offset, 0, window).
+    //
+    // When the source is fully valid and the read is non-clamping, the
+    // precondition checked above already gives window <= source_valid - offset,
+    // so the clamp is the window itself and no guard expression is built.
+    ExprPtr available;
+    if (source_fully_valid && !params.clamp) {
+      available = window;
+    } else {
+      CHECK_SPAN(IsIntegerScalarExpr(offset), params.span)
+          << params.op_name << " offset " << i << " must be an integer scalar to narrow dimension " << i
+          << " against a partial source, but got " << offset->GetType()->TypeName();
+      const ExprPtr remaining = ProveValidExtentEqual(offset, IndexZero()) == ProofResult::kTrue
+                                    ? src_valid
+                                    : FoldExtent(MakeSub(src_valid, offset, params.span));
+      available = MinExtent(ClampNonNegative(remaining, params.span), window, params.span);
+    }
+
+    // result = min(requested, available).
+    //
+    // With no explicit request, the source's extent under the window *is* the
+    // answer, guard expression and all.
+    //
+    // With one, the request is narrowed to the source's extent only when that is
+    // provably the smaller of the two. An undecidable relation between them is
+    // taken on trust, exactly as the bounds obligation above is: the request is
+    // the caller's declared statement of what this read touches, and it is the
+    // only one of the two that the operator is sure it can name. A source valid
+    // extent is a *type-level* expression, and may legitimately mention a symbol
+    // that has no value in the reading function at all — a `pl.dynamic()` dim used
+    // in a parameter's `valid_shape` is bound at the call site, so a standalone
+    // (precompiled) kernel never receives it. Folding such a symbol into a runtime
+    // `min` would emit an operand that does not exist. Narrowing only on a proof
+    // keeps every real intersection — a partial source is still cut down to what it
+    // actually has — without inventing a guard over a name we cannot materialize.
+    if (params.requested_valid.empty()) {
+      result.push_back(available);
+      continue;
+    }
+    const ExprPtr& requested = params.requested_valid[i];
+    const bool source_is_narrower = !AreExprsEqual(available, window) &&
+                                    ProveValidExtentLessEqual(available, requested) == ProofResult::kTrue;
+    result.push_back(source_is_narrower ? available : requested);
+  }
+
+  return result;
+}
+
+void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
+                                  const std::vector<ExprPtr>& valid_shape, const std::string& op_name,
+                                  const Span& span) {
+  static const auto one = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  for (int64_t axis : drop_dims) {
+    const auto index = static_cast<size_t>(axis);
+    INTERNAL_CHECK_SPAN(index < valid_shape.size(), span)
+        << "Internal error: " << op_name << " drop_dims axis " << axis
+        << " is out of range for valid_shape rank " << valid_shape.size();
+    const ExprPtr& extent = valid_shape[index];
+    CHECK_SPAN(ProveValidExtentEqual(extent, one) == ProofResult::kTrue, span)
+        << op_name << " cannot drop dimension " << axis << ": its valid extent is " << PythonPrint(extent)
+        << ", which is not provably 1. Rank reduction erases an axis, so the axis must be fully valid; "
+           "keep the dimension instead of dropping it";
+  }
 }
 
 // ============================================================================
@@ -331,6 +694,167 @@ std::vector<ExprPtr> ApplyDropDims(const std::vector<ExprPtr>& shape, const std:
 // Cross-function call return type deduction
 // ============================================================================
 
+namespace {
+
+using TypeVarMap = std::unordered_map<const Var*, ExprPtr>;
+
+struct CallTypeBindingConstraint {
+  VarPtr var;
+  ExprPtr existing;
+  ExprPtr candidate;
+  std::string context;
+};
+
+void BindCallTypeVar(const VarPtr& var, const ExprPtr& value, const std::string& context, TypeVarMap& var_map,
+                     std::vector<CallTypeBindingConstraint>& constraints) {
+  // A callee placeholder can also appear verbatim in the caller's annotation.
+  // Treat that as an uninformative unification constraint so a later concrete
+  // actual can refine the placeholder.
+  if (var.get() == value.get()) return;
+
+  auto [it, inserted] = var_map.emplace(var.get(), value);
+  if (inserted) return;
+
+  constraints.push_back({var, it->second, value, context});
+}
+
+bool CanDecomposeCallExprPattern(const ExprPtr& pattern, const ExprPtr& value) {
+  if (!pattern || !value) return false;
+  if (As<Var>(pattern)) return true;
+  if (structural_equal(pattern, value) || ProveValidExtentEqual(pattern, value) == ProofResult::kTrue) {
+    return true;
+  }
+  if (pattern->GetKind() != value->GetKind()) return false;
+
+  auto pattern_binary = std::dynamic_pointer_cast<const BinaryExpr>(pattern);
+  auto value_binary = std::dynamic_pointer_cast<const BinaryExpr>(value);
+  if (pattern_binary && value_binary) {
+    return CanDecomposeCallExprPattern(pattern_binary->left_, value_binary->left_) &&
+           CanDecomposeCallExprPattern(pattern_binary->right_, value_binary->right_);
+  }
+
+  auto pattern_unary = std::dynamic_pointer_cast<const UnaryExpr>(pattern);
+  auto value_unary = std::dynamic_pointer_cast<const UnaryExpr>(value);
+  return pattern_unary && value_unary &&
+         CanDecomposeCallExprPattern(pattern_unary->operand_, value_unary->operand_);
+}
+
+void CollectCallExprBindings(const ExprPtr& pattern, const ExprPtr& value, const std::string& context,
+                             TypeVarMap& var_map, std::vector<CallTypeBindingConstraint>& constraints) {
+  if (!pattern || !value) return;
+  if (auto var = As<Var>(pattern)) {
+    BindCallTypeVar(var, value, context, var_map, constraints);
+    return;
+  }
+
+  // Composite parameter metadata can bind variables when the actual metadata
+  // has a compatible expression structure. Check the whole pattern before
+  // recording any bindings so a mismatch in a non-variable operand cannot
+  // leave behind a partial, incorrect binding. A direct binding discovered
+  // elsewhere still substitutes through differently-shaped return metadata.
+  if (!CanDecomposeCallExprPattern(pattern, value)) return;
+  auto pattern_binary = std::dynamic_pointer_cast<const BinaryExpr>(pattern);
+  auto value_binary = std::dynamic_pointer_cast<const BinaryExpr>(value);
+  if (pattern_binary && value_binary) {
+    CollectCallExprBindings(pattern_binary->left_, value_binary->left_, context + " left operand", var_map,
+                            constraints);
+    CollectCallExprBindings(pattern_binary->right_, value_binary->right_, context + " right operand", var_map,
+                            constraints);
+    return;
+  }
+  auto pattern_unary = std::dynamic_pointer_cast<const UnaryExpr>(pattern);
+  auto value_unary = std::dynamic_pointer_cast<const UnaryExpr>(value);
+  if (pattern_unary && value_unary) {
+    CollectCallExprBindings(pattern_unary->operand_, value_unary->operand_, context + " operand", var_map,
+                            constraints);
+  }
+}
+
+void CollectCallExprVectorBindings(const std::vector<ExprPtr>& patterns, const std::vector<ExprPtr>& values,
+                                   const std::string& context, TypeVarMap& var_map,
+                                   std::vector<CallTypeBindingConstraint>& constraints) {
+  const size_t count = std::min(patterns.size(), values.size());
+  for (size_t i = 0; i < count; ++i) {
+    CollectCallExprBindings(patterns[i], values[i], context + "[" + std::to_string(i) + "]", var_map,
+                            constraints);
+  }
+}
+
+const std::vector<ExprPtr>& GetEffectiveTileValidShape(const TileType& type) {
+  if (type.tile_view_ && !type.tile_view_->valid_shape.empty()) {
+    return type.tile_view_->valid_shape;
+  }
+  return type.shape_;
+}
+
+void CollectCallTypeBindings(const TypePtr& pattern, const TypePtr& value, const std::string& context,
+                             TypeVarMap& var_map, std::vector<CallTypeBindingConstraint>& constraints) {
+  if (!pattern || !value) return;
+
+  if (auto pattern_tuple = As<TupleType>(pattern)) {
+    auto value_tuple = As<TupleType>(value);
+    if (!value_tuple) return;
+    const size_t count = std::min(pattern_tuple->types_.size(), value_tuple->types_.size());
+    for (size_t i = 0; i < count; ++i) {
+      CollectCallTypeBindings(pattern_tuple->types_[i], value_tuple->types_[i],
+                              context + " tuple element[" + std::to_string(i) + "]", var_map, constraints);
+    }
+    return;
+  }
+
+  if (auto pattern_tensor = AsTensorTypeLike(pattern)) {
+    auto value_tensor = AsTensorTypeLike(value);
+    if (!value_tensor) return;
+    CollectCallExprVectorBindings(pattern_tensor->shape_, value_tensor->shape_, context + " physical shape",
+                                  var_map, constraints);
+    CollectCallExprVectorBindings(GetEffectiveTensorValidShape(*pattern_tensor),
+                                  GetEffectiveTensorValidShape(*value_tensor), context + " valid shape",
+                                  var_map, constraints);
+    if (pattern_tensor->tensor_view_ && value_tensor->tensor_view_) {
+      CollectCallExprVectorBindings(pattern_tensor->tensor_view_->stride, value_tensor->tensor_view_->stride,
+                                    context + " tensor stride", var_map, constraints);
+    }
+    return;
+  }
+
+  auto pattern_tile = As<TileType>(pattern);
+  auto value_tile = As<TileType>(value);
+  if (!pattern_tile || !value_tile) return;
+  CollectCallExprVectorBindings(pattern_tile->shape_, value_tile->shape_, context + " physical shape",
+                                var_map, constraints);
+  CollectCallExprVectorBindings(GetEffectiveTileValidShape(*pattern_tile),
+                                GetEffectiveTileValidShape(*value_tile), context + " valid shape", var_map,
+                                constraints);
+  if (pattern_tile->tile_view_ && value_tile->tile_view_) {
+    CollectCallExprVectorBindings(pattern_tile->tile_view_->stride, value_tile->tile_view_->stride,
+                                  context + " tile stride", var_map, constraints);
+    CollectCallExprBindings(pattern_tile->tile_view_->start_offset, value_tile->tile_view_->start_offset,
+                            context + " tile start_offset", var_map, constraints);
+  }
+}
+
+TypePtr SubstituteCallReturnType(const TypePtr& type, const TypeVarMap& var_map) {
+  if (!type) return type;
+  if (auto tuple = As<TupleType>(type)) {
+    std::vector<TypePtr> elements;
+    elements.reserve(tuple->types_.size());
+    bool changed = false;
+    for (const auto& element : tuple->types_) {
+      auto new_element = SubstituteCallReturnType(element, var_map);
+      if (new_element.get() != element.get()) changed = true;
+      elements.push_back(std::move(new_element));
+    }
+    if (!changed) return type;
+    return std::make_shared<TupleType>(std::move(elements));
+  }
+
+  const auto memref = GetTypeMemRef(type);
+  return CloneTypeWithMemRefAndRemapExprs(
+      type, memref, [&var_map](const ExprPtr& expr) { return transform_utils::Substitute(expr, var_map); });
+}
+
+}  // namespace
+
 std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_params,
                                           const std::vector<ExprPtr>& args,
                                           const std::vector<TypePtr>& return_types) {
@@ -339,115 +863,33 @@ std::vector<TypePtr> DeduceCallReturnType(const std::vector<VarPtr>& callee_para
       << "DeduceCallReturnType: callee_params size (" << callee_params.size() << ") must match args size ("
       << args.size() << ")";
 
-  // 1. Build Var* -> ExprPtr mapping from param shapes vs arg shapes
-  std::unordered_map<const Var*, ExprPtr> var_map;
-  size_t n = callee_params.size();
-  for (size_t i = 0; i < n; ++i) {
-    auto param_type = callee_params[i]->GetType();
-    auto arg_type = args[i]->GetType();
-    if (!param_type || !arg_type) continue;
-    auto p_shaped = As<ShapedType>(param_type);
-    auto a_shaped = As<ShapedType>(arg_type);
-    if (!p_shaped || !a_shaped) continue;
-    size_t ndim = std::min(p_shaped->shape_.size(), a_shaped->shape_.size());
-    for (size_t d = 0; d < ndim; ++d) {
-      if (auto var = As<Var>(p_shaped->shape_[d])) {
-        auto [it, inserted] = var_map.emplace(var.get(), a_shaped->shape_[d]);
-        // Validate consistency only when both are statically known constants.
-        // Symbolic dims (Vars, exprs) may be equal at runtime — defer to runtime.
-        if (!inserted) {
-          auto existing_const = GetConstantDimension(it->second);
-          auto new_const = GetConstantDimension(a_shaped->shape_[d]);
-          if (existing_const && new_const) {
-            CHECK(*existing_const == *new_const)
-                << "Dynamic shape variable '" << var->name_hint_
-                << "' has conflicting bindings: " << FormatShape({it->second}) << " vs "
-                << FormatShape({a_shaped->shape_[d]}) << " (from argument " << i << ", dimension " << d
-                << ")";
-          }
-        }
-      }
-    }
+  TypeVarMap var_map;
+  std::vector<CallTypeBindingConstraint> constraints;
+  for (size_t i = 0; i < callee_params.size(); ++i) {
+    if (!callee_params[i] || !args[i]) continue;
+    CollectCallTypeBindings(callee_params[i]->GetType(), args[i]->GetType(), "argument " + std::to_string(i),
+                            var_map, constraints);
   }
   if (var_map.empty()) return return_types;
 
-  // 2. Substitution helpers
-  auto subst_dim = [&](const ExprPtr& dim) -> ExprPtr {
-    if (auto var = As<Var>(dim)) {
-      auto it = var_map.find(var.get());
-      if (it != var_map.end()) return it->second;
-    }
-    return dim;
-  };
+  // Validate repeated bindings only after all arguments have contributed.
+  // A constraint may mention another callee placeholder that is bound by a
+  // later argument (for example STAGED = NR * 64, then NR = world_size()).
+  for (const auto& constraint : constraints) {
+    if (structural_equal(constraint.existing, constraint.candidate)) continue;
+    auto existing = transform_utils::Substitute(constraint.existing, var_map);
+    auto candidate = transform_utils::Substitute(constraint.candidate, var_map);
+    if (structural_equal(existing, candidate)) continue;
+    CHECK(ProveValidExtentEqual(existing, candidate) == ProofResult::kTrue)
+        << "Dynamic type variable '" << constraint.var->name_hint_ << "' has conflicting bindings "
+        << PythonPrint(existing) << " and " << PythonPrint(candidate) << " that are not provably equal at "
+        << constraint.context << "; cross-function calls do not emit a runtime shape guard";
+  }
 
-  auto subst_dims = [&](const std::vector<ExprPtr>& dims) {
-    std::vector<ExprPtr> result;
-    result.reserve(dims.size());
-    bool changed = false;
-    for (const auto& d : dims) {
-      auto nd = subst_dim(d);
-      if (nd.get() != d.get()) changed = true;
-      result.push_back(nd);
-    }
-    return std::pair{std::move(result), changed};
-  };
-
-  std::function<TypePtr(const TypePtr&)> subst_type;
-  subst_type = [&](const TypePtr& type) -> TypePtr {
-    if (!type) return type;
-    if (auto t = As<TensorType>(type)) {
-      auto [new_shape, changed] = subst_dims(t->shape_);
-      std::optional<TensorView> new_tv = t->tensor_view_;
-      if (new_tv.has_value()) {
-        auto [new_stride, s_changed] = subst_dims(new_tv->stride);
-        auto [new_vs, vs_changed] = subst_dims(new_tv->valid_shape);
-        if (s_changed || vs_changed) {
-          new_tv->stride = std::move(new_stride);
-          new_tv->valid_shape = std::move(new_vs);
-          changed = true;
-        }
-      }
-      if (!changed) return type;
-      return std::make_shared<TensorType>(std::move(new_shape), t->dtype_, t->memref_, std::move(new_tv));
-    }
-    if (auto t = As<TileType>(type)) {
-      auto [new_shape, changed] = subst_dims(t->shape_);
-      std::optional<TileView> new_tv = t->tile_view_;
-      if (new_tv.has_value()) {
-        auto [new_vs, vs_changed] = subst_dims(new_tv->valid_shape);
-        auto [new_stride, s_changed] = subst_dims(new_tv->stride);
-        auto new_start = subst_dim(new_tv->start_offset);
-        bool so_changed = (new_start.get() != new_tv->start_offset.get());
-        if (vs_changed || s_changed || so_changed) {
-          new_tv->valid_shape = std::move(new_vs);
-          new_tv->stride = std::move(new_stride);
-          new_tv->start_offset = std::move(new_start);
-          changed = true;
-        }
-      }
-      if (!changed) return type;
-      return std::make_shared<TileType>(std::move(new_shape), t->dtype_, t->memref_, std::move(new_tv),
-                                        t->memory_space_);
-    }
-    if (auto t = As<TupleType>(type)) {
-      std::vector<TypePtr> new_types;
-      bool changed = false;
-      for (const auto& inner : t->types_) {
-        auto nt = subst_type(inner);
-        if (nt.get() != inner.get()) changed = true;
-        new_types.push_back(nt);
-      }
-      if (!changed) return type;
-      return std::make_shared<TupleType>(std::move(new_types));
-    }
-    return type;  // ScalarType, etc. — no shape dims
-  };
-
-  // 3. Apply to all return types
   std::vector<TypePtr> result;
   result.reserve(return_types.size());
   for (const auto& rt : return_types) {
-    result.push_back(subst_type(rt));
+    result.push_back(SubstituteCallReturnType(rt, var_map));
   }
   return result;
 }

@@ -6,6 +6,8 @@ Orchestration codegen follows the same principle as [PTO codegen](00-pto_codegen
 
 For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
 
+Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/42-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
+
 ## Overview
 
 The orchestration codegen generates PTO2 runtime C++ code that manages task-graph execution on Ascend hardware. While [PTO codegen](00-pto_codegen.md) produces InCore kernel code (tile-level compute), orchestration codegen produces the host-side code that:
@@ -189,16 +191,20 @@ Arg params_t1;
 params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 ```
 
-Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic:
-pipeline IR satisfies the `ReturnParamsExplicit` property
-([`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)),
-so `FindReturnedParamIndex` resolves each return value to a param by pointer
-identity via `ir::return_lineage`. The legacy lineage tracing (var-to-var
-aliases, loop carries, builtin writebacks, `TupleGetItem` of tuple calls,
-Group/Spmd wrappers) remains only for hand-parsed IR. When no param can be
-traced, single-return aliasing falls back to the sole `Out`/`InOut` param only
-when the callee has exactly one — multiple outputs with an untraceable return
-are an internal error, never a guess.
+Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic — and
+not an analysis either. `ReturnParamsExplicit`
+([`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)) guarantees
+that every tensor param-writeback return value *is* the param, by pointer
+identity. Codegen therefore reads the return-position → param-index map straight
+off the callee's `ReturnStmt` via `ir::return_lineage::ExplicitReturnedParamIndices`;
+no SSA walk, no callee recursion, no `Program`. The interprocedural lineage
+tracer (`ReturnedParamIndices`) stays behind in the IR layer for the passes that
+run *before* the property is established.
+
+The property is thus a codegen precondition. When a return position resolves to
+no param, single-return aliasing falls back to the sole `Out`/`InOut` param only
+when the callee has exactly one — a multi-output callee whose `ReturnStmt` does
+not reference a param directly is an internal error, never a guess.
 
 Excluded from remap: a phi/loop-carry reassignment (it rebinds an lvalue the
 enclosing `if`/loop owns) keeps its `<name> = <src>;` form; and a tensor whose
@@ -257,7 +263,31 @@ rt_submit_task(mixed_0, params_t0);
 | `tensor.slice` | `make_tensor_external(ptr + byte_offset, ...)` | Create view into existing tensor |
 | `tensor.transpose` | `Tensor xt = ext_x.transpose(axis1, axis2)` | Zero-copy metadata swap of two axes (lowers to runtime `Tensor::transpose`) |
 | `tensor.dim` (static) | `int64_t d0 = 16` | Constant dimension value |
-| `tensor.dim` (dynamic) | `int64_t d0 = (int64_t)orch_args.tensor(N).shapes[axis]` | Runtime dimension from ChipStorageTaskArgs |
+| `tensor.dim` (dynamic) | `int64_t d0 = (int64_t)orch_args.tensor(N).ref().shapes[axis]` | Runtime dimension from ChipStorageTaskArgs. In an Orchestration body the parser folds it onto the declared extent instead — see below |
+
+### Dynamic-dim symbols
+
+A `pl.dynamic("M")` symbol names the runtime extent of whatever tensor argument
+declares it. In a kernel it is a type-level placeholder, but an Orchestration body
+may use it as a **value** — a loop bound, a `pl.create_tensor` extent, or a folded
+`pl.tensor.dim` — so each symbol the body references is defined once at entry, read
+from the descriptor of the first parameter declaring it:
+
+```cpp
+    // Dynamic-dim symbols (extent of the declaring argument)
+    int64_t M = (int64_t)orch_args.tensor(0).ref().shapes[0];
+```
+
+Only symbols the emitted body mentions get a definition; a symbol appearing solely
+in a parameter's type produces none (external tensor shapes are never printed).
+
+Because the symbol **is** the extent, the parser folds `pl.tensor.dim(x, i)` in an
+Orchestration body onto the extent `x`'s type already names — one runtime extent,
+one IR name. Reading it back would mint a second scalar that no analyzer can prove
+equal to the symbol, and every shape built from that copy would then disagree
+structurally with shapes built from the symbol. The fold is **Orchestration-only**:
+an Inline/InCore callee may be reached with a differently-shaped actual, so there
+`tensor.dim` stays a genuine runtime read.
 
 ## Complete Example
 

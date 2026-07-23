@@ -385,6 +385,25 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
           continue;
         }
       }
+    } else if (k == kAttrDevice) {
+      // The distributed dispatch ``device=`` attr holds a single ExprPtr (a
+      // ConstInt rank or a Var loop index). It references a Var defined
+      // elsewhere (the host-orch ``for r in pl.range(P)`` loop var), so it must
+      // be remapped alongside the args — otherwise a loop-var substitution
+      // (e.g. the P==1 unroll folding ``r`` -> ``0``) rewrites the slice
+      // subscripts but leaves ``device=r`` dangling to the now-undefined loop
+      // var, and codegen emits an unbound index -> NameError. Mirrors the
+      // kAttrDevice handling in the SSA pass.
+      const auto* dev = std::any_cast<ExprPtr>(&v);
+      if (dev && *dev) {
+        auto new_dev = ExprFunctor<ExprPtr>::VisitExpr(*dev);
+        INTERNAL_CHECK_SPAN(new_dev, op->span_) << "Call device attribute mutated to null";
+        if (new_dev.get() != dev->get()) {
+          attrs_changed = true;
+          new_attrs.emplace_back(k, std::any(std::move(new_dev)));
+          continue;
+        }
+      }
     }
     new_attrs.emplace_back(k, v);
   }
@@ -446,6 +465,21 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
     }
   }
 
+  // Mutate the dispatch predicate (pl.spmd_submit(..., predicate=(t[i] > 0))) —
+  // a first-class SSA-bearing Expr, so substitution must rewrite it like
+  // args_/deps_/core_num_ (pass-submit-awareness.md rule 2).
+  std::optional<ExprPtr> new_predicate = op->predicate_;
+  bool predicate_changed = false;
+  if (op->predicate_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->predicate_, op->span_) << "Submit predicate is null";
+    auto remapped = ExprFunctor<ExprPtr>::VisitExpr(*op->predicate_);
+    INTERNAL_CHECK_SPAN(remapped, op->span_) << "Submit predicate mutated to null";
+    if (remapped.get() != op->predicate_->get()) {
+      new_predicate = remapped;
+      predicate_changed = true;
+    }
+  }
+
   auto new_type = RemapTypeViaVisitor(op->GetType());
   bool type_changed = (new_type.get() != op->GetType().get());
 
@@ -493,7 +527,10 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
     new_attrs.emplace_back(k, v);
   }
 
-  if (!args_changed && !deps_changed && !type_changed && !attrs_changed && !core_num_changed) return op;
+  if (!args_changed && !deps_changed && !type_changed && !attrs_changed && !core_num_changed &&
+      !predicate_changed) {
+    return op;
+  }
   std::vector<std::pair<std::string, std::any>> attrs_to_use;
   if (attrs_changed) {
     attrs_to_use = std::move(new_attrs);
@@ -502,7 +539,8 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
   }
   return std::make_shared<const Submit>(op->op_, std::move(new_args), std::move(new_deps), op->kwargs_,
                                         std::move(attrs_to_use), std::move(new_type), op->span_,
-                                        std::move(new_core_num), op->sync_start_, op->allow_early_resolve_);
+                                        std::move(new_core_num), op->sync_start_, op->allow_early_resolve_,
+                                        std::move(new_predicate));
 }
 
 ExprPtr IRMutator::VisitExpr_(const MakeTuplePtr& op) {
@@ -925,6 +963,29 @@ std::pair<std::vector<std::pair<std::string, std::any>>, bool> IRMutator::Mutate
         if (remapped_var && remapped_var.get() != var->get()) {
           any_changed = true;
           new_attrs.emplace_back(k, std::any(std::move(remapped_var)));
+          continue;
+        }
+      }
+    } else if (k == kAttrPredicate) {
+      // ``with pl.spmd(..., predicate=(t[i] > 0)):`` — an Expr tree, not a
+      // Var, so mutate the whole subtree (the operand tensor Var and its
+      // index Vars must follow any remapping the mutator is performing).
+      //
+      // No pipeline pass currently reaches this: the passes that run while the
+      // attr still exists (before OutlineSpmdScopes) either do not remap Vars
+      // inside it, or — like FlattenCallExpr — override the Spmd handler and
+      // copy attrs_ verbatim. ConvertToSSA has its own SubstScopeAttrs. This
+      // branch is therefore untested-by-construction, and kept for the same
+      // reason the sibling Var attrs above are handled here: any future
+      // IRMutator-based pass that renames Vars must not silently skip the
+      // predicate. Deleting it would make the predicate the one scope attr the
+      // generic mutator ignores.
+      const auto* pred = std::any_cast<ExprPtr>(&v);
+      if (pred && *pred) {
+        auto remapped = ExprFunctor<ExprPtr>::VisitExpr(*pred);
+        if (remapped && remapped.get() != pred->get()) {
+          any_changed = true;
+          new_attrs.emplace_back(k, std::any(std::move(remapped)));
           continue;
         }
       }

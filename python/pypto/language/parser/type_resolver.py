@@ -401,6 +401,22 @@ class TypeResolver:
         is_distributed = type_name == "DistributedTensor"
         is_tensor_like = type_name == "Tensor" or is_distributed
         tensor_ctor = ir.DistributedTensorType if is_distributed else ir.TensorType
+
+        # PassDumpLevel.EXPLICIT appends a `"window_buffer=<name>"` debug marker as
+        # a trailing subscript element on DistributedTensor annotations (issue
+        # #2088). It is informational only — the real back-reference re-derives
+        # from pld.tensor.window — so drop it before validation/resolution to keep
+        # EXPLICIT pass dumps reparseable (validate_ir reloads every dump via
+        # pl.loads).
+        if is_distributed and isinstance(slice_value, ast.Tuple) and slice_value.elts:
+            last = slice_value.elts[-1]
+            if (
+                isinstance(last, ast.Constant)
+                and isinstance(last.value, str)
+                and last.value.startswith("window_buffer=")
+            ):
+                slice_value.elts = slice_value.elts[:-1]
+
         valid_counts = (2, 3, 4) if is_tensor_like else (2, 3, 4, 5)
         if not isinstance(slice_value, ast.Tuple) or len(slice_value.elts) not in valid_counts:
             if is_tensor_like:
@@ -1289,7 +1305,10 @@ class TypeResolver:
             raise ParserTypeError(
                 f"Expected pl.TensorView(...) call, got: {ast.unparse(node)}",
                 span=self._get_span(node),
-                hint="Use pl.TensorView(valid_shape=[...], stride=[...], layout=pl.TensorLayout.NZ)",
+                hint=(
+                    "Use pl.TensorView(valid_shape=[...], stride=[...], "
+                    "layout=pl.TensorLayout.NZ, pad=pl.PadValue.zero)"
+                ),
             )
         if node.args:
             raise ParserTypeError(
@@ -1305,11 +1324,13 @@ class TypeResolver:
                 tv.stride = self._parse_tileview_expr_list(kw.value)
             elif kw.arg == "layout":
                 tv.layout = self.resolve_layout(kw.value)
+            elif kw.arg == "pad":
+                tv.pad = self._resolve_padvalue(kw.value)
             else:
                 raise ParserTypeError(
                     f"Unknown TensorView keyword argument: {kw.arg!r}",
                     span=self._get_span(kw),
-                    hint="Supported: valid_shape, stride, layout",
+                    hint="Supported: valid_shape, stride, layout, pad",
                 )
         return tv
 

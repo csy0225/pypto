@@ -111,7 +111,11 @@ void BindPass(nb::module_& m) {
              "return->param map is a lookup (#1702)")
       .value("AivSplitValid", IRProperty::AivSplitValid,
              "Split-mode AIV/AIC functions (explicit split_aiv marker + non-None split mode) have no "
-             "vector reduce op that collapses the split axis (partial-reduction miscompile)");
+             "vector reduce op that collapses the split axis (partial-reduction miscompile)")
+      .value("IterArgCarryClassified", IRProperty::IterArgCarryClassified,
+             "Every ForStmt with iter_args in an Orchestration function carries an "
+             "attrs['iter_arg_rebind_<i>'] classification per slot (plus attrs['iter_arg_array_size_<i>'] "
+             "for TaskId array carries), so orchestration codegen reads the carry lowering");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -277,13 +281,15 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner>(),
+                    MemoryPlanner, bool>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("memory_planner") = MemoryPlanner::PyPTO,
+           nb::arg("enable_pypto_l0c_double_buffer") = false,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "optional disabled diagnostic checks, and memory planner selection")
+           "optional disabled diagnostic checks, memory planner selection, and the experimental "
+           "PyPTO-planner L0C double-buffer (dbC=2) opt-in")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -299,6 +305,8 @@ void BindPass(nb::module_& m) {
       .def("get_instruments", &PassContext::GetInstruments, "Get the instruments registered on this context")
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
+      .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
+           "Whether L0C double-buffering (dbC=2) is enabled under the PyPTO memory planner")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
 
@@ -307,7 +315,8 @@ void BindPass(nb::module_& m) {
       .def(nb::init<>(), "Create an empty pipeline")
       .def("add_pass", &PassPipeline::AddPass, nb::arg("pass_obj"), "Add a pass to the pipeline")
       .def("run", &PassPipeline::Run, nb::arg("program"), "Execute all passes in sequence")
-      .def("get_pass_names", &PassPipeline::GetPassNames, "Get names of all passes");
+      .def("get_pass_names", &PassPipeline::GetPassNames, "Get names of all passes")
+      .def("get_passes", &PassPipeline::GetPasses, "Get copies of all passes in execution order");
 
   // Factory functions with snake_case names
   passes.def("init_mem_ref", &pass::InitMemRef,
@@ -375,7 +384,14 @@ void BindPass(nb::module_& m) {
       .value("FOR_RANGE_MUST_BE_SCALAR", typecheck::ErrorType::FOR_RANGE_MUST_BE_SCALAR,
              "ForStmt range must be ScalarType")
       .value("CONDITION_MUST_BE_BOOL", typecheck::ErrorType::CONDITION_MUST_BE_BOOL,
-             "IfStmt/WhileStmt condition dtype must be BOOL");
+             "IfStmt/WhileStmt condition dtype must be BOOL")
+      .value("TENSOR_PADDING_MISMATCH", typecheck::ErrorType::TENSOR_PADDING_MISMATCH,
+             "Tensor pad metadata mismatch")
+      .value("DISTRIBUTED_WINDOW_IDENTITY_MISMATCH",
+             typecheck::ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH,
+             "Distributed tensors refer to different window buffers")
+      .value("TILE_VIEW_MISMATCH", typecheck::ErrorType::TILE_VIEW_MISMATCH,
+             "Effective TileView metadata mismatch");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")
@@ -541,6 +557,12 @@ void BindPass(nb::module_& m) {
              "wrapping the function body and each ForStmt / IfStmt branch body (suppressed\n"
              "inside a manual scope). Codegen then emits PTO2_SCOPE only from RuntimeScopeStmt\n"
              "nodes, 1:1 with the IR. Runs last in the pipeline, after the final Simplify.");
+  passes.def("classify_iter_arg_carry", &pass::ClassifyIterArgCarry,
+             "Classify ForStmt iter_arg carries and size TaskId array carries.\n\n"
+             "For every Orchestration function, stamps attrs['iter_arg_rebind_<i>'] (bool, every\n"
+             "slot) and attrs['iter_arg_array_size_<i>'] (int, positive extents only) onto each\n"
+             "ForStmt, so orchestration codegen reads the carry lowering instead of re-deriving\n"
+             "it from an alias fixpoint. Runs last, after materialize_runtime_scopes.");
   passes.def("normalize_stmt_structure", &pass::NormalizeStmtStructure,
              "Create a pass that normalizes statement structure");
   passes.def("derive_call_directions", &pass::DeriveCallDirections,
@@ -727,8 +749,12 @@ void BindPass(nb::module_& m) {
       .def_rw("bw_b", &utils::L0TileConfig::bw_b)
       .def_rw("bw_drain", &utils::L0TileConfig::bw_drain)
       .def_rw("drain_fixed_cycles", &utils::L0TileConfig::drain_fixed_cycles)
+      .def_rw("drain_row_cycles", &utils::L0TileConfig::drain_row_cycles)
+      .def_rw("drain_penalty_cycles", &utils::L0TileConfig::drain_penalty_cycles)
+      .def_rw("drain_c0_bytes", &utils::L0TileConfig::drain_c0_bytes)
       .def_rw("mad_head", &utils::L0TileConfig::mad_head)
       .def_rw("mad_k_fractal_bytes", &utils::L0TileConfig::mad_k_fractal_bytes)
+      .def_rw("mad_fp32_passes", &utils::L0TileConfig::mad_fp32_passes)
       .def_rw("allow_padding", &utils::L0TileConfig::allow_padding)
       .def_rw("allow_k_boundary", &utils::L0TileConfig::allow_k_boundary);
 

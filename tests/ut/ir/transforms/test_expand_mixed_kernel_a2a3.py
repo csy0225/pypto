@@ -63,6 +63,265 @@ def _op_name(stmt: ir.Stmt) -> str:
     return ""
 
 
+def test_hand_written_group_members_share_canonical_abi():
+    """Different AIC/AIV signatures are normalized to the Group ABI (#2097).
+
+    ``MixedKernels`` gives every active lane the same runtime argument array.
+    A hand-written Group is allowed to capture the union of its member inputs,
+    so ExpandMixedKernel must make both member wrappers consume that union in
+    the same order instead of letting orchestration codegen use the first call's
+    shorter signature for both lanes.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink, task)
+            result = self.vec_side(out, task)
+            return result
+
+    after = _run_pipeline(Program)
+    cube = after.get_function("cube_side")
+    vec = after.get_function("vec_side")
+    group = after.get_function("mixed")
+    assert cube is not None
+    assert vec is not None
+    assert group is not None
+    expected_names = [param.name_hint for param in group.params]
+
+    assert [param.name_hint for param in cube.params] == expected_names
+    assert [param.name_hint for param in vec.params] == expected_names
+    assert cube.param_directions == group.param_directions
+    assert vec.param_directions == group.param_directions
+
+    member_calls = []
+    for stmt in ir.flatten_to_stmts(group.body):
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
+            member_calls.append(stmt.value)
+        elif isinstance(stmt, ir.EvalStmt) and isinstance(stmt.expr, ir.Call):
+            member_calls.append(stmt.expr)
+    assert len(member_calls) == 2
+    for call in member_calls:
+        assert [arg.name_hint for arg in call.args] == expected_names
+
+
+def test_hand_written_no_split_pipe_group_infers_dual_aiv_dispatch():
+    """910B explicit pipe members get the same lane-1 handshake replay as auto-expanded mixed kernels."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            v2c = pl.reserve_buffer(name="probe_v2c", size=4096, base=pl.AUTO)
+            c2v_peer = pl.import_peer_buffer(name="probe_c2v", peer_func="vec_side")
+            pl.aic_initialize_pipe(c2v_peer, v2c, dir_mask=3, slot_size=512)
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            c2v = pl.reserve_buffer(name="probe_c2v", size=4096, base=pl.AUTO)
+            v2c_peer = pl.import_peer_buffer(name="probe_v2c", peer_func="cube_side")
+            pl.aiv_initialize_pipe(c2v, v2c_peer, dir_mask=3, slot_size=512)
+            tile = pl.tpop_from_aic(shape=[16, 16], dtype=pl.FP32, split=0)
+            pl.tfree_to_aic(tile, split=0)
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink)
+            return self.vec_side(out)
+
+    after = _run_pipeline(Program)
+    vec = after.get_function("vec_side")
+    assert vec is not None
+    assert vec.attrs.get("dual_aiv_dispatch") is True
+
+
+def test_reused_hand_written_group_members_get_private_adapters():
+    """A member used outside its Group keeps its original ABI."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return sink
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            self.cube_side(q, sink, task)
+            result = self.vec_side(out, task)
+            return result
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            sink: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            sink = self.cube_side(q, sink, task)
+            return self.mixed(q, sink, out, task)
+
+    after = _run_pipeline(Program)
+    group = after.get_function("mixed")
+    aic_adapter = after.get_function("mixed_aic_adapter")
+    aiv_adapter = after.get_function("mixed_aiv_adapter")
+    cube = after.get_function("cube_side")
+    vec = after.get_function("vec_side")
+    assert group is not None
+    assert aic_adapter is not None
+    assert aiv_adapter is not None
+    assert cube is not None
+    assert vec is not None
+    canonical_names = [param.name_hint for param in group.params]
+
+    assert len(cube.params) == 3
+    assert len(vec.params) == 2
+    assert [param.name_hint for param in aic_adapter.params] == canonical_names
+    assert [param.name_hint for param in aiv_adapter.params] == canonical_names
+    group_text = group.as_python()
+    assert "mixed_aic_adapter(" in group_text
+    assert "mixed_aiv_adapter(" in group_text
+
+
+def test_hand_written_group_submit_remaps_no_dep_override():
+    """A widened Submit keeps no_dep attached to the original member argument."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.AIC)
+        def cube_side(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return q
+
+        @pl.function(type=pl.FunctionType.AIV)
+        def vec_side(
+            self,
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return out
+
+        @pl.function(type=pl.FunctionType.Group)
+        def mixed(
+            self,
+            q: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            task: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            _cube_out, _cube_tid = pl.submit(self.cube_side, q, task)
+            vec_out, _vec_tid = pl.submit(
+                self.vec_side,
+                pl.no_dep(out),
+                task,
+                attrs={"arg_directions": [pl.adir.output_existing, pl.adir.scalar]},
+            )
+            return vec_out
+
+    after = _run_pipeline(Program)
+    group = after.get_function("mixed")
+    assert group is not None
+    submits = [
+        stmt.value
+        for stmt in ir.flatten_to_stmts(group.body)
+        if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Submit)
+    ]
+    vec_submit = next(submit for submit in submits if submit.op.name == "vec_side")
+
+    assert list(vec_submit.args) == list(group.params)
+    assert vec_submit.attrs["arg_direction_overrides"] == [1]
+    assert list(vec_submit.arg_directions) == []
+
+
+def test_explicit_sync_core_type_routes_each_event_to_one_lane():
+    """Mixed JIT kernels must not duplicate set/wait onto both core types."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def explicit_sync(
+            self,
+            workspace: pl.Tensor[[256], pl.INT64],
+            x: pl.Tensor[[16], pl.FP32],
+        ) -> pl.Tensor[[16], pl.FP32]:
+            pl.system.set_ffts(workspace)
+            pl.system.sync_set(4, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type="aiv")
+            pl.system.sync_wait(4, pipe=pl.PipeType.MTE2, core_type="aic")
+            return x
+
+    after = _run_pipeline(Before)
+    aic = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIC)
+    aiv = next(f for f in after.functions.values() if f.func_type == ir.FunctionType.AIV)
+    aic_ops = [_op_name(stmt) for stmt in ir.flatten_to_stmts(aic.body)]
+    aiv_ops = [_op_name(stmt) for stmt in ir.flatten_to_stmts(aiv.body)]
+
+    assert aic_ops.count("system.set_ffts") == 1
+    assert aic_ops.count("system.sync_wait") == 1
+    assert "system.sync_set" not in aic_ops
+    assert aiv_ops.count("system.set_ffts") == 1
+    assert aiv_ops.count("system.sync_set") == 1
+    assert "system.sync_wait" not in aiv_ops
+
+
 def test_v2c_boundary_uses_nz_layout_on_a2a3():
     """On Ascend910B, cross-core push needs no layout adaptation on the AIV side.
 

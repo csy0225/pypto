@@ -29,7 +29,7 @@ N6 分布式算子族为 Python DSL 提供了对硬件跨 rank（cross-rank）�
 | `pld.tensor.broadcast` | 将 root rank 的数据复制到所有 rank | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.reduce_scatter` | 跨 rank 规约并分散 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.allgather` | 从所有 rank 收集数据到窗口 | `DistributedTensorType`（同 src） | builtin collective |
-| `pld.tensor.all_to_all` | 基于推送的对称个性化交换——每个 rank 通过 `pld.tensor.put`（TPUT）将自己的各目标 block 推送到每个对等方的窗口中，返回窗口作为结果 | `DistributedTensorType`（同 src） | composite |
+| `pld.tensor.all_to_all` | 基于推送的对称个性化交换——每个 rank 通过 `pld.tensor.put`（TPUT）将自己的各目标 block 推送到每个对等方的窗口中，返回窗口作为结果 | `DistributedTensorType`（同 src） | composite / HOST builtin |
 | `pld.system.notify` | 给 peer 的槽位发信号 | `Unknown`（副作用） | TNOTIFY |
 | `pld.system.wait` | 在自身槽位上阻塞 | `Unknown`（副作用） | TWAIT |
 
@@ -232,14 +232,31 @@ full-slice `get` 要求 `dst` / `src` 形状一致；subregion `get` 允许完�
 ### `pld.tensor.allreduce`
 
 ```text
-pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
-pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
+pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
+pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
 ```
 
+对于 mesh 降级，如果 packed ND 目标的 partial `TensorView.valid_shape` 能通过折叠
+leading dimensions 表示为单个 2D 矩形，Pass 会保留该元数据并且只归约这个矩形；
+strided 目标、DN partial view 和无法按该方式表示的 partial 区域会被明确拒绝。
+
 对所有参与 rank 的窗口绑定 `src` 切片做原地 all-reduce，并返回与 `src`
-相同的类型。host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
+相同的类型。`mode` 关键字选择降级算法：
+
+- **`"mesh"`（默认）** — 全对全直接交换，O(P) 个 HCCL 窗口。信号 shape
+  `[NR, 1]`（每 rank 一个槽位）。4 阶段分解：notify-all (Set 1) /
+  wait-all (Ge 1) / remote_load+accumulate / store-back，外加
+  写后读 (WAR) 防护屏障 (AtomicAdd 1 → Ge 2)。
+- **`"ring"`** — NCCL 风格的分块 reduce-scatter + allgather 调度，
+  O(1) 个 HCCL 窗口。信号 shape `[2 * (NR − 1), NR]`（每轮 ring 一行，
+  每 rank 一个槽位）。2(P−1) 轮 ring 步骤，每轮带有屏障 (AtomicAdd 1 →
+  Ge 1)。块大小 = `SIZE // NR`，且 `SIZE` 必须是 `NR` 的整数倍；当 `SIZE`
+  与 `NR` 均为编译期常量时，`LowerCompositeOps` 会常量折叠块大小。
+
+host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
 [`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
-语义 shape 为 `[world_size, 1]`。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
+语义 shape 为 `[world_size, 1]`（仅 mesh 模式 — `mode="ring"` 必须显式传入
+signal）。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
 再用该变量构造 buffer size 和 window shape。循环内的所有调用都会被拒绝，因为当前 signal 协议只能
 单次使用。显式 `signal` 仍然是 InCore
 lowering 和内部测试使用的形态。通信域物化会把该 signal buffer 保留在与 `src`
@@ -312,6 +329,8 @@ host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断�
   ``--device=0,1,2,3`` 或 ``--device=0-3``）、`test_l3_allgather.py`、
   `test_l3_reduce_scatter.py`、`test_l3_broadcast.py`（三者同样采用动态 NR，
   P=2/P=4）、`test_l3_tensor_allreduce_intrinsic.py`、
+  `test_l3_tensor_allreduce_ring_intrinsic.py`、
+  `test_l3_allreduce_ring.py`（手写 ring RS+AG）、
   `test_l3_ep_dispatch_combine.py`、`test_l3_notify_wait.py`，以及
   `tests/st/distributed/` 下其他 L3 ST。**Put/Get 端到端权威契约** 已启用：
   `test_l3_put.py`（环形覆写、行偏移 put、原子加 put、分块/流水 transfer ✅）、

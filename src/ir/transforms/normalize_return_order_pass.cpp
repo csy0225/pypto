@@ -142,7 +142,44 @@ FunctionPtr CanonicalizeReturnValues(const FunctionPtr& func, const ProgramPtr& 
 
    protected:
     StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
-      if (done_ || op->value_.empty() || ret_to_param_.size() != op->value_.size()) return op;
+      if (done_ || op->value_.empty()) return op;
+
+      // A Group/Spmd wrapper around a multi-result kernel forwards the inner
+      // call's whole tuple as ONE return value, while declaring N return
+      // positions:  ``result = self.inner(...); return result``.  Expand that
+      // into the N params the inner call writes back, so the return is
+      // positionally explicit like every other kernel's.
+      //
+      // Left un-expanded it is invisible to every consumer of the
+      // return-position -> param map: the map comes back one-short, callers
+      // deem it imprecise and fall back to the legacy tail-alignment
+      // heuristic, which shifts each returned element onto the wrong Out/InOut
+      // param as soon as the callee writes an Out/InOut param it does not
+      // return (an accumulator, ``__gm_pipe_buffer``, an in-place KV cache).
+      // That silently binds a consumer task to the wrong tensor operand --
+      // #1573 resurfacing on exactly the wrappers its fix left on the
+      // heuristic.
+      if (op->value_.size() == 1 && ret_to_param_.size() > 1) {
+        // Only a function that declares N flat return positions may be given an
+        // N-value return. A single ``pl.Tuple[T1, ..., TN]`` return declares ONE
+        // (its ``return_types_`` is one TupleType) and stays one value.
+        if (func_->return_types_.size() != ret_to_param_.size()) return op;
+        std::vector<ExprPtr> expanded;
+        expanded.reserve(ret_to_param_.size());
+        for (const auto& idx : ret_to_param_) {
+          // Every position must be nameable as a param for the expansion to be
+          // well-formed; otherwise leave the return alone (status quo ante).
+          if (!idx) return op;
+          const auto& param = func_->params_[idx.value()];  // NOLINT(bugprone-unchecked-optional-access)
+          if (!AsTensorTypeLike(param->GetType())) return op;
+          expanded.push_back(param);
+        }
+        done_ = true;
+        changed = true;
+        return std::make_shared<ReturnStmt>(expanded, op->span_);
+      }
+
+      if (ret_to_param_.size() != op->value_.size()) return op;
       done_ = true;
       std::vector<ExprPtr> new_values = op->value_;
       for (size_t i = 0; i < new_values.size(); ++i) {
@@ -426,8 +463,7 @@ Pass NormalizeReturnOrder() {
     bool modified = false;
 
     for (const auto& [gvar, func] : program->functions_) {
-      const bool is_wrapper =
-          func->func_type_ == FunctionType::Group || func->func_type_ == FunctionType::Spmd;
+      const bool is_wrapper = IsWrapperType(func->func_type_);
       if (IsInCoreType(func->func_type_) || is_wrapper) {
         // Step A0: make every tensor return an explicit param reference.
         FunctionPtr current = func;

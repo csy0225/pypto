@@ -311,6 +311,7 @@ def _compile_for_cache(
         dump_passes=dump_passes,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
         memory_planner=test_case.get_memory_planner(),
+        enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
     )
     # External kernels are referenced in the manifest at their original path
     # (not copied into the artifact), so accept them even when no kernel .cpp is
@@ -349,7 +350,6 @@ def _fused_compile_task(
     session_platform: str,
     dump_passes: bool,
     analyze_auto_scopes_for_deps: bool,
-    pto_isa_commit: str | None,
 ) -> CompileArtifact:
     """Compile IR → kernels/orch C++ → golden.py → .so for one test case.
 
@@ -375,9 +375,7 @@ def _fused_compile_task(
             )
         from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
-        chip_callable, runtime_name, _ = compile_and_assemble(
-            work_dir, resolved, pto_isa_commit=pto_isa_commit
-        )
+        chip_callable, runtime_name, _ = compile_and_assemble(work_dir, resolved)
         return CompileArtifact(
             work_dir=work_dir,
             resolved_platform=resolved,
@@ -421,8 +419,8 @@ def _dfx_to_cli(dfx: "_DfxOpts") -> list[str]:
     argv: list[str] = []
     if dfx.enable_l2_swimlane:
         argv.append("--enable-l2-swimlane")
-    if dfx.enable_dump_tensor:
-        argv += ["--dump-tensor", str(dfx.enable_dump_tensor)]
+    if dfx.enable_dump_args:
+        argv += ["--dump-args", str(dfx.enable_dump_args)]
     if dfx.enable_pmu:
         argv += ["--enable-pmu", str(dfx.enable_pmu)]
     if dfx.enable_dep_gen:
@@ -532,15 +530,13 @@ def _shell_quote_run(project_root: Path, inner: "list[str]") -> str:
     )
 
 
-def _build_execute_artifact_cmd(
-    mode_args: "list[str]", dfx: "_DfxOpts", pto_isa_commit: str | None
-) -> list[str]:
+def _build_execute_artifact_cmd(mode_args: "list[str]", dfx: "_DfxOpts") -> list[str]:
     """Assemble the ``python -m pypto.runtime.execute_artifact`` child argv.
 
     *mode_args* selects single (``--work-dir`` / ``--platform``) vs batch
     (``--batch-manifest``); everything else — the interpreter, ``--device-id
-    $TASK_DEVICE``, ``--no-validate``, the DFX flags and the optional pto-isa pin —
-    is shared by both task-submit paths.
+    $TASK_DEVICE``, ``--no-validate``, and the DFX flags — is shared by both
+    task-submit paths.
 
     Uses the exact interpreter running the harness (the per-job venv python), not
     bare ``"python"``: task-submit runs the child via ``runuser`` and bare
@@ -560,8 +556,6 @@ def _build_execute_artifact_cmd(
         "--no-validate",
         *_dfx_to_cli(dfx),
     ]
-    if pto_isa_commit:
-        inner += ["--pto-isa-commit", pto_isa_commit]
     return inner
 
 
@@ -614,7 +608,6 @@ def _run_artifact_via_task_submit(
     work_dir: Path,
     platform: str,
     dfx: "_DfxOpts",
-    pto_isa_commit: str | None,
     max_time: int,
     queue_timeout: int,
     device: str = "auto",
@@ -629,9 +622,7 @@ def _run_artifact_via_task_submit(
     card) or a specific id / range (pin to it — used to validate the flow before
     trusting auto-allocation).
     """
-    inner = _build_execute_artifact_cmd(
-        ["--work-dir", str(work_dir), "--platform", platform], dfx, pto_isa_commit
-    )
+    inner = _build_execute_artifact_cmd(["--work-dir", str(work_dir), "--platform", platform], dfx)
     proc, exec_err = _exec_task_submit(inner, device, max_time, queue_timeout, work_dir / "execute.log")
     if proc is None:
         return (False, exec_err, None)
@@ -645,7 +636,6 @@ def _run_batch_via_task_submit(
     manifest_path: Path,
     device: str,
     dfx: "_DfxOpts",
-    pto_isa_commit: str | None,
     max_time: int,
     queue_timeout: int,
 ) -> "dict[str, tuple[bool, str | None, int | None]]":
@@ -662,7 +652,7 @@ def _run_batch_via_task_submit(
         json.dumps([{"work_dir": str(wd), "platform": plat} for wd, plat in entries]),
         encoding="utf-8",
     )
-    inner = _build_execute_artifact_cmd(["--batch-manifest", str(manifest_path)], dfx, pto_isa_commit)
+    inner = _build_execute_artifact_cmd(["--batch-manifest", str(manifest_path)], dfx)
     proc, exec_err = _exec_task_submit(
         inner, device, max_time, queue_timeout, manifest_path.with_suffix(".log")
     )
@@ -878,7 +868,6 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
         assert _execute_pool is not None, "execute pool not initialised"
         device = _pipeline_ctx.get("task_submit_device", "auto")
         dfx = _pipeline_ctx.get("dfx", _DfxOpts())
-        pto_isa_commit = _pipeline_ctx.get("pto_isa_commit")
         max_time = _pipeline_ctx.get("task_max_time", 600)
         queue_timeout = _pipeline_ctx.get("task_queue_timeout", 1800)
         # A 0 / negative batch size would never fill a batch (``len(pending) >= 0``
@@ -901,7 +890,6 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
                 manifest_path,
                 device,
                 dfx,
-                pto_isa_commit,
                 batch_max_time,
                 queue_timeout,
             )
@@ -955,12 +943,11 @@ def start_pipeline(  # noqa: PLR0913
     session_platform: str,
     dump_passes: bool,
     codegen_only: bool,
-    pto_isa_commit: str | None,
     compile_workers: int,
     device_pool: "queue.Queue[int]",
     analyze_auto_scopes_for_deps: bool = False,
     enable_l2_swimlane: bool = False,
-    enable_dump_tensor: int = 0,
+    enable_dump_args: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
     enable_scope_stats: bool = False,
@@ -997,7 +984,7 @@ def start_pipeline(  # noqa: PLR0913
     if not codegen_only:
         from pypto.runtime.device_runner import ensure_pto_isa_root  # noqa: PLC0415
 
-        ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+        ensure_pto_isa_root(clone_protocol="https")
 
     _device_pool = device_pool
     _pipeline_ctx = {
@@ -1005,11 +992,10 @@ def start_pipeline(  # noqa: PLR0913
         "session_platform": session_platform,
         "dump_passes": dump_passes,
         "codegen_only": codegen_only,
-        "pto_isa_commit": pto_isa_commit,
         "analyze_auto_scopes_for_deps": analyze_auto_scopes_for_deps,
         "dfx": _DfxOpts(
             enable_l2_swimlane=enable_l2_swimlane,
-            enable_dump_tensor=enable_dump_tensor,
+            enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
             enable_scope_stats=enable_scope_stats,
@@ -1057,7 +1043,6 @@ def start_pipeline(  # noqa: PLR0913
                 session_platform,
                 dump_passes,
                 analyze_auto_scopes_for_deps,
-                pto_isa_commit,
             )
             _compile_futures[key] = cfut
             group_futs.append(cfut)
@@ -1096,9 +1081,9 @@ def configure_inline_task_submit(
 
     Used when ``--execute-via-task-submit`` is passed *without*
     ``--precompile-workers``: no compile pipeline runs, but ``_run_inline``
-    consults ``_pipeline_ctx`` to decide how to execute.  ``pto_isa_commit`` and
-    DFX still come from the test's ``RunConfig`` on that path, so only the
-    execute-mode toggle and task-submit knobs are stashed here.
+    consults ``_pipeline_ctx`` to decide how to execute. DFX still comes from
+    the test's ``RunConfig`` on that path, so only the execute-mode toggle and
+    task-submit knobs are stashed here.
     """
     _pipeline_ctx["execute_mode"] = "task-submit"
     _pipeline_ctx["task_max_time"] = task_max_time
@@ -1323,6 +1308,7 @@ class TestRunner:
                 dump_passes=self.config.dump_passes,
                 analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
                 memory_planner=test_case.get_memory_planner(),
+                enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
             )
 
             # External kernels are referenced in the manifest at their original
@@ -1351,9 +1337,7 @@ class TestRunner:
 
             from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
-            chip_callable, runtime_name, _ = compile_and_assemble(
-                work_dir, resolved_platform, pto_isa_commit=self.config.pto_isa_commit
-            )
+            chip_callable, runtime_name, _ = compile_and_assemble(work_dir, resolved_platform)
             # Undiscovered cases (the minority the collection scan can't see)
             # borrow a card via task-submit too, so EVERY device run goes through
             # task-submit's per-card lock. Running these in-process would bypass
@@ -1370,7 +1354,6 @@ class TestRunner:
                     work_dir,
                     resolved_platform,
                     _DfxOpts.from_run_config(self.config),
-                    self.config.pto_isa_commit,
                     _pipeline_ctx.get("task_max_time", 600),
                     _pipeline_ctx.get("task_queue_timeout", 1800),
                     _pipeline_ctx.get("task_submit_device", "auto"),

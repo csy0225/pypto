@@ -92,6 +92,7 @@ struct PassProperties {
 | MaterializeDistTensorCtx | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
 | Simplify | — | — | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
+| ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
 
 > **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md).
 
@@ -176,6 +177,24 @@ with passes.PassContext([passes.CallbackInstrument(after_pass=after_pass)]):
 ```
 
 `run_passes(dump_ir=True)` uses `CallbackInstrument` internally to dump IR after each pass, delegating verification to the C++ pipeline. When invoked inside an existing `PassContext`, dump mode preserves the outer context's instruments (e.g., user-provided `VerificationInstrument`) and verification level, appending the dump instrument to the combined list.
+
+**Dump verbosity (`PassDumpLevel`).** The `dump_passes` knob (on `ir.compile`, `RunConfig`, and `run_passes`' `dump_ir`) accepts a `PassDumpLevel` enum — or a `bool` for backwards compatibility (`True` → `CONCISE`, `False` → `NONE`):
+
+| Level | Meaning |
+| ----- | ------- |
+| `NONE` | No per-pass dumps. |
+| `CONCISE` | Concise canonical IR (the default); best for diffing passes. |
+| `EXPLICIT` | Fully-resolved dump — self-describing for layouts (issue #2088). |
+
+By default (`CONCISE`) a dumped `pl.Tile` annotation omits its `blayout`/`slayout`/`fractal` whenever they equal the memory-space *implicit* view, and canonical IR stores an implicit view as `nullopt` — so a tile can print with no `TileView` at all even though its real layout is non-trivial (e.g. a `pl.Mem.Acc` tile is really `blayout=col_major, slayout=row_major, fractal=1024`). `EXPLICIT` makes every dumped tile print its fully-resolved layout from `GetEffectiveTileView`, and surfaces the `window_buffer` back-reference that a `pld.DistributedTensor` carries but the concise form drops — so a layout/aliasing bug is decidable from the printed IR alone. `EXPLICIT` dumps still reparse to identical IR: the tile layout canonicalizes back to `nullopt` (an explicit view matching the implicit one), and the window-buffer marker is an informational trailing string the parser strips on reload (the real reference re-derives from `pld.tensor.window`). This keeps `compiled.validate_ir()` — which reloads every dump — working. Programmatically, pass `explicit_layout=True` to `python_print(...)`.
+
+```python
+from pypto.ir import PassDumpLevel
+from pypto.runtime import RunConfig
+
+RunConfig(dump_passes=PassDumpLevel.EXPLICIT)   # fully-resolved dumps
+RunConfig(dump_passes=True)                     # == PassDumpLevel.CONCISE
+```
 
 ### ReportInstrument
 
@@ -296,10 +315,11 @@ class PassPipeline {
   void AddPass(Pass pass);
   ProgramPtr Run(const ProgramPtr& program) const;  // executes passes in order
   std::vector<std::string> GetPassNames() const;
+  std::vector<Pass> GetPasses() const;
 };
 ```
 
-`PassPipeline` is a simple ordered list of passes. Each pass's `operator()` checks the active `PassContext` for instruments.
+`PassPipeline` is the single source of truth for ordered pass objects and their names. `GetPasses()` returns lightweight copies of the pass handles for inspection or composing another pipeline. Each pass's `operator()` checks the active `PassContext` for instruments.
 
 ### Automatic Verification
 
@@ -356,6 +376,7 @@ ir.compile(program, verification_level=ir.VerificationLevel.NONE)
 | `get_strategy(strategy)` | Get PassManager configured for strategy |
 | `run_passes(program, dump_ir, output_dir, prefix)` | Execute passes via PassPipeline |
 | `get_pass_names()` | Get names of all passes |
+| `passes` / `pass_names` | Read-only snapshots derived from the underlying PassPipeline |
 
 ### Usage
 
@@ -407,6 +428,7 @@ The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
 29. [`MaterializeDistTensorCtx`](40-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
 30. `Simplify`
 31. [`MaterializeRuntimeScopes`](41-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+32. [`ClassifyIterArgCarry`](42-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
 
 `DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
 without the tensor-only prefix passes. Use `Default` for normal compilation and

@@ -37,7 +37,6 @@
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
-#include "pypto/ir/transforms/utils/wrapper_call_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -51,21 +50,12 @@ using namespace pypto::ir;  // NOLINT(build/namespaces)
 
 std::string GetSSABaseName(const std::string& name) { return auto_name::GetCompatibleBaseName(name); }
 
-bool IsBuiltinOp(const std::string& op_name) {
-  return op_name.find("tile.") == 0 || op_name.find("tensor.") == 0 || op_name.find("system.") == 0 ||
-         op_name.find("array.") == 0;
-}
+// IsBuiltinOp now lives in ir::op_predicates and is thin-forwarded from the
+// header; codegen call sites still read unqualified via that forward.
 
 bool IsTensorOp(const std::string& op_name) { return op_name.find("tensor.") == 0; }
 
 bool IsArrayOp(const std::string& op_name) { return op_name.find("array.") == 0; }
-
-// See orchestration_analysis.h for the contract.
-CallPtr AsCallOrSubmitView(const ExprPtr& expr) {
-  if (auto call = As<Call>(expr)) return call;
-  if (auto submit = As<Submit>(expr)) return SubmitToCallView(submit);
-  return nullptr;
-}
 
 std::string FormatConstIntValue(const ConstIntPtr& c, const std::string& cpp_type) {
   int64_t v = c->value_;
@@ -91,20 +81,6 @@ int GetOrCreateFuncId(const std::string& func_name, std::map<std::string, int>* 
   return (*func_name_to_id)[func_name];
 }
 
-std::optional<int64_t> EvalConstInt(const ExprPtr& expr) {
-  if (auto ci = As<ConstInt>(expr)) return ci->value_;
-  return std::nullopt;
-}
-
-int64_t EvalConstTripCount(const ForStmtPtr& for_stmt) {
-  auto start = EvalConstInt(for_stmt->start_);
-  auto stop = EvalConstInt(for_stmt->stop_);
-  auto step = EvalConstInt(for_stmt->step_);
-  if (!start || !stop || !step || *step <= 0) return 0;
-  int64_t trip = (*stop - *start + *step - 1) / *step;
-  return trip > 0 ? trip : 0;
-}
-
 namespace {
 
 int GetGMPipeSlotCount(int dir_mask) {
@@ -128,7 +104,12 @@ int64_t ComputeGMPipeWorkspaceElements(const ProgramPtr& program, const Function
   std::function<void(const FunctionPtr&)> scan_func;
   scan_stmts = [&](const std::vector<StmtPtr>& stmts) {
     for (const auto& stmt : stmts) {
-      auto call = transform_utils::GetCallFromStmt(stmt);
+      CallPtr call;
+      if (auto assign = As<AssignStmt>(stmt)) {
+        call = transform_utils::AsCallOrSubmitView(assign->value_);
+      } else if (auto eval = As<EvalStmt>(stmt)) {
+        call = transform_utils::AsCallOrSubmitView(eval->expr_);
+      }
       if (op_predicates::IsInitializePipe(call)) {
         const int pipe_id = call->GetKwarg<int>("id", 0);
         const int dir_mask = call->GetKwarg<int>("dir_mask", 0);
@@ -222,116 +203,6 @@ void OrchestrationInfoCollector::VisitStmt_(const AssignStmtPtr& assign) {
 }
 
 // ---------------------------------------------------------------------------
-// BufferRootCollector
-// ---------------------------------------------------------------------------
-
-BufferRootCollector::BufferRootCollector(ProgramPtr program) : program_(std::move(program)) {}
-
-void BufferRootCollector::Initialize(const std::vector<VarPtr>& params) {
-  for (const auto& param : params) {
-    buffer_roots[param.get()] = param.get();
-  }
-}
-
-void BufferRootCollector::VisitStmt_(const ForStmtPtr& for_stmt) {
-  for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
-    const auto& iter_arg = for_stmt->iter_args_[i];
-    const Var* root = ResolveExpr(iter_arg->initValue_);
-    if (root) {
-      buffer_roots[iter_arg.get()] = root;
-      if (i < for_stmt->return_vars_.size()) {
-        buffer_roots[for_stmt->return_vars_[i].get()] = root;
-      }
-    }
-  }
-  IRVisitor::VisitStmt_(for_stmt);
-}
-
-void BufferRootCollector::VisitStmt_(const WhileStmtPtr& while_stmt) {
-  for (size_t i = 0; i < while_stmt->iter_args_.size(); ++i) {
-    const auto& iter_arg = while_stmt->iter_args_[i];
-    const Var* root = ResolveExpr(iter_arg->initValue_);
-    if (root) {
-      buffer_roots[iter_arg.get()] = root;
-      if (i < while_stmt->return_vars_.size()) {
-        buffer_roots[while_stmt->return_vars_[i].get()] = root;
-      }
-    }
-  }
-  IRVisitor::VisitStmt_(while_stmt);
-}
-
-void BufferRootCollector::VisitStmt_(const AssignStmtPtr& assign) {
-  // Submit funnels through the Call-shaped view so a kernel launch's Out/InOut
-  // roots are tracked identically to a plain Call (results keyed on the stable
-  // binding Var). Builtin tensor.* ops are never Submits, so the early
-  // op-name branches below are unaffected.
-  if (auto call = AsCallOrSubmitView(assign->value_)) {
-    const std::string& op_name = call->op_->name_;
-    if (IsOp(call, "tensor.create") || IsOp(call, "tensor.slice")) {
-      buffer_roots[assign->var_.get()] = assign->var_.get();
-    } else if (IsOp(call, "tensor.assemble")) {
-      if (call->args_.size() == 3) {
-        if (const Var* target_root = ResolveExpr(call->args_[0])) {
-          buffer_roots[assign->var_.get()] = target_root;
-        }
-      }
-    } else if (!IsBuiltinOp(op_name)) {
-      auto out_roots = CollectCallOutputRoots(call);
-      if (As<TupleType>(call->GetType())) {
-        tuple_output_roots_[assign->var_.get()] = std::move(out_roots);
-      } else if (!out_roots.empty() && out_roots[0]) {
-        buffer_roots[assign->var_.get()] = out_roots[0];
-      }
-    }
-  } else if (auto tuple_get = As<TupleGetItemExpr>(assign->value_)) {
-    if (auto tuple_var = AsVarLike(tuple_get->tuple_)) {
-      auto it = tuple_output_roots_.find(tuple_var.get());
-      if (it != tuple_output_roots_.end() && tuple_get->index_ < static_cast<int>(it->second.size()) &&
-          it->second[tuple_get->index_]) {
-        buffer_roots[assign->var_.get()] = it->second[tuple_get->index_];
-      }
-    }
-  } else if (auto src_var = AsVarLike(assign->value_)) {
-    if (const Var* root = ResolveVar(src_var.get())) {
-      buffer_roots[assign->var_.get()] = root;
-    }
-  }
-  IRVisitor::VisitStmt_(assign);
-}
-
-const Var* BufferRootCollector::ResolveVar(const Var* var) const {
-  auto it = buffer_roots.find(var);
-  return it != buffer_roots.end() ? it->second : nullptr;
-}
-
-const Var* BufferRootCollector::ResolveExpr(const ExprPtr& expr) const {
-  if (auto var = AsVarLike(expr)) {
-    return ResolveVar(var.get());
-  }
-  return nullptr;
-}
-
-std::vector<const Var*> BufferRootCollector::CollectCallOutputRoots(const CallPtr& call) const {
-  auto callee = program_->GetFunction(call->op_->name_);
-  if (!callee) return {};
-
-  std::vector<const Var*> roots;
-  for (size_t i = 0; i < callee->param_directions_.size() && i < call->args_.size(); ++i) {
-    if (callee->param_directions_[i] != ParamDirection::Out &&
-        callee->param_directions_[i] != ParamDirection::InOut) {
-      continue;
-    }
-    if (auto arg_var = AsVarLike(call->args_[i])) {
-      roots.push_back(ResolveVar(arg_var.get()));
-    } else {
-      roots.push_back(nullptr);
-    }
-  }
-  return roots;
-}
-
-// ---------------------------------------------------------------------------
 // VarLineageCollector
 // ---------------------------------------------------------------------------
 
@@ -353,9 +224,9 @@ void VarLineageCollector::VisitStmt_(const ForStmtPtr& for_stmt) {
       // Scalar carries (e.g. a loop counter ``idx = batch_base + inner``) are
       // value-typed: the body may overwrite them with a freshly computed value
       // that has no relationship to the init param.  Propagating param lineage
-      // to a Scalar return_var makes FindReturnedParamIndices incorrectly map
-      // a Scalar return element to a param index, causing EmitTensorAlias to
-      // emit ``const Tensor&`` for an int64_t variable (issue #1580).
+      // to a Scalar return_var would make the return->param map bind a Scalar
+      // return element to a param index, causing EmitTensorAlias to emit
+      // ``const Tensor&`` for an int64_t variable (issue #1580).
       if (i < for_stmt->return_vars_.size() && AsTensorTypeLike(for_stmt->return_vars_[i]->GetType())) {
         var_to_param[for_stmt->return_vars_[i].get()] = param;
       }
@@ -390,20 +261,17 @@ void VarLineageCollector::VisitStmt_(const AssignStmtPtr& assign) {
     // from the Out/InOut argument. This covers sequential SPMD submissions
     // like: out = self.kernel(a, b, out) where `out` is the output buffer.
     //
-    // Group functions (produced by ScopeOutliner) have all directions set to
-    // In, so we trace through their bodies to find the inner kernel call and
-    // use its directions mapped back to the Group's parameter positions.
+    // Group/Spmd wrappers carry their effective directions in the signature —
+    // DeriveCallDirections materialized them — so a plain field read covers
+    // every callee kind.
     if (!IsBuiltinOp(call->op_->name_)) {
       auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
       if (callee) {
-        std::vector<ParamDirection> effective_dirs = callee->param_directions_;
-        if (callee->func_type_ == FunctionType::Group || callee->func_type_ == FunctionType::Spmd) {
-          effective_dirs = ComputeGroupEffectiveDirections(callee, program_);
-        }
+        const auto& effective_dirs = callee->param_directions_;
         // Prefer tracing through the Out/InOut arg the callee actually
         // returns (multi-Out kernels would otherwise be mis-traced to the
         // first Out, leaking scratch-buffer lineage onto the result Var).
-        std::optional<size_t> returned_idx = FindReturnedParamIndex(callee, program_);
+        std::optional<size_t> returned_idx = ir::return_lineage::ExplicitReturnedParamIndex(callee);
         for (size_t i = 0; i < effective_dirs.size() && i < call->args_.size(); ++i) {
           if (effective_dirs[i] != ParamDirection::Out && effective_dirs[i] != ParamDirection::InOut) {
             continue;
@@ -435,143 +303,6 @@ const Var* VarLineageCollector::ResolveExpr(const ExprPtr& expr) const {
     return ResolveVar(var.get());
   }
   return nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// FindReturnedParamIndex
-// ---------------------------------------------------------------------------
-
-// Both functions delegate to the shared IR-level return-lineage utility,
-// which traces through SSA rebinds, loop carries, builtin writeback ops,
-// TupleGetItem of user calls, and Group/Spmd wrapper inner calls — with
-// per-function memoization and cycle protection. See return_lineage_utils.h.
-
-std::optional<size_t> FindReturnedParamIndex(const FunctionPtr& callee, const ProgramPtr& program) {
-  return ir::return_lineage::ReturnedParamIndex(callee, program);
-}
-
-std::vector<std::optional<size_t>> FindReturnedParamIndices(const FunctionPtr& callee,
-                                                            const ProgramPtr& program) {
-  return ir::return_lineage::ReturnedParamIndices(callee, program);
-}
-
-// ---------------------------------------------------------------------------
-// ComputeGroupEffectiveDirections
-// ---------------------------------------------------------------------------
-
-std::vector<ParamDirection> ComputeGroupEffectiveDirections(const FunctionPtr& group_func,
-                                                            const ProgramPtr& program) {
-  if (!group_func) return {};
-  std::vector<ParamDirection> fallback(group_func->params_.size(), ParamDirection::In);
-  if (!program) return fallback;
-
-  // Recursive summary for Group/Spmd functions:
-  // - walk callsites in function body;
-  // - for nested Group/Spmd callees, reuse recursively-computed effective dirs;
-  // - merge directions as lattice: InOut > Out > In.
-  //
-  // This keeps writeback semantics across Group->Group wrappers generated by SPMD/outline passes.
-  std::unordered_map<const Function*, std::vector<ParamDirection>> memo;
-  std::unordered_set<const Function*> visiting;
-
-  std::function<std::vector<ParamDirection>(const FunctionPtr&)> compute_effective =
-      [&](const FunctionPtr& func) -> std::vector<ParamDirection> {
-    if (!func) return {};
-    auto memo_it = memo.find(func.get());
-    if (memo_it != memo.end()) return memo_it->second;
-
-    std::vector<ParamDirection> directions(func->params_.size(), ParamDirection::In);
-    if (!func->body_) {
-      memo.emplace(func.get(), directions);
-      return directions;
-    }
-
-    // Cycle guard: fall back to declared directions if a recursion cycle exists.
-    if (!visiting.insert(func.get()).second) {
-      std::vector<ParamDirection> declared = func->param_directions_;
-      if (declared.size() != func->params_.size()) declared.resize(func->params_.size(), ParamDirection::In);
-      return declared;
-    }
-
-    auto inner_calls = ir::CollectInnerCalls(func, program);
-    if (!inner_calls.empty()) {
-      std::unordered_map<const Var*, size_t> param_to_index;
-      for (size_t i = 0; i < func->params_.size(); ++i) {
-        param_to_index[func->params_[i].get()] = i;
-      }
-
-      for (const auto& [inner_call, inner_callee] : inner_calls) {
-        const auto& inner_args = inner_call->args_;
-        std::vector<ParamDirection> inner_dirs;
-        if (inner_callee->func_type_ == FunctionType::Group ||
-            inner_callee->func_type_ == FunctionType::Spmd) {
-          inner_dirs = compute_effective(inner_callee);
-        } else {
-          inner_dirs = inner_callee->param_directions_;
-        }
-        for (size_t arg_idx = 0; arg_idx < inner_args.size() && arg_idx < inner_dirs.size(); ++arg_idx) {
-          auto var = AsVarLike(inner_args[arg_idx]);
-          if (!var) continue;
-          auto it = param_to_index.find(var.get());
-          if (it == param_to_index.end()) continue;
-          ParamDirection d = inner_dirs[arg_idx];
-          ParamDirection& merged = directions[it->second];
-          if (d == ParamDirection::InOut || (d == ParamDirection::Out && merged == ParamDirection::In)) {
-            merged = d;
-          }
-        }
-      }
-    }
-
-    visiting.erase(func.get());
-    memo.emplace(func.get(), directions);
-    return directions;
-  };
-
-  return compute_effective(group_func);
-}
-
-// ---------------------------------------------------------------------------
-// CollectBodyAliases
-// ---------------------------------------------------------------------------
-
-BodyAliases CollectBodyAliases(const StmtPtr& body) {
-  class AliasingNodeCollector : public IRVisitor {
-   public:
-    BodyAliases result;
-    void VisitStmt_(const AssignStmtPtr& a) override {
-      result.assigns.push_back(a);
-      IRVisitor::VisitStmt_(a);
-    }
-    void VisitStmt_(const ForStmtPtr& f) override {
-      result.nested_fors.push_back(f);
-      IRVisitor::VisitStmt_(f);
-    }
-  };
-  AliasingNodeCollector collector;
-  collector.VisitStmt(body);
-  return collector.result;
-}
-
-// ---------------------------------------------------------------------------
-// UnwrapAutoScope
-// ---------------------------------------------------------------------------
-
-namespace {
-
-constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
-
-}  // namespace
-
-StmtPtr UnwrapAutoScope(const StmtPtr& stmt) {
-  if (auto scope = As<RuntimeScopeStmt>(stmt);
-      scope && (!scope->manual_ || scope->GetAttr<bool>(kAttrCompilerAutoManualScopeCandidate, false))) {
-    return UnwrapAutoScope(scope->body_);
-  }
-  if (auto seq = As<SeqStmts>(stmt); seq && seq->stmts_.size() == 1) {
-    return UnwrapAutoScope(seq->stmts_[0]);
-  }
-  return stmt;
 }
 
 }  // namespace codegen

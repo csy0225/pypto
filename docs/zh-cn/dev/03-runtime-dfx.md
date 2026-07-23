@@ -10,7 +10,7 @@ PyPTO 将 Simpler 的五项运行时诊断子功能以独立开关的形式暴�
 | `RunConfig` 字段 | pytest flag | `CallConfig` 成员 | `dfx_outputs/` 下产物 | 后处理工具 |
 | ---------------- | ----------- | ----------------- | --------------------- | ---------- |
 | `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
-| `enable_dump_tensor: int` | `--dump-tensor [LEVEL]`（裸 flag = `1`） | `enable_dump_tensor`（`0` 关，`1` 部分，`2` 全量） | `tensor_dump/{tensor_dump.json,bin}` | `dump_viewer`（手动） |
+| `enable_dump_args: int` | `--dump-args [LEVEL]`（裸 flag = `1`） | `enable_dump_args`（`0` 关，`1` 部分，`2` 全量） | `args_dump/{args_dump.json,bin}` | `dump_viewer`（手动） |
 | `enable_pmu: int` | `--enable-pmu [N]`（裸 flag = `2`） | `enable_pmu`（`0` 关，`>0` 事件类型） | `pmu.csv` | — |
 | `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_viewer`（手动） |
 | `enable_scope_stats: bool` | `--enable-scope-stats` | `enable_scope_stats` | `scope_stats/scope_stats.jsonl` | `scope_stats_plot`（手动） |
@@ -30,6 +30,25 @@ PyPTO 将该 prefix 设为 `<work_dir>/dfx_outputs/`，其下的子路径按上�
 `execute_on_device` 会**先于** C++ 边界抛 `ValueError`，让 traceback
 直接指向调用方代码。
 
+### L3（分布式）：每次 dispatch 一个子目录
+
+分布式 run 会向多张卡下发，且同一张卡在一次 host 编排中可能收到多次
+dispatch——若共用同一 prefix，各次 dispatch 会互相覆盖同名产物。因此 L3
+路径下 PyPTO 按 dispatch 对 prefix 做命名空间隔离：
+
+```text
+<work_dir>/dfx_outputs/
+├── rank0/d0/          # rank 0 的第 0 次 dispatch
+├── rank0/d1/          # rank 0 的第 1 次 dispatch
+├── rank1/d0/
+└── rank_local/d0/     # 无通信（comm-less）dispatch——没有真实 rank
+```
+
+`d{k}` 是该卡在本次 run 内的第 k 次 dispatch，每次 run 从 `d0` 重新计数。
+未绑定 rank 的 dispatch（comm-less 程序，没有 `device=` 属性）落在
+`rank_local` 而非 `rank{r}` 下。每个叶子目录内是上表所述的扁平产物，
+因此在单个 dispatch 目录内 L2 契约完全适用。
+
 ## L2 泳道会把 kernel 跑两遍（onboard）
 
 泳道转换器需要把每个 task 的耗时和一张**只有 `deps.json` 才携带的任务图**做
@@ -46,7 +65,7 @@ join——device 热路径不再记录 per-task fanout，因此没有 dep_gen �
    映射，所以同一进程内第二趟 DFX 会撞上注册上限（`halHostRegister` 返回 8）；子进程
    退出时操作系统会彻底回收这些状态。抓图是 best-effort——子进程失败时只打印告警、
    计时趟照常运行（泳道退化成匿名 `task(rXtY)`）。
-2. **计时趟** —— 开泳道（以及 PMU / tensor-dump / scope-stats 等其它对时序敏感的
+2. **计时趟** —— 开泳道（以及 PMU / args-dump / scope-stats 等其它对时序敏感的
    DFX），强制关闭 dep_gen，产出耗时干净的 `l2_swimlane_records.json`，这一趟的耗时
    才会被上报，在本进程内运行。
 
@@ -93,9 +112,9 @@ pytest tests/st/runtime/ \
 
 ## 选择性张量 Dump
 
-`enable_dump_tensor` 是一个**级别**（`0`=off、`1`=partial、`2`=full；
+`enable_dump_args` 是一个**级别**（`0`=off、`1`=partial、`2`=full；
 `True`→`1`、`False`→`0`）。级别 `2` 会把每个 task 的每个绑定都写入
-`tensor_dump/`。在大规模工作负载下，host 端 dump 收集器（约 42 MB/s 排空
+`args_dump/`。在大规模工作负载下，host 端 dump 收集器（约 42 MB/s 排空
 速率）会被打满，进而 AICPU 会被 STARS 算子执行超时机制杀掉 —— 1 GB 量级的
 KV-cache 等大绑定填充队列的速度远快于排空速度。可以用 **partial**（级别 `1`）
 并标记只关注的张量把 dump 范围收窄。提供两种入口，底层都由 runtime 的
@@ -130,7 +149,7 @@ with pl.manual_scope():
 用 `pl.dump_tag` 标记它的输入，或用 `pl.submit(..., dumps=[...])` 提交它。
 两种入口都写入消费 Call / `Submit` 的同一个 `dump_vars` attr，以 **Var 身份**
 跟踪 —— 而非名字。它像 `Submit::deps_` 一样随 SSA、内联、codegen 流动，
-因此没有模糊名字匹配、没有误报。这些标记仅在部分 dump（`enable_dump_tensor == 1`）
+因此没有模糊名字匹配、没有误报。这些标记仅在部分 dump（`enable_dump_args == 1`）
 下生效；dump 关闭（`0`）时不起作用，全量 dump（`2`）下也无意义——后者会捕获每个
 绑定。
 
@@ -252,7 +271,7 @@ python runtime/tools/scope_stats_plot.py \
 ## 重放已有的 build_output
 
 需要在改完 kernel cpp 之后重新跑一遍编译产物（典型场景：手调 kernel
-后用 PMU / swimlane / tensor-dump 验证修改是否正确），使用 debug 专用
+后用 PMU / swimlane / args-dump 验证修改是否正确），使用 debug 专用
 的 [`pypto.runtime.debug.replay`](../../../python/pypto/runtime/debug/replay.py)
 模块。它复用与 `pypto.runtime.run` 相同的 `execute_compiled` 路径,
 因此 DFX 开关的行为完全一致。
@@ -397,13 +416,13 @@ prog(a, b, c)
 重建 chip callables；`platform` 与 `distributed_config` 默认取编译时
 记录的值，可覆盖以在不同目标 / 设备集上重放。
 
-**限制**：DFX 标志（`--pmu`、`--swimlane`、`--dump-tensor` 等）**尚未
+**限制**：DFX 标志（`--pmu`、`--swimlane`、`--dump-args` 等）**尚未
 透传到 L3 派发路径**——目前仅对单芯片重放生效。L3 的「改完再跑」循环
 本身（改 `.pto`/cpp 后的正确性复检）是完整支持的。
 
 ## 相关文档
 
 - Simpler runtime 侧参考：`runtime/docs/dfx/{l2-swimlane,
-  tensor-dump,pmu-profiling,dep_gen,scope-stats}.md`。
+  args-dump,pmu-profiling,dep_gen,scope-stats}.md`。
 - 编译期 profiling（正交、单 PyPTO 进程）：
   [01-compile-profiling.md](01-compile-profiling.md)。

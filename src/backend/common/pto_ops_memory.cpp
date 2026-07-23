@@ -14,8 +14,6 @@
  * @brief PTO codegen registration for memory / tensor / array / SPMD ops.
  */
 
-#include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -29,9 +27,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_handler.h"
-#include "pypto/backend/common/pto_ops_common.h"
 #include "pypto/codegen/codegen_base.h"
-#include "pypto/codegen/distributed/comm_layout.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
@@ -41,8 +37,6 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
-#include "pypto/ir/transforms/utils/memref_utils.h"
-#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
 
@@ -109,8 +103,8 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   auto tensor_type = AsTensorTypeLike(tensor->GetType());
   INTERNAL_CHECK_SPAN(tensor_type, op->span_) << "tile.load tensor argument must have TensorType";
 
-  const size_t ndim = shapes_tuple->elements_.size();
-  INTERNAL_CHECK_SPAN(ndim >= 1, op->span_) << "tile.load shapes tuple must have at least one element";
+  INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
+      << "tile.load shapes tuple must have at least one element";
 
   std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
@@ -127,90 +121,6 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::vector<std::string> partition_dims = GetDimStrings(valid_shapes_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
   std::vector<std::string> size_codes = GetSizeCodes(valid_shapes_tuple->elements_, codegen);
-
-  // ND2NZ constraint: a natural Mat load fills an NZ tile (the implicit Mat view,
-  // blayout=col_major / slayout=row_major), and the hardware ND2NZ path requires a
-  // 2-dim GlobalTensor. When such an NZ load has a rank>2 source window, collapse
-  // the contiguous leading dims to 2D — emit a fresh 2D tensor_view ([prod(leading
-  // window dims), last] with strides [last, 1]) over the same base pointer and a
-  // matching 2D partition (offset folded mixed-radix over the source tensor dims).
-  // Transposed (DN) Mat loads keep their ND window for DN addressing; Vec/other
-  // loads are plain ND and are not NZ.
-  auto result_tile_type = ir::As<ir::TileType>(op->GetType());
-  bool is_nz_mat_load = false;
-  if (result_tile_type && result_tile_type->memory_space_ == ir::MemorySpace::Mat) {
-    const auto rv = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
-    is_nz_mat_load = rv.blayout == ir::TileLayout::col_major && rv.slayout == ir::TileLayout::row_major;
-  }
-  if (is_nz_mat_load && ndim > 2) {
-    const ir::Span& span = op->span_;
-    // The leading-dim collapse folds the row dims [0, ndim-1) into one axis with a
-    // contiguous row stride, so it is sound only when the valid sub-box of those
-    // dims is contiguous in row-major order (see IsRowMajorCollapseContiguous —
-    // the shared rule that FlattenTileNdTo2D uses to route non-contiguous operands
-    // to a per-batch load, so this guard should never fire on a batch_matmul
-    // operand). A partial middle dim under a non-singleton outer dim (e.g. a
-    // multi-batch slice that also cuts the matrix-row dim) is non-contiguous.
-    INTERNAL_CHECK_SPAN(ir::tile_conversion_utils::IsRowMajorCollapseContiguous(valid_shapes_tuple->elements_,
-                                                                                tensor_type->shape_),
-                        span)
-        << "tile.load NZ 2D source-window collapse: the valid sub-box of the leading dims is not "
-           "contiguous in row-major order (a partial middle dim under a non-singleton outer dim), so "
-           "the collapse cannot legalize this to a 2D ND2NZ load";
-    // ConstInt-folding index arithmetic: a static window (the common matmul case)
-    // folds to clean constants, while a dynamic dim/offset/valid stays symbolic and
-    // is materialized by GetSizeCodes / GetIndexOffsetCodes (arith.muli/addi) below
-    // — the same constant-or-symbol handling the function-parameter make_tensor_view
-    // uses, so this path is not limited to static-shape tensors.
-    auto idx = [&](int64_t v) -> ir::ExprPtr {
-      return std::make_shared<ir::ConstInt>(v, DataType::INDEX, span);
-    };
-    auto fold_mul = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
-      auto ca = ir::As<ir::ConstInt>(a);
-      auto cb = ir::As<ir::ConstInt>(b);
-      if (ca && cb) return idx(ca->value_ * cb->value_);
-      if (ca && ca->value_ == 1) return b;
-      if (cb && cb->value_ == 1) return a;
-      return ir::MakeMul(a, b, span);
-    };
-    auto fold_add = [&](const ir::ExprPtr& a, const ir::ExprPtr& b) -> ir::ExprPtr {
-      auto ca = ir::As<ir::ConstInt>(a);
-      auto cb = ir::As<ir::ConstInt>(b);
-      if (ca && cb) return idx(ca->value_ + cb->value_);
-      if (ca && ca->value_ == 0) return b;
-      if (cb && cb->value_ == 0) return a;
-      return ir::MakeAdd(a, b, span);
-    };
-
-    // make_tensor_view describes the collapsed SOURCE TENSOR: [prod(tensor leading
-    // dims), tensor_last] with a contiguous row stride [tensor_last, 1] — the
-    // tensor's real row stride, so a window narrower than the last dim (e.g. a
-    // K-slice) still strides by the full tensor width. The partition then slices the
-    // window's VALID region; its offset folds mixed-radix over the tensor dims.
-    ir::ExprPtr tensor_rows = tensor_type->shape_[0];
-    ir::ExprPtr valid_rows = valid_shapes_tuple->elements_[0];
-    ir::ExprPtr row_offset = offsets_tuple->elements_[0];
-    for (size_t i = 1; i + 1 < ndim; ++i) {
-      tensor_rows = fold_mul(tensor_rows, tensor_type->shape_[i]);
-      valid_rows = fold_mul(valid_rows, valid_shapes_tuple->elements_[i]);
-      row_offset = fold_add(fold_mul(row_offset, tensor_type->shape_[i]), offsets_tuple->elements_[i]);
-    }
-    const ir::ExprPtr tensor_cols = tensor_type->shape_.back();
-
-    const std::vector<std::string> view_shape = GetSizeCodes({tensor_rows, tensor_cols}, codegen);
-    const std::string one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
-    const std::string view2d = codegen.NewNamedTemp(tensor->name_hint_ + "_view2d");
-    std::ostringstream mtv;
-    mtv << view2d << " = pto.make_tensor_view " << codegen.GetVarName(tensor) << ", shape = ["
-        << view_shape[0] << ", " << view_shape[1] << "], strides = [" << view_shape[1] << ", " << one
-        << "] {layout = #pto.layout<nd>}: !pto.tensor_view<?x?x" << dtype_str << ">";
-    codegen.Emit(mtv.str());
-    tensor_view = view2d;
-    tensor_view_type = "!pto.tensor_view<?x?x" + dtype_str + ">";
-    partition_dims = {"?", "?"};
-    offset_codes = GetIndexOffsetCodes({row_offset, offsets_tuple->elements_.back()}, codegen);
-    size_codes = GetSizeCodes({valid_rows, valid_shapes_tuple->elements_.back()}, codegen);
-  }
 
   std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
@@ -772,36 +682,39 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     return MakeTensorWriteCodegenPTO(op, codegen);
   });
 
-  // ``tensor.as_layout`` (RFC #1300 §3.3): pure metadata reinterpret over the
-  // same physical buffer. A compiler pass may prepend ``b_dn =
-  // tensor.as_layout(b, DN)`` at the top of an InCore body to bridge an
-  // ND ↔ DN view (``b_dn`` carries TensorType ``[..., b, a] DN`` with explicit
-  // canonical strides) and rewrite the body to use ``b_dn`` in place of ``b``.
+  // ``tensor.view`` (RFC #1300 section 3.3): pure metadata reinterpret over the
+  // same physical buffer. A compiler pass may prepend a view at the top of an
+  // InCore body to bridge layouts or reshape the logical tensor.
   //
   // Codegen lowers this to a fresh ``pto.make_tensor_view`` bound to the
   // input's underlying buffer (the function parameter SSA), using the LHS's
   // own ``(shape, stride, layout)`` from its TensorType. Downstream
   // ``tile.load`` lookups via ``GetOrCreateTensorView`` find the LHS through
-  // the ``RegisterTensorView`` call below.
-  reg("tensor.as_layout", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+  // the ``RegisterTensorView`` call below. The LHS also aliases the input base
+  // pointer and CommContext so later tensor or distributed ops address the
+  // original storage.
+  reg("tensor.view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "tensor.as_layout requires 1 arg (input)";
+    INTERNAL_CHECK_SPAN(op->args_.size() >= 1 && op->args_.size() <= 3, op->span_)
+        << "tensor.view requires 1 to 3 args (input[, shape[, valid_shape]])";
     auto input_var = AsVarLike(op->args_[0]);
-    CHECK(input_var) << "tensor.as_layout input must be a Var/IterArg";
+    INTERNAL_CHECK_SPAN(input_var, op->span_) << "tensor.view input must be a Var/IterArg";
 
     auto lhs_var = codegen.GetCurrentResultVar();
     INTERNAL_CHECK_SPAN(static_cast<bool>(lhs_var), op->span_)
-        << "Internal error: tensor.as_layout result var must be set by VisitStmt_(AssignStmt)";
-    auto lhs_type = As<ir::TensorType>(lhs_var->GetType());
-    CHECK(lhs_type) << "tensor.as_layout output must be TensorType, got " << lhs_var->GetType()->TypeName();
+        << "Internal error: tensor.view result var must be set by VisitStmt_(AssignStmt)";
+    auto lhs_type = ir::AsTensorTypeLike(lhs_var->GetType());
+    INTERNAL_CHECK_SPAN(lhs_type, op->span_)
+        << "tensor.view output must be TensorType or DistributedTensorType, got "
+        << lhs_var->GetType()->TypeName();
     INTERNAL_CHECK_SPAN(lhs_type->tensor_view_.has_value(), op->span_)
-        << "Internal error: tensor.as_layout output must have an explicit TensorView "
-           "(set by DeduceTensorAsLayoutType + CanonicalizeView)";
+        << "Internal error: tensor.view output must have an explicit TensorView "
+           "(set by DeduceTensorViewType + CanonicalizeView)";
 
     const size_t rank = lhs_type->shape_.size();
     const auto& view = lhs_type->tensor_view_.value();
     INTERNAL_CHECK_SPAN(view.stride.size() == rank, op->span_)
-        << "Internal error: tensor.as_layout output stride rank " << view.stride.size()
+        << "Internal error: tensor.view output stride rank " << view.stride.size()
         << " does not match shape rank " << rank;
 
     // The result SSA name (auto-allocated by VisitStmt_(AssignStmt) for the
@@ -809,7 +722,11 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     // register it in tensor_to_view so downstream tile.load lookups resolve.
     std::string result_buf = codegen.GetCurrentResultTarget();
     INTERNAL_CHECK_SPAN(!result_buf.empty(), op->span_) << "Internal error: result buf must be set";
+    std::string input_base_ptr = codegen.GetTensorBasePtr(input_var);
     codegen.RegisterTensorView(lhs_var, result_buf);
+    codegen.RegisterVarToMlir(lhs_var, result_buf);
+    codegen.RegisterBasePtr(lhs_var, input_base_ptr);
+    codegen.RegisterCommCtxFor(lhs_var, codegen.GetCommCtxSSAFor(input_var.get()));
 
     // Materialize shape and stride SSA names.
     auto emit_dim = [&](const ir::ExprPtr& dim) -> std::string {
@@ -836,7 +753,7 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
     }
 
     std::ostringstream oss;
-    oss << result_buf << " = pto.make_tensor_view " << codegen.GetVarName(input_var) << ", shape = [";
+    oss << result_buf << " = pto.make_tensor_view " << input_base_ptr << ", shape = [";
     for (size_t j = 0; j < rank; ++j) {
       if (j > 0) oss << ", ";
       oss << shape_dim_names[j];
@@ -889,6 +806,65 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("tensor.dim", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTensorDimCodegenPTO(op, codegen);
+  });
+
+  reg("system.fence", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = AsPto(codegen_base);
+    INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+        << "system.fence takes no arguments, got " << op->args_.size();
+    codegen.Emit("pto.fence.barrier_all #pto.fence_scope<gm>");
+    return std::string("");
+  });
+
+  reg("system.cacheinvalid", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    auto& codegen = AsPto(codegen_base);
+    INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+        << "system.cacheinvalid takes 3 arguments (tensor, offsets, shapes), got " << op->args_.size();
+    const auto tensor_var = AsVarLike(op->args_[0]);
+    INTERNAL_CHECK_SPAN(tensor_var, op->span_)
+        << "system.cacheinvalid first argument must be a tensor variable";
+    auto tensor_type = AsTensorTypeLike(tensor_var->GetType());
+    INTERNAL_CHECK_SPAN(tensor_type, op->span_) << "system.cacheinvalid first argument must be a tensor";
+    auto shapes_tuple = As<ir::MakeTuple>(op->args_[1]);
+    INTERNAL_CHECK_SPAN(shapes_tuple, op->span_) << "system.cacheinvalid shapes must be a tuple";
+    auto offsets_tuple = As<ir::MakeTuple>(op->args_[2]);
+    INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "system.cacheinvalid offsets must be a tuple";
+
+    const std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
+
+    // A region of all-ones sizes is a single element (scalar write): flatten the
+    // N-D offsets into a linear element offset and invalidate through a raw ptr.
+    // Any larger dimension (or a dynamic size) is a tile store: address the region
+    // through a partition_tensor_view, matching tile.store's outs() operand.
+    bool is_scalar_write = true;
+    for (const auto& size : shapes_tuple->elements_) {
+      auto size_const = As<ir::ConstInt>(size);
+      if (!size_const || size_const->value_ != 1) {
+        is_scalar_write = false;
+        break;
+      }
+    }
+
+    if (is_scalar_write) {
+      const std::string base_ptr = codegen.GetTensorBasePtr(tensor_var);
+      const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
+      const std::string off = GetFlatOffsetSSA(offsets_tuple, tensor_type->shape_, codegen);
+      const std::string write_ptr = codegen.NewTemp();
+      codegen.Emit(write_ptr + " = pto.addptr " + base_ptr + ", " + off + " : " + ptr_type + " -> " +
+                   ptr_type);
+      codegen.Emit("pto.cmo.cacheinvalid " + write_ptr + " single_cache_line");
+    } else {
+      const std::string tensor_view = codegen.GetOrCreateTensorView(tensor_var);
+      const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
+      const std::string partition_type =
+          MakePartitionTensorViewType(GetDimStrings(shapes_tuple->elements_), dtype_str);
+      const std::string payload_view =
+          EmitPartitionViewPTO(tensor_var->name_hint_, tensor_view, tensor_view_type, partition_type,
+                               GetIndexOffsetCodes(offsets_tuple->elements_, codegen),
+                               GetSizeCodes(shapes_tuple->elements_, codegen), codegen);
+      codegen.Emit("pto.cmo.cacheinvalid " + payload_view + " single_cache_line : " + partition_type);
+    }
+    return std::string("");
   });
 }
 }  // namespace backend

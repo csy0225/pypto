@@ -12,6 +12,7 @@
 import pytest
 from pypto import DataType, ir, passes
 from pypto import language as pl
+from pypto.ir.op import system_ops
 from pypto.pypto_core.ir import ConstInt
 
 
@@ -108,9 +109,88 @@ def test_cross_core_ops_registered():
         "system.aiv_initialize_pipe",
         "system.reserve_buffer",
         "system.import_peer_buffer",
+        "system.set_ffts",
+        "system.sync_set",
+        "system.sync_wait",
     ]
     for name in op_names:
         assert ir.is_op_registered(name), f"{name} should be registered"
+
+
+def test_set_ffts_accepts_a3_workspace_tensor():
+    """The FFTS setup op accepts a practical one-dimensional INT64 workspace."""
+    span = ir.Span.unknown()
+    workspace = ir.Var("ffts_workspace", ir.TensorType([256], DataType.INT64), span)
+
+    call = system_ops.set_ffts(workspace, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
+    assert call.args == [workspace]
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "message"),
+    [
+        ([255], DataType.INT64, "at least 256"),
+        ([256], DataType.INT32, "INT64"),
+        ([16, 16], DataType.INT64, "1-D"),
+    ],
+)
+def test_set_ffts_rejects_invalid_workspace(shape, dtype, message):
+    """Reject workspaces that PTOAS cannot use as its A3 FFTS backing store."""
+    workspace = ir.Var("ffts_workspace", ir.TensorType(shape, dtype), ir.Span.unknown())
+    with pytest.raises((TypeError, ValueError), match=message):
+        system_ops.set_ffts(workspace)
+
+
+def test_cross_core_sync_static_and_dynamic_event_ids():
+    """Cross-core sync accepts either a user event id or a dynamic index operand."""
+    span = ir.Span.unknown()
+
+    static_set = system_ops.sync_set(3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type="aiv", span=span)
+    assert isinstance(static_set.type, ir.UnknownType)
+    assert static_set.args == []
+    assert static_set.kwargs == {
+        "pipe": int(ir.PipeType.FIX),
+        "event_id": 3,
+        "ffts_mode": 1,
+        "core_type": "aiv",
+    }
+
+    event_id = ir.Var("event_id", ir.ScalarType(DataType.INDEX), span)
+    dynamic_wait = system_ops.sync_wait(event_id, pipe=ir.PipeType.MTE3, core_type="aic", span=span)
+    assert isinstance(dynamic_wait.type, ir.UnknownType)
+    assert dynamic_wait.args == [event_id]
+    assert "event_id" not in dynamic_wait.kwargs
+    assert dynamic_wait.kwargs["core_type"] == "aic"
+
+
+@pytest.mark.parametrize("core_type", ["cube", "vector", "mix"])
+def test_cross_core_sync_rejects_invalid_core_type(core_type):
+    """Mixed kernels target explicit events with the public AIC/AIV names."""
+    with pytest.raises(ValueError, match="core_type"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=core_type)
+
+
+@pytest.mark.parametrize("event_id", [-1, 14])
+def test_cross_core_sync_rejects_reserved_or_out_of_range_event_ids(event_id):
+    """Only event ids 0..13 are available to user-authored cross-core sync."""
+    with pytest.raises(ValueError, match="event_id"):
+        system_ops.sync_set(event_id, pipe=ir.PipeType.FIX)
+
+
+def test_cross_core_sync_rejects_non_index_dynamic_event_id():
+    """PTO's dynamic event operand is index-typed."""
+    event_id = ir.Var("event_id", ir.ScalarType(DataType.INT32), ir.Span.unknown())
+    with pytest.raises(ValueError, match=r"ScalarType\(INDEX\)"):
+        system_ops.sync_wait(event_id, pipe=ir.PipeType.MTE3)
+
+
+@pytest.mark.parametrize("ffts_mode", [-1, 3])
+def test_cross_core_sync_rejects_invalid_ffts_mode(ffts_mode):
+    """PTO sync.set accepts FFTS modes 0, 1, and 2 only."""
+    with pytest.raises(ValueError, match="ffts_mode"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, ffts_mode=ffts_mode)
 
 
 def test_aiv_shard_halves_split_axis():

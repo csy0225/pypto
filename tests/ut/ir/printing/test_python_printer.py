@@ -517,6 +517,107 @@ def test_python_print_tile_type_prints_explicit_tile_memory_space():
     assert ", pl.Mem.Vec" in result
 
 
+def _tile(shape, dtype, memory_space):
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(d, DataType.INT32, span) for d in shape]
+    return ir.TileType(dims, dtype, None, None, memory_space)
+
+
+def test_python_print_tile_type_explicit_layout_default_omits_implicit():
+    """Default (concise) printing omits the implicit layout for an Acc tile.
+
+    Regression guard for issue #2088: a canonical Acc tile stores its boxed view
+    as ``nullopt``, so the concise form prints no TileView at all — which reads,
+    misleadingly, as "defaults".
+    """
+    acc = _tile([128, 128], DataType.FP32, MemorySpace.Acc)
+
+    result = python_print(acc)
+
+    assert result == "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc]"
+    assert "TileView" not in result
+
+
+def test_python_print_tile_type_explicit_layout_resolves_acc():
+    """explicit_layout resolves an Acc tile's implicit boxed view (issue #2088).
+
+    ``Mem.Acc``'s implicit view is ``blayout=col_major, slayout=row_major,
+    fractal=1024`` even though the canonical ``tile_view_`` is ``nullopt``. Under
+    explicit_layout the dump must state that real layout, not omit it.
+    """
+    acc = _tile([128, 128], DataType.FP32, MemorySpace.Acc)
+
+    result = python_print(acc, explicit_layout=True)
+
+    assert result == (
+        "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc, "
+        "pl.TileView(blayout=pl.TileLayout.col_major, "
+        "slayout=pl.TileLayout.row_major, fractal=1024)]"
+    )
+
+
+@pytest.mark.parametrize(
+    ("memory_space", "expected_view"),
+    [
+        (MemorySpace.Acc, "blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=1024"),
+        (MemorySpace.Mat, "blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major, fractal=512"),
+        (MemorySpace.Right, "blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.col_major, fractal=512"),
+        (MemorySpace.Vec, "blayout=pl.TileLayout.row_major, slayout=pl.TileLayout.none_box, fractal=512"),
+    ],
+)
+def test_python_print_tile_type_explicit_layout_per_memory_space(memory_space, expected_view):
+    """Every memory space's resolved blayout/slayout/fractal is printed in full."""
+    tile_type = _tile([128, 64], DataType.FP16, memory_space)
+
+    result = python_print(tile_type, explicit_layout=True)
+
+    assert f"pl.TileView({expected_view})" in result
+
+
+def test_python_print_tile_type_explicit_layout_roundtrips_to_canonical():
+    """The explicit boxed view canonicalizes back to the concise form.
+
+    Guarantees an explicit-layout dump stays parseable and reparses to identical
+    IR: reconstructing an Acc tile from the printed boxed view collapses the view
+    back to ``nullopt`` (matches the implicit), so both print identically concise.
+    """
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(128, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    boxed = ir.TileView(blayout=ir.TileLayout.col_major, slayout=ir.TileLayout.row_major, fractal=1024)
+    reconstructed = ir.TileType(dims, DataType.FP32, None, boxed, MemorySpace.Acc)
+
+    # The explicit view matched the implicit Acc view -> canonicalized to nullopt.
+    assert reconstructed.tile_view is None
+    assert python_print(reconstructed) == "pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc]"
+
+
+def test_python_print_distributed_tensor_explicit_layout_surfaces_window_buffer():
+    """explicit_layout surfaces a DistributedTensor's window-buffer back-reference.
+
+    Two same shape/dtype distributed tensors with different ``window_buffer_``
+    are structurally distinct, yet the concise form drops the field so they print
+    identically (issue #2088). The EXPLICIT dump surfaces the buffer name so a
+    dump can tell them apart. It is a debug-only marker (a quoted string), not
+    round-trip subscript syntax — the value re-derives from ``pld.tensor.window``.
+    """
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(128, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    base = ir.Var("wbuf", ir.PtrType(), span)
+    window_buffer = ir.WindowBuffer(base, ir.ConstInt(4096, DataType.INT32, span), False, False, span)
+    dt_plain = ir.DistributedTensorType(dims, DataType.FP16)
+    dt_wb = ir.DistributedTensorType(dims, DataType.FP16, window_buffer)
+
+    # Concise: the window buffer is dropped, so both print identically.
+    assert python_print(dt_plain) == python_print(dt_wb)
+    assert "window_buffer" not in python_print(dt_wb)
+
+    # Explicit: the window buffer name is surfaced, distinguishing the two.
+    explicit_plain = python_print(dt_plain, explicit_layout=True)
+    explicit_wb = python_print(dt_wb, explicit_layout=True)
+    assert "window_buffer=wbuf" in explicit_wb
+    assert explicit_plain != explicit_wb
+
+
 def test_python_print_all_scalar_types():
     """Test all scalar type annotations."""
     span = ir.Span.unknown()
@@ -1549,6 +1650,93 @@ def test_attrs_structural_equality_is_order_insensitive():
     # And the hash must agree (equal nodes must hash equal): structural_hash folds
     # attrs commutatively, so key order does not change the hash.
     assert ir.structural_hash(prog_ab) == ir.structural_hash(prog_ba)
+
+
+def test_reinterpret_view_public_api_print_parse_roundtrip():
+    """Top-level tensor/tile calls round-trip with auto/explicit shapes.
+
+    The IR stores ``shape`` positionally and ``dtype`` as a kwarg, so this also
+    guards the printer's public argument ordering. The pipeline attr case
+    ensures the specialized printer does not bypass generic attr serialization.
+    """
+    source = textwrap.dedent("""\
+        @pl.program
+        class ReinterpretViews:
+            @pl.function(type=pl.FunctionType.InCore)
+            def tensor_auto(
+                self, data: pl.Tensor[[8, 16], pl.FP32]
+            ) -> pl.Tensor[[8, 32], pl.INT16]:
+                return pl.reinterpret_view(data, pl.INT16)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tensor_explicit(
+                self, data: pl.Tensor[[8, 16], pl.FP32]
+            ) -> pl.Tensor[[4, 64], pl.INT16]:
+                return pl.reinterpret_view(data, pl.INT16, shape=[4, 64])
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tile_auto(
+                self, data: pl.Tile[[8, 16], pl.FP32]
+            ) -> pl.Tile[[8, 32], pl.INT16]:
+                return pl.reinterpret_view(data, pl.INT16)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tile_explicit(
+                self, data: pl.Tile[[8, 16], pl.FP32]
+            ) -> pl.Tile[[4, 64], pl.INT16]:
+                return pl.reinterpret_view(
+                    data,
+                    pl.INT16,
+                    shape=[4, 64],
+                    attrs={"pipeline_membership": "0:1"},
+                )
+    """)
+
+    program = pl.parse_program(source)
+    printed = python_print(program, format=False)
+
+    assert printed.count("reinterpret_view") == 4
+    assert "pl.tensor.reinterpret_view(data, dtype=pl.INT16)" in printed
+    assert "pl.tensor.reinterpret_view(data, dtype=pl.INT16, shape=[4, 64])" in printed
+    assert "pl.tile.reinterpret_view(data, dtype=pl.INT16)" in printed
+    assert 'attrs={"pipeline_membership": "0:1"}' in printed
+
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert python_print(reparsed, format=False) == printed
+
+
+def test_full_special_case_preserves_serialized_attrs():
+    """Special full-call printing must not drop pipeline membership."""
+    source = textwrap.dedent("""\
+        @pl.program
+        class FullPipelineMembership:
+            @pl.function(type=pl.FunctionType.InCore)
+            def tile_full(self) -> pl.Tile[[8, 16], pl.FP32]:
+                return pl.tile.full(
+                    [8, 16],
+                    dtype=pl.FP32,
+                    value=1.0,
+                    attrs={"pipeline_membership": "0:1"},
+                )
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tensor_full(self) -> pl.Tensor[[8, 16], pl.FP32]:
+                return pl.tensor.full(
+                    [8, 16],
+                    dtype=pl.FP32,
+                    value=2.0,
+                    attrs={"pipeline_membership": "1:1"},
+                )
+    """)
+
+    program = pl.parse_program(source)
+    printed = python_print(program, format=False)
+
+    assert printed.count('attrs={"pipeline_membership":') == 2
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert python_print(reparsed, format=False) == printed
 
 
 if __name__ == "__main__":

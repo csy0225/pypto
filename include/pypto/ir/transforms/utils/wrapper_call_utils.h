@@ -13,6 +13,7 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_WRAPPER_CALL_UTILS_H_
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "pypto/ir/expr.h"
@@ -75,11 +76,55 @@ GroupCalleeInfo FindGroupCallees(const FunctionPtr& group_func, const ProgramPtr
  * @brief Collect every Call inside @p wrapper that resolves to a Function
  *        of a non-Orchestration, non-Opaque type.
  *
- * Used by cross-function direction propagation in `ComputeGroupEffectiveDirections`.
- * Visits the body in order; each inner Call appears once even if its callee is
- * called from multiple sites.
+ * Used by cross-function direction propagation in
+ * `ComputeWrapperEffectiveDirections`. Visits the body in order; each inner
+ * Call appears once even if its callee is called from multiple sites.
  */
 std::vector<WrapperCallInfo> CollectInnerCalls(const FunctionPtr& wrapper, const ProgramPtr& program);
+
+/**
+ * @brief Recover the true param directions of every Group / Spmd wrapper in
+ *        @p program, keyed by `Function*`.
+ *
+ * Wrapper functions synthesised by the scope outliners forward their params
+ * 1:1 to an inner kernel call, but their own `param_directions_` can still
+ * read `In` for a param the inner kernel writes — the outliner infers
+ * directions from the *body it extracted*, and later passes
+ * (`ExpandMixedKernel`, `SplitVectorKernel`, ...) rebuild wrapper bodies
+ * around new callees without revisiting the signature.
+ *
+ * For each wrapper this walks its body's inner calls and merges each inner
+ * callee's direction back onto the wrapper param the arg refers to, matching
+ * by Var pointer identity. Merge lattice: `InOut` > `Out` > `In`.
+ *
+ * The merge is **monotone**: it starts from each wrapper's declared directions
+ * and only ever promotes (`In` → `Out` → `InOut`), never weakens a declared
+ * writer to read-only. A wrapper with no body, no inner calls, or a param
+ * written through a builtin instead of an inner call therefore keeps what its
+ * signature already says.
+ *
+ * Nested and *mutually recursive* wrappers are resolved by iterating the
+ * monotone transfer to its least fixed point over a worklist, so the result
+ * does not depend on the order wrappers are visited: `A → B → A` converges to
+ * the same directions whichever of the two is seeded first. (A recursive walk
+ * with a cycle guard cannot promise that — the guard's fallback value leaks
+ * into whichever wrapper the walk happened to enter first.)
+ *
+ * Whole-program rather than per-function because both callers iterate every
+ * function: each wrapper body is walked exactly once, and each promotion moves
+ * one param one step up the lattice, so the loop is bounded by twice the total
+ * wrapper param count.
+ *
+ * `DeriveCallDirections` calls this and writes each result back into
+ * `Function::param_directions_`, so every consumer downstream of that pass
+ * reads the field directly instead of recomputing. Callers that run *before*
+ * `DeriveCallDirections` and need the effective view must call this
+ * explicitly.
+ *
+ * @return one entry per Group/Spmd function. Empty if @p program is null.
+ */
+std::unordered_map<const Function*, std::vector<ParamDirection>> ComputeWrapperEffectiveDirections(
+    const ProgramPtr& program);
 
 }  // namespace ir
 }  // namespace pypto

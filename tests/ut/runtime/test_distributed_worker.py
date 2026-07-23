@@ -11,11 +11,16 @@
 
 Runs without a device or the ``simpler`` package by patching the module-level
 setup helpers in :mod:`pypto.runtime.distributed_runner`, so construction does
-no real compile/fork. The reuse contract is observed by counting how often the
-setup helpers vs. ``_dispatch`` run.
+no real compile/fork. The tests cover both ordinary prepared dispatch and the
+persistent contract: one outer ``Worker.run``, retained per-program domains,
+and a complete synchronous cleanup boundary for every caller-visible request.
 """
 
 import sys
+import threading
+import weakref
+from collections.abc import Callable
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -31,6 +36,7 @@ from pypto.runtime.distributed_runner import (
     DistributedWorker,
     _assemble_chip_callables,
     _clear_dfx_dispatch_dirs,
+    _collect_l3_swimlane,
     _make_call_config,
     _submit_chip,
 )
@@ -98,9 +104,8 @@ class TestSetupOnce:
         m["construct"].assert_called_once()
         m["register"].assert_called_once()
         m["worker"].init.assert_called_once()
-        # Hierarchy is forked eagerly so the device-memory API works before the
-        # first dispatch (comm-less programs otherwise defer the fork to run()).
-        m["worker"]._start_hierarchical.assert_called_once()
+        # Simpler's public init owns eager hierarchy startup.
+        m["worker"]._start_hierarchical.assert_not_called()
 
         a = DeviceTensor(0x1000, (128, 128), torch.float32)
         b = DeviceTensor(0x2000, (128, 128), torch.float32)
@@ -180,6 +185,43 @@ class TestPerTaskRingSizing:
         rt.close()
 
 
+class TestArenaPrewarm:
+    """``init`` prewarms the prebuilt runtime-arena cache with the ring sizing the
+    first dispatch will use, so the ~800ms cold build lands at prepare() time
+    rather than inside the first (usually timed) dispatch.
+    """
+
+    def test_prewarms_with_prepared_baseline_when_no_config(self, patched_setup):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+
+        # No worker RunConfig → the program's baseline CallConfig (the same one
+        # config-less dispatches reuse) is what init prewarms with; no rebuild.
+        assert m["make_call_config"].call_count == 1
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+    def test_prewarms_with_worker_config_ring_sizing(self, patched_setup):
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rc = RunConfig(platform="a2a3sim", ring_heap=4 * 1024 * 1024)
+
+        rt = DistributedWorker(compiled, rc)
+
+        # A worker RunConfig builds a second CallConfig from (program
+        # DistributedConfig, rc) — the same construction a dispatch with rc uses,
+        # so the prewarmed arena's sizing key matches that dispatch's.
+        assert m["make_call_config"].call_count == 2
+        prewarm_build = m["make_call_config"].call_args
+        assert prewarm_build.args[0] is compiled._distributed_config
+        assert prewarm_build.args[1] is rc
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+
 class TestPerCallValidation:
     def test_accepts_device_tensor(self, patched_setup):
         compiled = _fake_compiled([_param("a", [128, 128]), _param("b", [128, 128])], [])
@@ -205,6 +247,44 @@ class TestPerCallValidation:
         with pytest.raises(TypeError, match="shared memory"):
             rt(torch.zeros(128, 128), DeviceTensor(0x2000, (128, 128), torch.float32))
         rt.close()
+
+    def test_releasing_registered_tensors_disables_later_uploads(self, patched_setup):
+        compiled = _fake_compiled([_param("weight", [4, 4])], [])
+        weight = torch.zeros(4, 4, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[weight])
+
+        rt.release_inherited_host_tensor_refs()
+        rt.release_inherited_host_tensor_refs()
+
+        assert rt._inherited_host_tensors == ()
+        assert not rt._inherited_host_storage_ptrs
+        with pytest.raises(ValueError, match="inherited_host_tensors"):
+            rt.alloc_tensor(weight.shape, weight.dtype, init=weight)
+        rt.close()
+
+    def test_registered_tensor_still_requires_shared_memory_for_dispatch(self, patched_setup):
+        compiled = _fake_compiled([_param("buffer", [128, 128])], [])
+        buffer = torch.zeros(128, 128, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[buffer])
+
+        with pytest.raises(TypeError, match="shared memory"):
+            rt(buffer)
+
+        rt.close()
+
+    @pytest.mark.parametrize(
+        ("weight", "expected_exception"),
+        [
+            (object(), TypeError),
+            (torch.zeros(128, 128, dtype=torch.float32).t(), ValueError),
+            (torch.empty(1, device="meta"), ValueError),
+        ],
+    )
+    def test_rejects_invalid_prefork_tensor_registration(self, patched_setup, weight, expected_exception):
+        compiled = _fake_compiled([_param("weight", [128, 128])], [])
+
+        with pytest.raises(expected_exception, match=r"torch\.Tensor|contiguous CPU"):
+            DistributedWorker(compiled, inherited_host_tensors=[weight])
 
     def test_scalar_param_forwarded_as_is(self, patched_setup):
         # Scalar params (shape=None, e.g. seq_len) bypass tensor validation and
@@ -342,6 +422,20 @@ class TestAllocStackedTensor:
         # Tracked per (worker_id, ptr) for auto-free.
         assert (0, 0xA000) in rt._owned_tensors
         assert (1, 0xB000) in rt._owned_tensors
+        rt.close()
+
+    def test_registered_inherited_storage_uploads_without_shared_memory(self, patched_setup):
+        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        host = torch.arange(2 * 4 * 4, dtype=torch.float32).view(2, 4, 4)
+        rt = DistributedWorker(_compiled_2cards(), inherited_host_tensors=[host])
+
+        stacked = rt.alloc_stacked_tensor(host)
+
+        assert stacked.worker_ids == (0, 1)
+        orch = patched_setup["worker"]._orch
+        nbytes = 4 * 4 * 4
+        orch.copy_to.assert_any_call(0, 0xA000, host[0].data_ptr(), nbytes)
+        orch.copy_to.assert_any_call(1, 0xB000, host[1].data_ptr(), nbytes)
         rt.close()
 
     def test_permuted_worker_ids_place_shards(self, patched_setup):
@@ -517,6 +611,18 @@ class TestLifecycle:
         rt.close()
         rt.close()  # second close is a no-op
         assert patched_setup["worker"].close.call_count == 1
+
+    def test_close_releases_inherited_refs_when_worker_close_raises(self, patched_setup):
+        compiled = _fake_compiled([_param("weight", [16, 16])], [])
+        weight = torch.zeros(16, 16, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[weight])
+        patched_setup["worker"].close.side_effect = RuntimeError("worker close failed")
+
+        with pytest.raises(RuntimeError, match="worker close failed"):
+            rt.close()
+
+        assert rt._inherited_host_tensors == ()
+        assert not rt._inherited_host_storage_ptrs
 
     def test_context_manager_closes(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -976,6 +1082,14 @@ class TestMultiProgram:
         # prepare() delegates to DistributedWorker([primary, *extra_compiled], ...).
         assert fake_worker.call_args.args[0] == [primary, extra]
 
+    def test_prepare_forwards_persistent_flag(self):
+        from pypto.ir.distributed_compiled_program import DistributedCompiledProgram  # noqa: PLC0415
+
+        primary = _fake_compiled([_param("a", [4])], [])
+        with patch("pypto.runtime.distributed_runner.DistributedWorker") as fake_worker:
+            DistributedCompiledProgram.prepare(primary, persistent=True)
+        assert fake_worker.call_args.kwargs["persistent"] is True
+
     def test_empty_sequence_raises(self, patched_setup):
         with pytest.raises(ValueError, match="at least one compiled program"):
             DistributedWorker([])
@@ -1080,7 +1194,7 @@ class _RecordingOrch:
         self.calls: list[tuple[Any, int, str]] = []
         # ``_submit_chip`` reads/writes this per-card dispatch counter on the
         # orch; declare it so the attribute is known to the type checker.
-        self._dfx_dispatch_idx: dict[int, int] = {}
+        self._dfx_dispatch_idx: dict[str, int] = {}
 
     def submit_next_level(self, callable_id: Any, task_args: Any, config: Any, *, worker: int) -> str:
         self.calls.append((callable_id, worker, config.output_prefix))
@@ -1150,12 +1264,47 @@ class TestSubmitChip:
         assert orch.calls == [("chip", 5, "")]
         assert cfg.output_prefix == ""
 
-    def test_unconstrained_worker_not_suffixed(self):
+    def test_unconstrained_worker_suffixed_as_rank_local(self):
+        # A comm-less / unconstrained dispatch (``worker < 0``) has no real rank
+        # but still gets a per-dispatch namespace under ``rank_local`` so its
+        # fixed-name artifacts don't clobber sibling dispatches and
+        # ``_collect_l3_swimlane`` (globs ``rank*``) finds them.
         orch = _RecordingOrch()
         cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
         _submit_chip(orch, "chip", "ta", cfg, -1)
-        assert orch.calls == [("chip", -1, "/work/dfx_outputs")]
+        _submit_chip(orch, "chip", "ta", cfg, -1)  # second comm-less dispatch
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank_local/d0",
+            "/work/dfx_outputs/rank_local/d1",
+        ]
+        # worker is still forwarded as -1 (unconstrained) to the runtime.
+        assert [c[1] for c in orch.calls] == [-1, -1]
         assert cfg.output_prefix == "/work/dfx_outputs"
+
+    def test_distinct_unconstrained_workers_share_one_counter(self):
+        # Every ``worker < 0`` collapses to the same ``rank_local`` dir, so the
+        # dispatch counter must be keyed by that *label* — keying it by the raw
+        # worker would give two distinct negative workers ``rank_local/d0``
+        # each, clobbering the first dispatch's fixed-name artifacts.
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix="/work/dfx_outputs")
+        _submit_chip(orch, "chip", "ta", cfg, -1)
+        _submit_chip(orch, "chip", "ta", cfg, -2)  # a different unconstrained worker
+        assert [c[2] for c in orch.calls] == [
+            "/work/dfx_outputs/rank_local/d0",
+            "/work/dfx_outputs/rank_local/d1",
+        ]
+
+
+def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
+    """Lay down ``<dfx>/<rel>/l2_swimlane_records.json`` for each dispatch dir.
+
+    Shared by the cleaner and collector tests below so the on-disk DFX layout
+    they both assume is spelled out once.
+    """
+    for rel in rels:
+        (dfx / rel).mkdir(parents=True)
+        (dfx / rel / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
 
 
 class TestClearDfxDispatchDirs:
@@ -1166,17 +1315,20 @@ class TestClearDfxDispatchDirs:
         # only write d0, so the stale d1/d2 must be cleared. A sibling non-d{k}
         # dir (e.g. a future diagnostic) is preserved.
         dfx = tmp_path / "dfx_outputs"
-        for d in ("rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank0/keepme"):
-            (dfx / d).mkdir(parents=True)
-            (dfx / d / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
+        # ``rank_local`` is the comm-less dispatch namespace; it must be cleared
+        # like any other ``rank*`` dir (it matches the same ``rank*`` glob).
+        _write_dfx_dispatch_dirs(
+            dfx, "rank0/d0", "rank0/d1", "rank0/d2", "rank1/d0", "rank_local/d0", "rank0/keepme"
+        )
 
         _clear_dfx_dispatch_dirs(dfx)
 
-        # All d{k} dirs gone...
+        # All d{k} dirs gone (rank-pinned and comm-less alike)...
         assert not (dfx / "rank0" / "d0").exists()
         assert not (dfx / "rank0" / "d1").exists()
         assert not (dfx / "rank0" / "d2").exists()
         assert not (dfx / "rank1" / "d0").exists()
+        assert not (dfx / "rank_local" / "d0").exists()
         # ...but the non-dispatch dir and the rank dirs themselves remain.
         assert (dfx / "rank0" / "keepme").is_dir()
         assert (dfx / "rank0").is_dir()
@@ -1184,6 +1336,63 @@ class TestClearDfxDispatchDirs:
     def test_missing_base_is_noop(self, tmp_path):
         # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
         _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
+
+
+class TestCollectL3Swimlane:
+    """``_collect_l3_swimlane`` converts every ``rank*/d{k}`` dispatch's records."""
+
+    @staticmethod
+    def _spy_generate_swimlane(monkeypatch) -> list[Path]:
+        """Record which dispatch dirs the converter was invoked on."""
+        import pypto.runtime.runner as _runner  # noqa: PLC0415
+
+        seen: list[Path] = []
+
+        def _fake(work_dir, out_dir, records, func_names=None):  # noqa: ANN001, ARG001
+            seen.append(out_dir)
+
+        monkeypatch.setattr(_runner, "_generate_swimlane", _fake)
+        return seen
+
+    def test_collects_rank_pinned_and_comm_less_dirs(self, tmp_path, monkeypatch):
+        # The consumer half of the comm-less fix: globbing ``rank*`` (rather
+        # than iterating a rank count) is what makes a comm-less dispatch's
+        # records — written under ``rank_local`` — get converted at all.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        dfx = tmp_path / "dfx_outputs"
+        # ``rank0/keepme`` carries a records file like a real dispatch dir, so
+        # only the ``d[0-9]*`` filter can exclude it — that makes the assertion
+        # below a genuine discriminator for the glob rather than for the
+        # ``records.exists()`` guard.
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0", "rank0/d1", "rank_local/d0", "rank0/keepme")
+        # A dispatch dir with no records (DFX wrote nothing) is skipped.
+        (dfx / "rank_local" / "d1").mkdir(parents=True)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert sorted(str(p.relative_to(dfx)) for p in seen) == [
+            "rank0/d0",
+            "rank0/d1",
+            "rank_local/d0",
+        ]
+
+    def test_simulator_platform_skips_conversion(self, tmp_path, monkeypatch):
+        # Onboard-only: the simulator emits records but not the task metadata
+        # the converter joins against, so the raw records are kept as-is.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_dfx_dispatch_dirs(tmp_path / "dfx_outputs", "rank_local/d0")
+
+        _collect_l3_swimlane(tmp_path, "a2a3sim")
+
+        assert seen == []
+
+    def test_missing_dfx_base_is_noop(self, tmp_path, monkeypatch):
+        # DFX was off (or nothing was written) -> nothing to convert, no error.
+        seen = self._spy_generate_swimlane(monkeypatch)
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen == []
 
 
 class _BoolStrictCallConfig:
@@ -1199,7 +1408,7 @@ class _BoolStrictCallConfig:
     def __init__(self) -> None:
         self.block_dim: Any = None
         self.aicpu_thread_num = 0
-        self.enable_dump_tensor = 0
+        self.enable_dump_args = 0
         self.enable_pmu = 0
         self.enable_scope_stats = False
         self.enable_l2_swimlane: Any = 0
@@ -1261,9 +1470,322 @@ class TestMakeCallConfigDepGenType:
     def test_int_zero_swimlane_yields_bool_false_dep_gen(self, tmp_path, fake_simpler_task_interface):
         # Another DFX flag opens the block while swimlane is the int ``0``; the
         # ``and``/``or`` chain would otherwise assign int ``0`` and still crash.
-        run_config = RunConfig(enable_dump_tensor=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
+        run_config = RunConfig(enable_dump_args=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
         cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
         assert cfg.enable_dep_gen is False
+
+
+class _PersistentDomainHandle:
+    def __init__(self, name: str, workers: list[int], window_size: int, allocation_index: int) -> None:
+        self.name = name
+        self.workers = tuple(workers)
+        self.contexts = {
+            worker: SimpleNamespace(
+                local_window_base=0x10000000 + allocation_index * 0x100000 + worker * 0x10000,
+                actual_window_size=window_size,
+            )
+            for worker in workers
+        }
+        self.release_count = 0
+
+    def __getitem__(self, worker_id: int):
+        return self.contexts[worker_id]
+
+    def release(self) -> None:
+        self.release_count += 1
+
+
+class _PersistentOrch:
+    def __init__(self) -> None:
+        self.allocate_calls: list[dict[str, Any]] = []
+        self.copy_calls: list[tuple[int, int, int, int]] = []
+        self.handles: list[_PersistentDomainHandle] = []
+        self.scope_end_count = 0
+        self.drain_count = 0
+        self.scope_begin_count = 0
+        self.drain_hook: Callable[[], None] | None = None
+
+    def allocate_domain(self, **kwargs):
+        self.allocate_calls.append(kwargs)
+        handle = _PersistentDomainHandle(
+            kwargs["name"],
+            list(kwargs["workers"]),
+            int(kwargs["window_size"]),
+            len(self.handles),
+        )
+        self.handles.append(handle)
+        return handle
+
+    def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
+        self.copy_calls.append((worker_id, dst, src, size))
+
+    def scope_end(self) -> None:
+        self.scope_end_count += 1
+
+    def _drain(self) -> None:
+        self.drain_count += 1
+        if self.drain_hook is not None:
+            self.drain_hook()
+
+    def scope_begin(self) -> None:
+        self.scope_begin_count += 1
+
+
+def _persistent_entry(window_size: int, seen_handles: list[Any]):
+    def entry(
+        orch,
+        _args,
+        config,
+        *,
+        tensors,
+        callables,
+        sub_ids,
+        _keep,
+        world_size,
+        _domain_provider=None,
+    ):
+        del orch, _args, config, tensors, callables, sub_ids, _keep
+        assert _domain_provider is not None
+        with _domain_provider(
+            name="comm_d0",
+            workers=[*range(world_size)],
+            window_size=window_size,
+            buffers=[SimpleNamespace(name="signal", dtype="opaque", count=4, nbytes=4)],
+        ) as domain:
+            seen_handles.append(domain)
+
+    return entry
+
+
+class TestPersistentDistributedWorker:
+    def test_rejects_artifact_without_domain_provider_hook(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        with pytest.raises(ValueError, match="requires regenerated host orchestration"):
+            DistributedWorker(compiled, persistent=True)
+
+    def test_one_worker_run_reuses_and_zeros_domain(self, patched_setup):
+        m = patched_setup
+        orch = _PersistentOrch()
+        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        seen_handles: list[Any] = []
+        window_size = (1 << 20) + 17
+        m["load_entry"].return_value = (_persistent_entry(window_size, seen_handles), None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = DeviceTensor(0x1000, (16, 16), torch.float32)
+        rt(arg)
+        rt(arg)
+        rt.close()
+
+        assert m["worker"].run.call_count == 1
+        assert [call["name"] for call in orch.allocate_calls] == ["p0:comm_d0"]
+        assert len(seen_handles) == 2
+        assert seen_handles[0] is seen_handles[1]
+        # The first request receives the freshly-zeroed allocation. The second
+        # restores 1 MiB + 17 bytes on each of two workers before dispatch.
+        assert [(worker, size) for worker, _dst, _src, size in orch.copy_calls] == [
+            (0, 1 << 20),
+            (0, 17),
+            (1, 1 << 20),
+            (1, 17),
+        ]
+        assert orch.scope_end_count == 2
+        assert orch.drain_count == 2
+        assert orch.scope_begin_count == 2
+        # A retained domain survives both request boundaries and is released
+        # once, when the long-running outer Worker.run exits during close().
+        assert orch.handles[0].release_count == 1
+        # Persistent dispatch reproduces Worker.run's per-request cleanup, but
+        # deliberately omits _release_all_live_domains so the domain is reusable.
+        assert m["worker"]._release_active_remote_slot_refs.call_count == 2
+        assert m["worker"]._flush_pending_remote_frees.call_count == 2
+        assert m["worker"]._cleanup_l3_l2_regions.call_count == 2
+        assert m["worker"]._l3_l2_orch_comm_host_buffers.clear.call_count == 2
+        assert m["worker"]._execute_pending_domain_releases.call_count == 2
+
+    def test_task_args_stay_alive_through_request_drain(self, patched_setup):
+        m = patched_setup
+        orch = _PersistentOrch()
+        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        task_args_ref = None
+
+        class TaskArgsSentinel:
+            pass
+
+        def entry(
+            orch,
+            _args,
+            config,
+            *,
+            tensors,
+            callables,
+            sub_ids,
+            _keep,
+            world_size,
+            _domain_provider=None,
+        ):
+            del orch, _args, config, tensors, callables, sub_ids, world_size, _domain_provider
+            nonlocal task_args_ref
+            task_args = TaskArgsSentinel()
+            task_args_ref = weakref.ref(task_args)
+            _keep.append(task_args)
+
+        def assert_task_args_alive() -> None:
+            assert task_args_ref is not None
+            assert task_args_ref() is not None
+
+        # Generated TaskArgs may still be dereferenced by in-flight tasks, so
+        # the request-owned keepalive must remain populated throughout drain.
+        orch.drain_hook = assert_task_args_alive
+        m["load_entry"].return_value = (entry, None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+
+        rt = DistributedWorker(compiled, persistent=True)
+        rt(DeviceTensor(0x1000, (16, 16), torch.float32))
+
+        assert task_args_ref is not None
+        # Once the synchronous request boundary has drained, the keepalive is
+        # cleared instead of retaining every request for the worker lifetime.
+        assert task_args_ref() is None
+        rt.close()
+
+    def test_multi_program_domains_are_isolated_and_reused(self, patched_setup):
+        m = patched_setup
+        orch = _PersistentOrch()
+        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+        seen_a: list[Any] = []
+        seen_b: list[Any] = []
+        m["load_entry"].side_effect = [
+            (_persistent_entry(64, seen_a), None),
+            (_persistent_entry(128, seen_b), None),
+        ]
+        compiled_a = _fake_compiled([_param("a", [16, 16])], [])
+        compiled_b = _fake_compiled([_param("b", [16, 16])], [])
+        compiled_a._distributed_config = DistributedConfig(device_ids=[0, 1])
+        compiled_b._distributed_config = DistributedConfig(device_ids=[0, 1])
+        arg = DeviceTensor(0x1000, (16, 16), torch.float32)
+
+        rt = DistributedWorker([compiled_a, compiled_b], persistent=True)
+        rt.run(compiled_a, arg)
+        rt.run(compiled_b, arg)
+        rt.run(compiled_a, arg)
+        rt.close()
+
+        assert m["worker"].run.call_count == 1
+        assert [call["name"] for call in orch.allocate_calls] == ["p0:comm_d0", "p1:comm_d0"]
+        assert seen_a[0] is seen_a[1]
+        assert seen_a[0] is not seen_b[0]
+        # Only program A is reused; program B's first use needs no reset.
+        assert [(worker, size) for worker, _dst, _src, size in orch.copy_calls] == [
+            (0, 64),
+            (1, 64),
+        ]
+        # Isolation does not change final ownership: each retained domain is
+        # released exactly once when the shared persistent worker closes.
+        assert [handle.release_count for handle in orch.handles] == [1, 1]
+
+    def test_dispatch_error_reaches_caller_and_releases_domain(self, patched_setup):
+        m = patched_setup
+        orch = _PersistentOrch()
+        m["worker"].run.side_effect = lambda fn: fn(orch, None, None)
+
+        def failing_entry(
+            orch,
+            _args,
+            config,
+            *,
+            tensors,
+            callables,
+            sub_ids,
+            _keep,
+            world_size,
+            _domain_provider=None,
+        ):
+            del orch, _args, config, tensors, callables, sub_ids, _keep
+            assert _domain_provider is not None
+            with _domain_provider(
+                name="comm_d0",
+                workers=[*range(world_size)],
+                window_size=64,
+                buffers=[SimpleNamespace(name="signal", dtype="opaque", count=4, nbytes=4)],
+            ):
+                raise RuntimeError("persistent dispatch failed")
+
+        m["load_entry"].return_value = (failing_entry, None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = DeviceTensor(0x1000, (16, 16), torch.float32)
+
+        with pytest.raises(RuntimeError, match="persistent dispatch failed"):
+            rt(arg)
+        rt.close()
+
+        # The terminal request unwinds the outer Worker.run, whose final cleanup
+        # releases the retained domain before the error reaches the caller.
+        assert orch.handles[0].release_count == 1
+        assert m["worker"].run.call_count == 1
+
+    def test_dispatch_error_waits_for_outer_worker_cleanup(self, patched_setup):
+        m = patched_setup
+        orch = _PersistentOrch()
+        outer_finalizer_started = threading.Event()
+        allow_outer_finalizer_to_finish = threading.Event()
+
+        def worker_run(fn):
+            fn(orch, None, None)
+            # Model the interval in real Worker.run between the orchestration
+            # callable returning and its outer drain/cleanup finally completing.
+            outer_finalizer_started.set()
+            assert allow_outer_finalizer_to_finish.wait(timeout=2)
+
+        m["worker"].run.side_effect = worker_run
+
+        def failing_entry(
+            orch,
+            _args,
+            config,
+            *,
+            tensors,
+            callables,
+            sub_ids,
+            _keep,
+            world_size,
+            _domain_provider=None,
+        ):
+            del orch, _args, config, tensors, callables, sub_ids, _keep, world_size, _domain_provider
+            raise RuntimeError("persistent dispatch failed before cleanup")
+
+        m["load_entry"].return_value = (failing_entry, None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled, persistent=True)
+        caller_done = threading.Event()
+        errors: list[BaseException] = []
+
+        def call_worker() -> None:
+            try:
+                rt(DeviceTensor(0x1000, (16, 16), torch.float32))
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                errors.append(exc)
+            finally:
+                caller_done.set()
+
+        caller = threading.Thread(target=call_worker)
+        caller.start()
+        assert outer_finalizer_started.wait(timeout=2)
+        # A failing entry may already have submitted device work. Its caller
+        # must not observe completion while Worker.run is still finalizing it.
+        assert not caller_done.is_set()
+
+        allow_outer_finalizer_to_finish.set()
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+        assert caller_done.is_set()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert str(errors[0]) == "persistent dispatch failed before cleanup"
+        rt.close()
 
 
 if __name__ == "__main__":

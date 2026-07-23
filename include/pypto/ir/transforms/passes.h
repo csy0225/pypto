@@ -784,6 +784,32 @@ Pass FoldNoOpReshape();
 Pass MaterializeRuntimeScopes();
 
 /**
+ * @brief Classify ForStmt iter_arg carries and size TaskId array carries
+ *
+ * An Orchestration ``ForStmt`` iter_arg lowers one of two ways:
+ *  - **trivial**: the yield value aliases the iter_arg (same backing buffer), so
+ *    iter_arg and return_var share the init value's emit name. Materialising a
+ *    fresh ``Tensor`` would break the runtime dependency tracker, which keys off
+ *    ``Tensor*`` identity.
+ *  - **rebind**: the yield value is a different buffer, so a mutable carry
+ *    variable is declared and the yield assigns back to it (issue #1286).
+ *
+ * Inside a ``pl.manual_scope`` a ``Scalar[TASK_ID]`` carry additionally lowers to
+ * a ``PTO2TaskId[N]`` array whose extent N comes from the loop's (or a threaded
+ * inner loop's) constant trip count.
+ *
+ * The orchestration codegen used to derive both from an alias-equivalence
+ * fixpoint over the loop body. This pass moves that analysis into the IR: it
+ * stamps ``iter_arg_rebind_<i>`` (bool, every slot) and ``iter_arg_array_size_<i>``
+ * (int, positive extents only) onto ``ForStmt::attrs_``, and codegen degenerates
+ * to an attr read. Only ``FunctionType::Orchestration`` functions are touched.
+ *
+ * Runs last, after ``MaterializeRuntimeScopes``, so the classified IR is exactly
+ * the IR codegen lowers.
+ */
+Pass ClassifyIterArgCarry();
+
+/**
  * @brief Copy each cross-core tpop's split/pipe-id onto its matching tfree op
  *
  * A `system.tfree_to_ai{c,v}` carries no split/id of its own — those live on the
@@ -846,6 +872,15 @@ class PassPipeline {
    * @brief Get the names of all passes in the pipeline
    */
   [[nodiscard]] std::vector<std::string> GetPassNames() const;
+
+  /**
+   * @brief Get copies of the passes in execution order
+   *
+   * Pass is a lightweight shared handle, so returning a vector by value keeps
+   * the pipeline's ordered storage private while allowing callers to inspect or
+   * compose a new pipeline without maintaining a second pass list.
+   */
+  [[nodiscard]] std::vector<Pass> GetPasses() const;
 
  private:
   std::vector<Pass> passes_;

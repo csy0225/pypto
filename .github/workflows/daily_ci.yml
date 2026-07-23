@@ -90,8 +90,8 @@ jobs:
         # puts the workspace path into the task command so the cleanup step below
         # can grep -F "$GITHUB_WORKSPACE" to find THIS job's task.
         run: |
-          task-submit --timeout 1800 --max-time 1800 --device 6 \
-            --run "cd $GITHUB_WORKSPACE && pytest tests/st/runtime/ops/test_assemble.py tests/st/runtime/ops/test_mscatter.py tests/st/runtime/ops/test_random.py tests/st/runtime/framework_and_models/test_qwen3_decode_scope3_mixed.py tests/st/runtime/control_flow/test_dyn_orch_shape.py::TestDynOrchShapeOperations::test_dyn_orch_paged_attention -v --forked --platform=a5 --device=6 --pto-isa-commit=${{ needs.toolchain.outputs.pto_isa_commit }} \
+          task-submit --timeout 3600 --max-time 1800 --device 6 \
+            --run "cd $GITHUB_WORKSPACE && pytest tests/st/runtime/ops/test_assemble.py tests/st/runtime/ops/test_mscatter.py tests/st/runtime/ops/test_random.py tests/st/runtime/framework_and_models/test_qwen3_decode_scope3_mixed.py tests/st/runtime/control_flow/test_dyn_orch_shape.py::TestDynOrchShapeOperations::test_dyn_orch_paged_attention -v --forked --platform=a5 --device=6 \
               -k 'not (test_tile_row_expand or test_fillpad_zero or test_fillpad_max or test_fillpad_min or TestMscatter)'"
 
       - name: Kill orphaned task-submit tasks
@@ -131,7 +131,6 @@ jobs:
       run:
         working-directory: perf-checkout
     env:
-      ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/perf-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/perf-checkout/pto-isa
       PTOAS_VERSION: ${{ needs.toolchain.outputs.ptoas_version }}
@@ -139,14 +138,13 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
-      CCACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/ccache
       CCACHE_MAXSIZE: 30G
-      # Shared with the container codegen-tests job (root) via the same ci-cache
-      # dir; 000 keeps cache files mutually writable across root and ci-runner.
+      # Every job now runs as ci-runner (no container root), but the shared
+      # ci-cache/ccache dir still holds root-owned entries from the container era,
+      # so keep the umask that keeps new entries mutually writable. The cache
+      # *paths* (CCACHE_DIR / PIP_CACHE_DIR) and CCACHE_NAMESPACE are derived by
+      # setup-ci-job from the runner config's CI_CACHE_ROOT.
       CCACHE_UMASK: '000'
-      # Per-job pip dir: pip has no shared-umask knob, so the root-owned
-      # codegen-tests pip mount can't be reused by this ci-runner host job.
-      PIP_CACHE_DIR: /home/ci-runner/hw-native-sys-pypto/ci-cache/pip-perf
     steps:
       - name: Fetch composite action definitions
         # Local `uses: ./.github/actions/...` resolves against $GITHUB_WORKSPACE,
@@ -161,13 +159,15 @@ jobs:
           # need the token persisted into .git/config afterward (zizmor artipacked).
           persist-credentials: false
 
-      - name: Setup NPU device job
-        uses: ./.github/actions/setup-npu-device-job
+      - name: Setup CI job
+        uses: ./.github/actions/setup-ci-job
         with:
           checkout-path: perf-checkout
+          needs-device: 'true'
+          pip-cache-name: pip-perf
           pto-isa-commit: ${{ needs.toolchain.outputs.pto_isa_commit }}
 
-      - name: Clone pypto-lib (Qwen3-14B decode)
+      - name: Clone pypto-lib (Qwen3-14B decode forward)
         # $GITHUB_WORKSPACE/pypto-lib is a sibling of the perf-checkout checkout
         # path, so actions/checkout won't clean it on a persistent self-hosted
         # runner — a leftover dir from a previous run makes `git clone` fail with
@@ -196,8 +196,8 @@ jobs:
           : > "$GITHUB_WORKSPACE/qwen3_perf.log"   # truncate any stale log
           for i in $(seq 1 5); do
             echo "=== qwen3 decode perf sample $i/5 ==="
-            task-submit --device "$DEVICE_ID" --timeout 1800 --max-time 1800 \
-              --run "source $GITHUB_WORKSPACE/perf-checkout/activate.sh && cd $GITHUB_WORKSPACE/pypto-lib && python models/qwen3/14b/decode_layer.py -p a2a3 -d \$TASK_DEVICE --enable-l2-swimlane --max-seq --seed 1234" \
+            task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
+              --run "source $GITHUB_WORKSPACE/perf-checkout/activate.sh && cd $GITHUB_WORKSPACE/pypto-lib && python models/qwen3/14b/decode_fwd.py -p a2a3 -d \$TASK_DEVICE --enable-l2-swimlane --max-seq --seed 1234" \
               2>&1 | tee -a "$GITHUB_WORKSPACE/qwen3_perf.log" \
               || echo "WARN: perf sample $i exited non-zero"
           done
@@ -210,7 +210,7 @@ jobs:
           python .github/scripts/perf_guard.py
           --log "$GITHUB_WORKSPACE/qwen3_perf.log"
           --baseline .github/perf_baselines/qwen3_14b_decode.json
-          --name "qwen3-14b decode_layer"
+          --name "qwen3-14b decode_fwd"
           --metric makespan_us
 
       - name: Kill orphaned task-submit tasks

@@ -38,6 +38,18 @@ def assert_code_equal(actual: str, expected: str) -> None:
         raise AssertionError(f"Code mismatch:\n{diff}")
 
 
+def _ensure_return_params_explicit(program):
+    """Phase-5 invariant: codegen requires IRProperty.ReturnParamsExplicit.
+
+    Orchestration codegen reads each callee's return->param map straight off its
+    ReturnStmt (pointer identity). NormalizeReturnOrder establishes that form.
+    Tests that hand-build IR (without going through PassManager) need to invoke
+    it before codegen; it is a no-op when the program already went through the
+    pass pipeline.
+    """
+    return passes.normalize_return_order()(program)
+
+
 def _ensure_arg_directions(program):
     """Phase-5 invariant: codegen requires Call.arg_directions to be populated.
 
@@ -49,22 +61,23 @@ def _ensure_arg_directions(program):
     return passes.derive_call_directions()(program)
 
 
-def _materialize_scopes(program):
-    """Codegen requires explicit RuntimeScopeStmt wrappers (PTO2_SCOPE blocks).
+def _finalize_for_codegen(program):
+    """Run the two codegen-entry passes on a hand-built program.
 
-    Tests that hand-build IR (without going through PassManager) need to invoke
-    MaterializeRuntimeScopes before codegen so the orchestration function body
-    and for/if bodies carry explicit AUTO RuntimeScopeStmt nodes. Codegen no
-    longer emits implicit PTO2_SCOPE() wrappers. This is a no-op when the program
-    was already produced by the pass pipeline. Must run after DeriveCallDirections
-    (a declared requirement of the pass).
+    MaterializeRuntimeScopes gives the orchestration function body and for/if
+    bodies explicit AUTO RuntimeScopeStmt nodes (codegen no longer emits implicit
+    PTO2_SCOPE() wrappers). ClassifyIterArgCarry then stamps each ForStmt's
+    iter_arg carry plan, which codegen reads instead of deriving. Both are
+    codegen preconditions and both are no-ops when the program already went
+    through the pass pipeline. Must run after DeriveCallDirections (a declared
+    requirement of both passes).
     """
-    return passes.materialize_runtime_scopes()(program)
+    return passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
 
 
 def _generate_orch_code(program) -> str:
     """Generate orchestration code using backend-agnostic codegen."""
-    program = _materialize_scopes(_ensure_arg_directions(program))
+    program = _finalize_for_codegen(_ensure_arg_directions(_ensure_return_params_explicit(program)))
     for func in program.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             result = codegen.generate_orchestration(program, func)
@@ -74,7 +87,7 @@ def _generate_orch_code(program) -> str:
 
 def _generate_orch_result(program) -> "codegen.OrchestrationResult":
     """Generate orchestration result using backend-agnostic codegen."""
-    program = _materialize_scopes(_ensure_arg_directions(program))
+    program = _finalize_for_codegen(_ensure_arg_directions(_ensure_return_params_explicit(program)))
     for func in program.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             return codegen.generate_orchestration(program, func)
@@ -186,7 +199,7 @@ def _generate_orch_full_pipeline(
 
 
 def _generate_orch_from_transformed_program(program) -> str:
-    program = passes.materialize_runtime_scopes()(program)
+    program = _finalize_for_codegen(program)
     for func in program.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             return codegen.generate_orchestration(program, func).code

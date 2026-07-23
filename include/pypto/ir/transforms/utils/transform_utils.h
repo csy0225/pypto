@@ -12,14 +12,19 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_TRANSFORM_UTILS_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_TRANSFORM_UTILS_H_
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 
 namespace pypto::ir::transform_utils {
 
@@ -109,14 +114,88 @@ inline std::vector<VarPtr> CollectDefVars(const StmtPtr& stmt) {
 /// Returns true if op_name is a compute tensor op (not a host-side memory/transfer/metadata op).
 ///
 /// Host-side ops are memory allocation/transfer (create, read, write, slice, assemble, dim)
-/// and metadata-only transforms (reshape, transpose at tensor level).
-inline bool IsComputeTensorOp(const std::string& op_name) {
-  if (op_name.compare(0, 7, "tensor.") != 0) return false;
-  static const std::unordered_set<std::string> kHostSideOps = {
-      "tensor.create",   "tensor.read", "tensor.write",   "tensor.slice",
-      "tensor.assemble", "tensor.dim",  "tensor.reshape", "tensor.transpose",
-  };
-  return kHostSideOps.count(op_name) == 0;
+/// and metadata-only transforms (reshape, reinterpret_view, transpose, view at tensor level).
+inline bool IsComputeTensorOp(const OpPtr& op) {
+  if (!op || op->name_.compare(0, 7, "tensor.") != 0) return false;
+  return !(IsOp(op, "tensor.create") || IsOp(op, "tensor.read") || IsOp(op, "tensor.write") ||
+           IsOp(op, "tensor.slice") || IsOp(op, "tensor.assemble") || IsOp(op, "tensor.dim") ||
+           IsOp(op, "tensor.reshape") || IsOp(op, "tensor.reinterpret_view") ||
+           IsOp(op, "tensor.transpose") || IsOp(op, "tensor.view"));
+}
+
+// ============================================================================
+// Call-like views and constant evaluation
+// ============================================================================
+
+/// Returns a Call-shaped view of @p expr when it is a Call or a Submit, else
+/// null. ``Submit`` (a task launch) is the canonical IR form after
+/// ``DeriveCallDirections``; analyses that do not care about task-launch
+/// semantics funnel it through ``SubmitToCallView`` so the Call-based logic
+/// applies unchanged. Maps keyed on node identity must use the binding Var,
+/// never this transient view.
+inline CallPtr AsCallOrSubmitView(const ExprPtr& expr) {
+  if (auto call = As<Call>(expr)) return call;
+  if (auto submit = As<Submit>(expr)) return SubmitToCallView(submit);
+  return nullptr;
+}
+
+/// Constant-evaluate @p expr if it is a ``ConstInt``; ``nullopt`` otherwise.
+inline std::optional<int64_t> EvalConstInt(const ExprPtr& expr) {
+  if (auto ci = As<ConstInt>(expr)) return ci->value_;
+  return std::nullopt;
+}
+
+/// Return the const trip count of @p for_stmt when start/stop/step are all
+/// ``ConstInt`` and step is positive; 0 otherwise.
+inline int64_t EvalConstTripCount(const ForStmtPtr& for_stmt) {
+  auto start = EvalConstInt(for_stmt->start_);
+  auto stop = EvalConstInt(for_stmt->stop_);
+  auto step = EvalConstInt(for_stmt->step_);
+  if (!start || !stop || !step || *step <= 0) return 0;
+  int64_t trip = (*stop - *start + *step - 1) / *step;
+  return trip > 0 ? trip : 0;
+}
+
+/// Peek through a leading compiler-inserted ``RuntimeScopeStmt`` so structural
+/// analyses reach the original statements.
+///
+/// ``MaterializeRuntimeScopes`` wraps the orchestration function body and each
+/// ForStmt / IfStmt branch body in an AUTO ``RuntimeScopeStmt`` so codegen emits
+/// ``PTO2_SCOPE()`` 1:1 from the IR. ``GetLastYieldStmt`` / ``FlattenToStmts``
+/// do not descend through a scope node, so callers unwrap first. User
+/// ``pl.manual_scope`` scopes stay opaque — they were never auto-wrapped —
+/// except for compiler-synthesised manual scopes, which carry
+/// ``kAttrCompilerAutoManualScopeCandidate``.
+///
+/// A user-written ``with pl.auto_scope():`` body may arrive as a single-statement
+/// ``SeqStmts`` wrapper (before ``NormalizeStmtStructure`` collapses it); peek
+/// through it (and any nested AUTO scopes) too.
+inline StmtPtr UnwrapAutoScope(const StmtPtr& stmt) {
+  if (auto scope = As<RuntimeScopeStmt>(stmt);
+      scope && (!scope->manual_ || scope->GetAttr<bool>(kAttrCompilerAutoManualScopeCandidate, false))) {
+    return UnwrapAutoScope(scope->body_);
+  }
+  if (auto seq = As<SeqStmts>(stmt); seq && seq->stmts_.size() == 1) {
+    return UnwrapAutoScope(seq->stmts_[0]);
+  }
+  return stmt;
+}
+
+// ============================================================================
+// iter_arg carry classification (attrs stamped by ``ClassifyIterArgCarry``)
+// ============================================================================
+
+/// True when iter_arg @p idx needs a materialised mutable carry variable.
+/// False (the default when the attr is absent) means the iter_arg is a trivial
+/// alias of its init value.
+inline bool IterArgIsRebind(const ForStmtPtr& for_stmt, size_t idx) {
+  return for_stmt->GetAttr<bool>(IterArgRebindAttrKey(idx), false);
+}
+
+/// TaskId manual-scope array-carry extent for iter_arg @p idx; 0 means the
+/// scalar / tensor / ArrayType carry path.
+inline int64_t IterArgArraySize(const ForStmtPtr& for_stmt, size_t idx) {
+  return static_cast<int64_t>(for_stmt->GetAttr<int>(IterArgArraySizeAttrKey(idx), 0));
 }
 
 }  // namespace pypto::ir::transform_utils

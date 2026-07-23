@@ -17,7 +17,6 @@ harness package (migrated from pto-testing-framework).
 import ast
 import inspect
 import queue
-import random
 import shutil
 import sys
 import tempfile
@@ -114,20 +113,6 @@ def pytest_addoption(parser):
         help="Optimization strategy for PyPTO pass pipeline (default: Default)",
     )
     parser.addoption(
-        "--fuzz-count",
-        action="store",
-        default=10,
-        type=int,
-        help="Number of fuzz test iterations (default: 10)",
-    )
-    parser.addoption(
-        "--fuzz-seed",
-        action="store",
-        default=None,
-        type=int,
-        help="Random seed for fuzz tests (default: random)",
-    )
-    parser.addoption(
         "--kernels-dir",
         action="store",
         default=None,
@@ -214,12 +199,6 @@ def pytest_addoption(parser):
         "Default: leave the runtime logger at its V5/INFO default.",
     )
     parser.addoption(
-        "--pto-isa-commit",
-        action="store",
-        default=None,
-        help="Pin the pto-isa clone to a specific git commit (hash or tag). Default: use latest remote HEAD.",
-    )
-    parser.addoption(
         "--analyze-auto-scopes-for-deps",
         action="store_true",
         default=False,
@@ -242,14 +221,14 @@ def pytest_addoption(parser):
         "swimlane is skipped).",
     )
     parser.addoption(
-        "--dump-tensor",
+        "--dump-args",
         nargs="?",
         type=int,
         const=1,
         default=0,
-        help="Per-task tensor dump level into <work_dir>/dfx_outputs/args_dump/. "
+        help="Per-task argument dump level into <work_dir>/dfx_outputs/args_dump/. "
         "Bare flag = 1 (partial: only pl.dump_tag / dumps= marked tensors); "
-        "'--dump-tensor 2' = full (every task); absent = 0 (off).",
+        "'--dump-args 2' = full (every task); absent = 0 (off).",
     )
     parser.addoption(
         "--enable-dep-gen",
@@ -450,9 +429,8 @@ def test_config(request) -> RunConfig:
         save_kernels_dir=save_kernels_dir,
         dump_passes=request.config.getoption("--dump-passes"),
         codegen_only=request.config.getoption("--codegen-only"),
-        pto_isa_commit=request.config.getoption("--pto-isa-commit"),
         enable_l2_swimlane=request.config.getoption("--enable-l2-swimlane"),
-        enable_dump_tensor=request.config.getoption("--dump-tensor"),
+        enable_dump_args=request.config.getoption("--dump-args"),
         enable_pmu=request.config.getoption("--enable-pmu"),
         enable_dep_gen=request.config.getoption("--enable-dep-gen"),
         enable_scope_stats=request.config.getoption("--enable-scope-stats"),
@@ -486,21 +464,6 @@ def optimization_strategy(request) -> str:
     return request.config.getoption("--strategy")
 
 
-@pytest.fixture
-def fuzz_count(request) -> int:
-    """Fixture providing fuzz test iteration count."""
-    return request.config.getoption("--fuzz-count")
-
-
-@pytest.fixture
-def fuzz_seed(request) -> int:
-    """Fixture providing fuzz test seed."""
-    seed = request.config.getoption("--fuzz-seed")
-    if seed is None:
-        seed = random.randint(0, 2**31 - 1)
-    return seed
-
-
 # Standard test shapes for parameterized tests
 STANDARD_SHAPES = [
     (64, 64),
@@ -524,7 +487,6 @@ def pytest_configure(config):
         "(intersected with the --platform CLI filter)",
     )
     config.addinivalue_line("markers", "slow: mark test as slow")
-    config.addinivalue_line("markers", "fuzz: mark test as fuzz test")
     config.addinivalue_line(
         "markers",
         "device_batch: auto-applied to tests that execute via test_runner.run "
@@ -826,9 +788,8 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 
     dump_passes: bool = session.config.getoption("--dump-passes")
     codegen_only: bool = session.config.getoption("--codegen-only")
-    pto_isa_commit: str | None = session.config.getoption("--pto-isa-commit")
     enable_l2_swimlane: bool = session.config.getoption("--enable-l2-swimlane")
-    enable_dump_tensor: int = session.config.getoption("--dump-tensor")
+    enable_dump_args: int = session.config.getoption("--dump-args")
     enable_pmu: int = session.config.getoption("--enable-pmu")
     enable_dep_gen: bool = session.config.getoption("--enable-dep-gen")
     enable_scope_stats: bool = session.config.getoption("--enable-scope-stats")
@@ -889,11 +850,10 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         session_platform=session_platform,
         dump_passes=dump_passes,
         codegen_only=codegen_only,
-        pto_isa_commit=pto_isa_commit,
         compile_workers=max_workers,
         device_pool=device_pool,
         enable_l2_swimlane=enable_l2_swimlane,
-        enable_dump_tensor=enable_dump_tensor,
+        enable_dump_args=enable_dump_args,
         enable_pmu=enable_pmu,
         enable_dep_gen=enable_dep_gen,
         enable_scope_stats=enable_scope_stats,

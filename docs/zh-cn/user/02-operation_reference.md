@@ -41,6 +41,8 @@
 | `col_argmin` | `(input: T, tmp_tile: Tile \| None = None) -> T` | 列 argmin（每列最小值的行索引，int32 输出；tile 路径需要 `tmp_tile`） |
 | `rsqrt` | `(input: T, high_precision: bool = False) -> T` | 倒数平方根；`high_precision=True` 选择高精度路径（仅对 Tensor 输入生效，Tile 路径需要改用 `pl.tile.rsqrt(src, tmp=...)`） |
 | `create` / `create_tile` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem) -> Tile` | 在指定内存空间创建 tile（tile-only，对应 `pl.tile.create`） |
+| `read` | `(src: T, offset: IntLike \| Sequence[IntLike]) -> Scalar` | 读取指定索引的标量（按源类型分发）。语法糖：`A[i, j]` |
+| `write` | `(dst: T, offset: IntLike \| Sequence[IntLike], value: Scalar) -> Expr` | 写入指定索引的标量（按目标类型分发）。语法糖：`A[i, j] = v` |
 
 ## 仅 Tensor（`pl.tensor.*`）
 
@@ -49,10 +51,12 @@
 | 名称 | 签名 | 说明 |
 | ---- | ---- | ---- |
 | `create` / `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None, init_value: int \| float \| None = None) -> Tensor` | 创建新张量（可选 `layout` 参数，如 `pl.DN`、`pl.NZ`；`init_value` 由 AICPU 预填充缓冲区——`0` 对任意 dtype 清零，非零值需整型或 ≥32 位浮点 dtype） |
-| `read` | `(tensor: Tensor, indices: Sequence[IntLike]) -> Scalar` | 读取指定索引的标量。语法糖：`A[i, j]` |
+| `read` | `(tensor: Tensor, indices: IntLike \| Sequence[IntLike]) -> Scalar` | 读取指定索引的标量。语法糖：`A[i, j]` |
+| `write` | `(tensor: Tensor, indices: IntLike \| Sequence[IntLike], value: Scalar \| Expr) -> Expr` | 写入指定索引的标量。语法糖：`A[i, j] = v` |
 | `dim` | `(tensor: Tensor, axis: int) -> Scalar` | 获取维度大小（支持负索引） |
 | `slice` | `(tensor: Tensor, shape: Sequence[IntLike], offset: Sequence[IntLike]) -> Tensor` | 切片。语法糖：`A[0:16, :]` |
 | `reshape` | `(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor` | 变形 |
+| `view` | `(tensor: Tensor, shape: Sequence[IntLike] \| None = None, *, layout: TensorLayout \| None = None) -> Tensor` | 在同一存储上进行零拷贝重新解释；目标 rank 至少为 1，DN 至少为 2。编排层仅支持 ND shape 重新解释，且不能同时改变 layout |
 | `transpose` | `(tensor: Tensor, axis1: int, axis2: int) -> Tensor` | 交换两个轴 |
 | `assemble` | `(target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = AtomicType.None_) -> Tensor` | 将 source 写入 target 的指定偏移。语法糖（仅 SSA 前）：`target[i:i+H, j:j+W] = source`。`atomic=AtomicType.Add` 改为累加而非覆盖（split-K）——仅当 target 为函数输出（全局内存）时合法；浮点结果不确定，target 需预先清零，支持 dtype fp32/bf16/fp16/int32/int16/int8（bf16 仅在 Ascend910B/A2/A3 上支持） |
 | `scatter_update` | `(input: Tensor, dim: int, index: Tensor, src: Tensor) -> Tensor` | 按 `index` 指定的稀疏行位置，将 `src` 的行数据写入 `input`。`input`/`src`：2D `[rows, d]` 或 4D `[B, S, 1, d]`；`index`：2D `[b, s]` 整型。当前仅支持 `dim=-2` |
@@ -99,6 +103,8 @@
 | `store` | `(tile: Tile, offsets: Sequence[IntLike], output_tensor: Tensor, *, atomic: AtomicType = AtomicType.None_) -> Tensor` | Tile → DDR（pipe 根据源 tile 内存空间自动推断）。`atomic=AtomicType.Add` 将 tile 累加到 DDR 现有内容上（split-K）；浮点结果不确定，目标需预先清零，支持 dtype fp32/bf16/fp16/int32/int16/int8（bf16 仅在 Ascend910B/A2/A3 上支持） |
 | `assemble` | `(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile` | 将源 tile 写入目标 tile 的指定偏移处。语法糖（仅 SSA 前）：`target[i:i+H, j:j+W] = source` |
 | `scatter_update` | `(input: Tile, dim: int, index: Tile, src: Tile) -> Tile` | 按 `index` tile 指定的稀疏行位置，将 `src` tile 的行数据写入 `input` tile。`input`/`src`：2D `[rows, d]` 或 4D `[B, S, 1, d]`；`index`：2D `[b, s]` 整型。降级为 `tile.scatter`（pto.tscatter，整行 flat 索引）实现。当前仅支持 `dim=-2` |
+| `read` | `(tile: Tile, indices: IntLike \| Sequence[IntLike]) -> Scalar` | 读取指定索引的标量。语法糖：`A[i, j]` |
+| `write` | `(tile: Tile, indices: IntLike \| Sequence[IntLike], value: Scalar \| Expr) -> Expr` | 写入指定索引的标量。语法糖：`A[i, j] = v` |
 | `move` | `(tile: Tile, target_memory: Mem) -> Tile` | 在内存层级间移动 tile（包括 Vec→Vec 拷贝） |
 | `create` | `(shape: Sequence[IntLike], dtype: DataType, target_memory: Mem = Mem.Vec) -> Tile` | 在指定内存空间创建 tile |
 | `full` | `(shape: list[int], dtype: DataType, value: int \| float) -> Tile` | 创建用常量填充的 tile |
@@ -168,9 +174,6 @@
 | `row_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | 行 argmin，每行最小值的列索引（需要临时缓冲区，int32 输出） |
 | `col_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | 列 argmax，每列最大值的行索引（需要临时缓冲区，int32 输出） |
 | `col_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | 列 argmin，每列最小值的行索引（需要临时缓冲区，int32 输出） |
-| `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | 沿轴求和 |
-| `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | 沿轴取最大值 |
-| `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | 沿轴取最小值 |
 
 ## 线性代数（`pl.tile.*`）
 
@@ -272,3 +275,5 @@ packed predicate mask；A2/A3 上如需得到数值结果，请配合 `sel` 和�
 | `incore` | `() -> IncoreContext` | InCore 作用域的上下文管理器 |
 | `dynamic` | `(name: str) -> DynVar` | 创建动态维度变量 |
 | `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None, init_value: int \| float \| None = None) -> Tensor` | 创建张量（从 `pl.tensor` 提升；`init_value` 由 AICPU 预填充缓冲区——`0` 对任意 dtype 清零，非零值需整型或 ≥32 位浮点 dtype） |
+| `max` | `(lhs: Scalar \| int \| Expr, rhs: Scalar \| int \| Expr) -> Scalar` | 两个**标量**取最大值（不是 tile 规约 —— 请用 `pl.tile.row_max` / `pl.tile.col_max`） |
+| `min` | `(lhs: Scalar \| int \| Expr, rhs: Scalar \| int \| Expr) -> Scalar` | 两个**标量**取最小值（不是 tile 规约 —— 请用 `pl.tile.row_min` / `pl.tile.col_min`） |

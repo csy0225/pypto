@@ -54,6 +54,7 @@ class IRProperty(Enum):
     ManualDepsOnSubmitOnly = ...
     ReturnParamsExplicit = ...
     AivSplitValid = ...
+    IterArgCarryClassified = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -271,8 +272,14 @@ class PassContext:
         diagnostic_phase: DiagnosticPhase = DiagnosticPhase.PRE_PIPELINE,
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
         memory_planner: MemoryPlanner = MemoryPlanner.PYPTO,
+        enable_pypto_l0c_double_buffer: bool = False,
     ) -> None:
-        """Create a PassContext with instruments and pass configuration (incl. memory planner)."""
+        """Create a PassContext with instruments and pass configuration (incl. memory planner).
+
+        ``enable_pypto_l0c_double_buffer`` opts in to L0C double-buffering (dbC=2)
+        under the PyPTO memory planner (experimental, default off; no effect under
+        PtoAS, which already emits dbC=2).
+        """
         ...
 
     def __enter__(self) -> PassContext: ...
@@ -298,6 +305,10 @@ class PassContext:
         """Get the memory planner selection for this context."""
         ...
 
+    def get_enable_pypto_l0c_double_buffer(self) -> bool:
+        """Whether L0C double-buffering (dbC=2) is enabled under the PyPTO memory planner."""
+        ...
+
     def get_instruments(self) -> list[PassInstrument]:
         """Get the instruments registered on this context."""
         ...
@@ -321,6 +332,9 @@ class PassPipeline:
 
     def get_pass_names(self) -> list[str]:
         """Get names of all passes."""
+
+    def get_passes(self) -> list[Pass]:
+        """Get copies of all passes in execution order."""
 
 # Factory functions
 
@@ -373,6 +387,9 @@ class TypeCheckErrorType(Enum):
     IF_CONDITION_MUST_BE_SCALAR = ...
     FOR_RANGE_MUST_BE_SCALAR = ...
     CONDITION_MUST_BE_BOOL = ...
+    TENSOR_PADDING_MISMATCH = ...
+    DISTRIBUTED_WINDOW_IDENTITY_MISMATCH = ...
+    TILE_VIEW_MISMATCH = ...
 
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
@@ -667,6 +684,23 @@ def materialize_runtime_scopes() -> Pass:
     functions are touched.
     """
 
+def classify_iter_arg_carry() -> Pass:
+    """Classify ForStmt iter_arg carries and size TaskId array carries.
+
+    For every ``FunctionType.Orchestration`` function, classifies each ``ForStmt``
+    iter_arg as a **trivial** alias of its init value or a **rebind** needing a
+    materialised mutable carry, and sizes ``Scalar[TASK_ID]`` array carries inside
+    a ``pl.manual_scope`` from the constant trip count.
+
+    The plan is stamped onto ``ForStmt.attrs``: ``iter_arg_rebind_<i>`` (bool, one
+    per slot) and ``iter_arg_array_size_<i>`` (int, positive extents only).
+    Orchestration codegen reads these attrs instead of re-deriving the
+    classification from an alias-equivalence fixpoint over the loop body.
+
+    Runs last, after :func:`materialize_runtime_scopes`, so the classified IR is
+    exactly the IR codegen lowers.
+    """
+
 class NestedCallErrorType(Enum):
     """Nested call verification error types."""
 
@@ -774,8 +808,12 @@ class l0_tile_chooser:
         bw_b: float
         bw_drain: float
         drain_fixed_cycles: float
+        drain_row_cycles: float
+        drain_penalty_cycles: float
+        drain_c0_bytes: int
         mad_head: int
         mad_k_fractal_bytes: int
+        mad_fp32_passes: int
         allow_padding: bool
         allow_k_boundary: bool
         def __init__(self) -> None: ...

@@ -33,11 +33,13 @@ from dataclasses import dataclass
 from importlib import resources
 
 try:
-    from importlib.resources.abc import Traversable  # pyright: ignore[reportMissingImports] # Python >= 3.11
+    from importlib.resources.abc import Traversable  # pyright: ignore[reportMissingImports]
 except ImportError:  # pragma: no cover - fallback for older interpreters
     from importlib.abc import Traversable
 from typing import Any
 
+from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
+from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
 from pypto.compile_profiling import CompileProfiler, StageRecord
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core import codegen as _codegen_core
@@ -235,40 +237,6 @@ _KERNEL_HEADER = """\
 using namespace pto;
 
 """
-
-
-def _preprocess_ptoas_output(content: str) -> str:
-    """Strip includes/using and make functions static in ptoas output.
-
-    Removes the header lines that the wrapper already provides, and replaces
-    ``__global__ AICORE void`` with ``static __aicore__ void`` so the wrapper's
-    ``kernel_entry`` is the actual entry point.
-    """
-    lines = content.splitlines(keepends=True)
-    filtered: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("#include") and (
-            "pto-inst" in stripped or "cstdint" in stripped or "tensor.h" in stripped
-        ):
-            continue
-        if stripped == "using namespace pto;":
-            continue
-        filtered.append(line)
-    result = "".join(filtered)
-    # Non-mixed kernels: optional [extern "C"] [__global__] AICORE void -> static
-    # __aicore__ void. Newer ptoas prefixes the function with extern "C"; it must be
-    # consumed too, else the rewrite yields the illegal `extern "C" static` (external
-    # vs. internal linkage clash that clang rejects). kernel_entry below is the sole
-    # extern "C" export.
-    result = re.sub(
-        r'(?:extern\s*"C"\s*)?(?:__global__\s+)?AICORE\s+void',
-        "static __aicore__ void",
-        result,
-    )
-    # Mixed-kernel sub-functions and helpers: normalize remaining AICORE qualifiers.
-    result = re.sub(r"\bAICORE\b", "__aicore__", result)
-    return result
 
 
 def _const_int_from_shape_expr(expr: object) -> int | None:
@@ -755,6 +723,7 @@ def _generate_config_file(
     func_name_to_signature: dict[str, list[str]] | None = None,
     orchestration_signature: list[str] | None = None,
     func_name_to_external_source: dict[str, str] | None = None,
+    func_name_to_external_include_dirs: dict[str, tuple[str, ...]] | None = None,
     *,
     block_dim: int | None = None,
 ) -> str:
@@ -785,9 +754,13 @@ def _generate_config_file(
     wasteful D2H copy-back and pure-OUT tensors take the on-device memset fast
     path. Without it the signature is empty and every tensor is conservatively
     copied back (the pre-existing behavior).
+
+    ``func_name_to_external_include_dirs`` maps external kernel names to their
+    ordered CCEC include search paths. Non-external kernels ignore this map.
     """
     func_name_to_signature = func_name_to_signature or {}
     func_name_to_external_source = func_name_to_external_source or {}
+    func_name_to_external_include_dirs = func_name_to_external_include_dirs or {}
     orchestration_signature = orchestration_signature or []
     has_signatures = any(func_name_to_signature.values()) or bool(orchestration_signature)
 
@@ -842,6 +815,11 @@ def _generate_config_file(
         entry = (
             f'\t{{"func_id": {func_id}, "name": "{name}", "source": {source_expr}, "core_type": "{ct_str}"'
         )
+        if ext_source is not None:
+            entry += ', "external": True'
+            include_dirs = func_name_to_external_include_dirs.get(name)
+            if include_dirs:
+                entry += f', "extra_include_dirs": {list(include_dirs)!r}'
         signature = func_name_to_signature.get(name)
         if signature:
             entry += f', "signature": [{_format_signature(signature)}]'
@@ -983,6 +961,14 @@ def _external_source_of(func: _ir_core.Function) -> str | None:
     instead of generating a kernel.
     """
     return dict(func.attrs).get("external_source")
+
+
+def _external_include_dirs_of(func: _ir_core.Function) -> tuple[str, ...]:
+    """Return ordered include directories carried by a JIT external kernel."""
+    try:
+        return decode_external_include_dirs(dict(func.attrs).get(EXTERNAL_INCLUDE_DIRS_ATTR))
+    except ValueError as e:
+        raise RuntimeError(f"Invalid external include metadata on function '{func.name}': {e}") from e
 
 
 def _compile_pto_module(
@@ -1541,6 +1527,12 @@ def _generate_single_chip(
         for f in transformed_program.functions.values()
         if (src := _external_source_of(f)) is not None
     }
+    func_name_to_external_include_dirs: dict[str, tuple[str, ...]] = {
+        f.name: include_dirs
+        for f in transformed_program.functions.values()
+        if _external_source_of(f) is not None
+        if (include_dirs := _external_include_dirs_of(f))
+    }
 
     # ── Phase 1: IR → MLIR (sequential, fast) ────────────────────────
     # PTOCodegen converts IR to MLIR strings. This is cheap (pure string
@@ -1617,7 +1609,13 @@ def _generate_single_chip(
                 f"// Generated by PyPTO IR Compiler\n\n"
                 f"{orch_result.code}"
             )
-            if not skip_ptoas:
+            # An all-external graph has no PTOAS phase to skip. It still needs
+            # the manifest so the runtime can compile those sources with CCEC
+            # and assemble the orchestration.
+            all_kernels_external = all(
+                name in func_name_to_external_source for name in orch_result.func_name_to_id
+            )
+            if not skip_ptoas or all_kernels_external:
                 result_files["kernel_config.py"] = _generate_config_file(
                     orch_func.name,
                     orch_result.func_name_to_id,
@@ -1625,6 +1623,7 @@ def _generate_single_chip(
                     orch_result.func_name_to_signature,
                     orch_result.orchestration_signature,
                     func_name_to_external_source,
+                    func_name_to_external_include_dirs,
                     block_dim=block_dim,
                 )
         except Exception as e:

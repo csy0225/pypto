@@ -1,0 +1,355 @@
+name: Setup CI job
+description: >-
+  Shared setup for every self-hosted pypto job — the CPU ones (ci.yml
+  `codegen-tests`) and the on-device ones (ci.yml `system-tests`,
+  `system-tests-direct`, `dist-system-tests`, `pypto-lib-model`; daily_ci.yml
+  `qwen3-perf`). All of them run directly on the host, as the same user, through
+  this one action: resilient submodule checkout into a per-job dir, ptoas +
+  pto-isa install, a per-job conda venv + activate.sh, and a from-source
+  build/install of pypto (+ simpler). No container: the CPU jobs used to run in
+  `localhost:5000/ci-py310` as root, which forced a root/ci-runner umask split on
+  the shared ccache — running them on the host as ci-runner retires that.
+
+  The device jobs differ from the CPU ones in two inputs: `needs-device` (gate the
+  npu-smi check + CANN set_env.sh) and `install-toolchain` (gate ptoas download +
+  pto-isa clone + the simpler build — the `--codegen-only` job needs none of
+  them).
+
+  Each host describes its own layout in the runner's `.env` (the file in the
+  runner application's root dir, which the runner service loads into every job it
+  runs). That is where the absolute paths live — not in git — so no workflow names
+  one and a differently-laid-out host needs no repo change. The runner must set:
+
+    CONDA_ROOT     conda install to layer the per-job venv on (all runners)
+    CI_CACHE_ROOT  dir CI may keep its caches in (created if absent; all runners)
+    CANN_ROOT      CANN toolkit — device runners only (needs-device)
+
+  Beyond those, the host is expected to provide (by name, not by path): a conda
+  env `py310` under CONDA_ROOT, and task-submit / npu-smi / ccache / git / curl on
+  PATH. The `.env` makes the *locations* portable; these names are the
+  provisioning contract a runner has to satisfy to be usable at all. Note the CPU
+  runner (codegen-tests) now needs the `py310` env too — previously it used the
+  container's Python.
+
+  The calling job must define PTOAS_ROOT, PTO_ISA_ROOT, PTOAS_VERSION,
+  PTOAS_SHA256, the CMAKE_* and the non-path CCACHE_* (MAXSIZE / UMASK) environment
+  variables; they are read from the job environment here. CCACHE_NAMESPACE and
+  every cache path (CCACHE_DIR, PIP_CACHE_DIR, PTOAS_CACHE_DIR) are resolved and
+  exported by this action — they derive from CI_CACHE_ROOT and so cannot live in
+  the caller's static job-level `env:` block.
+
+inputs:
+  checkout-path:
+    description: >-
+      Workspace-relative dir to check the repo out into (also the venv /
+      activate.sh home). Isolates each job's tree on the shared self-hosted host.
+      Since $GITHUB_WORKSPACE is per-runner-instance and an instance runs one job
+      at a time, this per-job dir makes each build tree single-writer.
+    required: true
+  pip-cache-name:
+    description: >-
+      pip cache dir under CI_CACHE_ROOT (e.g. pip-st, pip-dist). Unlike ccache,
+      pip has no shared-umask knob, so concurrent jobs each take their own dir
+      rather than fight over file ownership.
+    required: true
+  needs-device:
+    description: >-
+      When 'true' the job talks to an NPU: verify a card is visible (npu-smi) and
+      have activate.sh source CANN's set_env.sh, which wires up the Ascend/HCCL
+      host environment. When 'false' (the codegen-only job) both are skipped and
+      CANN_ROOT is not required in the runner config.
+    required: false
+    default: 'false'
+  install-toolchain:
+    description: >-
+      When 'true' (the default) download ptoas, clone the pinned pto-isa, and
+      build+install simpler (./runtime) — everything the codegen -> device path
+      needs. The `--codegen-only` job passes 'false': it never assembles, never
+      touches pto-isa and never runs simpler, so it only needs the pypto build.
+    required: false
+    default: 'true'
+  pto-isa-commit:
+    description: >-
+      pto-isa commit to pin (needs.toolchain.outputs.pto_isa_commit). Required
+      when install-toolchain is 'true' (it selects both the pto-isa checkout and
+      the ccache namespace). Leave empty for the codegen-only job, which pins
+      nothing and keeps ccache in the default namespace.
+    required: false
+    default: ''
+  unset-ring:
+    description: >-
+      When 'true', activate.sh unsets PTO2_RING_* — the dist HCCL tests break with
+      the runner's systemd ring-sizing env. Default 'false' keeps them (the other
+      device jobs rely on the runner's ring env, propagated to the device run).
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner config and derive cache paths
+      # The runner describes its own host layout in <runner-root>/.env, which the
+      # runner service loads into every job it runs — so these arrive as plain env
+      # vars and nothing here has to know an absolute path. First step on purpose:
+      # a runner missing its .env must fail here with an actionable message, not
+      # 40 minutes later as an opaque "conda: command not found" mid-build.
+      shell: bash
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        INSTALL_TOOLCHAIN: ${{ inputs.install-toolchain }}
+        PTO_ISA_COMMIT_IN: ${{ inputs.pto-isa-commit }}
+        PIP_CACHE_NAME: ${{ inputs.pip-cache-name }}
+      run: |
+        set -uo pipefail
+        # A device job that installs the toolchain must have a pto-isa commit to
+        # pin; fail here rather than clone HEAD or leave ccache mis-namespaced.
+        if [ "$INSTALL_TOOLCHAIN" = "true" ] && [ -z "$PTO_ISA_COMMIT_IN" ]; then
+          echo "::error::install-toolchain=true requires pto-isa-commit (pass needs.toolchain.outputs.pto_isa_commit)"
+          exit 1
+        fi
+        # Prerequisites CI does not create, so they must already be there. The
+        # codegen job needs no Ascend env, so CANN_ROOT is device-jobs-only.
+        required="CONDA_ROOT"
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          required="$required CANN_ROOT"
+        fi
+        bad=0
+        for key in $required CI_CACHE_ROOT; do
+          if [ -z "${!key:-}" ]; then
+            echo "::error::$key is not set — add it to this runner's .env"
+            bad=1
+          fi
+        done
+        if [ "$bad" -ne 0 ]; then
+          # The runner's .env takes the whole rest of the line as the value: it
+          # supports neither inline comments nor quoting. Keep these samples bare
+          # so they can be pasted verbatim without smuggling in a trailing "#...".
+          echo "The runner declares its host layout in <runner-root>/.env."
+          echo "One KEY=VALUE per line, no quotes and no trailing comments:"
+          echo "  CONDA_ROOT=/path/to/miniconda3"
+          echo "  CI_CACHE_ROOT=/path/to/ci-cache"
+          echo "  CANN_ROOT=/path/to/Ascend/cann-9.0.0"
+          echo "(CANN_ROOT is only needed on device runners; CI_CACHE_ROOT is"
+          echo " created if absent. The service reads .env at startup — restart"
+          echo " it after editing.)"
+          exit 1
+        fi
+        for key in $required; do
+          if [ ! -d "${!key}" ]; then
+            echo "::error::$key points at a missing directory: ${!key}"
+            case "${!key}" in
+              *"#"*) echo "The value contains a '#'. The runner's .env has no"
+                     echo "inline comments — the rest of the line is part of the"
+                     echo "value. Put $key on a line of its own, bare." ;;
+            esac
+            exit 1
+          fi
+        done
+        # CI_CACHE_ROOT is different in kind: CI owns everything under it, so it
+        # only has to be declared, not to pre-exist — a fresh host starts with an
+        # empty (or absent) cache and simply takes the miss.
+        if ! mkdir -p "$CI_CACHE_ROOT"; then
+          echo "::error::CI_CACHE_ROOT is not creatable: $CI_CACHE_ROOT"
+          exit 1
+        fi
+        # Every cache path derives from that one root, so no workflow has to name
+        # an absolute path. These must be exported here rather than sit in the
+        # caller's job-level `env:`, which is static and cannot see this step.
+        # These match the previous hardcoded ci-cache/{ccache,pip-*,ptoas} paths
+        # byte for byte, so existing entries stay valid — no forced rebuild.
+        {
+          echo "CCACHE_DIR=$CI_CACHE_ROOT/ccache"
+          echo "PIP_CACHE_DIR=$CI_CACHE_ROOT/$PIP_CACHE_NAME"
+          echo "PTOAS_CACHE_DIR=$CI_CACHE_ROOT/ptoas"
+        } >> "$GITHUB_ENV"
+        echo "runner config OK (checked: CI_CACHE_ROOT $required)"
+        # Identity and storage of the host we landed on, made visible in every log:
+        # these jobs run on a pool of self-hosted runners that are not necessarily
+        # identically provisioned, so surface the basics instead of guessing later.
+        echo "host=$(hostname) user=$(id -un) uid=$(id -u) umask=$(umask)"
+        df -h "$CI_CACHE_ROOT" | tail -1 | sed 's/^/cache_df /' || true
+
+    # Self-hosted runners reuse the workspace across runs. A prior run — or a
+    # force-pushed PR ref moving refs/remotes/pull/<n>/merge — can leave the
+    # checkout dir with a stale submodule object store, so actions/checkout's
+    # forced submodule update dies with "fatal: Unable to find current revision
+    # in submodule path ...". Try the fast incremental checkout first; on any
+    # failure purge the dir and re-clone from scratch.
+    - name: Checkout (incremental)
+      id: checkout
+      continue-on-error: true
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Purge stale checkout on failure
+      if: steps.checkout.outcome == 'failure'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: rm -rf "${{ inputs.checkout-path }}"
+
+    - name: Checkout (clean re-clone)
+      if: steps.checkout.outcome == 'failure'
+      uses: actions/checkout@v4
+      with:
+        submodules: true
+        path: ${{ inputs.checkout-path }}
+        persist-credentials: false
+
+    - name: Check NPU
+      if: ${{ inputs.needs-device == 'true' }}
+      shell: bash
+      run: npu-smi info
+
+    - name: Scope ccache to pto-isa version
+      # Namespace ccache by the pinned pto-isa commit so an ISA bump forces a real
+      # recompile instead of serving stale objects (see issue #1139). The
+      # codegen-only job pins no pto-isa and passes an empty commit; it keeps the
+      # default namespace (its pypto build does not include pto-isa headers).
+      if: ${{ inputs.pto-isa-commit != '' }}
+      shell: bash
+      run: echo "CCACHE_NAMESPACE=pto-isa-${{ inputs.pto-isa-commit }}" >> "$GITHUB_ENV"
+
+    - name: Install ptoas (local cache)
+      # $PTOAS_CACHE_DIR (ci-cache/ptoas) comes from the derive step above.
+      if: ${{ inputs.install-toolchain == 'true' }}
+      shell: bash
+      run: |
+        # uname -m keeps this arch-portable; on the arm64 runners it resolves to
+        # aarch64, so the cache archive name is unchanged from the old literal.
+        PTOAS_ARCH="$(uname -m)"
+        CACHE_ARCHIVE="$PTOAS_CACHE_DIR/ptoas-${PTOAS_ARCH}-${PTOAS_VERSION}-${PTOAS_SHA256}.tar.gz"
+        # $PTOAS_CACHE_DIR is shared across concurrent jobs on the host (unlike the
+        # per-job pip dir), so two cache-miss jobs must not fight over one temp
+        # file: download into a per-job mktemp, verify it, then atomically rename
+        # into place (last writer wins — content is identical). A trap removes the
+        # temp if we die mid-download. CACHE_ARCHIVE therefore only ever holds a
+        # verified archive; the final sha256 re-check guards a cache hit against a
+        # partial/corrupt file left by a crashed pre-atomic-rename run.
+        if [ ! -f "$CACHE_ARCHIVE" ]; then
+          echo "Cache miss — downloading ptoas ${PTOAS_VERSION} for ${PTOAS_ARCH}"
+          mkdir -p "$PTOAS_CACHE_DIR"
+          tmp_archive="$(mktemp "$PTOAS_CACHE_DIR/.ptoas-${PTOAS_ARCH}.XXXXXX")"
+          trap 'rm -f "$tmp_archive"' EXIT
+          curl --fail --location --retry 3 --retry-all-errors \
+            "https://github.com/hw-native-sys/PTOAS/releases/download/${PTOAS_VERSION}/ptoas-bin-${PTOAS_ARCH}.tar.gz" \
+            -o "$tmp_archive"
+          echo "${PTOAS_SHA256}  $tmp_archive" | sha256sum -c -
+          mv -f "$tmp_archive" "$CACHE_ARCHIVE"
+          trap - EXIT
+        else
+          echo "Cache hit — using $CACHE_ARCHIVE"
+        fi
+        echo "${PTOAS_SHA256}  $CACHE_ARCHIVE" | sha256sum -c -
+        mkdir -p "$PTOAS_ROOT"
+        tar -xzf "$CACHE_ARCHIVE" -C "$PTOAS_ROOT"
+        # Guard each chmod on existence so a packaging variation (only one of the
+        # two ptoas paths present) doesn't fail the whole step.
+        [ -f "$PTOAS_ROOT/ptoas" ] && chmod +x "$PTOAS_ROOT/ptoas"
+        [ -f "$PTOAS_ROOT/bin/ptoas" ] && chmod +x "$PTOAS_ROOT/bin/ptoas"
+        true
+
+    - name: Clone pto-isa
+      if: ${{ inputs.install-toolchain == 'true' }}
+      shell: bash
+      run: |
+        rm -rf "$PTO_ISA_ROOT"
+        timeout 60 git clone https://github.com/hw-native-sys/pto-isa.git "$PTO_ISA_ROOT" \
+          || { rm -rf "$PTO_ISA_ROOT"; timeout 300 git clone https://gitcode.com/luohuan40/pto-isa.git "$PTO_ISA_ROOT"; }
+        cd "$PTO_ISA_ROOT"
+        git checkout ${{ inputs.pto-isa-commit }}
+
+    - name: Bootstrap conda + per-job venv + write activate.sh
+      # Per-job venv layered on the conda env; activate.sh lets each later step
+      # (and every task-submit child) enter the env with a single
+      # `source activate.sh`. For device jobs it also sources set_env.sh, which
+      # wires up the Ascend/HCCL host environment. LD_LIBRARY_PATH is prepended
+      # with $CONDA_PREFIX/lib because ptoas needs a newer GLIBCXX than the system.
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        NEEDS_DEVICE: ${{ inputs.needs-device }}
+        UNSET_RING: ${{ inputs.unset-ring }}
+        # Part of the runner's provisioning contract, like having task-submit /
+        # npu-smi on PATH: the host provides a conda env under this name.
+        CONDA_ENV: py310
+      run: |
+        source "$CONDA_ROOT/etc/profile.d/conda.sh"
+        if ! conda activate "$CONDA_ENV"; then
+          echo "::error::conda env '$CONDA_ENV' not found under $CONDA_ROOT"
+          echo "This runner must provide it (see the action's provisioning notes)."
+          exit 1
+        fi
+        # Explicit reset: don't rely solely on the checkout's `git clean -ffdx`
+        # to have removed a prior run's venv — a stale venv would let `python -m
+        # venv` reuse it and carry over old site-packages.
+        rm -rf venv
+        python -m venv venv --system-site-packages
+        # Bake the runner's roots in as literals rather than referencing
+        # $CANN_ROOT/$CONDA_ROOT at source time: activate.sh is also sourced by
+        # task-submit children, whose truncated env snapshot does not carry the
+        # job's GITHUB_ENV. Same reasoning as _PYPTO_ENV_DIR below.
+        {
+          echo "_PYPTO_CONDA_ROOT=$CONDA_ROOT"
+          echo "_PYPTO_CONDA_ENV=$CONDA_ENV"
+        } > activate.sh
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          echo "_PYPTO_CANN_ROOT=$CANN_ROOT" >> activate.sh
+        fi
+        cat >> activate.sh <<'EOF'
+        source "$_PYPTO_CONDA_ROOT/etc/profile.d/conda.sh"
+        conda activate "$_PYPTO_CONDA_ENV"
+        # Derive the venv from this script's own location instead of
+        # $GITHUB_WORKSPACE: when activate.sh is sourced inside a task-submit
+        # child, a truncated env snapshot could drop $GITHUB_WORKSPACE and point
+        # the source at a wrong/absent path. BASH_SOURCE is snapshot-independent.
+        _PYPTO_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_PYPTO_ENV_DIR/venv/bin/activate"
+        EOF
+        # The codegen job needs no Ascend env, so only device jobs source set_env.sh.
+        if [ "$NEEDS_DEVICE" = "true" ]; then
+          printf '%s\n' 'source "$_PYPTO_CANN_ROOT/set_env.sh"' >> activate.sh
+        fi
+        # ${LD_LIBRARY_PATH:+:...} so an empty inherited value yields no trailing
+        # colon, which the loader would read as the current directory (the codegen
+        # job never sources set_env.sh, so LD_LIBRARY_PATH is often unset here).
+        printf '%s\n' 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' >> activate.sh
+        # dist HCCL tests break with the runner's systemd PTO2_RING_* env; the
+        # other jobs rely on it. Append the unset only when the caller asks.
+        if [ "$UNSET_RING" = "true" ]; then
+          printf '%s\n' 'unset PTO2_RING_HEAP PTO2_RING_TASK_WINDOW PTO2_RING_DEP_POOL' >> activate.sh
+        fi
+
+    - name: Show ccache stats (before)
+      shell: bash
+      run: ccache -s || true
+
+    - name: Build and install pypto (+ simpler)
+      shell: bash
+      working-directory: ${{ inputs.checkout-path }}
+      env:
+        INSTALL_TOOLCHAIN: ${{ inputs.install-toolchain }}
+      run: |
+        source activate.sh
+        rm -rf ./build ./_skbuild ./runtime/build ./runtime/_skbuild
+        python -m pip install --upgrade pip
+        pip install scikit-build-core nanobind cmake ninja
+        pip install --no-build-isolation .[dev]
+        # simpler (./runtime) is only needed on the codegen -> device path; the
+        # --codegen-only job skips it (install-toolchain=false).
+        if [ "$INSTALL_TOOLCHAIN" = "true" ]; then
+          pip install --no-build-isolation ./runtime
+          # Fail fast if the venv can't import our freshly-built packages (catches
+          # a stale conda shadow or a broken venv here, not 10 min later in the
+          # test step). The conda py310 base env must NOT have pypto/simpler
+          # installed, or --system-site-packages would let them shadow the venv.
+          python -c "import pypto, simpler; print('env OK:', pypto.__file__)"
+        else
+          python -c "import pypto; print('env OK:', pypto.__file__)"
+        fi
+
+    - name: Show ccache stats (after)
+      shell: bash
+      run: ccache -s || true

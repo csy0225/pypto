@@ -82,7 +82,7 @@ def _format_warnings(
     return "\n".join(out) + "\n" if out else ""
 
 
-PassSpec = tuple[str, Callable[[], passes.Pass]]
+PassFactory = Callable[[], passes.Pass]
 
 
 class OptimizationStrategy(Enum):
@@ -90,6 +90,38 @@ class OptimizationStrategy(Enum):
 
     Default = "Default"  # Full tensor-oriented PTO pipeline
     DebugTileOptimization = "DebugTileOptimization"  # Debug-only PTO tile pipeline
+
+
+class PassDumpLevel(Enum):
+    """Verbosity level for per-pass IR dumps (the ``dump_passes`` knob).
+
+    Ordered from least to most detail. ``dump_passes`` accepts either this enum
+    or a ``bool`` for backwards compatibility (``True`` -> ``CONCISE``,
+    ``False`` -> ``NONE``); see :func:`coerce_dump_level`.
+
+    Note: this is a plain ``Enum``, so every member is truthy —
+    ``bool(PassDumpLevel.NONE) is True``. Never gate on a raw ``if dump_passes:``;
+    route through :func:`coerce_dump_level` and compare ``is PassDumpLevel.NONE``.
+    """
+
+    NONE = 0  # No per-pass dumps.
+    CONCISE = 1  # Concise canonical IR — the default; best for diffing passes.
+    # Fully-resolved dump (issue #2088): every tile prints its effective
+    # blayout/slayout/fractal (including tiles whose canonical view is implicit),
+    # and distributed tensors surface their window-buffer back-reference, so a
+    # layout/aliasing bug is decidable from the printed IR alone.
+    EXPLICIT = 2
+
+
+def coerce_dump_level(dump_passes: bool | PassDumpLevel) -> PassDumpLevel:
+    """Normalize a ``dump_passes`` value (bool or enum) to a :class:`PassDumpLevel`.
+
+    ``True`` maps to ``CONCISE`` (the historical dump-on behavior) and ``False``
+    to ``NONE``, so existing ``bool`` callers keep working unchanged.
+    """
+    if isinstance(dump_passes, PassDumpLevel):
+        return dump_passes
+    return PassDumpLevel.CONCISE if dump_passes else PassDumpLevel.NONE
 
 
 class PassManager:
@@ -110,86 +142,81 @@ class PassManager:
             result = pm.run_passes(program)
     """
 
-    # Static storage: strategy -> List of (pass_name, pass_factory) tuples
-    _strategy_passes: dict[OptimizationStrategy, list[PassSpec]] = {}
-
-    @classmethod
-    def _register_passes(cls):
-        """Register all strategy Pass configurations."""
-        tensor_prefix_passes: list[PassSpec] = [
+    @staticmethod
+    def _get_pass_factories(
+        strategy: OptimizationStrategy,
+        *,
+        analyze_auto_scopes_for_deps: bool,
+    ) -> tuple[PassFactory, ...]:
+        """Build the immutable pass-factory recipe for an optimization strategy."""
+        tensor_prefix_passes: tuple[PassFactory, ...] = (
             # Eliminate FunctionType.Inline functions by splicing their bodies at
             # every call site. Runs FIRST so no downstream pass observes Inline
             # functions or Calls to them.
-            ("InlineFunctions", lambda: passes.inline_functions()),
-            ("UnrollLoops", lambda: passes.unroll_loops()),
-            ("CtrlFlowTransform", lambda: passes.ctrl_flow_transform()),
-            ("ConvertToSSA", lambda: passes.convert_to_ssa()),
+            passes.inline_functions,
+            passes.unroll_loops,
+            passes.ctrl_flow_transform,
+            passes.convert_to_ssa,
             # Propagate scalar constants (e.g. `CHUNK_K: Scalar[INDEX] = 512`)
             # into downstream expression and type-annotation uses before tile
             # lowering inspects them. Runs post-SSA to exploit single-definition.
-            ("Simplify", lambda: passes.simplify()),
-            ("NormalizeStmtStructure", lambda: passes.normalize_stmt_structure()),
-            ("FlattenCallExpr", lambda: passes.flatten_call_expr()),
-        ]
-        tensor_only_passes: list[PassSpec] = [
-            ("OutlineHierarchyScopes", lambda: passes.outline_hierarchy_scopes()),
-            ("OutlineIncoreScopes", lambda: passes.outline_incore_scopes()),
-            ("OutlineClusterScopes", lambda: passes.outline_cluster_scopes()),
-            # Some whole-network builders keep a layer-level CHIP
-            # Orchestration helper as an explicit call boundary. Expand only
-            # helpers marked inline_orchestration *after* InCore/Cluster
-            # outlining and before tensor-to-tile conversion, so each task kernel
-            # retains its own memory-planning boundary while the enclosing chip
-            # callable remains one graph.
-            ("InlineOrchestrationHelpers", lambda: passes.inline_orchestration_helpers()),
-            ("ConvertTensorToTileOps", lambda: passes.convert_tensor_to_tile_ops()),
-            ("OptimizeOrchTensors", lambda: passes.optimize_orch_tensors()),
-        ]
-        tile_pto_passes: list[PassSpec] = [
-            ("LowerCompositeOps", lambda: passes.lower_composite_ops()),
-            ("FlattenTileNdTo2D", lambda: passes.flatten_tile_nd_to_2d()),
-            ("AutoTileMatmulL0", lambda: passes.auto_tile_matmul_l0()),
-            ("CanonicalizeTileSlice", lambda: passes.canonicalize_tile_slice()),
-            ("InferTileMemorySpace", lambda: passes.infer_tile_memory_space()),
-            ("ResolveBackendOpLayouts", lambda: passes.resolve_backend_op_layouts()),
+            passes.simplify,
+            passes.normalize_stmt_structure,
+            passes.flatten_call_expr,
+        )
+        tensor_only_passes: tuple[PassFactory, ...] = (
+            passes.outline_hierarchy_scopes,
+            passes.outline_incore_scopes,
+            passes.outline_cluster_scopes,
+            passes.inline_orchestration_helpers,
+            passes.convert_tensor_to_tile_ops,
+            passes.optimize_orch_tensors,
+        )
+        tile_pto_passes: tuple[PassFactory, ...] = (
+            passes.lower_composite_ops,
+            passes.flatten_tile_nd_to_2d,
+            passes.auto_tile_matmul_l0,
+            passes.canonicalize_tile_slice,
+            passes.infer_tile_memory_space,
+            passes.resolve_backend_op_layouts,
             # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit
             # split_aiv form (aiv_shard/aic_gather + halved vector sub-region) so
             # ExpandMixedKernel folds them into split-stamped tpush/tpop uniformly. This
             # is the live auto-split lowering path; after it runs every split function
             # reaches SplitVectorKernel already split_aiv-marked, so SplitVectorKernel
             # only stamps attrs. Runs immediately before ExpandMixedKernel.
-            ("LowerAutoVectorSplit", lambda: passes.lower_auto_vector_split()),
-            ("ExpandMixedKernel", lambda: passes.expand_mixed_kernel()),
-            ("InjectGMPipeBuffer", lambda: passes.inject_gm_pipe_buffer()),
-            ("SplitVectorKernel", lambda: passes.split_vector_kernel()),
+            passes.lower_auto_vector_split,
+            passes.expand_mixed_kernel,
+            passes.inject_gm_pipe_buffer,
+            passes.split_vector_kernel,
             # Copy each cross-core tpop's split/pipe-id onto its matching tfree op so
             # codegen reads them from the op (no codegen-side tpop lookup table). Runs
             # right after SplitVectorKernel finalizes split on tpops and before
             # SkewCrossCorePipeline clones tpop/tfree pairs (so clones carry split).
-            ("StampTfreeSplit", lambda: passes.stamp_tfree_split()),
-            ("NormalizeReturnOrder", lambda: passes.normalize_return_order()),
-            ("SkewCrossCorePipeline", lambda: passes.skew_cross_core_pipeline()),
-            ("LowerPipelineLoops", lambda: passes.lower_pipeline_loops()),
-            ("CanonicalizeIOOrder", lambda: passes.canonicalize_io_order()),
+            passes.stamp_tfree_split,
+            passes.normalize_return_order,
+            passes.skew_cross_core_pipeline,
+            passes.lower_pipeline_loops,
+            passes.canonicalize_io_order,
             # MaterializeTensorStrides fills empty stride slots on every
             # TensorView with packed canonical strides (RFC #1300 §2.4).
-            ("MaterializeTensorStrides", lambda: passes.materialize_tensor_strides()),
-            ("InitMemRef", lambda: passes.init_mem_ref()),
+            passes.materialize_tensor_strides,
+            passes.init_mem_ref,
             # MaterializeSemanticAliases forces loop-carried / in-place buffers to
             # share one MemRef (semantics-required aliasing). It always runs; only
             # the opportunistic lifetime coalescing (MemoryReuse) is skippable when
             # ptoas owns reuse (memory_planner=PTOAS).
-            ("MaterializeSemanticAliases", lambda: passes.materialize_semantic_aliases()),
+            passes.materialize_semantic_aliases,
             # MemoryReuse coalesces independent tile buffers by lifetime; on
             # Ascend910B split-AIV it also avoids the load + tpop_from_aic in-place
             # hazard so a separate legalisation pass is no longer needed.
-            ("MemoryReuse", lambda: passes.memory_reuse()),
-            ("AllocateMemoryAddr", lambda: passes.allocate_memory_addr()),
-            ("FoldNoOpReshape", lambda: passes.fold_no_op_reshape()),
-            ("FuseCreateAssembleToSlice", lambda: passes.fuse_create_assemble_to_slice()),
-            ("DeriveCallDirections", lambda: passes.derive_call_directions()),
-            ("AutoDeriveTaskDependencies", lambda: passes.auto_derive_task_dependencies()),
-            ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
+            passes.memory_reuse,
+            passes.allocate_memory_addr,
+            passes.fold_no_op_reshape,
+            passes.fuse_create_assemble_to_slice,
+            passes.derive_call_directions,
+            lambda: passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps),
+            passes.expand_manual_phase_fence,
             # First normalize host allreduce calls that omit signal into the
             # explicit internal allreduce(data, signal, op=...) form. Then
             # trace pld.tensor.alloc_window_buffer -> pld.tensor.window ->
@@ -200,21 +227,28 @@ class PassManager:
             # LowerHostTensorCollectives, because host_orch is never
             # tile-lowered and the alloc/window/dispatch/allreduce chain is
             # still discoverable.
-            ("SynthesizeAllReduceSignals", lambda: passes.synthesize_allreduce_signals()),
-            ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
-            ("LowerHostTensorCollectives", lambda: passes.lower_host_tensor_collectives()),
-            ("MaterializeDistTensorCtx", lambda: passes.materialize_dist_tensor_ctx()),
-            ("Simplify", lambda: passes.simplify()),
+            passes.synthesize_allreduce_signals,
+            passes.materialize_comm_domain_scopes,
+            passes.lower_host_tensor_collectives,
+            passes.materialize_dist_tensor_ctx,
+            passes.simplify,
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
             # 1:1 from the IR. Runs dead last, after the final Simplify, so no
             # other transform has to reason about the inserted scope wrappers.
-            ("MaterializeRuntimeScopes", lambda: passes.materialize_runtime_scopes()),
-        ]
-        cls._strategy_passes = {
-            OptimizationStrategy.Default: tensor_prefix_passes + tensor_only_passes + tile_pto_passes,
-            OptimizationStrategy.DebugTileOptimization: tensor_prefix_passes + tile_pto_passes,
-        }
+            passes.materialize_runtime_scopes,
+            # Classify each Orchestration ForStmt iter_arg as a trivial alias or a
+            # materialised rebind carry (and size manual-scope TaskId array
+            # carries), stamping the plan onto ForStmt.attrs. Runs after
+            # MaterializeRuntimeScopes so the classified IR is exactly the IR
+            # orchestration codegen lowers.
+            passes.classify_iter_arg_carry,
+        )
+        if strategy == OptimizationStrategy.Default:
+            return tensor_prefix_passes + tensor_only_passes + tile_pto_passes
+        if strategy == OptimizationStrategy.DebugTileOptimization:
+            return tensor_prefix_passes + tile_pto_passes
+        raise ValueError(f"Unsupported optimization strategy: {strategy!r}")
 
     @classmethod
     def get_strategy(
@@ -237,8 +271,6 @@ class PassManager:
         Returns:
             A PassManager instance configured with the appropriate passes
         """
-        if not cls._strategy_passes:
-            cls._register_passes()
         return cls(
             strategy,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
@@ -259,8 +291,6 @@ class PassManager:
         """
         self.strategy = strategy
         self.analyze_auto_scopes_for_deps = analyze_auto_scopes_for_deps
-        self.passes: list[passes.Pass] = []
-        self.pass_names: list[str] = []
 
         # When the active PassContext selects ptoas as the memory planner, skip
         # the opportunistic lifetime reuse (MemoryReuse) and address assignment
@@ -272,30 +302,68 @@ class PassManager:
         # recover that from independent addr-less allocs. Read here because
         # __init__ runs inside the compile() PassContext (see compile.py).
         ctx = passes.PassContext.current()
-        skip_mem_planning = ctx is not None and ctx.get_memory_planner() == passes.MemoryPlanner.PTOAS
+        # The construction-time planner fixes the pass LIST (MemoryReuse +
+        # AllocateMemoryAddr are dropped only for PTOAS). PTOAS-gated pass *behaviour*
+        # (AutoTileMatmulL0's dbC=2) reads the planner again at execution time, so
+        # run_passes re-asserts the run-time planner still matches this one — otherwise a
+        # PassManager built outside PTOAS but run inside a PTOAS context would keep
+        # MemoryReuse yet still select dbC=2, coalescing the two co-live L0C accumulators
+        # into one shrunk single-buffer tile (see _check_planner_consistency).
+        self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        skip_mem_planning = self._construction_planner == passes.MemoryPlanner.PTOAS
         _mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
 
-        # Build pass list
-        for pass_name, pass_factory in self._strategy_passes[strategy]:
-            if skip_mem_planning and pass_name in _mem_planning_passes:
-                continue
-            if pass_name == "AutoDeriveTaskDependencies":
-                self.passes.append(
-                    passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps)
-                )
-            else:
-                self.passes.append(pass_factory())
-            self.pass_names.append(pass_name)
-
-        # Build C++ PassPipeline
+        # The C++ pipeline is the single source of truth for both pass objects
+        # and names. Strategy recipes contain factories only; names always come
+        # from the constructed Pass instances.
         self._pipeline = passes.PassPipeline()
-        for p in self.passes:
-            self._pipeline.add_pass(p)
+        pass_factories = self._get_pass_factories(
+            strategy,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        )
+        for pass_factory in pass_factories:
+            pass_obj = pass_factory()
+            if skip_mem_planning and pass_obj.get_name() in _mem_planning_passes:
+                continue
+            self._pipeline.add_pass(pass_obj)
+
+    @property
+    def passes(self) -> tuple[passes.Pass, ...]:
+        """Get the pipeline's passes in execution order as an immutable snapshot."""
+        return tuple(self._pipeline.get_passes())
+
+    @property
+    def pass_names(self) -> list[str]:
+        """Get pass names derived from the pipeline's actual Pass instances."""
+        return self._pipeline.get_pass_names()
+
+    def _check_planner_consistency(self) -> None:
+        """Fail loud if the run-time memory planner differs from the construction-time one.
+
+        The pass LIST is fixed at construction: ``MemoryReuse`` / ``AllocateMemoryAddr``
+        are dropped iff the construction-time ``PassContext`` selected PTOAS. But
+        PTOAS-gated pass *behaviour* — ``AutoTileMatmulL0``'s dbC=2 selection — reads
+        ``GetMemoryPlanner()`` at *execution* time. If a PassManager built outside PTOAS
+        is then run inside a PTOAS context, the pipeline still contains ``MemoryReuse``
+        yet the chooser selects dbC=2, so ``MemoryReuse`` coalesces the two co-live L0C
+        accumulators into one — a shrunk single-buffer tile, the exact regression dbC=2
+        exists to avoid. ``compile()`` builds and runs under the same context, so this
+        never fires there; it guards misuse (build under one planner, run under another).
+        """
+        ctx = passes.PassContext.current()
+        run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        if run_planner != self._construction_planner:
+            raise RuntimeError(
+                f"PassManager was constructed under memory_planner={self._construction_planner!r} "
+                f"(which fixed whether MemoryReuse/AllocateMemoryAddr are in the pipeline) but is "
+                f"being run under memory_planner={run_planner!r}. Build the PassManager inside the "
+                f"same PassContext it is run in (compile() does this)."
+            )
 
     def run_passes(
         self,
         input_ir: core_ir.Program,
-        dump_ir: bool = False,
+        dump_ir: "bool | PassDumpLevel" = False,
         output_dir: str | None = None,
         prefix: str = "pl",
     ) -> core_ir.Program:
@@ -303,17 +371,23 @@ class PassManager:
 
         Args:
             input_ir: Input Program to transform
-            dump_ir: Whether to dump IR after each pass (default: False)
-            output_dir: Directory to dump IR files. Required when dump_ir=True.
+            dump_ir: Per-pass dump control. Accepts a :class:`PassDumpLevel`
+                (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
+                (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). Default: no dump.
+            output_dir: Directory to dump IR files. Required when dumping.
             prefix: Module prefix for python_print (default: 'pl')
 
         Returns:
             Transformed Program after all passes have been applied
 
         Raises:
-            ValueError: If dump_ir=True but output_dir is None
+            ValueError: If dumping is enabled but output_dir is None
+            RuntimeError: If the run-time memory planner differs from the one the
+                PassManager was constructed under (see _check_planner_consistency)
         """
-        if not dump_ir:
+        self._check_planner_consistency()
+        dump_level = coerce_dump_level(dump_ir)
+        if dump_level is PassDumpLevel.NONE:
             prof = CompileProfiler.current()
             if prof is not None:
                 return self._run_with_profiling(input_ir, prof)
@@ -321,24 +395,29 @@ class PassManager:
 
         # Dump mode: validate parameters, use CallbackInstrument for IR dumping
         if output_dir is None:
-            raise ValueError("output_dir is required when dump_ir=True")
+            raise ValueError("output_dir is required when dumping IR")
 
         if not isinstance(input_ir, core_ir.Program):
             raise ValueError("dump_ir mode only supports Program input")
 
         os.makedirs(output_dir, exist_ok=True)
 
+        # EXPLICIT (issue #2088): make each dump self-describing for tile layouts
+        # and distributed window buffers.
+        explicit_layout = dump_level is PassDumpLevel.EXPLICIT
+
         # Save frontend IR
         frontend_path = os.path.join(output_dir, "00_frontend.py")
         with open(frontend_path, "w") as f:
-            content = python_print(input_ir, prefix=prefix)
+            content = python_print(input_ir, prefix=prefix, explicit_layout=explicit_layout)
             f.write(content)
             if not content.endswith("\n"):
                 f.write("\n")
 
         # Use instrument for IR dumping -- verification handled by C++ pipeline.
-        # We index self.pass_names (Python-side names from _register_passes) rather than
-        # _pass_obj.get_name() because registered names may differ from C++ names.
+        # Snapshot the pipeline-derived names for stable callback indexing during
+        # this run. Pass names have no independent Python-side storage.
+        pass_names = self.pass_names
         pass_index = 0
 
         # Resolve diagnostic checks once for post-pass dump.
@@ -358,18 +437,18 @@ class PassManager:
         def before_pass_profiling(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
             nonlocal stage_open
             if prof is not None:
-                prof._begin_stage(self.pass_names[pass_index])
+                prof._begin_stage(pass_names[pass_index])
                 stage_open = True
 
         def after_pass(_pass_obj: passes.Pass, program: core_ir.Program) -> None:
             nonlocal pass_index, stage_open
-            pass_name = self.pass_names[pass_index]
+            pass_name = pass_names[pass_index]
             stem = f"{pass_index + 1:02d}_after_{pass_name}"
 
             # Dump IR
             dump_path = os.path.join(output_dir, f"{stem}.py")
             with open(dump_path, "w") as f:
-                content = python_print(program, prefix=prefix)
+                content = python_print(program, prefix=prefix, explicit_layout=explicit_layout)
                 f.write(content)
                 if not content.endswith("\n"):
                     f.write("\n")
@@ -410,13 +489,22 @@ class PassManager:
         # so callers' diagnostic intent isn't reset.
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        # Propagate the outer memory planner AND the PyPTO dbC=2 opt-in: a nested
+        # PassContext otherwise resets them to the binding defaults, which silently
+        # disables planner-gated pass behaviour (AutoTileMatmulL0's dbC=2 tile
+        # selection reads GetMemoryPlanner() + GetEnablePyptoL0cDoubleBuffer()
+        # *during* pass execution) whenever the pipeline dumps IR.
+        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         outer_phase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if outer_phase == passes.DiagnosticPhase.POST_PASS:
             inner_phase = passes.DiagnosticPhase.PRE_PIPELINE
         else:
             inner_phase = outer_phase
 
-        with passes.PassContext([*outer_instruments, *extra_instruments], level, inner_phase, disabled):
+        with passes.PassContext(
+            [*outer_instruments, *extra_instruments], level, inner_phase, disabled, mplan, dbc_flag
+        ):
             try:
                 return self._pipeline.run(input_ir)
             finally:
@@ -425,12 +513,13 @@ class PassManager:
 
     def _run_with_profiling(self, input_ir: core_ir.Program, prof: CompileProfiler) -> core_ir.Program:
         """Run the pipeline with per-pass timing recorded into *prof*."""
+        pass_names = self.pass_names
         pass_index = 0
         stage_open = False
 
         def before_pass(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
             nonlocal pass_index, stage_open
-            prof._begin_stage(self.pass_names[pass_index])
+            prof._begin_stage(pass_names[pass_index])
             stage_open = True
 
         def after_pass(_pass_obj: passes.Pass, _program: core_ir.Program) -> None:
@@ -446,6 +535,10 @@ class PassManager:
         ctx = passes.PassContext.current()
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
+        # Propagate the outer memory planner + PyPTO dbC=2 opt-in (see run_passes)
+        # so profiling doesn't silently reset them and disable planner-gated behaviour.
+        mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
+        dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False
         dphase = ctx.get_diagnostic_phase() if ctx else passes.get_default_diagnostic_phase()
         if ctx:
             disabled = ctx.get_disabled_diagnostics()
@@ -453,7 +546,9 @@ class PassManager:
             disabled = passes.DiagnosticCheckSet()
             disabled.insert(passes.DiagnosticCheck.UnusedControlFlowResult)
 
-        with passes.PassContext([*outer_instruments, timing_instrument], level, dphase, disabled):
+        with passes.PassContext(
+            [*outer_instruments, timing_instrument], level, dphase, disabled, mplan, dbc_flag
+        ):
             try:
                 return self._pipeline.run(input_ir)
             finally:
@@ -464,10 +559,6 @@ class PassManager:
         """Get the names of all passes in this manager.
 
         Returns:
-            List of pass names assigned during registration
+            Pass names derived from the underlying pipeline
         """
-        return self.pass_names
-
-
-# Initialize the pass registry when the module is loaded
-PassManager._register_passes()
+        return self._pipeline.get_pass_names()

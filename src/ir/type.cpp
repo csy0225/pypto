@@ -50,13 +50,33 @@ std::optional<MemorySpace> ValidateTileMemorySpaceConsistency(const std::optiona
   return memory_space;
 }
 
-// Canonical encoding: an explicit TileView matching the implicit semantics for
-// (shape, memory_space) collapses to nullopt. One in-memory form per semantic
-// state — required for lossless print/parse round-trip.
+void ClearRedundantFullValidShape(std::vector<ExprPtr>& valid_shape, const std::vector<ExprPtr>& shape) {
+  if (!valid_shape.empty() && AreExprVectorsEqual(valid_shape, shape)) {
+    valid_shape.clear();
+  }
+}
+
+void CanonicalizeTensorViewInPlace(std::optional<TensorView>& tensor_view,
+                                   const std::vector<ExprPtr>& shape) {
+  if (!tensor_view.has_value()) {
+    return;
+  }
+
+  ClearRedundantFullValidShape(tensor_view->valid_shape, shape);
+  if (tensor_view->stride.empty() && tensor_view->layout == TensorLayout::ND &&
+      tensor_view->valid_shape.empty() && tensor_view->pad == PadValue::null) {
+    tensor_view.reset();
+  }
+}
+
 void CanonicalizeTileViewInPlace(std::optional<TileView>& tile_view, const std::vector<ExprPtr>& shape,
                                  const std::optional<MemorySpace>& memory_space) {
-  if (tile_view.has_value() &&
-      tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
+  if (!tile_view.has_value()) {
+    return;
+  }
+
+  ClearRedundantFullValidShape(tile_view->valid_shape, shape);
+  if (tile_view_semantics::IsImplicitPrintedTileView(*tile_view, shape, memory_space)) {
     tile_view.reset();
   }
 }
@@ -80,10 +100,12 @@ namespace {
 constexpr uint64_t kConstIntHashTag = 1;
 constexpr uint64_t kExprPtrHashTag = 2;
 constexpr uint64_t kBinaryExprHashTag = 3;
+constexpr uint64_t kCallExprHashTag = 4;
 
-// Mirror AreExprsEqual: ConstInt nodes compare by value, binary ops compare
-// structurally (kind + operands), all others by pointer identity. The hash
-// must match this granularity.
+// Mirror AreExprsEqual: ConstInt nodes compare by value, binary ops and Call
+// nodes compare structurally (kind + operands / op + args), all others by
+// pointer identity.  The hash must match this granularity — any extension to
+// AreExprsEqual MUST get a corresponding branch here.
 inline uint64_t HashExprForAreExprsEqual(const ExprPtr& e) {
   if (!e) return 0;
   if (auto c = As<ConstInt>(e)) {
@@ -93,6 +115,13 @@ inline uint64_t HashExprForAreExprsEqual(const ExprPtr& e) {
     uint64_t h = hash_combine(kBinaryExprHashTag, static_cast<uint64_t>(e->GetKind()));
     h = hash_combine(h, HashExprForAreExprsEqual(b->left_));
     return hash_combine(h, HashExprForAreExprsEqual(b->right_));
+  }
+  if (auto call = As<Call>(e)) {
+    uint64_t h = hash_combine(kCallExprHashTag, std::hash<std::string>{}(call->op_ ? call->op_->name_ : ""));
+    for (const auto& arg : call->args_) {
+      h = hash_combine(h, HashExprForAreExprsEqual(arg));
+    }
+    return h;
   }
   return hash_combine(kExprPtrHashTag, std::hash<const void*>{}(e.get()));
 }
@@ -203,6 +232,18 @@ ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, MemRefPtr mem
 
 ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, std::optional<MemRefPtr> memref)
     : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {}
+
+TensorType::TensorType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
+                       std::optional<TensorView> tensor_view)
+    : ShapedType(dtype, std::move(shape), std::move(memref)), tensor_view_(std::move(tensor_view)) {
+  CanonicalizeTensorViewInPlace(tensor_view_, shape_);
+}
+
+TensorType::TensorType(const std::vector<int64_t>& shape, DataType dtype, std::optional<MemRefPtr> memref,
+                       std::optional<TensorView> tensor_view)
+    : ShapedType(dtype, shape, std::move(memref)), tensor_view_(std::move(tensor_view)) {
+  CanonicalizeTensorViewInPlace(tensor_view_, shape_);
+}
 
 TileType::TileType(const std::vector<int64_t>& shape, DataType dtype, std::optional<MemRefPtr> memref,
                    std::optional<TileView> tile_view, std::optional<MemorySpace> memory_space)

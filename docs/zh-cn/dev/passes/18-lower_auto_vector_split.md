@@ -77,12 +77,12 @@ result = passes.lower_auto_vector_split()(program)
 的多模式情形。区域局部的 `tile_vars` / `var_replacements` 映射保证折半后的变量不会泄漏
 到同级区域或区域外的全宽算子。任何区域**之外**的语句以全宽发出。所有区域下降后，作用域
 包装被丢弃，函数被打上 `split_aiv` + `split_aiv_region_validated`（后者通知
-[`ExpandMixedKernel`](21-expand_mixed_kernel.md) 跳过其单一函数级模式的转置检查——
+[`ExpandMixedKernel`](19-expand_mixed_kernel.md) 跳过其单一函数级模式的转置检查——
 改由 pass 21 用每个区域正确的拆分轴校验各自的转置风险）。
 
 函数级 AUTO split（`optimizations=[pl.split(mode)]`）与显式 `pl.split_aiv` 区域是
 **互斥**的——同时携带二者的作用域会被拒绝。该检查在更早的
-[`OutlineIncoreScopes`](10-outline_incore_scopes.md) 中执行，那里作用域自身的 `split_`
+[`OutlineIncoreScopes`](08-outline_incore_scopes.md) 中执行，那里作用域自身的 `split_`
 （用户的 `pl.split`）与其区域都仍可见；否则本区域路径会按区域下降并静默丢弃函数级 split。
 （提取后二者会无法区分地合并：**单个** `pl.split_aiv` 区域会合法地派生出一个函数级代表
 `split` 模式，故此处无法再检测该冲突。）
@@ -104,7 +104,7 @@ result = passes.lower_auto_vector_split()(program)
   **原样透传区域体**（不折半、不本地化偏移、不注入 `subblock_idx`；作者的
   `aiv_id = get_subblock_idx()` 绑定已携带 lane 信息）。`None` 区域内的 `tile.aiv_shard` /
   `tile.aic_gather` 会被拒绝（无拆分轴可切分）——由 `AivSplitValid` 校验器与此处的常开保护
-  共同拦截。该函数仍会被标记 `split_aiv`，因此下游 [`ExpandMixedKernel`](21-expand_mixed_kernel.md) /
+  共同拦截。该函数仍会被标记 `split_aiv`，因此下游 [`ExpandMixedKernel`](19-expand_mixed_kernel.md) /
   `SplitVectorKernel` 会把它派发到**两个** AIV lane（经由 `dual_aiv_dispatch`），而**非**
   lane-0-only 的非拆分 replay（后者只针对非 `split_aiv` 核）——故两个 lane 都运行完整函数体。
   当区域的 tile 无法折半（单位维）或归约必须保持全宽时使用本模式。
@@ -138,9 +138,11 @@ result = passes.lower_auto_vector_split()(program)
    边界 tile.move（ClassifyMoveDirection）：
      CUBE_TO_VECTOR —— 将 move 替换为
          tile.aiv_shard(full_cube_tile, split=int(mode))   -> 半
-       把 move 的目标内存（Vec）重新附加到推导出的半类型上，将结果 var 连同其半
-       尺寸种入 tile_vars，并记录 旧->新 var 重绑。cube 源（matmul / Acc 结果）
-       保持全尺寸。
+       推导出的半类型已经带有消费侧 lane 内存（Vec）：切分推导器让 memory_space
+       保持为空，由 OpRegistry::Create 用 tile.aiv_shard 的 set_output_memory
+       声明填充，因此本路径与显式 pl.aiv_shard 形式读取的是同一处声明。将结果
+       var 连同其半尺寸种入 tile_vars，并记录 旧->新 var 重绑。cube 源（matmul /
+       Acc 结果）保持全尺寸。
      VECTOR_TO_CUBE —— 插入
          tile.aic_gather(half_vector_tile, split=int(mode))  -> 全
        将源解析到其折半后的 var 使 gather 把 半 -> 全 翻倍，随后保留对折叠后全尺寸
@@ -215,10 +217,16 @@ V→C `tile.move` 变为 `tile.aic_gather`；对折叠后 tile 的 cube 放置 m
 `[128, 128]` `Mat`——cube 侧绝不会看到折半 tile：
 
 ```python
-gathered_mat: pl.Tile[[..], pl.FP32, pl.Mem.Vec]  = pl.tile.aic_gather(vec, split=1)
+gathered_mat: pl.Tile[[..], pl.FP32, pl.Mem.Mat]  = pl.tile.aic_gather(vec, split=1)
 gathered:     pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.move(gathered_mat,
                                                                       target_memory=pl.Mem.Mat)
 ```
+
+gather 结果是 `Mat` 而非 `Vec`：边界算子声明的类型指的是**消费侧** lane 的空间，
+而 AIC 会把 V→C 传输 pop 进 L1。（`Vec` 指的是*生产侧* lane，与镜像算子
+`tile.aiv_shard` 相矛盾——后者为其 cube 产出的操作数声明向量侧的 `Vec`。）随后的
+cube 放置 move 才把 tile 放到最终的操作数空间——matmul 操作数为 `Mat → Left`；
+此处的 `Mat → Mat` 是空操作，仅因本 pass 保留了作者原有的 move 而存在。
 
 ## 实现
 

@@ -307,20 +307,20 @@ class TestOrchestrationMore:
         # transpose calls .transpose on the local Tensor (no ext_ prefix).
         assert "Tensor t = chunk.transpose(1, 2);" in code
 
-    def test_tensor_as_layout_cross_flip_lowers_to_transpose(self):
+    def test_tensor_view_cross_flip_lowers_to_transpose(self):
         """Cross-layout flip (ND→DN) lowers to runtime Tensor::transpose on the
         trailing pair (shapes + strides swapped, start_offset preserved)."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
         ib = IRBuilder()
-        with ib.function("orch_as_layout", type=ir.FunctionType.Orchestration) as f:
+        with ib.function("orch_view", type=ir.FunctionType.Orchestration) as f:
             b = f.param("b", ir.TensorType([8, 4], DataType.FP16))
             f.return_type(ir.TensorType([4, 8], DataType.FP16))
-            b_dn = ib.let("b_dn", tensor_ops.as_layout(b, ir.TensorLayout.DN))
+            b_dn = ib.let("b_dn", tensor_ops.view(b, layout=ir.TensorLayout.DN))
             ib.return_stmt(b_dn)
         orch = f.get_result()
-        program = ir.Program([orch], "test_as_layout_cross_flip", ir.Span.unknown())
+        program = ir.Program([orch], "test_view_cross_flip", ir.Span.unknown())
 
         code = _generate_orch_code(program)
 
@@ -331,24 +331,109 @@ class TestOrchestrationMore:
         assert "raw_shapes" not in code
         assert "is_raw_eq_shapes" not in code
 
-    def test_tensor_as_layout_identity_flip_aliases(self):
-        """tensor.as_layout with target == source layout emits a plain alias, not a transpose."""
+    def test_tensor_view_identity_flip_aliases(self):
+        """tensor.view with target == source layout emits a plain alias, not a transpose."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
         ib = IRBuilder()
-        with ib.function("orch_as_layout_id", type=ir.FunctionType.Orchestration) as f:
+        with ib.function("orch_view_id", type=ir.FunctionType.Orchestration) as f:
             b = f.param("b", ir.TensorType([8, 4], DataType.FP16))
             f.return_type(ir.TensorType([8, 4], DataType.FP16))
-            b_same = ib.let("b_same", tensor_ops.as_layout(b, ir.TensorLayout.ND))
+            b_same = ib.let("b_same", tensor_ops.view(b, layout=ir.TensorLayout.ND))
             ib.return_stmt(b_same)
         orch = f.get_result()
-        program = ir.Program([orch], "test_as_layout_identity", ir.Span.unknown())
+        program = ir.Program([orch], "test_view_identity", ir.Span.unknown())
 
         code = _generate_orch_code(program)
 
         assert "Tensor b_same = ext_b;" in code
         assert ".transpose(" not in code
+
+    def test_tensor_view_shape_reinterpret_runs_through_default_pipeline(self):
+        """ND shape-only views survive the default pipeline and emit reshape."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class ShapeViewProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_view(
+                self,
+                data: pl.Tensor[[2, 16], pl.FP16],
+            ) -> pl.Tensor[[4, 8], pl.FP16]:
+                viewed: pl.Tensor[[4, 8], pl.FP16] = pl.tensor.view(data, [4, 8])
+                return viewed
+
+        program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(ShapeViewProgram)
+        orch_func = next(
+            f for f in program.functions.values() if f.func_type == ir.FunctionType.Orchestration
+        )
+        code = codegen.generate_orchestration(program, orch_func).code
+
+        shape_decl = re.search(r"uint32_t (\w+)_shapes\[2\] = \{4, 8\};", code)
+        assert shape_decl is not None, code
+        viewed_name = shape_decl.group(1)
+        reshape_line = next(line for line in code.splitlines() if f"Tensor {viewed_name} =" in line)
+        assert f".reshape({viewed_name}_shapes, 2);" in reshape_line
+
+    def test_tensor_view_shape_layout_combination_rejected(self):
+        """Combining shape reinterpret with a layout change is rejected at
+        orchestration codegen time -- the runtime ``Tensor::reshape`` does not
+        support arbitrary-stride layout views. The error uses ``CHECK_SPAN``
+        and raises ``ValueError`` (not ``InternalError``).
+
+        See ``error-checking.md``: documented user-facing limitations inside
+        passes / lowering use ``CHECK`` / ``CHECK_SPAN``.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        ib = IRBuilder()
+        with ib.function("orch_view_bad", type=ir.FunctionType.Orchestration) as f:
+            b = f.param("b", ir.TensorType([8, 4], DataType.FP16))
+            f.return_type(ir.TensorType([4, 8], DataType.FP16))
+            # Combining shape=[4, 8] with layout=DN: the runtime has no
+            # reshape-with-stride primitive, so codegen must reject this.
+            bad = ib.let("bad", tensor_ops.view(b, [4, 8], layout=ir.TensorLayout.DN))
+            ib.return_stmt(bad)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_view_bad_combine", ir.Span.unknown())
+
+        with pytest.raises(ValueError, match="cannot combine shape reinterpret"):
+            _generate_orch_code(program)
+
+    def test_tensor_view_shape_reinterpret_rejects_dn_source(self):
+        """Shape-only tensor.view on a DN source cannot lower to runtime reshape.
+
+        Even when the requested target layout equals the source layout, runtime
+        ``Tensor::reshape`` assumes ND/row-major contiguous storage and cannot
+        preserve a DN physical stride.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        span = ir.Span.unknown()
+        dn_view = ir.TensorView(
+            stride=[
+                ir.ConstInt(1, DataType.INDEX, span),
+                ir.ConstInt(8, DataType.INDEX, span),
+            ],
+            layout=ir.TensorLayout.DN,
+        )
+        dn_type = ir.TensorType([8, 4], DataType.FP16, memref=None, tensor_view=dn_view)
+
+        ib = IRBuilder()
+        with ib.function("orch_view_bad_dn", type=ir.FunctionType.Orchestration) as f:
+            b = f.param("b", dn_type)
+            bad = ib.let("bad", tensor_ops.view(b, [4, 8]))
+            f.return_type(bad.type)
+            ib.return_stmt(bad)
+        orch = f.get_result()
+        program = ir.Program([orch], "test_view_bad_dn_shape", span)
+
+        with pytest.raises(ValueError, match="only supports shape reinterpret for ND layout"):
+            _generate_orch_code(program)
 
     def test_if_statement(self):
         """Test if/else codegen with conditional scalar values."""
@@ -375,9 +460,9 @@ class TestOrchestrationMore:
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 for i in pl.range(4):
                     if i == 0:
-                        is_first: pl.Scalar[pl.INT64] = pl.yield_(1)
+                        is_first: pl.Scalar[pl.INT64] = pl.yield_(pl.const(1, pl.INT64))
                     else:
-                        is_first: pl.Scalar[pl.INT64] = pl.yield_(0)
+                        is_first: pl.Scalar[pl.INT64] = pl.yield_(pl.const(0, pl.INT64))
                     result: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                     result = self.kernel_process(a, is_first, result)
                 return result
@@ -1221,7 +1306,7 @@ class TestOrchestrationMore:
 
         # No orch-body toggle (simpler#953): the runtime latches the dump level
         # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
 
         # Both tasks dump only the tagged arg (ext_a), never ext_b.
         assert code.count("params_t0.dump(ext_a);") == 1
@@ -1234,7 +1319,7 @@ class TestOrchestrationMore:
 
     def test_no_dump_tag_emits_no_toggle_or_dump(self):
         """Without any ``pl.dump_tag`` no ``.dump(...)`` calls are emitted. The
-        runtime's ``CallConfig::enable_dump_tensor`` level then drives the dump
+        runtime's ``CallConfig::enable_dump_args`` level then drives the dump
         behaviour: level 2 (full) dumps every tensor of every task; level 1
         (partial) dumps only ``.dump(...)``-marked tensors (here: none).
         """
@@ -1268,7 +1353,7 @@ class TestOrchestrationMore:
 
         code = _generate_orch_code(NoDumpTagProgram)
 
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         for line in code.split("\n"):
             assert ".dump(" not in line, f"Plain orch should not emit any dump call: {line!r}"
 
@@ -1309,7 +1394,7 @@ class TestOrchestrationMore:
 
         code = _generate_orch_code(StrayTagProgram)
 
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         for line in code.split("\n"):
             assert ".dump(" not in line, f"Stray tag should not emit any dump call: {line!r}"
 
@@ -1363,7 +1448,7 @@ class TestOrchestrationMore:
         transformed = pm.run_passes(InlineDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         assert code.count("params_t0.dump(ext_a);") == 1
         for line in code.split("\n"):
             if ".dump(" in line:
@@ -1421,7 +1506,7 @@ class TestOrchestrationMore:
         transformed = pm.run_passes(InlineBodyVarDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         # The dump rides on the call's ``dump_vars`` Var ref, which follows the
         # FreshName rename (e.g. ``tmp_inline0``) and SSA versioning, so the
         # emitted dump references the renamed local — at least one
@@ -1512,7 +1597,7 @@ class TestOrchestrationMore:
         # level stack happened at all), then assert the dump emit picks it up
         # via the Var ref riding through the renames.
         assert "_inline" in code, "expected at least one inline-renamed Var in the code"
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         dump_lines = [line for line in code.split("\n") if ".dump(" in line]
         assert dump_lines, f"expected dump calls after multi-level inline, got code:\n{code}"
         assert any("tmp" in line for line in dump_lines), (
@@ -1578,7 +1663,7 @@ class TestOrchestrationMore:
         transformed = pm.run_passes(TwoLevelInlineDumpTagProgram)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
         assert code.count("params_t0.dump(ext_a);") == 1
 
     def test_mixed_group_emission_order(self):
@@ -1683,6 +1768,65 @@ class TestOrchestrationMore:
         submit_t1 = code.rindex("rt_submit_aiv_task(")
         assert l0_t0 < deps_t1, "L0TaskArgs must appear before set_dependencies"
         assert deps_t1 < submit_t1, "set_dependencies must appear before submit"
+
+    def test_dyn_dim_symbol_is_defined_from_the_declaring_argument(self):
+        """A ``pl.dynamic()`` symbol used as a value must be defined in the emitted C++.
+
+        The symbol names the runtime extent of whatever argument declares it, so an
+        orchestration body may use it as a value — a loop bound, a
+        ``pl.create_tensor`` extent, or a folded ``pl.tensor.dim``. Without a
+        definition read from the task-arg descriptor, the emitted host code
+        references a bare ``M`` that does not exist in that scope and fails to
+        compile.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        m = pl.dynamic("M")
+        n = pl.dynamic("N")
+
+        @pl.program
+        class DynSymbolProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def add_kernel(
+                self,
+                a: pl.Tensor[[m, n], pl.FP32],
+                b: pl.Tensor[[m, n], pl.FP32],
+                c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
+            ) -> pl.Tensor[[m, n], pl.FP32]:
+                a_tile = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Vec)
+                b_tile = pl.load(b, [0, 0], [16, 16])
+                return pl.store(pl.add(a_tile, b_tile), [0, 0], c)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orchestrator(
+                self,
+                a: pl.Tensor[[m, n], pl.FP32],
+                b: pl.Tensor[[m, n], pl.FP32],
+                c: pl.Out[pl.Tensor[[m, n], pl.FP32]],
+            ) -> pl.Tensor[[m, n], pl.FP32]:
+                rows = pl.tensor.dim(a, 0)  # folds to M
+                tmp = pl.create_tensor([rows, n], dtype=pl.FP32)
+                staged = self.add_kernel(a, b, tmp)
+                return self.add_kernel(staged, b, c)
+
+        program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(DynSymbolProgram)
+        orch_func = next(
+            f for f in program.functions.values() if f.func_type == ir.FunctionType.Orchestration
+        )
+        code = codegen.generate_orchestration(program, orch_func).code
+
+        # Each symbol is read once, from the descriptor of the argument declaring it.
+        m_decl = re.search(r"int64_t M = \(int64_t\)orch_args\.tensor\(0\)\.ref\(\)\.shapes\[0\];", code)
+        n_decl = re.search(r"int64_t N = \(int64_t\)orch_args\.tensor\(0\)\.ref\(\)\.shapes\[1\];", code)
+        assert m_decl is not None, code
+        assert n_decl is not None, code
+
+        # The temp's extents are the symbols, and they are defined before that use.
+        tmp_shapes = re.search(r"uint32_t \w+_ci_shapes\[2\] = \{(.+?)\};", code)
+        assert tmp_shapes is not None, code
+        assert "M" in tmp_shapes.group(1) and "N" in tmp_shapes.group(1), tmp_shapes.group(1)
+        assert m_decl.start() < tmp_shapes.start(), code
 
 
 if __name__ == "__main__":

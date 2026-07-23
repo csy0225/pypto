@@ -35,6 +35,7 @@ other_jit_func(a, b)              self.other_jit_func(a, b)  (multi-function onl
 from __future__ import annotations
 
 import ast
+import copy
 import functools
 import inspect
 import textwrap
@@ -42,6 +43,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, encode_external_include_dirs
 from pypto.language.typing.array import Array as _LangArray
 from pypto.pypto_core import DataType
 
@@ -157,6 +159,8 @@ class SpecializeContext:
     external_core_type: str | None = None
     external_aic_source: str | None = None
     external_aiv_source: str | None = None
+    external_dual_aiv_dispatch: bool = False
+    external_include_dirs: tuple[str, ...] = ()
 
     @property
     def dynamic_dims(self) -> set[tuple[str, int]]:
@@ -393,20 +397,6 @@ def _collect_annotation_dynamic_dims_cached(
                 bindings[f"{name}__{dim_idx}"] = dim.name
                 literals[dim.name] = dim.name
     return dims, bindings, literals
-
-
-def _collect_dep_names(func_def: ast.FunctionDef, jit_func_names: set[str]) -> list[str]:
-    """Return names of @pl.jit.incore functions called in this function body."""
-    deps: list[str] = []
-    seen: set[str] = set()
-    for node in ast.walk(func_def):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Name) and func.id in jit_func_names and func.id not in seen:
-            deps.append(func.id)
-            seen.add(func.id)
-    return deps
 
 
 # ---------------------------------------------------------------------------
@@ -1109,11 +1099,37 @@ class _BodyTransformer(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 
+def _fold_const_names(node: ast.expr, py_globals: dict[str, Any]) -> ast.expr:
+    """Replace ``Name`` nodes bound to module int/float/bool constants with literals.
+
+    An explicit tuple / scalar return annotation is copied into the generated
+    ``@pl.program`` source verbatim (the return element has no ``TensorMeta`` to
+    render from). Without folding, a symbolic shape dim (e.g.
+    ``pl.Tensor[[BATCH, VOCAB], pl.FP32]``) would reach the parser as an
+    unresolved name (``NameError: name 'BATCH' is not defined``). Fold the
+    function's own module constants — the same names the body transformer inlines
+    at use sites — so the emitted annotation carries concrete extents.
+
+    The input AST is left untouched (a deep copy is transformed) because
+    ``func_def`` is shared with the body specialization pass.
+    """
+
+    class _Folder(ast.NodeTransformer):
+        def visit_Name(self, name: ast.Name) -> ast.expr:
+            value = py_globals.get(name.id)
+            if isinstance(value, (int, float, bool)) and not isinstance(value, type):
+                return ast.copy_location(ast.Constant(value=value), name)
+            return name
+
+    return _Folder().visit(copy.deepcopy(node))
+
+
 def _infer_return_type(
     func_def: ast.FunctionDef,
     tensor_meta: dict[str, TensorMeta],
     out_params: list[str],
     distributed_params: set[str] | None = None,
+    py_globals: dict[str, Any] | None = None,
 ) -> str | None:
     """Infer the return type annotation string from the return statement.
 
@@ -1135,6 +1151,13 @@ def _infer_return_type(
     type is ``pld.DistributedTensor`` rather than ``pl.Tensor`` — propagated
     here so a function returning a window-bound view does not leak as plain
     ``pl.Tensor`` (the two kinds have distinct IR ``ObjectKind``).
+
+    ``py_globals`` are the originating function's module globals. When a return
+    element is filled from the explicit annotation (a local with no
+    ``TensorMeta``, e.g. ``logits`` unpacked from a dep call), any module int
+    constant in its shape (``pl.Tensor[[BATCH, VOCAB], pl.FP32]``) is folded to a
+    literal via :func:`_fold_const_names`; otherwise the symbolic name would
+    reach the parser unresolved.
     """
     dist_set = distributed_params or set()
 
@@ -1145,16 +1168,78 @@ def _infer_return_type(
             return_node = node
             break
 
-    # Multi-return: `return a, b, ...` -> emit `tuple[T_a, T_b, ...]`
+    # Multi-return: `return a, b, ...` -> emit `tuple[T_a, T_b, ...]`.
+    # Tensor elements are specialized from runtime metadata. Non-tensor elements
+    # (for example a TASK_ID captured by ``with pl.spmd(...) as tid``) must be
+    # supplied by a matching explicit tuple return annotation because they have
+    # no TensorMeta entry.
     if return_node is not None and isinstance(return_node.value, ast.Tuple):
-        elt_annotations: list[str] = []
-        for elt in return_node.value.elts:
-            if not isinstance(elt, ast.Name) or elt.id not in tensor_meta:
-                return None  # Can't infer this element — drop the annotation
-            elt_annotations.append(
-                _build_tensor_annotation(tensor_meta[elt.id], is_out=False, is_distributed=elt.id in dist_set)
+        return_elts = return_node.value.elts
+        explicit_elements: list[ast.expr] | None = None
+        if isinstance(func_def.returns, ast.Subscript) and _is_tuple_annotation(func_def.returns.value):
+            annotation_slice = func_def.returns.slice
+            explicit_elements = (
+                annotation_slice.elts if isinstance(annotation_slice, ast.Tuple) else [annotation_slice]
             )
+            if len(explicit_elements) != len(return_elts):
+                explicit_elements = None
+
+        def _element_uninferable(i: int) -> bool:
+            e = return_elts[i]
+            return not (isinstance(e, ast.Name) and e.id in tensor_meta)
+
+        # A *complete* (subscripted) explicit element for an un-inferrable return
+        # — e.g. ``pl.Scalar[pl.TASK_ID]`` — is one the parser cannot re-derive
+        # from a value, so the annotation is required and must not be dropped. A
+        # plain tensor local, in contrast, is re-inferable once the annotation is
+        # gone (the pre-#2016 behavior).
+        annotation_required = explicit_elements is not None and any(
+            _element_uninferable(i) and isinstance(explicit_elements[i], ast.Subscript)
+            for i in range(len(return_elts))
+        )
+
+        elt_annotations: list[str] = []
+        has_bare_element = False
+        for index, elt in enumerate(return_elts):
+            if isinstance(elt, ast.Name) and elt.id in tensor_meta:
+                elt_annotations.append(
+                    _build_tensor_annotation(
+                        tensor_meta[elt.id],
+                        is_out=False,
+                        is_distributed=elt.id in dist_set,
+                    )
+                )
+            elif explicit_elements is not None and isinstance(explicit_elements[index], ast.Subscript):
+                # Complete explicit element; fold module int constants in its shape
+                # to literals so the emitted source carries concrete extents.
+                folded = _fold_const_names(explicit_elements[index], py_globals or {})
+                elt_annotations.append(ast.unparse(folded))
+            elif explicit_elements is not None:
+                # Un-inferrable element with a bare (shapeless) explicit annotation.
+                elt_annotations.append(ast.unparse(explicit_elements[index]))
+                has_bare_element = True
+            else:
+                return None  # no explicit annotation at all — drop (pre-#2016)
+
+        # Drop the annotation only when it is entirely dispensable: a bare element
+        # is present AND no sibling element requires the annotation. That keeps a
+        # bare tensor-local tuple parsing again without stripping a TASK_ID an
+        # adjacent element depends on (the bare element then surfaces as a clear
+        # ``Incomplete type annotation`` the author must shape).
+        if has_bare_element and not annotation_required:
+            return None
         return f"tuple[{', '.join(elt_annotations)}]"
+
+    # A TASK_ID (or another explicit Scalar) has no TensorMeta entry. Preserve
+    # its declared type for any scalar expression so an inline helper can
+    # return a task ID, constant, or computed scalar to its caller rather than
+    # being treated as a void function.
+    if (
+        return_node is not None
+        and isinstance(func_def.returns, ast.Subscript)
+        and _is_scalar_annotation(func_def.returns.value)
+    ):
+        return ast.unparse(_fold_const_names(func_def.returns, py_globals or {}))
 
     # `return f(...)`: the result type depends on f's declared return types,
     # which we don't have here. Emit no annotation rather than wrongly assuming
@@ -1291,6 +1376,15 @@ def _is_scalar_annotation(node: ast.expr) -> bool:
         return node.id == "Scalar"
     if isinstance(node, ast.Attribute):
         return node.attr == "Scalar"
+    return False
+
+
+def _is_tuple_annotation(node: ast.expr) -> bool:
+    """Return True if the AST node represents tuple, Tuple, or typing.Tuple."""
+    if isinstance(node, ast.Name):
+        return node.id in ("tuple", "Tuple")
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("tuple", "Tuple")
     return False
 
 
@@ -1561,7 +1655,9 @@ class Specializer:
         )
 
         # Infer return type
-        ret_type = _infer_return_type(func_def, ctx.tensor_meta, out_params, distributed_params)
+        ret_type = _infer_return_type(
+            func_def, ctx.tensor_meta, out_params, distributed_params, ctx.py_globals
+        )
         ret_ann = f" -> {ret_type}" if ret_type else ""
 
         # External C++ kernel: emit header-only declaration(s) backed by the
@@ -1672,9 +1768,22 @@ class Specializer:
         call_args = ", ".join(all_param_names)
         header = f"def {name}(self, {sig_params}){ret_ann}:"
 
-        def _member(member_name: str, core_upper: str, source: str) -> list[str]:
+        def _member(
+            member_name: str,
+            core_upper: str,
+            source: str,
+            *,
+            dual_aiv_dispatch: bool = False,
+        ) -> list[str]:
+            function_attrs: list[str] = []
+            if ctx.external_include_dirs:
+                encoded_include_dirs = encode_external_include_dirs(ctx.external_include_dirs)
+                function_attrs.append(f'"{EXTERNAL_INCLUDE_DIRS_ATTR}": {encoded_include_dirs!r}')
+            if dual_aiv_dispatch:
+                function_attrs.append('"dual_aiv_dispatch": True')
+            attrs = f", attrs={{{', '.join(function_attrs)}}}" if function_attrs else ""
             return [
-                f"@pl.function(type=pl.FunctionType.{core_upper}, external_source={source!r})",
+                f"@pl.function(type=pl.FunctionType.{core_upper}, external_source={source!r}{attrs})",
                 f"def {member_name}(self, {sig_params}){ret_ann}:",
                 "    ...",
             ]
@@ -1693,7 +1802,12 @@ class Specializer:
         # entry's ``self.<name>(...)`` call resolves to the group.
         assert ctx.external_aic_source is not None and ctx.external_aiv_source is not None
         lines = _member(f"{name}_aic", "AIC", ctx.external_aic_source)
-        lines += _member(f"{name}_aiv", "AIV", ctx.external_aiv_source)
+        lines += _member(
+            f"{name}_aiv",
+            "AIV",
+            ctx.external_aiv_source,
+            dual_aiv_dispatch=ctx.external_dual_aiv_dispatch,
+        )
         lines.append("@pl.function(type=pl.FunctionType.Group)")
         lines.append(header)
         # AIV lanes never capture a return; the AIC lane echoes the outputs, so
@@ -1843,6 +1957,8 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
     external_core_type: str | None = None,
     external_aic_source: str | None = None,
     external_aiv_source: str | None = None,
+    external_dual_aiv_dispatch: bool = False,
+    external_include_dirs: tuple[str, ...] = (),
 ) -> SpecializeContext:
     """Build a SpecializeContext from a Python function and call-site data.
 
@@ -1905,6 +2021,8 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         external_core_type=external_core_type,
         external_aic_source=external_aic_source,
         external_aiv_source=external_aiv_source,
+        external_dual_aiv_dispatch=external_dual_aiv_dispatch,
+        external_include_dirs=external_include_dirs,
     )
 
 

@@ -65,6 +65,26 @@ std::string MakeStoreResultName(size_t index) {
   return auto_name::BuildName("ret" + std::to_string(index), "", "store");
 }
 
+bool IsPassthroughTensorOp(const CallPtr& call) {
+  return IsOp(call, "tensor.dim") || IsOp(call, "tensor.view");
+}
+
+void CheckReinterpretViewIncoreLayout(const CallPtr& call) {
+  if (!IsOp(call, "tensor.reinterpret_view")) return;
+
+  INTERNAL_CHECK_SPAN(!call->args_.empty(), call->span_)
+      << "Internal error: tensor.reinterpret_view reached conversion without a data argument";
+  auto source_type = As<TensorType>(call->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(source_type, call->span_)
+      << "Internal error: tensor.reinterpret_view source must be TensorType before tile conversion";
+  const TensorLayout source_layout =
+      source_type->tensor_view_.has_value() ? source_type->tensor_view_->layout : TensorLayout::ND;
+  CHECK_SPAN(source_layout == TensorLayout::ND, call->span_)
+      << "tensor.reinterpret_view in an InCore function currently supports only packed ND tensors; "
+         "DN layout changes which logical axis is physically contiguous, and that information cannot "
+         "yet be preserved by tensor-to-tile lowering";
+}
+
 /**
  * @brief Visitor that collects tensor-typed variable names used directly by converted ops.
  *
@@ -517,6 +537,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // Pin this Var's address for the pass so a freed-then-reused address cannot
     // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
     RetainVar(op->var_);
+    CheckReinterpretViewIncoreLayout(As<Call>(op->value_));
     auto new_value = VisitExpr(op->value_);
     auto call = As<Call>(new_value);
 
@@ -531,13 +552,16 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
     const auto* entry = conv_registry_.Lookup(call->op_->name_);
     if (!entry) {
+      if (IsOp(call, "tensor.view")) {
+        CHECK_SPAN(!call->args_.empty() && AsTensorTypeLike(call->args_[0]->GetType()), call->span_)
+            << "tensor.view in an InCore function requires a GM Tensor input that remains tensor-like "
+               "through ConvertTensorToTileOps; viewing the result of an op lowered to Tile is not supported";
+      }
       // Verify unregistered TensorOps are expected passthroughs
       if (op_registry_.IsRegistered(call->op_->name_)) {
         const auto& op_entry = op_registry_.GetEntry(call->op_->name_);
-        static const std::unordered_set<std::string> kPassthroughTensorOps = {"tensor.dim"};
-        INTERNAL_CHECK_SPAN(
-            op_entry.GetOpCategory() != "TensorOp" || kPassthroughTensorOps.count(call->op_->name_),
-            call->span_)
+        INTERNAL_CHECK_SPAN(op_entry.GetOpCategory() != "TensorOp" || IsPassthroughTensorOp(call),
+                            call->span_)
             << "TensorOp \"" << call->op_->name_ << "\" has no registered tile conversion. "
             << "Add a conversion in src/ir/transforms/op_conversion_registry.cpp.";
       }
@@ -585,6 +609,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    CheckReinterpretViewIncoreLayout(As<Call>(op->expr_));
     auto new_expr = VisitExpr(op->expr_);
     // Helper: return updated EvalStmt only when the expression actually changed.
     auto maybe_update = [&]() -> StmtPtr {
@@ -850,11 +875,13 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (IsOp(call, "pld.tensor.allreduce") && !call->args_.empty()) {
     return call->args_[0];
   }
-  // pld.tensor.allgather(local_data, target, signal, out): writes gathered
-  // chunks into out on every rank (Phase 3 per-peer pld.tile.get).  out (args_[3])
-  // is the primary write target; target (args_[1]) is used for staging only.
-  if (IsOp(call, "pld.tensor.allgather") && call->args_.size() >= 4) {
-    return call->args_[3];
+  // pld.tensor.allgather unified 3-arg API (see DeduceTensorAllGatherType):
+  //   arg[1] (target) is the result window for both HOST and InCore paths.
+  //   local_data (arg[0]) is read-only; signal (arg[2]) is barrier only.
+  if (IsOp(call, "pld.tensor.allgather")) {
+    if (call->args_.size() >= 3) {
+      return call->args_[1];  // target is the write target (window-as-result)
+    }
   }
   // pld.tensor.reduce_scatter(target, signal, *, op): writes the reduced
   // chunk back into target (Phase 4 store).  target (args_[0]) is the
@@ -1028,24 +1055,17 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
   }
 
   if (IsOp(call, "pld.tensor.allgather")) {
-    // pld.tensor.allgather(local_data, target, signal, out):
-    //   local_data (args_[0]) is In (read-only — staged into target).
-    //   target (args_[1]) is read (Phase 3 pld.tile.get from peers)
-    //     and written (Phase 1 store into own window).  InOut.
-    //   signal (args_[2]) is written (notify) and read (wait).  InOut.
-    //   out (args_[3]) is write-only — the intrinsic writes directly into it.
+    // Unified 3-arg InCore (AnalyzeCallAccess only fires for InCore functions).
+    //   arg[0] = local_data — Tensor [1, SIZE] (In, read-only)
+    //   arg[1] = target     — DistributedTensor window (InOut, push target + result)
+    //   arg[2] = signal     — DistributedTensor INT32 barrier (InOut)
     if (call->args_.size() >= 1) {
-      // local_data: read only
       MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
     }
-    for (size_t i = 1; i < std::min<size_t>(3, call->args_.size()); ++i) {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
       auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
       MarkAccess(origins, has_read);
       MarkAccess(origins, has_write);
-    }
-    if (call->args_.size() >= 4) {
-      // out: write only
-      MarkAccess(CollectReferencedOrigins(call->args_[3], origin_map), has_write);
     }
     return;
   }
@@ -1956,9 +1976,10 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
     new_args.insert(new_args.end(), extra_args.begin(), extra_args.end());
 
     // Note: 7-arg Submit ctor order is (op, args, deps, kwargs, attrs, type, span).
-    auto new_submit = std::make_shared<Submit>(
-        submit->op_, std::move(new_args), submit->deps_, submit->kwargs_, submit->attrs_, submit->GetType(),
-        submit->span_, submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+    auto new_submit =
+        std::make_shared<Submit>(submit->op_, std::move(new_args), submit->deps_, submit->kwargs_,
+                                 submit->attrs_, submit->GetType(), submit->span_, submit->core_num_,
+                                 submit->sync_start_, submit->allow_early_resolve_, submit->predicate_);
     auto new_assign = MutableCopy(op);
     new_assign->value_ = new_submit;
     stmts.push_back(std::move(new_assign));
@@ -2015,7 +2036,7 @@ Pass ConvertTensorToTileOps() {
     std::vector<FunctionPtr> functions_phase2a;
     functions_phase2a.reserve(functions_phase1.size());
     for (const auto& func : functions_phase1) {
-      if (func->func_type_ == FunctionType::Spmd || func->func_type_ == FunctionType::Group) {
+      if (IsWrapperType(func->func_type_)) {
         auto result = PropagateOutputsThroughWrapper(func, incore_added_outputs, transformed_incore_funcs);
         functions_phase2a.push_back(result.func);
         if (result.num_added_outputs > 0) {

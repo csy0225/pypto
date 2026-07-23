@@ -64,7 +64,7 @@ class TestManualScopeCodegen:
 
         # No orch-body toggle (simpler#953): the runtime latches the dump level
         # (off / partial / full) host-side; codegen only emits ``.dump(...)``.
-        assert "enable_dump_tensor_selective" not in code
+        assert "enable_dump_args_selective" not in code
 
         # Only task 0 dumps ext_x; task 1 dumps nothing.
         assert code.count("params_t0.dump(ext_x);") == 1
@@ -1067,8 +1067,9 @@ class TestManualScopeCodegen:
         Array-carry codegen needs a const trip count to allocate a fixed-size
         ``PTO2TaskId[N]`` fence array. With a dynamic trip count we cannot
         emit correct multi-deps lowering; silently falling back to a scalar
-        ``last-dispatched`` fence would be wrong. The codegen surfaces this
-        as a clear user-facing CHECK.
+        ``last-dispatched`` fence would be wrong. ``ClassifyIterArgCarry`` (the
+        pipeline's last pass, which sizes the array carry) surfaces this as a
+        clear user-facing CHECK — before codegen ever runs.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -1108,9 +1109,8 @@ class TestManualScopeCodegen:
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        transformed = pm.run_passes(Prog)
         with pytest.raises(Exception, match="statically-known trip count"):
-            _generate_orch_code(transformed)
+            _generate_orch_code(pm.run_passes(Prog))
 
     def test_manual_scope_double_buffered_array_carry_above_legacy_16_cap(self):
         """A stable full-array dep with ``N > 16`` lowers through a dummy barrier.
@@ -1543,7 +1543,7 @@ class TestManualScopeCodegen:
         transformed = pm.run_passes(Prog)
         code = _generate_orch_code(transformed)
 
-        assert "enable_dump_tensor_selective" not in code, code
+        assert "enable_dump_args_selective" not in code, code
         dump_lines = [ln for ln in code.split("\n") if ".dump(" in ln]
         assert dump_lines, code
         assert any("ext_x" in ln for ln in dump_lines), code

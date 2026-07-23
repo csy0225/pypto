@@ -11,12 +11,12 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -56,6 +56,36 @@ struct CommSetup {
   ExprPtr nranks_idx;  ///< nranks cast to INDEX (for loop bounds)
   ExprPtr my_rank;     ///< Result of pld.system.rank (INT32)
 };
+
+std::vector<ExprPtr> CollapseShapeTo2D(const std::vector<ExprPtr>& shape, const Span& span) {
+  INTERNAL_CHECK_SPAN(!shape.empty(), span) << "Cannot flatten a rank-0 tensor shape";
+  if (shape.size() == 1) {
+    return {std::make_shared<ConstInt>(1, DataType::INDEX, span), shape[0]};
+  }
+  if (shape.size() == 2) return shape;
+
+  ExprPtr rows = shape[0];
+  for (size_t i = 1; i + 1 < shape.size(); ++i) {
+    rows = tile_conversion_utils::MakeCanonicalIndexMul(rows, shape[i], span, "LowerCompositeOps");
+  }
+  return {rows, shape.back()};
+}
+
+CallPtr CreateAllReduceTargetView(const ExprPtr& target, const DistributedTensorTypePtr& target_type,
+                                  const std::vector<ExprPtr>& flat_shape,
+                                  const std::vector<ExprPtr>& flat_valid_shape, const Span& span) {
+  // Mesh allreduce owns this alias and reduces only flat_valid_shape. Public
+  // tensor.view cannot infer a shape reinterpretation for partial validity.
+  auto shape_tuple = tile_conversion_utils::MakeShapeTuple(flat_shape, span);
+  std::vector<ExprPtr> view_args{target, shape_tuple};
+  if (target_type->tensor_view_.has_value() &&
+      (!target_type->tensor_view_->valid_shape.empty() || target_type->tensor_view_->pad != PadValue::null)) {
+    const auto& source_valid_shape = target_type->tensor_view_->valid_shape;
+    view_args.push_back(tile_conversion_utils::MakeShapeTuple(
+        source_valid_shape.empty() ? std::vector<ExprPtr>{} : flat_valid_shape, span));
+  }
+  return OpRegistry::GetInstance().Create("tensor.view", view_args, {}, span);
+}
 
 // ============================================================================
 // LoweringBuilder
@@ -175,6 +205,31 @@ class LoweringBuilder {
         span);
   }
 
+  /// Overload for 2D signal matrices (e.g. ring allreduce [2*(NR-1), NR]).
+  /// @param row_offset   Row index expression for the 2D signal (e.g. ring step var)
+  void EmitNotifyAll(const ExprPtr& signal, const ExprPtr& nranks_idx, const ExprPtr& my_rank,
+                     const ExprPtr& row_offset, NotifyOp notify_op, const ExprPtr& value,
+                     const std::string& suffix, const Span& span) {
+    auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+    auto my_offsets = tile_conversion_utils::MakeSignalOffsets(my_rank, row_offset, span);
+
+    EmitFor(
+        "peer" + suffix, zero_idx, nranks_idx, one_idx,
+        [&](LoweringBuilder& body, const VarPtr& peer) {
+          body.EmitIf(
+              body.NotEq(peer, my_rank, span),
+              [&](LoweringBuilder& then_body) {
+                auto call =
+                    OpRegistry::GetInstance().Create("pld.system.notify", {signal, peer, my_offsets, value},
+                                                     {{"op", static_cast<int>(notify_op)}}, span);
+                then_body.Bind("notify" + suffix + "_ret", call, span);
+              },
+              /*else_fn=*/nullptr, span);
+        },
+        span);
+  }
+
   /// Emit wait-all loop: for src in 0..nranks: if src != my_rank: wait(...)
   /// @param signal       The signal DistributedTensor
   /// @param nranks_idx   Loop bound (INDEX-typed)
@@ -191,6 +246,31 @@ class LoweringBuilder {
         "src" + suffix, zero_idx, nranks_idx, one_idx,
         [&](LoweringBuilder& body, const VarPtr& src) {
           auto src_offsets = tile_conversion_utils::MakeSignalOffsets(src, span);
+          body.EmitIf(
+              body.NotEq(src, my_rank, span),
+              [&](LoweringBuilder& then_body) {
+                auto call =
+                    OpRegistry::GetInstance().Create("pld.system.wait", {signal, src_offsets, expected},
+                                                     {{"cmp", static_cast<int>(WaitCmp::kGe)}}, span);
+                then_body.Bind("wait" + suffix + "_ret", call, span);
+              },
+              /*else_fn=*/nullptr, span);
+        },
+        span);
+  }
+
+  /// Overload for 2D signal matrices (e.g. ring allreduce [2*(NR-1), NR]).
+  /// @param row_offset   Row index expression for the 2D signal (e.g. ring step var)
+  void EmitWaitAll(const ExprPtr& signal, const ExprPtr& nranks_idx, const ExprPtr& my_rank,
+                   const ExprPtr& row_offset, const ExprPtr& expected, const std::string& suffix,
+                   const Span& span) {
+    auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+
+    EmitFor(
+        "src" + suffix, zero_idx, nranks_idx, one_idx,
+        [&](LoweringBuilder& body, const VarPtr& src) {
+          auto src_offsets = tile_conversion_utils::MakeSignalOffsets(src, row_offset, span);
           body.EmitIf(
               body.NotEq(src, my_rank, span),
               [&](LoweringBuilder& then_body) {
@@ -477,7 +557,7 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 // In-place all-reduce of a window-bound DistributedTensor across every rank
 // of its comm group. Expands the single composite Call into the 4-phase
 // decomposition validated by the hand-written reference in
-// ``tests/st/distributed/test_l3_allreduce.py`` (``reduce_step``):
+// ``tests/st/distributed/collectives/test_l3_allreduce.py`` (``reduce_step``):
 //
 //   Phase 2a: for peer in 0..nranks:
 //               if peer != my_rank:
@@ -510,6 +590,11 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 // mutator bind it to the AssignStmt's LHS Var.
 // ============================================================================
 
+// Forward declaration — the ring rule is defined after the mesh rule but is
+// called from the mode dispatch inside LowerTensorAllReduceRule.
+ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>& args,
+                                     LoweringBuilder& b);
+
 ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
   // Host-orchestrator calls may omit the signal and get one synthesized before
@@ -530,7 +615,16 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
       << "pld.tensor.allreduce lowering supports ReduceOp::kSum only (got int " << op_value
       << ") — deducer should have rejected this";
 
-  const std::size_t ndim = target_type->shape_.size();
+  // Mode dispatch: "ring" delegates to the chunked reduce-scatter + allgather
+  // ring schedule; "mesh" (default) uses the direct-exchange lowering below.
+  // `mode` is a public DSL kwarg, so an unknown value is a user error — reject
+  // it explicitly instead of silently defaulting to mesh.
+  auto mode = GetKwargOr<std::string>(call->kwargs_, "mode", std::string("mesh"));
+  CHECK_SPAN(mode == "ring" || mode == "mesh", span)
+      << R"(pld.tensor.allreduce mode must be "ring" or "mesh", got ")" << mode << "\"";
+  if (mode == "ring") {
+    return LowerTensorRingAllReduceRule(call, args, b);
+  }
 
   // ---- Pre-build expressions shared across phases ----
   auto& reg = OpRegistry::GetInstance();
@@ -555,7 +649,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // cell[B], it has already been advanced from 1 (B's 2a Set) to 2
   // (B's 3.5a AtomicAdd). ``kEq(==1)`` would never unblock; ``kGe(>=1)``
   // does. The hand-written reference at
-  // ``tests/st/distributed/test_l3_allreduce.py`` uses ``Ge(1)`` for
+  // ``tests/st/distributed/collectives/test_l3_allreduce.py`` uses ``Ge(1)`` for
   // exactly this reason and survives the same race window.
   //
   // The cells end the call at 2, so the buffer is **not reusable** across
@@ -571,8 +665,20 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
   auto two_i32 = std::make_shared<ConstInt>(2, DataType::INT32, span);
-  auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(ndim, span);
-  auto shape_tuple = tile_conversion_utils::MakeShapeTuple(target_type->shape_, span);
+  auto flat_shape = CollapseShapeTo2D(target_type->shape_, span);
+  auto flat_valid_shape = flat_shape;
+  if (target_type->tensor_view_.has_value() && !target_type->tensor_view_->valid_shape.empty()) {
+    const auto& valid_shape = target_type->tensor_view_->valid_shape;
+    CHECK_SPAN(valid_shape.size() == target_type->shape_.size(), span)
+        << "pld.tensor.allreduce target valid_shape rank must match target rank";
+    CHECK_SPAN(tile_conversion_utils::IsRowMajorCollapseContiguous(valid_shape, target_type->shape_), span)
+        << "pld.tensor.allreduce target valid_shape cannot be represented by a single 2D view";
+    flat_valid_shape = CollapseShapeTo2D(valid_shape, span);
+  }
+  auto flat_valid_shape_tuple = tile_conversion_utils::MakeShapeTuple(flat_valid_shape, span);
+  auto flat_target = b.Bind(
+      "target_2d", CreateAllReduceTargetView(target, target_type, flat_shape, flat_valid_shape, span), span);
+  auto zero_offsets = tile_conversion_utils::MakeZeroOffsets(2, span);
 
   // ---- Phase 2a: notify all peers (Set cell[my_rank, 0] on each peer to 1) ----
   b.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, NotifyOp::kSet, one_i32, "", span);
@@ -583,10 +689,11 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // ---- Phase 3: acc = load(target); for peer != my_rank: acc += remote_load(peer) ----
   // tile.load needs the valid_shapes arg (same as shapes when omitted) plus
   // target_memory / transpose kwargs — mirrors `pl.load(...)`.
-  auto acc_initial = b.Bind("acc_initial",
-                            reg.Create("tile.load", {target, zero_offsets, shape_tuple, shape_tuple},
-                                       {{"target_memory", MemorySpace::Vec}}, span),
-                            span);
+  auto acc_initial = b.Bind(
+      "acc_initial",
+      reg.Create("tile.load", {flat_target, zero_offsets, flat_valid_shape_tuple, flat_valid_shape_tuple},
+                 {{"target_memory", MemorySpace::Vec}}, span),
+      span);
 
   auto acc_final = b.EmitForReduce(
       "peer", zero_idx, comm.nranks_idx, one_idx, acc_initial,
@@ -594,11 +701,12 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
         return body.EmitIfExpr(
             body.NotEq(peer, comm.my_rank, span),
             [&](LoweringBuilder& then_body) {
-              auto recv = then_body.Bind(
-                  "recv",
-                  OpRegistry::GetInstance().Create("pld.tile.remote_load",
-                                                   {target, peer, zero_offsets, shape_tuple}, {}, span),
-                  span);
+              auto recv =
+                  then_body.Bind("recv",
+                                 OpRegistry::GetInstance().Create(
+                                     "pld.tile.remote_load",
+                                     {flat_target, peer, zero_offsets, flat_valid_shape_tuple}, {}, span),
+                                 span);
               // Bind the add result so codegen sees a named tile buffer to
               // write into (pto.tadd lowers to `ins(...) outs(<bound>)`);
               // yielding a raw Call leaves outs() empty and MLIR rejects it.
@@ -627,14 +735,201 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   // no peer adds more than ``+1`` here, the cell tops out at 2 and
   // ``>= 2`` is both safe and tight. See the prelude comment block above
   // and the hand-written reference at
-  // ``tests/st/distributed/test_l3_allreduce.py``.
+  // ``tests/st/distributed/collectives/test_l3_allreduce.py``.
   b.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, NotifyOp::kAtomicAdd, one_i32, "2", span);
   b.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, two_i32, "2", span);
 
   // ---- Phase 4: store the reduced accumulator back into the target slot ----
-  b.Bind("store_ret", reg.Create("tile.store", {acc_final, zero_offsets, target}, {}, span), span);
+  b.Bind("store_ret", reg.Create("tile.store", {acc_final, zero_offsets, flat_target}, {}, span), span);
 
   // In-place semantics: the rebind LHS receives the (post-reduce) target view.
+  return target;
+}
+
+// ============================================================================
+// ``pld.tensor.allreduce`` ring lowering rule (mode="ring")
+//
+// NCCL-style chunked reduce-scatter + allgather ring schedule with 2(P−1)
+// per-round barriers.  Signal shape is [2*(NR−1), NR] — one row per ring
+// round, one cell per rank.  Barrier: AtomicAdd(0→1) / WaitGe(1) monotonic.
+//
+// The ring operates on the target DistributedTensor [NR, SIZE] in-place:
+// each rank's local window holds SIZE elements, and the ring exchanges
+// chunk_size = SIZE // NR elements per step.  No explicit stage-in needed.
+//
+// Hand-rolled reference: tests/st/distributed/collectives/test_l3_allreduce_ring.py
+// Runtime reference:     runtime/examples/workers/l3/allreduce_ring_distributed/
+// ============================================================================
+
+ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>& args,
+                                     LoweringBuilder& b) {
+  const Span& span = call->span_;
+  CHECK_SPAN(args.size() == 2, span) << "pld.tensor.allreduce mode=ring requires an explicit signal. "
+                                        "Use pld.tensor.allreduce(target, signal, mode=\"ring\")";
+  const auto& target = args[0];
+  const auto& signal = args[1];
+  auto target_type = As<DistributedTensorType>(target->GetType());
+  INTERNAL_CHECK_SPAN(target_type, span)
+      << "pld.tensor.allreduce target must be DistributedTensorType (deducer-rejected otherwise)";
+  CHECK_SPAN(target_type->shape_.size() == 2, span)
+      << "pld.tensor.allreduce mode=ring requires 2D target [NR, SIZE], got " << target_type->shape_.size()
+      << "D";
+
+  auto op_value = GetRequiredKwarg<int>(call->kwargs_, "op", "pld.tensor.allreduce");
+  INTERNAL_CHECK_SPAN(op_value == static_cast<int>(ReduceOp::kSum), span)
+      << "pld.tensor.allreduce mode=ring supports ReduceOp::kSum only (got int " << op_value << ")";
+
+  // Signal validation: the signal is user-supplied via its DSL type
+  // annotation, so a wrong shape/dtype is a user error — use CHECK_SPAN.
+  auto signal_type = As<DistributedTensorType>(signal->GetType());
+  CHECK_SPAN(signal_type, span) << "mode=ring signal must be a DistributedTensor";
+  CHECK_SPAN(signal_type->shape_.size() == 2, span) << "mode=ring signal must be 2D [2*(NR-1), NR]";
+  CHECK_SPAN(signal_type->dtype_ == DataType::INT32, span) << "mode=ring signal must be INT32";
+
+  // Cross-check signal dimensions for self-consistency when they are
+  // compile-time constants.  A signal built with mismatched shape[0] and
+  // shape[1] — e.g. annotation [3*(NR-1), NR] instead of [2*(NR-1), NR]
+  // — would silently produce wrong round counts or out-of-range barrier
+  // row indexing at runtime.  Skip when either dimension is dynamic.
+  auto sig_shape0_const = As<ConstInt>(signal_type->shape_[0]);
+  auto sig_shape1_const = As<ConstInt>(signal_type->shape_[1]);
+  if (sig_shape0_const && sig_shape1_const && sig_shape1_const->value_ > 0) {
+    CHECK_SPAN(sig_shape0_const->value_ == 2 * (sig_shape1_const->value_ - 1), span)
+        << "pld.tensor.allreduce mode=ring signal shape[0] (" << sig_shape0_const->value_
+        << ") must equal 2*(NR-1) = " << 2 * (sig_shape1_const->value_ - 1)
+        << " for NR = " << sig_shape1_const->value_;
+  }
+
+  auto& reg = OpRegistry::GetInstance();
+  auto comm = b.EmitCommSetup(target, span);
+
+  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
+
+  // Cast my_rank to INDEX for modulo arithmetic.
+  auto my_rank_idx =
+      b.Bind("my_rank_idx", std::make_shared<ir::Cast>(comm.my_rank, DataType::INDEX, span), span);
+
+  // chunk_size = SIZE // NR.
+  // Prefer the signal type's shape[1] for NR — it is a compile-time
+  // constant from the factory-parameter type annotation (e.g. [2*(NR-1), NR]).
+  // When both SIZE and NR are ConstInts, constant-fold to avoid a dynamic
+  // FloorDiv that downstream passes (InitMemRef) cannot handle.
+  auto size_expr = target_type->shape_[1];
+  auto nr_expr = signal_type->shape_[1];
+  ExprPtr chunk_size;
+  auto size_const = As<ConstInt>(size_expr);
+  auto nr_const = As<ConstInt>(nr_expr);
+  if (size_const && nr_const && nr_const->value_ > 0) {
+    // The ring schedule exchanges SIZE // NR elements per step and relies on
+    // every chunk being the same size. Without this CHECK, a non-divisible
+    // SIZE would silently drop the tail chunk. Reject it up front.
+    CHECK_SPAN(size_const->value_ % nr_const->value_ == 0, span)
+        << "pld.tensor.allreduce mode=ring requires the per-rank size (target dim 1 = " << size_const->value_
+        << ") to be an exact multiple of the rank count (" << nr_const->value_ << "); got a remainder of "
+        << (size_const->value_ % nr_const->value_);
+    chunk_size = std::make_shared<ConstInt>(size_const->value_ / nr_const->value_, DataType::INDEX, span);
+  } else {
+    chunk_size = MakeFloorDiv(size_expr, nr_expr, span);
+  }
+  auto chunk_shape = std::make_shared<MakeTuple>(
+      std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, span), chunk_size}, span);
+
+  // nr_minus_one = NR − 1 (loop bound, 0..NR-2 inclusive → P−1 steps)
+  auto nr_minus_one = b.Bind("nr_minus_one", MakeSub(comm.nranks_idx, one_idx, span), span);
+
+  // ------------------------------------------------------------------
+  // Phase 1: Reduce-Scatter — P−1 ring steps
+  // ------------------------------------------------------------------
+  b.EmitFor(
+      "rs_step", zero_idx, nr_minus_one, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& rs_step_var) {
+        auto step = body.Bind("step", MakeAdd(rs_step_var, one_idx, span), span);
+
+        // recv_add_idx = (my_rank − step − 1 + NR) % NR
+        auto r1 = MakeSub(my_rank_idx, step, span);
+        auto r2 = MakeSub(r1, one_idx, span);
+        auto r3 = MakeAdd(r2, comm.nranks_idx, span);
+        // recv_add_idx and send_idx are the same chunk index in this
+        // reduce-scatter formulation — bind once and reuse.
+        auto recv_add_idx = body.Bind("recv_add_idx", MakeFloorMod(r3, comm.nranks_idx, span), span);
+        const auto& send_idx = recv_add_idx;
+
+        // left = (my_rank − 1 + NR) % NR
+        auto l1 = MakeSub(my_rank_idx, one_idx, span);
+        auto l2 = MakeAdd(l1, comm.nranks_idx, span);
+        auto left_peer = body.Bind("left", MakeFloorMod(l2, comm.nranks_idx, span), span);
+
+        // ---- Round barrier (notify-all + wait-all) ----
+        body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, rs_step_var, NotifyOp::kAtomicAdd, one_i32,
+                           "_rs", span);
+        body.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, rs_step_var, one_i32, "_rs", span);
+
+        // ---- remote_load(left, send_idx) + local accumulate ----
+        auto send_offsets = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{zero_idx, MakeMul(send_idx, chunk_size, span)}, span);
+        auto recv = body.Bind(
+            "recv_rs",
+            reg.Create("pld.tile.remote_load", {target, left_peer, send_offsets, chunk_shape}, {}, span),
+            span);
+
+        auto recv_offsets = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{zero_idx, MakeMul(recv_add_idx, chunk_size, span)}, span);
+        auto acc = body.Bind("acc_rs",
+                             reg.Create("tile.load", {target, recv_offsets, chunk_shape, chunk_shape},
+                                        {{"target_memory", MemorySpace::Vec}}, span),
+                             span);
+        auto acc_next = body.Bind("acc_rs_next", body.Add(acc, recv, span), span);
+        body.Bind("store_rs", reg.Create("tile.store", {acc_next, recv_offsets, target}, {}, span), span);
+      },
+      span);
+
+  // ------------------------------------------------------------------
+  // Phase 2: AllGather — P−1 ring steps
+  // ------------------------------------------------------------------
+  b.EmitFor(
+      "ag_step", zero_idx, nr_minus_one, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& ag_step_var) {
+        auto step = body.Bind("ag_step_val", MakeAdd(ag_step_var, one_idx, span), span);
+        auto ag_round = body.Bind("ag_round", MakeAdd(ag_step_var, nr_minus_one, span), span);
+
+        auto r1 = MakeSub(my_rank_idx, step, span);
+        auto r2 = MakeAdd(r1, comm.nranks_idx, span);
+        auto recv_idx = body.Bind("ag_recv_idx", MakeFloorMod(r2, comm.nranks_idx, span), span);
+
+        // left = (my_rank − 1 + NR) % NR — used both as the remote_load peer
+        // and in the send_idx formula (hand-rolled ring uses `left`, not
+        // `my_rank`, for the AG send-chunk index).
+        auto l1 = MakeSub(my_rank_idx, one_idx, span);
+        auto l2 = MakeAdd(l1, comm.nranks_idx, span);
+        auto left_val = MakeFloorMod(l2, comm.nranks_idx, span);
+        auto left_peer = body.Bind("ag_left", left_val, span);
+
+        // send_idx = (left − step + 1 + NR) % NR
+        auto s1 = MakeSub(left_val, step, span);
+        auto s2 = MakeAdd(s1, one_idx, span);
+        auto s3 = MakeAdd(s2, comm.nranks_idx, span);
+        auto send_idx = body.Bind("ag_send_idx", MakeFloorMod(s3, comm.nranks_idx, span), span);
+
+        // ---- Round barrier ----
+        body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, ag_round, NotifyOp::kAtomicAdd, one_i32,
+                           "_ag", span);
+        body.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, ag_round, one_i32, "_ag", span);
+
+        // ---- remote_load(left, send_idx) + store locally ----
+        auto send_offsets = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{zero_idx, MakeMul(send_idx, chunk_size, span)}, span);
+        auto recv = body.Bind(
+            "recv_ag",
+            reg.Create("pld.tile.remote_load", {target, left_peer, send_offsets, chunk_shape}, {}, span),
+            span);
+        auto recv_offsets = std::make_shared<MakeTuple>(
+            std::vector<ExprPtr>{zero_idx, MakeMul(recv_idx, chunk_size, span)}, span);
+        body.Bind("store_ag", reg.Create("tile.store", {recv, recv_offsets, target}, {}, span), span);
+      },
+      span);
+
   return target;
 }
 
@@ -709,48 +1004,50 @@ ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>
 // ============================================================================
 // ``pld.tensor.allgather`` lowering rule
 //
-// All-gather: gather data from all ranks and write the concatenated result
-// into a user-provided output Tensor.  Fully N-rank general — NR is read from
-// the target's compile-time shape at lowering time.
+// All-gather: each rank pushes its single chunk to every peer's window slot
+// via pld.tile.put (TPUT-based).  After the barrier, the window itself holds
+// the full [NR, SIZE] gathered result (window-as-result).  Fully N-rank
+// general — NR is read from the target's compile-time shape at lowering time.
 //
 //   arg[0] = local_data  — Tensor [1, SIZE] (plain) or Tile [1, SIZE], this rank's chunk
-//   arg[1] = target      — DistributedTensor [NR, SIZE], staging window
+//   arg[1] = target      — DistributedTensor [NR, SIZE], staging window (also the result)
 //   arg[2] = signal      — DistributedTensor INT32, cross-rank barrier
-//   arg[3] = out         — Tensor [1, NR*SIZE], output buffer
 //
-// Phases (aligned with simpler allgather_distributed reference):
-//   0.  tile.load(local_data, [0,0], [1,SIZE])   — when local_data is a
-//       Tensor (emit a Tile from the plain input); skipped when Tile
-//   1.  tile.store(stage_tile, [0, 0], target)    — stage-in (each rank's
-//       private HCCL window starts at local row 0)
+// Phases:
+//   0.  tile.create [1, SIZE] VEC — staging tile for auto-chunking
+//   1.  for peer in 0..NR-1:
+//         pld.tile.put(target, peer, local_data, put_stage,
+//                      [my_rank, 0], [0, 0], [1, SIZE])
+//       — push this rank's chunk into every peer's window at row my_rank.
+//       Self-store (peer == my_rank) uses HCCL identity mapping (same
+//       trust model as pld.tile.get self-path).  pld.tile.put auto-chunks
+//       when SIZE exceeds the staging-tile capacity.
 //   2a. notify-all (Set 1)
 //   2b. wait-all  (Ge 1)
-//   3.  for r in 0..NR-1:
-//         pld.tile.get(out, peer=r, target, stage,
-//                      dst_offsets=[0, r*SIZE], src_offsets=[0,0], shape=[1,SIZE])
-//       — transfer each peer's chunk directly into out at column offset
-//         [0, r*SIZE]; one shared [1, SIZE] VEC staging tile, no tile.concat
-//       return out  (Tensor rebind)
+//   return target  (DistributedTensor rebind) — window IS the gathered result
 //
-// Self-read falls out of the same pld.tile.get path via HCCL identity
-// mapping (CommRemotePtr returns local ptr for peer == my_rank).
+// Compared to the original pull-based allgather, this push-based variant drops
+// the out Tensor parameter and the per-peer pld.tile.get gather loop.  Total
+// HBM drops from (NR+1)×SIZE to NR×SIZE, at the cost of the window remaining
+// occupied until the caller consumes the result.
 // ============================================================================
 
 ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
-  INTERNAL_CHECK_SPAN(args.size() == 4, span)
-      << "pld.tensor.allgather rule expects 4 args (local_data, target, signal, out), got " << args.size();
+  INTERNAL_CHECK_SPAN(args.size() == 3, span)
+      << "pld.tensor.allgather rule expects 3 args (local_data, target, signal), got " << args.size();
   const auto& local_data = args[0];
   const auto& target = args[1];
   const auto& signal = args[2];
-  const auto& out = args[3];
 
-  // local_data may be a Tile (pre-loaded by user) or a Tensor (intrinsic
-  // handles the load internally).  Record which so we can emit tile.load
-  // after the shared setup expressions are available.
-  bool is_tensor_input = (As<TensorType>(local_data->GetType()) != nullptr);
-  INTERNAL_CHECK_SPAN(As<TileType>(local_data->GetType()) || is_tensor_input, span)
-      << "pld.tensor.allgather local_data must be TileType or TensorType, got "
+  // local_data is user-provided (the DSL allows Tensor | DistributedTensor) and
+  // the deducer defers its validation to the lowering passes, so this is a
+  // user-facing contract check -> CHECK_SPAN.  The InCore push path only
+  // supports a plain Tensor source: pld.tile.put reads its `src` via
+  // AsTensorTypeLike; a DistributedTensor local_data would fault downstream.
+  CHECK_SPAN(As<TensorType>(local_data->GetType()), span)
+      << "pld.tensor.allgather local_data must be a plain Tensor [1, SIZE] on the "
+         "InCore path, got "
       << local_data->GetType()->TypeName();
   auto target_type = As<DistributedTensorType>(target->GetType());
   INTERNAL_CHECK_SPAN(target_type, span)
@@ -768,28 +1065,47 @@ ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>
   auto chunk_shape = std::make_shared<MakeTuple>(
       std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, span), size_expr}, span);
 
-  // Per the simpler allgather reference (examples/workers/l3/allgather_distributed/),
-  // every rank stores its chunk at local offset [0, 0] of its private HCCL
-  // window.  The DistributedTensor shape [NR, SIZE] is a logical view;
-  // physically each rank holds one row at local row 0.
+  // Offsets [0, 0] for loading local_data.
   auto zero_row_offsets =
       std::make_shared<MakeTuple>(std::vector<ExprPtr>{std::make_shared<ConstInt>(0, DataType::INDEX, span),
                                                        std::make_shared<ConstInt>(0, DataType::INDEX, span)},
                                   span);
 
-  // ---- Phase 0: load (Tensor → Tile, when local_data is a Tensor) ----
-  ExprPtr stage_tile;
-  if (is_tensor_input) {
-    stage_tile = b.Bind("local_tile",
-                        reg.Create("tile.load", {local_data, zero_row_offsets, chunk_shape, chunk_shape},
-                                   {{"target_memory", MemorySpace::Vec}}, span),
-                        span);
-  } else {
-    stage_tile = local_data;
-  }
+  // No explicit tile.load here: pld.tile.put reads from a Tensor source and
+  // auto-chunks the transfer through the VEC staging tile.
 
-  // ---- Phase 1: stage-in (stage_tile → target[0, 0]) ----
-  b.Bind("stage_in", reg.Create("tile.store", {stage_tile, zero_row_offsets, target}, {}, span), span);
+  // ---- Phase 1: push — pld.tile.put this rank's chunk into every peer's window ----
+  // Each peer receives this rank's chunk at target[my_rank, 0:SIZE].
+  // Self-store (peer == my_rank) uses HCCL identity mapping — the same trust
+  // model as the pld.tile.get self-path in the original pull-based allgather.
+  // pld.tile.put auto-chunks when SIZE exceeds the staging-tile capacity, so a
+  // single [1, SIZE] VEC staging tile suffices regardless of SIZE.
+  auto put_stage =
+      b.Bind("ag_stage",
+             reg.Create("tile.create", {chunk_shape},
+                        {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
+             span);
+
+  auto my_rank_offsets = std::make_shared<MakeTuple>(
+      std::vector<ExprPtr>{comm.my_rank, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
+
+  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  b.EmitFor(
+      "peer", zero_idx, comm.nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& peer) {
+        // pld.tile.put(dst, peer, src, stage, dst_offsets, src_offsets, shape):
+        // push local_data contents to every peer's window at row my_rank.
+        // src is the original Tensor local_data — pld.tile.put handles
+        // tile-load/chunking internally through the stage tile.
+        body.Bind(
+            "push",
+            reg.Create("pld.tile.put",
+                       {target, peer, local_data, put_stage, my_rank_offsets, zero_row_offsets, chunk_shape},
+                       {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
+            span);
+      },
+      span);
 
   // ---- Phase 2a: notify-all ----
   b.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, NotifyOp::kSet, one_i32, "", span);
@@ -797,45 +1113,8 @@ ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>
   // ---- Phase 2b: wait-all ----
   b.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, one_i32, "", span);
 
-  // ---- Phase 3: gather — per-peer pld.tile.get directly into output Tensor ----
-  // Each peer's chunk [1, SIZE] is transferred from the window buffer directly
-  // into the output Tensor at a rank-ordered column offset [0, r*SIZE] via
-  // pld.tile.get (subregion form).  A single VEC staging tile [1, SIZE] is
-  // shared across all peers — no tile.concat, each intermediate fits in UB
-  // regardless of NR or SIZE.
-  //
-  // The loop bound is the runtime nranks (comm.nranks_idx), matching the
-  // notify/wait phases.  This keeps the gather consistent with the barrier
-  // phases regardless of the comm-group size, avoiding a mismatch between
-  // compile-time target.shape[0] and the actual world size.
-
-  auto gather_stage =
-      b.Bind("ag_stage",
-             reg.Create("tile.create", {chunk_shape},
-                        {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
-             span);
-
-  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
-  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-  b.EmitFor(
-      "r", zero_idx, comm.nranks_idx, one_idx,
-      [&](LoweringBuilder& body, const VarPtr& r_var) {
-        // Column dst offset: [0, r*SIZE] — rank-ordered placement.
-        auto col_offset_expr = MakeMul(r_var, size_expr, span);
-        auto dst_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{std::make_shared<ConstInt>(0, DataType::INDEX, span), col_offset_expr},
-            span);
-
-        body.Bind("get",
-                  reg.Create("pld.tile.get",
-                             {out, r_var, target, gather_stage, dst_offsets, zero_row_offsets, chunk_shape},
-                             {}, span),
-                  span);
-      },
-      span);
-
-  // Return the output Tensor — the lowering writes directly into it.
-  return out;
+  // Return target — the window IS the gathered result (window-as-result).
+  return target;
 }
 
 // ============================================================================
@@ -1238,13 +1517,13 @@ class LowerCompositeOpsMutator : public IRMutator {
  private:
   [[nodiscard]] static bool ShouldSkipHostCollective(const CallPtr& call) {
     if (!call || !call->op_) return false;
-    // pld.tensor.allgather overloads: skip only the 2-arg HOST builtin form;
-    // the 4-arg InCore composite form must still be lowered by this pass.
-    if (IsOp(call, "pld.tensor.allgather")) {
-      return call->args_.size() == 2;
-    }
-    return IsOp(call, "pld.tensor.allreduce") || IsOp(call, "pld.tensor.barrier") ||
-           IsOp(call, "pld.tensor.broadcast") || IsOp(call, "pld.tensor.reduce_scatter");
+    // HOST vs InCore is a function-context property, decided authoritatively by
+    // the outer skip_host_collectives_ flag (set for HOST orchestration
+    // functions), not by arg count or arg[0] type.  Every collective is skipped
+    // uniformly here so the flag alone governs which functions defer lowering.
+    return IsOp(call, "pld.tensor.allgather") || IsOp(call, "pld.tensor.allreduce") ||
+           IsOp(call, "pld.tensor.barrier") || IsOp(call, "pld.tensor.broadcast") ||
+           IsOp(call, "pld.tensor.reduce_scatter") || IsOp(call, "pld.tensor.all_to_all");
   }
 
   [[nodiscard]] CompositeLoweringFn LookupRule(const CallPtr& call) const {

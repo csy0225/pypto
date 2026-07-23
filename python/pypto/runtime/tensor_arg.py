@@ -21,7 +21,34 @@ Host ``torch.Tensor`` arguments are delegated unchanged to simpler's
 ``make_tensor_arg``; only the device-resident branches are added here.
 """
 
+from functools import cache
 from typing import Any
+
+
+@cache
+def _modules() -> tuple[Any, Any]:
+    """Import and cache the two runtime modules on first ``make_tensor_arg`` call.
+
+    The imports stay inside this function so importing pypto never requires
+    simpler (only available in the runtime environment). ``functools.cache``
+    runs the body once — instead of on every call — which matters because the
+    generated ``host_orch`` calls ``make_tensor_arg`` once per tensor per rank
+    (~90 tensors × world_size), where per-call ``from ... import`` was pure
+    overhead on the host dispatch loop.
+
+    Only the *module objects* are cached; the individual symbols (``Tensor``,
+    ``DeviceTensor``, ``device_tensor_to_tensor``, ``make_tensor_arg``) are
+    resolved via attribute access on every call. Caching the module rather than
+    the bound symbols keeps ``make_tensor_arg`` responsive to test monkeypatches
+    of ``task_interface.make_tensor_arg`` (see ``tests/ut/runtime``), while still
+    paying the import cost only once.
+
+    Returns:
+        ``(task_interface, device_tensor)`` module objects.
+    """
+    from . import device_tensor, task_interface  # noqa: PLC0415
+
+    return task_interface, device_tensor
 
 
 def make_tensor_arg(arg: Any) -> Any:
@@ -39,19 +66,10 @@ def make_tensor_arg(arg: Any) -> Any:
     Returns:
         A simpler ``Tensor`` ready to add to ``TaskArgs``.
     """
-    # Imports are lazy: simpler is only available in the runtime environment,
-    # and pypto must remain importable without it.
-    from .device_tensor import DeviceTensor  # noqa: PLC0415
-    from .task_interface import (  # noqa: PLC0415
-        Tensor,  # pyright: ignore[reportAttributeAccessIssue]
-        device_tensor_to_tensor,
-    )
-    from .task_interface import (  # noqa: PLC0415
-        make_tensor_arg as _impl,  # pyright: ignore[reportAttributeAccessIssue]
-    )
+    task_interface, device_tensor = _modules()
 
-    if isinstance(arg, Tensor):
+    if isinstance(arg, task_interface.Tensor):
         return arg
-    if isinstance(arg, DeviceTensor):
-        return device_tensor_to_tensor(arg)
-    return _impl(arg)
+    if isinstance(arg, device_tensor.DeviceTensor):
+        return task_interface.device_tensor_to_tensor(arg)
+    return task_interface.make_tensor_arg(arg)

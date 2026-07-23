@@ -43,6 +43,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
@@ -321,6 +322,8 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   /// the ccec get_subblockid() register.
   [[nodiscard]] bool UsesSubblockOp() const { return uses_subblock_op_; }
 
+  [[nodiscard]] const std::set<const ir::Var*>& GetFFTSWorkspaceVars() const { return ffts_workspace_vars_; }
+
   void VisitExpr_(const VarPtr& op) override {
     if (iter_arg_ids_.count(op->UniqueId())) return;
     if (auto tile_type = ir::GetTileTypeWithMemRef(op->GetType())) {
@@ -342,6 +345,11 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
       if (!uses_subblock_op_ && ir::IsOp(op, "tile.get_subblock_idx")) {
         uses_subblock_op_ = true;
       }
+      if (ir::IsOp(op, "system.set_ffts") && op->args_.size() == 1) {
+        if (auto workspace = As<ir::Var>(op->args_[0])) {
+          ffts_workspace_vars_.insert(workspace.get());
+        }
+      }
     }
     ir::IRVisitor::VisitExpr_(op);
   }
@@ -353,6 +361,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   std::set<uint64_t> iter_arg_ids_;
   bool uses_spmd_block_ops_ = false;
   bool uses_subblock_op_ = false;
+  std::set<const ir::Var*> ffts_workspace_vars_;
 
   void AddMemRefIfUnique(const MemRefPtr& memref, const std::shared_ptr<const TileType>& tile_type) {
     const ir::Var* base_ptr = memref->base_.get();
@@ -588,6 +597,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
   const bool uses_spmd_params = collector.UsesSpmdBlockOps();
   const bool uses_subblock_param = collector.UsesSubblockOp();
+  fs_.ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
   if (uses_spmd_params) {
     fs_.used_ssa_names.insert("__pypto_spmd_block_idx");
     fs_.used_ssa_names.insert("__pypto_spmd_block_num");
@@ -609,6 +619,8 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   for (const auto& [tile_var, tile_type] : fs_.tile_var_allocs) {
     auto memref = ir::GetDefinedMemRef(tile_type);
 
+    std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
+
     std::string ssa_name;
     if (!emit_tile_addr_) {
       const std::string ident = MemRefIdentityKey(memref);
@@ -619,6 +631,16 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
         ssa_name = NewNamedTemp(tile_var->name_hint_);
         fs_.memref_identity_to_mlir[ident] = ssa_name;
       }
+      // Same bytes does not mean same tile_buf type: a [1, N] row-major op result
+      // and its [N, 1] col-major reshape view share base+offset+size. They still
+      // share one handle (differently-typed reads become `pto.treshape` views of
+      // it), but an MLIR SSA value has exactly one type, so callers that want to
+      // *re-type* the handle — the IfStmt phi head-declaration — must not touch a
+      // mixed-type identity. Record which identities are uniform.
+      auto [type_it, fresh] = fs_.memref_identity_type.emplace(ident, type_str);
+      if (!fresh && type_it->second != type_str) {
+        fs_.memref_identity_mixed_types.insert(ident);
+      }
     } else {
       ssa_name = NewNamedTemp(tile_var->name_hint_);
     }
@@ -626,7 +648,6 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
 
     // Pre-populate type so body visitors (e.g., tile.reshape no-op check)
     // can query it before per-variable alloc_tile emission runs.
-    std::string type_str = GetTileBufTypeStringFromTileType(tile_type);
     fs_.ssa_to_tile_buf_type[ssa_name] = type_str;
 
     // Also maintain fs_.memref_to_mlir for compatibility (first var per allocation)
@@ -690,7 +711,14 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     first_param = false;
     const auto& param = func->params_[tensor_param_indices[j]];
     auto tensor_type = ir::AsTensorTypeLike(param->GetType());
-    stream_ << "%arg" << j << ": !pto.ptr<" << GetTypeString(tensor_type->dtype_) << ">";
+    if (fs_.ffts_workspace_vars.count(param.get()) > 0) {
+      auto extent = As<ir::ConstInt>(tensor_type->shape_[0]);
+      INTERNAL_CHECK_SPAN(extent && tensor_type->dtype_ == DataType::INT64, param->span_)
+          << "FFTS workspace must be a statically sized INT64 tensor";
+      stream_ << "%arg" << j << ": memref<" << extent->value_ << "xi64>";
+    } else {
+      stream_ << "%arg" << j << ": !pto.ptr<" << GetTypeString(tensor_type->dtype_) << ">";
+    }
   }
   for (size_t j = 0; j < scalar_param_indices.size(); j++) {
     if (!first_param) stream_ << ", ";
@@ -780,6 +808,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
         RecordGMSlotBufferSSA(GetVarName(var), tensor_type->dtype_);
         continue;
       }
+      if (fs_.ffts_workspace_vars.count(var.get()) > 0) continue;
       std::string tensor_view = NewNamedTemp(var->name_hint_ + "_view");
       BindTensorView(var, tensor_view);
       // Remember the base pointer so mid-body pl.read/pl.write resolve to !pto.ptr
@@ -892,7 +921,8 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
   for (const auto& param : func->params_) {
     auto tensor_type = ir::AsTensorTypeLike(param->GetType());
     if (!tensor_type) continue;
-    if (param->name_hint_ == "__gm_pipe_buffer") continue;  // GM slot buffer is a raw pointer
+    if (param->name_hint_ == "__gm_pipe_buffer") continue;         // GM slot buffer is a raw pointer
+    if (fs_.ffts_workspace_vars.count(param.get()) > 0) continue;  // FFTS workspace stays a memref
 
     std::string tensor_view = fs_.tensor_to_view.at(GetVarKey(param));
     const size_t rank = tensor_type->shape_.size();
@@ -1247,6 +1277,30 @@ std::string PTOCodegen::AllocNewTileBuf(const std::string& tile_buf_type_string,
   return name;
 }
 
+std::string PTOCodegen::TryGetSharedTileBufHandle(const ir::MemRefPtr& memref) const {
+  if (emit_tile_addr_ || !memref) {
+    return "";
+  }
+  const std::string ident = MemRefIdentityKey(memref);
+  // A mixed-type identity's handle already carries another var's type; re-typing
+  // it would make one SSA value have two types and ptoas would reject the module.
+  if (fs_.memref_identity_mixed_types.count(ident) != 0) {
+    return "";
+  }
+  auto it = fs_.memref_identity_to_mlir.find(ident);
+  return it != fs_.memref_identity_to_mlir.end() ? it->second : std::string{};
+}
+
+bool PTOCodegen::DeclareTileBufAtHead(const std::string& ssa_name, const AllocTileFields& fields) {
+  if (!fs_.emitted_tile_alloc_names.insert(ssa_name).second) {
+    return false;  // already declared — in the head, or inline earlier in the body
+  }
+  fs_.extra_alloc_tiles.push_back(FunctionState::ExtraAllocTile{ssa_name, fields.type_str, fields.addr_ssa,
+                                                                fields.valid_row_ssa, fields.valid_col_ssa});
+  fs_.ssa_to_tile_buf_type[ssa_name] = fields.type_str;
+  return true;
+}
+
 void PTOCodegen::SetCurrentResultBuf(const std::string& buf) { fs_.current_result_buf = buf; }
 
 void PTOCodegen::RegisterTileBufType(const std::string& ssa_name, const std::string& type_string) {
@@ -1286,8 +1340,11 @@ std::string PTOCodegen::GetGMSlotBufferSSA() const { return fs_.gm_slot_buffer_s
 std::string PTOCodegen::GetCommCtxSSAFor(const ir::Var* dist_var) const {
   if (dist_var == nullptr) return "";
   auto it = fs_.dist_tensor_to_ctx.find(dist_var);
-  if (it == fs_.dist_tensor_to_ctx.end()) return "";
-  return it->second;
+  if (it != fs_.dist_tensor_to_ctx.end()) return it->second;
+  if (auto iter_arg = dynamic_cast<const ir::IterArg*>(dist_var)) {
+    if (auto init_var = AsVarLike(iter_arg->initValue_)) return GetCommCtxSSAFor(init_var.get());
+  }
+  return "";
 }
 
 void PTOCodegen::RegisterCommCtxFor(const ir::VarPtr& dist_var, const std::string& ctx_ssa) {
@@ -1482,6 +1539,33 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
         BindTensorView(op->var_, view);
         BindVarToMlir(op->var_, view);  // view name == SSA name, as in ForStmt
         RegisterBasePtr(op->var_, GetTensorBasePtr(rhs_var));
+        const std::string comm_ctx = GetCommCtxSSAFor(rhs_var.get());
+        if (As<ir::DistributedTensorType>(op->var_->GetType())) {
+          INTERNAL_CHECK_SPAN(!comm_ctx.empty(), op->span_)
+              << "Internal error: DistributedTensor alias '" << op->var_->name_hint_ << "' from source '"
+              << rhs_var->name_hint_ << "' has no CommContext binding";
+        }
+        RegisterCommCtxFor(op->var_, comm_ctx);
+        return;
+      }
+    } else if (!emit_tile_addr_ && As<TileType>(op->var_->GetType())) {
+      // Bare tile SSA alias (`lhs = rhs`) under memory_planner=PTOAS. `lhs` and
+      // `rhs` denote the identical tile value, so `lhs` must resolve to `rhs`'s
+      // CURRENT SSA binding. This matters when `rhs` is a view (tile.reshape /
+      // tile.transpose_view) that re-pointed itself at a typed view SSA of a
+      // shared buffer — e.g. the `[N, 1]` col-major reshape of a `[1, N]`
+      // row-major op result, which shares the op result's MemRef. `lhs` was
+      // pre-bound (GenerateFunction) to that shared handle, whose SSA is typed
+      // `[1, N]`; keeping it makes a later yield of `lhs` (an `m = m_new`
+      // online-softmax carry) emit a `[1, N] -> [N, 1]` write-back tmov that
+      // ptoas rejects for shape mismatch. Following `rhs` binds `lhs` to the
+      // `[N, 1]` view SSA so the write-back has matching src/dst shapes — the
+      // same shape the `s = pl.mul(...)`-style yield (no bare alias) already
+      // gets. Under PyPTO (emit_tile_addr_) the baked address already aliases
+      // the two allocs, so this is a no-op there and is left untouched.
+      const std::string rhs_ssa = GetVarName(rhs_var);
+      if (!rhs_ssa.empty()) {
+        BindVarToMlir(op->var_, rhs_ssa);
         return;
       }
     }
@@ -1722,6 +1806,48 @@ std::string PTOCodegen::GetTileBufTypeStringFromTileType(
   auto c = ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_));
   return FormatTileBufTypeString(loc, c.dtype_str, c.rows, c.cols, c.blayout, c.slayout, c.fractal, c.pad,
                                  c.v_row, c.v_col, c.v_row_dynamic, c.v_col_dynamic);
+}
+
+std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
+    const std::shared_ptr<const ir::TileType>& tile_type) const {
+  INTERNAL_CHECK(tile_type) << "Internal error: tile_type must not be null";
+  auto memory_space = tile_type->GetMemorySpace();
+  INTERNAL_CHECK(memory_space.has_value()) << "Internal error: tile_type must have memory_space";
+
+  auto c = ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_));
+
+  // `pto.alloc_tile` conveys the valid extent through `valid_row` / `valid_col`
+  // operands, so ExtractTileTypeInfo always renders `v_row=?, v_col=?`. A view op
+  // that takes NO such operands — `pto.treshape` — cannot: ptoas default-
+  // constructs its destination tile from the result type alone, so a dynamic
+  // valid leaves the tile's valid extent at zero and every consumer silently
+  // becomes a no-op. Render static valid dims whenever the view's effective
+  // valid_shape is statically known.
+  const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+  const auto& valid = view.valid_shape;
+  if (valid.size() == 1) {
+    // Match ComputeAllocTileFields / ExtractTileTypeInfo: a 1-D valid_shape
+    // maps to rows=1, cols=shape[0]. Without this a 1-D reshape view keeps the
+    // dynamic zero-valid extent and its consumers become silent no-ops.
+    if (auto v_col = As<ir::ConstInt>(valid[0])) {
+      c.v_row = 1;
+      c.v_col = v_col->value_;
+      c.v_row_dynamic = false;
+      c.v_col_dynamic = false;
+    }
+  } else if (valid.size() >= 2) {
+    auto v_row = As<ir::ConstInt>(valid[0]);
+    auto v_col = As<ir::ConstInt>(valid[1]);
+    if (v_row && v_col) {
+      c.v_row = v_row->value_;
+      c.v_col = v_col->value_;
+      c.v_row_dynamic = false;
+      c.v_col_dynamic = false;
+    }
+  }
+  return FormatTileBufTypeString(MemorySpaceToMLIR(*memory_space), c.dtype_str, c.rows, c.cols, c.blayout,
+                                 c.slayout, c.fractal, c.pad, c.v_row, c.v_col, c.v_row_dynamic,
+                                 c.v_col_dynamic);
 }
 
 std::string PTOCodegen::GetExprTypeAnnotation(const ir::ExprPtr& expr) {

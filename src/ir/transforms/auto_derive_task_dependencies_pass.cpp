@@ -26,7 +26,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/codegen/orchestration/orchestration_analysis.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -41,6 +40,8 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 
@@ -49,8 +50,7 @@ namespace ir {
 
 namespace {
 
-using ::pypto::codegen::ComputeGroupEffectiveDirections;
-using ::pypto::codegen::IsBuiltinOp;
+using ::pypto::ir::op_predicates::IsBuiltinOp;
 
 enum class AccessKind { Read, Write, ReadWrite };
 
@@ -61,7 +61,6 @@ constexpr size_t kMinWindowedTaskIdTempDeps = 1;
 constexpr size_t kInvalidArgIndex = std::numeric_limits<size_t>::max();
 constexpr const char* kAttrAutoNoDepCandidateIndices = "__auto_no_dep_candidate_indices";
 constexpr const char* kAttrAutoOutputExistingCandidateIndices = "__auto_output_existing_candidate_indices";
-constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler_auto_manual_scope_candidate";
 constexpr const char* kAttrCompilerAutoManualLayerCandidate = "__compiler_auto_manual_layer_candidate";
 
 struct AccessRegion {
@@ -348,15 +347,6 @@ bool HasTaskIdTail(const TypePtr& type) {
 bool HasTaskIdTail(const CallPtr& call) { return HasTaskIdTail(call ? call->GetType() : TypePtr{}); }
 
 bool HasTaskIdTail(const SubmitPtr& submit) { return HasTaskIdTail(submit ? submit->GetType() : TypePtr{}); }
-
-std::vector<ParamDirection> ResolveCalleeDirections(const ProgramPtr& program, const CallPtr& call,
-                                                    const FunctionPtr& callee) {
-  if (!callee) return {};
-  if (callee->func_type_ == FunctionType::Group || callee->func_type_ == FunctionType::Spmd) {
-    return ComputeGroupEffectiveDirections(callee, program);
-  }
-  return callee->param_directions_;
-}
 
 std::vector<VarPtr> GetDepAttr(const CallPtr& call, const char* key) {
   if (!call) return {};
@@ -874,7 +864,9 @@ class StorageRootAnalysis : public IRVisitor {
   std::vector<StorageLocation> CollectCallOutputLocations(const CallPtr& call) const {
     auto callee = program_ ? program_->GetFunction(call->op_->name_) : nullptr;
     if (!callee) return {};
-    auto dirs = ResolveCalleeDirections(program_, call, callee);
+    // Group/Spmd wrappers carry their effective directions in the signature:
+    // DeriveCallDirections (the immediately preceding pass) materialized them.
+    const auto& dirs = callee->param_directions_;
     std::vector<StorageLocation> locations;
     auto returned_locations = CollectReturnedLocations(call, callee);
     if (!returned_locations.empty()) return returned_locations;
@@ -1116,11 +1108,14 @@ class SubmitTaskIdCollector : public IRVisitor {
     }
     for (const auto& [source_id, slots] : covered_source_slots) {
       auto source_it = array_lineage_by_var_id_.find(source_id);
-      if (source_it == array_lineage_by_var_id_.end() || !source_it->second.extent.has_value()) continue;
-      if (!HasCompleteDynamicCoverage(slots, source_it->second.extent.value())) continue;
+      if (source_it == array_lineage_by_var_id_.end()) continue;
+      const auto& source_extent = source_it->second.extent;
+      if (!source_extent.has_value()) continue;
+      if (!HasCompleteDynamicCoverage(slots, *source_extent)) continue;
       if (lineage.has_unknown_dynamic_update || !lineage.unknown_static_slots.empty()) continue;
-      if (source_it->second.has_unknown_dynamic_update || !source_it->second.unknown_static_slots.empty())
+      if (source_it->second.has_unknown_dynamic_update || !source_it->second.unknown_static_slots.empty()) {
         continue;
+      }
       AppendAllUnique(&out, source_it->second.full_array_task_ids);
     }
     return out;
@@ -1243,11 +1238,14 @@ class SubmitTaskIdCollector : public IRVisitor {
   void RecordTaskIdArrayExtent(const VarPtr& var) {
     if (!var) return;
     auto lineage_it = array_lineage_by_var_id_.find(var->UniqueId());
-    if (lineage_it != array_lineage_by_var_id_.end() && lineage_it->second.extent.has_value()) {
-      task_id_array_extent_by_var_id_[var->UniqueId()] = lineage_it->second.extent.value();
-    } else {
-      task_id_array_extent_by_var_id_.erase(var->UniqueId());
+    if (lineage_it != array_lineage_by_var_id_.end()) {
+      const auto& extent = lineage_it->second.extent;
+      if (extent.has_value()) {
+        task_id_array_extent_by_var_id_[var->UniqueId()] = *extent;
+        return;
+      }
     }
+    task_id_array_extent_by_var_id_.erase(var->UniqueId());
   }
 
   bool IsCompleteTaskIdArray(const VarPtr& var) const {
@@ -1611,9 +1609,10 @@ class AutoDepMutator : public IRMutator {
                             !HasCompilerAutoManualScopeCandidateAttr(rewritten_call->attrs_))) {
       return submit;
     }
-    return std::make_shared<const Submit>(
-        submit->op_, submit->args_, submit->deps_, submit->kwargs_, rewritten_call->attrs_, submit->GetType(),
-        submit->span_, submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+    return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
+                                          rewritten_call->attrs_, submit->GetType(), submit->span_,
+                                          submit->core_num_, submit->sync_start_,
+                                          submit->allow_early_resolve_, submit->predicate_);
   }
 
   ExprPtr AnalyzeCallLike(const CallPtr& call, const Expr* identity_key,
@@ -1875,7 +1874,7 @@ class AutoDepMutator : public IRMutator {
       return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
                                             std::move(stripped_attrs), submit->GetType(), submit->span_,
                                             submit->core_num_, submit->sync_start_,
-                                            submit->allow_early_resolve_);
+                                            submit->allow_early_resolve_, submit->predicate_);
     }
   };
 
@@ -1907,7 +1906,7 @@ class AutoDepMutator : public IRMutator {
       return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
                                             std::move(stripped_attrs), submit->GetType(), submit->span_,
                                             submit->core_num_, submit->sync_start_,
-                                            submit->allow_early_resolve_);
+                                            submit->allow_early_resolve_, submit->predicate_);
     }
   };
 
@@ -1936,9 +1935,10 @@ class AutoDepMutator : public IRMutator {
 
       auto attrs = ApplyToAttrs(submit->attrs_, submit->GetArgDirections());
       if (!attrs.has_value()) return submit;
-      return std::make_shared<const Submit>(
-          submit->op_, submit->args_, submit->deps_, submit->kwargs_, std::move(*attrs), submit->GetType(),
-          submit->span_, submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+      return std::make_shared<const Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
+                                            std::move(*attrs), submit->GetType(), submit->span_,
+                                            submit->core_num_, submit->sync_start_,
+                                            submit->allow_early_resolve_, submit->predicate_);
     }
 
    private:

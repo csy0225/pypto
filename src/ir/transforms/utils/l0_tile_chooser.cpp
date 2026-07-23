@@ -169,7 +169,10 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
 
 // Cube MAD cost over the full padded grid. Per-TMATMUL cost is
 //   mad_head + cpr * ceil(m/16) * ceil(k/kt) * ceil(n/16),
-// with kt = mad_k_fractal_bytes/bytes_a and cpr = bytes_a/2 (1 BF16 / 2 FP32).
+// with kt = mad_k_fractal_bytes/bytes_a. cpr = cube passes per K-fractal: 1 for <=2-byte
+// inputs (bf16), and mad_fp32_passes for full fp32 (arch-specific: a2a3=2, a5=8 -- a5's
+// cube does a ~4x fuller fp32 mantissa decomposition; the fractal WIDTH kt is C0-derived
+// and arch-invariant, so this pass count is the only arch-varying fp32 cube term).
 // The K-fractal count is summed over the K-blocks the emit ACTUALLY runs:
 // floor(K/k) full k-wide blocks plus, when k does not divide K (the K-peel), one
 // narrower tail block of width K - floor(K/k)*k scored at ITS width -- not rounded
@@ -178,7 +181,8 @@ int64_t PaddedComputeVolume(int m, int n, int k, const L0TileConfig& cfg) {
 // k this reduces exactly to (K/k)*ceil(k/kt) -- unchanged.
 int64_t MadCycles(int m, int n, int k, const L0TileConfig& cfg) {
   const int64_t kt = std::max<int64_t>(1, cfg.mad_k_fractal_bytes / static_cast<int64_t>(cfg.bytes_a));
-  const int64_t cpr = std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
+  const int64_t cpr = (cfg.bytes_a == 4) ? std::max<int64_t>(1, static_cast<int64_t>(cfg.mad_fp32_passes))
+                                         : std::max<int64_t>(1, static_cast<int64_t>(cfg.bytes_a) / 2);
   const int64_t num_full = cfg.K / k;                        // full k-wide K-blocks
   const int64_t k_tail = cfg.K - num_full * k;               // peel tail width (0 if k | K)
   const int64_t k_blocks = num_full + (k_tail > 0 ? 1 : 0);  // == CeilDiv(K, k)
@@ -250,31 +254,79 @@ double LoadCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r)
   return std::min(held_a, held_b);
 }
 
-// L0C drain cost over the full problem. FIXPIPE drains one output tile at a time:
-// each drain pays a fixed issue overhead plus its bytes at the drain bandwidth,
-// and there are ceil(M/m)*ceil(N/n) output tiles. So drain is TILE-DEPENDENT --
-// splitting the OUTPUT (M/N) raises the drain count, while splitting K does NOT
-// (partial sums accumulate in the single L0C, one drain per (m,n) block). This
-// is the term that stops the chooser from over-splitting M/N on shallow-K shapes
-// (op-sim device-validated: per-drain work = drain_fixed_cycles + bytes/bw_drain;
-// omitting it under-priced M/N-split tiles and cost 2-13% on small shallow-K).
-// NOTE: bw_drain is the 32-aligned-N slope; N % 32 != 0 drains slower (a separate
-// fixpipe fractal cliff) -- not modelled, ~ranking-neutral within a problem.
+// The odd part of x: x divided by its largest power-of-2 factor (odd(8)=1,
+// odd(12)=3, odd(10)=5). x must be positive (guaranteed: n >= min_n >= 16 and
+// N0 >= 1, so the fractal count n1 >= 1).
+int64_t OddPart(int64_t x) {
+  while ((x & 1) == 0) x >>= 1;
+  return x;
+}
+
+// L0C drain cost over the full problem. FIXPIPE drains one output tile at a time,
+// so drain is TILE-DEPENDENT -- splitting the OUTPUT (M/N) raises the drain count,
+// while splitting K does NOT (partial sums accumulate in the single L0C, one drain
+// per (m,n) block). This term stops the chooser from over-splitting M/N on
+// shallow-K shapes.
+//
+// per_tile = drain_fixed                                                   // fixed issue overhead (m-indep)
+//          + m * ( max(drain_row, bytes_c*n/bw_drain)                      // per-row: floor OR throughput
+//                  + drain_penalty * (odd(N1) - 1) )                       // misalignment serialization
+//
+// Direct fit of an on-device FIXPIPE sweep (dense m x n surface). Per the writeback
+// model (pto-isa docs/isa/cube/fixpipe-model.md + nz-fractal-layout.md), FIXPIPE
+// addresses one M-row of the `N1 M1 M0 N0` FRACTAL_NZ accumulator at a time (=> cost
+// ∝ m), each row a grouped nburst/loop over the N1 = ceil(n/N0) N-fractals (N0 =
+// C0/bytes_c = 8 for the fp32 L0C accumulator, output-dtype independent). The per-row
+// cost is max(FLOOR, THROUGHPUT): a fixed per-row burst-issue/addressing floor
+// (drain_row, N-independent) that dominates narrow N, OR the fractal byte throughput
+// (bytes_c*n/bw_drain) that dominates wide N -- the sweep confirmed both regimes
+// (flat base below the ~n=131 crossover, byte-throughput above; a byte-only model
+// under-costs narrow N up to 2.2x, a flat-only model under-costs wide N 1.5x). A
+// non-pow2 fractal count adds the odd residual odd(N1)-1 serial burst passes at
+// drain_penalty per M-row. The predicate is a NON-POWER-OF-2 N-fractal count N1, not
+// literally N%32: n=80 -> odd(ceil(80/8))=odd(10)=5 (penalized), but so is n=96 ->
+// odd(12)=3 even though 96%32==0; aligned pow2 N1 (n=64->8, n=128->16) pays nothing.
+// So a misaligned-N tile is priced drain-heavy and is not over-picked. The drain is
+// write-side, so no gamma_c (C read-back rides the load traffic, not the writeback).
 double DrainCycles(int m, int n, const L0TileConfig& cfg) {
-  const double gamma_c = cfg.c_read ? 2.0 : 1.0;
   const double num_drains = static_cast<double>(CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n));
-  const double bytes = gamma_c * static_cast<double>(cfg.bytes_c) * m * n;
-  return num_drains * (cfg.drain_fixed_cycles + bytes / cfg.bw_drain);
+  const int64_t n0 = std::max<int64_t>(1, cfg.drain_c0_bytes / static_cast<int64_t>(cfg.bytes_c));
+  const int64_t n1 = CeilDiv(static_cast<int64_t>(n), n0);  // N-fractal count
+  const double throughput = static_cast<double>(cfg.bytes_c) * n / cfg.bw_drain;
+  const double per_row = std::max(cfg.drain_row_cycles, throughput) +
+                         cfg.drain_penalty_cycles * static_cast<double>(OddPart(n1) - 1);
+  const double per_tile = cfg.drain_fixed_cycles + static_cast<double>(m) * per_row;
+  return num_drains * per_tile;
 }
 
 // Roofline wall in cycles. With a single L0C (drain_hidden=false) the FIXPIPE
 // drain is exposed -- the cube stalls on each tile's store -- so it ADDS to the
-// pipe maximum. With L0C double-buffered (drain_hidden=true) the drain overlaps
-// the next tile's compute, so it JOINS the maximum instead of adding.
+// pipe maximum. With L0C double-buffered (drain_hidden=true) drain(i) overlaps
+// compute(i+1), so the T output-tile drains JOIN the maximum instead of adding --
+// but the pipeline is not perfectly overlapped end to end: the first tile's
+// compute (fill) and the last tile's drain (drain) have no partner to hide behind.
+// So the ideal all-hidden T*max(C,D) roofline undercounts by exactly one tile's
+// *non-dominant* pipe:
+//     wall_dbc = T*max(C_tile, D_tile) + min(C_tile, D_tile)
+//              = max(compute, drain) + min(compute, drain) / T      (T = num tiles)
+// At a 2x2 grid (T=4) this restores ~25% of the smaller pipe the old
+// all-drains-hidden form dropped, so dbC is not over-picked on small grids and is
+// not biased toward drain-heavy tiles whose exposed tail otherwise read as free.
+// The exposed pipe is the drain when compute-bound and the compute (fill) when
+// drain-bound; min() is whichever is exposed either way. The bubble uses the
+// average tile (C_tile=compute/T, D_tile=drain/T); on a peeled-tail grid the actual
+// exposed tile is smaller, so this is a slight -- and safe (conservative) --
+// over-correction. Tail-accurate pricing is a follow-up (see docs).
 int64_t WallCycles(int m, int n, int k, const L0TileConfig& cfg, const Regime& r) {
   const double compute = std::max(LoadCycles(m, n, k, cfg, r), static_cast<double>(MadCycles(m, n, k, cfg)));
   const double drain = DrainCycles(m, n, cfg);
-  const double wall = r.dbc ? std::max(compute, drain) : compute + drain;
+  double wall;
+  if (r.dbc) {
+    const double num_tiles = static_cast<double>(CeilDiv(cfg.M, m) * CeilDiv(cfg.N, n));
+    wall = std::max(compute, drain) + std::min(compute, drain) / num_tiles;
+  } else {
+    wall = compute + drain;
+  }
   // Guard the float->int cast: a non-finite or out-of-exact-range wall would be UB.
   // Given the validated positive bandwidths and aligned-bounded dims this never fires.
   INTERNAL_CHECK(std::isfinite(wall) && wall <= 9007199254740992.0)  // 2^53
@@ -396,6 +448,12 @@ L0TileResult ChooseL0Tile(const L0TileConfig& cfg) {
   CHECK(cfg.bw_a > 0.0 && cfg.bw_b > 0.0 && cfg.bw_drain > 0.0)
       << "ChooseL0Tile: roofline bandwidths must be strictly positive (got bw_a=" << cfg.bw_a
       << ", bw_b=" << cfg.bw_b << ", bw_drain=" << cfg.bw_drain << ") -- they divide the load/drain cost.";
+  CHECK(cfg.drain_c0_bytes > 0 && cfg.drain_row_cycles >= 0.0 && cfg.drain_penalty_cycles >= 0.0 &&
+        cfg.drain_fixed_cycles >= 0.0)
+      << "ChooseL0Tile: drain params must be non-negative with a positive fractal C0 (got drain_c0_bytes="
+      << cfg.drain_c0_bytes << ", drain_row_cycles=" << cfg.drain_row_cycles
+      << ", drain_penalty_cycles=" << cfg.drain_penalty_cycles
+      << ", drain_fixed_cycles=" << cfg.drain_fixed_cycles << ").";
 
   // Without padding, the problem dimensions themselves must already meet the
   // cube minimum. Callers (the pass) should pre-screen and skip with a

@@ -274,6 +274,30 @@ def test_parse_l3_two_ranks_per_round_max(span_root):
     assert stats.host_wall_us == [200.0, 300.0]
 
 
+def test_parse_l3_recovers_interleaved_records_on_one_line(span_root):
+    """Two ``[STRACE]`` records mashed onto one physical line are both recovered.
+
+    L3 forks one chip worker per rank sharing the capture fd; concurrent writes
+    can interleave two complete records onto a single physical line. The parser
+    must re-split on the ``[STRACE]`` marker and recover both — dropping the
+    second record would zero that (round, rank).
+    """
+    lines = _launch_lines(0, span_root, host_us=100, device_us=10, pid=100)
+    lines += _launch_lines(1, span_root, host_us=300, device_us=30, pid=100)
+    # Simulate the wire collision: inv0's device-wall record and inv1's host
+    # record land on the same physical line (no newline between them). Every
+    # other record keeps its own line.
+    mashed = "\n".join([lines[0], f"{lines[1]} {lines[2]}", lines[3]])
+
+    stats = _parse_stats_from_strace(mashed, rounds=2, warmup=0, distributed=True)
+
+    # Both invocations survive. Without the re-split, the second record on the
+    # mashed line is dropped, so inv1's host span reads 0 for round1.
+    assert stats.fallback_flattened is False
+    assert stats.per_rank("device") == {100: [10.0, 30.0]}
+    assert stats.per_rank("host") == {100: [100.0, 300.0]}
+
+
 def test_parse_l3_multi_dispatch_sums_within_round(span_root):
     """A rank dispatched multiple times per round (heterogeneous hids) sums within the round."""
     lines: list[str] = []
@@ -539,8 +563,10 @@ class _FakeDistributedCompiled:
     def __init__(self, rt: _FakeDistributedWorker) -> None:
         self._rt = rt
         self.platform = "a2a3sim"
+        self.prepare_config: Any = "unset"
 
-    def prepare(self) -> _FakeDistributedWorker:
+    def prepare(self, config: Any = None) -> _FakeDistributedWorker:
+        self.prepare_config = config
         return self._rt
 
 
@@ -561,6 +587,9 @@ def test_benchmark_l3_dispatches_via_distributed_worker():
     assert rt.register_calls == 1  # registered exactly once
     assert rt.handle.call_count == 3  # warmup + rounds launches
     assert chip_ctor.call_count == 0  # L3 must NOT touch ChipWorker
+    # prepare() gets the dispatch config, so it prewarms the runtime arena with
+    # the ring sizing the loop dispatches with (here: None -> baseline sizing).
+    assert compiled.prepare_config is None
     # The parser is told this is a distributed run.
     assert parse.call_args.kwargs == {"rounds": 2, "warmup": 1, "distributed": True}
     assert stats.rounds == 2
@@ -592,7 +621,7 @@ def test_benchmark_l3_capture_wraps_prepare(span_root):
     """
 
     class _CompiledEmittingAtPrepare(_FakeDistributedCompiled):
-        def prepare(self) -> _FakeDistributedWorker:
+        def prepare(self, config: Any = None) -> _FakeDistributedWorker:
             # Two ranks each emit one dispatch's markers at fork/prepare time,
             # before the measured loop runs.
             for pid, dev_us in ((100, 10.0), (101, 20.0)):
@@ -615,7 +644,7 @@ def test_benchmark_l3_capture_wraps_prepare(span_root):
 
 
 def test_benchmark_raises_when_no_markers_captured():
-    """A runtime built without SIMPLER_PROFILING emits no markers; the parser
+    """A runtime built without SIMPLER_HOST_STRACE emits no markers; the parser
     returns empty stats and ``benchmark`` surfaces a clear error rather than a
     silently-empty result (which callers could misread as 0 device timing)."""
     worker = _FakeWorker()

@@ -278,6 +278,40 @@ for batch in stream:
     handle(batch.a, batch.b, batch.out)
 ```
 
+`compile()` 只读取每个张量参数的 shape/dtype —— 从不触碰内容 —— 所以这些样例
+张量纯粹是元数据载体。
+
+### 从签名编译（无需样例张量）
+
+当每个张量参数都**完整注解**了 shape 和 dtype 时，`compile()` 可以直接从签名
+读出整个 shape 契约 —— **不传任何位置参数**即可，样例张量全部省掉：
+
+```python
+HIDDEN, VOCAB = 4096, 152064
+M = pl.dynamic("M")          # 运行期动态维
+
+@pl.jit
+def prefill_fwd(
+    hidden: pl.Tensor[[M, HIDDEN], pl.BF16],
+    lm_head: pl.Tensor[[VOCAB, HIDDEN], pl.BF16],
+    out: pl.Out[pl.Tensor[[M, VOCAB], pl.FP32]],
+): ...
+
+# 没有 torch.empty(...) 占位张量 —— shape 全部来自注解。
+compiled = prefill_fwd.compile()
+```
+
+对于签名很大的内核，这是更符合直觉的路径：shape 契约只在签名一处声明，而不是
+再写成一长串一次性的 `torch.empty(...)`。细节：
+
+- **静态维**（`HIDDEN`、`VOCAB` …）来自注解常量。
+- **动态维**（`pl.dynamic` / `bind_dynamic`）无需给值 —— 编译产物与具体 extent
+  无关，`compile()` 与等价的 `compile(sample_tensors)` 共享同一 cache 条目。
+- **标量参数**在签名里没有值 —— 用关键字参数传入，例如
+  `kernel.compile(num_tokens=128)`。
+- **bare `pl.Tensor`**（无 shape）无从读取，会给出明确报错；请补全
+  `pl.Tensor[[...], dtype]` 注解，或回退到 `compile(*sample_tensors)`。
+
 完整三种使用模式（推理服务、训练循环、register/dispatch 开销验证）见
 `examples/runtime/explicit_dispatch.py`。
 
@@ -285,7 +319,7 @@ for batch in stream:
 
 `worker.run` / `handle(...)` 只返回张量输出，不再暴露单次 launch 的计时对象。
 runtime 以 `[STRACE]` 日志标记的形式输出每次运行的 host/device 计时（simpler
-PR #1177，在 `PTO2_PROFILING` 下默认开启）；用 simpler 的 `strace_timing` /
+PR #1177，在 `SIMPLER_DFX` 下默认开启）；用 simpler 的 `strace_timing` /
 `device_log_timing` 工具解析这些标记，而不是读取返回值。需要 per-task 的 device
 计时时，开启 L2 swimlane DFX（`RunConfig(enable_l2_swimlane=True)`）并读取
 `l2_swimlane_records.json`。
@@ -312,7 +346,7 @@ print(stats.device_wall_us_median, stats.device_wall_us_min, len(stats.samples))
 `benchmark` 从 `[STRACE]` 标记读取计时（simpler PR #1177）：它在 worker 生命周期内
 将 runtime 日志级别提升到 `v9`，并在测量循环期间以 fd 级别捕获 `stderr`，因此循环
 期间产生的 stderr 会被转存到临时文件，而非实时打印。`device_wall_us` 在 L2 单芯片
-运行时是真实的 NPU 墙钟（分布式见下方 L3 说明）；在未开启 `SIMPLER_PROFILING` 的
+运行时是真实的 NPU 墙钟（分布式见下方 L3 说明）；在未开启 `SIMPLER_HOST_STRACE` 的
 runtime 上或 `*sim` 平台上为 `0`（用 `stats.all_zero_device` 判断）。
 
 除聚合值外，每次测量 launch 的完整 `[STRACE]` span 树保存在 `stats.invocations`
@@ -385,22 +419,27 @@ compiled(x, weight, out)                       # weight：无 H2D/D2H 拷贝
 对反复 dispatch 同一程序的常驻服务（如 generate 循环），可调用一次 `compiled.prepare()` 得到
 一个 `DistributedWorker` 句柄：setup 只做一次，多次 dispatch 复用同一个 worker。
 
-per-call 的 IO buffer（输入**和**输出）是**在 `prepare()` 之前分配的共享内存 host 张量**，
-原地复用 —— fork 出的 chip worker 通过继承的映射读写它们，所以输出直接从该张量读回。大块静态
-权重则用 `rt.alloc_tensor` 一次性上传到 worker 常驻的 `DeviceTensor`（其 `init` 源同样必须是
-`prepare()` 之前共享的张量），混合传入。非共享的 host 张量（或 `prepare()` 之后才分配的）会被拒绝
-—— chip worker 看不到它。
+per-call IO buffer 是**在 `prepare()` 之前分配的共享内存 host 张量**并原地复用，这样子进程的写入对父进程
+可见。大块静态权重可以保留为普通的 CPU 连续张量：必须在 fork 前通过
+`DistributedWorker(..., inherited_host_tensors=[...])` 注册。runtime 只将注册的 storage 保留为
+`rt.alloc_tensor` 和 `rt.alloc_stacked_tensor` 的只读 H2D 上传源；注册的张量不能直接作为 dispatch 参数。
+最后一次上传后，调用 `release_inherited_host_tensor_refs()` 释放 runtime 在父进程中持有的 host 引用；
+已经 fork 的子进程映射会保留到 worker 关闭。
 
 ```python
+from pypto.runtime import DistributedWorker
+
 compiled = ir.compile(MyDistributedProgram)
 
 # 共享内存 host buffer —— 必须在 prepare() 之前分配
 host_x = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
 host_out = torch.zeros((seq, 4096), dtype=torch.float16).share_memory_()
-host_weight = load_weight().share_memory_()
+host_weight = load_weight().contiguous()           # 不可变的普通 CPU 张量
 
-with compiled.prepare() as rt:                  # setup 只跑一次
+with DistributedWorker(compiled, inherited_host_tensors=[host_weight]) as rt:
     weight = rt.alloc_tensor(host_weight.shape, host_weight.dtype, init=host_weight)
+    rt.release_inherited_host_tensor_refs()      # 删除 runtime 在父进程中持有的 Host 引用
+    del host_weight                              # 删除调用方在父进程中持有的最后一个引用
     for step in generate_steps:
         host_x.copy_(next_input(step))          # 原地刷新输入
         rt(host_x, weight, host_out)            # host shm IO + 常驻权重
@@ -417,12 +456,14 @@ dispatch 都把 `x[r]` 切片重新上传到对应卡。要让每个分片**只�
 用 `rt.alloc_stacked_tensor` 构造一个 `StackedDeviceTensor`:
 
 ```python
-host_w = load_weight().share_memory_()           # [B, N, M],B == world_size
+host_w = load_weight().contiguous()              # [B, N, M],B == world_size
 host_a = torch.zeros((B, N, M), dtype=...).share_memory_()
 host_out = torch.zeros((B, N, M), dtype=...).share_memory_()
 
-with compiled.prepare() as rt:
+with DistributedWorker(compiled, inherited_host_tensors=[host_w]) as rt:
     w = rt.alloc_stacked_tensor(host_w)          # 第 i 片上传到第 i 张卡,只传一次
+    rt.release_inherited_host_tensor_refs()
+    del host_w
     for step in steps:
         host_a.copy_(next_input(step))
         rt(host_a, w, host_out)                  # x[r] 解析到常驻的第 r 片
@@ -437,7 +478,7 @@ with compiled.prepare() as rt:
 和单个 `DeviceTensor` 一样,`StackedDeviceTensor` 也不会被自动拷回。若要一次把每个分片
 当前的设备内容读回主机——例如某一步结束时读回常驻的 KV cache——可用
 `rt.copy_stacked_from(w, host_out)`,即 `alloc_stacked_tensor` 的对称读回接口。`host_out`
-原地填充(`host_out[i]` 接收第 `i` 片);与上传源一样,它必须是形状和 dtype 与该 stack
+原地填充(`host_out[i]` 接收第 `i` 片);它必须是形状和 dtype 与该 stack
 匹配、且在 `prepare()` **之前**分配的 CPU、连续、**共享内存** `[B, *tail]` 张量
 (调用 `.share_memory_()`):D2H 拷贝在 fork 出的 chip worker 中执行,只能写它在 fork
 时继承的主机内存。

@@ -111,6 +111,14 @@ void IRVisitor::VisitExpr_(const SubmitPtr& op) {
     INTERNAL_CHECK_SPAN(*op->core_num_, op->span_) << "Submit core_num is null";
     VisitExpr(*op->core_num_);
   }
+  // The dispatch predicate (pl.spmd_submit(..., predicate=(t[i] > 0))) is a
+  // first-class Expr operand — a comparison over a tensor.read and a constant.
+  // Visit it so unused-var / def-use / SSA-liveness analyses see the tensor and
+  // index Vars it references (mirrors the deps_ / core_num_ rationale).
+  if (op->predicate_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->predicate_, op->span_) << "Submit predicate is null";
+    VisitExpr(*op->predicate_);
+  }
   // Var-typed attrs reference Vars defined elsewhere in the IR.
   // IRMutator::VisitExpr_(SubmitPtr) already rewrites those Vars on
   // substitution; the visitor must walk them too so unused-var / def-use /
@@ -265,9 +273,12 @@ void IRVisitor::VisitStmt_(const WhileStmtPtr& op) {
 // Visit Var-typed entries in a ScopeStmt's ``attrs_``. Mirrors the Call.attrs
 // handling in VisitExpr_(CallPtr) so analyses (unused-var detection, SSA Var
 // liveness, etc.) see Var refs stashed on a ScopeStmt's ``manual_dep_edges`` /
-// ``task_id_var`` / ``arg_direction_overrides_vars`` / ``dump_vars`` attrs.
+// ``task_id_var`` / ``arg_direction_overrides_vars`` / ``dump_vars`` attrs, plus
+// the Expr-valued ``predicate`` attr. Subclasses opt a key out via
+// ShouldVisitScopeAttr rather than by overriding this walk.
 void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
   for (const auto& [k, v] : op->attrs_) {
+    if (!ShouldVisitScopeAttr(k)) continue;
     if (k == kAttrManualDepEdges || k == kAttrArgDirOverrideVars || k == kAttrDumpVars) {
       const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
       if (!edges) continue;
@@ -277,6 +288,13 @@ void IRVisitor::VisitScopeAttrs(const ScopeStmtPtr& op) {
     } else if (k == kAttrTaskIdVar) {
       const auto* var = std::any_cast<VarPtr>(&v);
       if (var && *var) VisitExpr(*var);
+    } else if (k == kAttrPredicate) {
+      // ``with pl.spmd(..., predicate=(t[i] > 0)):`` — unlike the keys above
+      // this is a whole Expr tree (a comparison over ``tensor.read``), so
+      // recurse into it: the operand tensor and its index Vars are live SSA
+      // values the outliner later moves onto ``Submit::predicate_``.
+      const auto* pred = std::any_cast<ExprPtr>(&v);
+      if (pred && *pred) VisitExpr(*pred);
     }
   }
 }

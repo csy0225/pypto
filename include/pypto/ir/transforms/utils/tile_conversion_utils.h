@@ -13,17 +13,38 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_TILE_CONVERSION_UTILS_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 
 namespace pypto::ir::tile_conversion_utils {
+
+/// Build a canonical INDEX multiply for shape and offset collapse. Constant
+/// overflow is a compiler error; zero and identity operands are folded.
+inline ExprPtr MakeCanonicalIndexMul(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span,
+                                     const char* pass_name) {
+  auto lhs_const = As<ConstInt>(lhs);
+  auto rhs_const = As<ConstInt>(rhs);
+  if (lhs_const && rhs_const) {
+    int64_t folded = 0;
+    INTERNAL_CHECK_SPAN(!__builtin_mul_overflow(lhs_const->value_, rhs_const->value_, &folded), span)
+        << pass_name << ": integer overflow while canonicalizing index multiply";
+    return std::make_shared<ConstInt>(folded, DataType::INDEX, span);
+  }
+  if ((lhs_const && lhs_const->value_ == 0) || (rhs_const && rhs_const->value_ == 0)) {
+    return std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  }
+  return tensor_view_semantics::MakeIndexMul(lhs, rhs, span);
+}
 
 /// Whether the valid sub-box over the leading "row" dims ``[0, ndim-1)`` of an ND
 /// load window flattens to a contiguous row axis in row-major order — the
@@ -78,6 +99,13 @@ inline ExprPtr MakeShapeTuple(const std::vector<ExprPtr>& shape, const Span& spa
 /// The signal matrix is shape [nranks, 1], so two INDEX elements suffice.
 inline ExprPtr MakeSignalOffsets(const ExprPtr& rank_expr, const Span& span) {
   std::vector<ExprPtr> elements = {rank_expr, std::make_shared<ConstInt>(0, DataType::INDEX, span)};
+  return std::make_shared<MakeTuple>(std::move(elements), span);
+}
+
+/// Build a 2D signal-slot offset tuple [row_expr, rank_expr] for 2D signal
+/// matrices (e.g. ring allreduce signals of shape [2*(NR-1), NR]).
+inline ExprPtr MakeSignalOffsets(const ExprPtr& rank_expr, const ExprPtr& row_expr, const Span& span) {
+  std::vector<ExprPtr> elements = {row_expr, rank_expr};
   return std::make_shared<MakeTuple>(std::move(elements), span);
 }
 

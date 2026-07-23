@@ -16,7 +16,10 @@ from pypto.jit.cache import (
     compute_source_hash,
     make_cache_key,
 )
-from pypto.pypto_core import DataType
+from pypto.jit.decorator import _resolve_enable_pypto_l0c_double_buffer, _resolve_memory_planner
+from pypto.pypto_core import DataType, passes
+from pypto.pypto_core.passes import MemoryPlanner
+from pypto.runtime import RunConfig
 
 
 class TestComputeSourceHash:
@@ -47,7 +50,7 @@ class TestComputeSourceHash:
 
 
 class TestMakeCacheKey:
-    def _make_key(
+    def _make_key(  # noqa: PLR0913 — mirrors make_cache_key's per-dimension args
         self,
         source_hash="abc",
         param_names=None,
@@ -59,6 +62,8 @@ class TestMakeCacheKey:
         strategy=None,
         distributed_config=None,
         analyze_auto_scopes_for_deps=False,
+        memory_planner=None,
+        enable_pypto_l0c_double_buffer=False,
     ):
         return make_cache_key(
             source_hash=source_hash,
@@ -71,6 +76,8 @@ class TestMakeCacheKey:
             strategy=strategy,
             distributed_config=distributed_config,
             analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            memory_planner=memory_planner,
+            enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
         )
 
     def test_basic_key_structure(self):
@@ -88,7 +95,11 @@ class TestMakeCacheKey:
         assert isinstance(tensor_part, tuple)
         assert isinstance(scalar_part, tuple)
         assert dist_part is None  # single-chip default
-        assert compile_opts == (("analyze_auto_scopes_for_deps", False),)
+        assert compile_opts == (
+            ("analyze_auto_scopes_for_deps", False),
+            ("memory_planner", None),
+            ("enable_pypto_l0c_double_buffer", False),
+        )
 
     def test_tensor_shape_in_key(self):
         key = self._make_key(
@@ -353,6 +364,78 @@ class TestMakeCacheKey:
             analyze_auto_scopes_for_deps=True,
         )
         assert k_off != k_on
+
+    def test_memory_planner_splits_key(self):
+        """The planner decides whether physical addresses are baked into the
+        artifact (ptoas level3 vs level2), so it must split the cache."""
+        keys = [
+            self._make_key(
+                param_names=["a"],
+                tensor_shapes={"a": (8, 8)},
+                tensor_dtypes={"a": DataType.FP32},
+                memory_planner=planner,
+            )
+            for planner in (None, MemoryPlanner.PYPTO, MemoryPlanner.PTOAS)
+        ]
+        assert len(set(keys)) == len(keys), f"planner must split the cache key, got {keys}"
+
+    def test_dbc_double_buffer_flag_splits_key(self):
+        """The PyPTO dbC=2 opt-in changes the AutoTileMatmulL0/MemoryReuse output,
+        so a kernel compiled with it off must not reuse that artifact when later
+        called with it on."""
+        key_off = self._make_key(
+            param_names=["a"],
+            tensor_shapes={"a": (8, 8)},
+            tensor_dtypes={"a": DataType.FP32},
+            enable_pypto_l0c_double_buffer=False,
+        )
+        key_on = self._make_key(
+            param_names=["a"],
+            tensor_shapes={"a": (8, 8)},
+            tensor_dtypes={"a": DataType.FP32},
+            enable_pypto_l0c_double_buffer=True,
+        )
+        assert key_off != key_on, "dbC=2 opt-in must split the cache key"
+
+
+class TestResolveMemoryPlanner:
+    """The planner the JIT keys on must match the one ``ir.compile()`` will use."""
+
+    def test_defaults_to_pypto(self):
+        assert _resolve_memory_planner(None) == MemoryPlanner.PYPTO
+
+    def test_reads_the_active_pass_context(self):
+        """The planner is usually selected by wrapping the call in a PassContext,
+        which never reaches RunConfig. Keying only on RunConfig would let such a
+        call reuse a PYPTO-compiled artifact."""
+        with passes.PassContext([], memory_planner=MemoryPlanner.PTOAS):
+            assert _resolve_memory_planner(None) == MemoryPlanner.PTOAS
+        assert _resolve_memory_planner(None) == MemoryPlanner.PYPTO
+
+
+class TestResolveEnablePyptoL0cDoubleBuffer:
+    """The dbC=2 opt-in the JIT keys on must match the one ``ir.compile()`` inherits."""
+
+    def test_defaults_to_off(self):
+        assert _resolve_enable_pypto_l0c_double_buffer() is False
+
+    def test_reads_the_active_pass_context(self):
+        """The flag is set by wrapping the call in a PassContext, which never
+        reaches RunConfig; keying only on RunConfig would let a flag-on call
+        reuse the flag-off artifact."""
+        with passes.PassContext([], enable_pypto_l0c_double_buffer=True):
+            assert _resolve_enable_pypto_l0c_double_buffer() is True
+        assert _resolve_enable_pypto_l0c_double_buffer() is False
+
+    def test_run_config_field_wins_over_default(self):
+        cfg = RunConfig(platform="a2a3", memory_planner=MemoryPlanner.PTOAS)
+        assert _resolve_memory_planner(cfg) == MemoryPlanner.PTOAS
+
+    def test_unset_run_config_field_defers_to_context(self):
+        cfg = RunConfig(platform="a2a3")
+        assert cfg.memory_planner is None
+        with passes.PassContext([], memory_planner=MemoryPlanner.PTOAS):
+            assert _resolve_memory_planner(cfg) == MemoryPlanner.PTOAS
 
 
 if __name__ == "__main__":

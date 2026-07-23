@@ -323,6 +323,170 @@ def test_tensor_col_prod():
     assert isinstance(result_type.shape[1], ir.ConstInt) and result_type.shape[1].value == 128
 
 
+# ---- valid_shape propagation through unary and reduction ops -------------------------------
+#
+# Unary ops rewrite each cell in place, so the result holds real data in exactly the cells the
+# input did. Reductions consume the input's *valid* region on the reduced axis — the backend
+# kernels bound their loops by the source's valid extent — so the reduced axis collapses to a
+# fully valid output axis while validity on the surviving axes carries over.
+
+
+def test_tensor_unary_preserves_partial_valid_shape():
+    """tensor.exp must carry the input's valid region onto its result."""
+    call = ir.op.tensor.exp(_partial_tensor_var([64, 128], [64, 40]))
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [64, 40]
+
+
+def test_tensor_unary_fully_valid_input_yields_no_explicit_view():
+    """A fully valid input yields a fully valid result, canonicalized to no explicit view."""
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(64, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    tensor_var = ir.Var("t", ir.TensorType(dims, DataType.FP32), span)
+
+    result_type = ir.op.tensor.exp(tensor_var).type
+    assert isinstance(result_type, ir.TensorType)
+    # Redundant full validity is canonicalized away.
+    assert result_type.tensor_view is None or len(result_type.tensor_view.valid_shape) == 0
+
+
+def test_tensor_unary_preserves_symbolic_valid_shape():
+    """A runtime (symbolic) valid extent survives a unary op."""
+    span = ir.Span.unknown()
+    vlen = ir.Var("vlen", ir.ScalarType(DataType.INDEX), span)
+    dims = [ir.ConstInt(64, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    view = ir.TensorView([], ir.TensorLayout.ND, valid_shape=[ir.ConstInt(64, DataType.INDEX, span), vlen])
+    tensor_var = ir.Var("t", ir.TensorType(dims, DataType.FP32, None, view), span)
+
+    result_type = ir.op.tensor.neg(tensor_var).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    valid = result_type.tensor_view.valid_shape
+    assert isinstance(valid[0], ir.ConstInt) and valid[0].value == 64
+    assert valid[1] == vlen  # the symbolic extent is carried through unchanged
+
+
+def test_tensor_cast_preserves_valid_shape_and_changes_dtype():
+    """tensor.cast changes only the element type; the valid region is untouched."""
+    call = ir.op.tensor.cast(_partial_tensor_var([64, 128], [64, 40]), target_type=DataType.FP16)
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.FP16
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [64, 40]
+
+
+def test_tensor_unary_result_carries_no_source_view_metadata():
+    """A fresh result takes the default layout and no stride/pad/memref from its source."""
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(64, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    # A strided, DN-layout, zero-padded source: none of that describes the fresh result.
+    view = ir.TensorView([1, 64], ir.TensorLayout.DN, valid_shape=[64, 40], pad=ir.PadValue.zero)
+    tensor_var = ir.Var("t", ir.TensorType(dims, DataType.FP32, None, view), span)
+
+    result_type = ir.op.tensor.exp(tensor_var).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.memref is None
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [64, 40]
+    assert len(result_type.tensor_view.stride) == 0
+    assert result_type.tensor_view.layout == ir.TensorLayout.ND
+    assert result_type.tensor_view.pad == ir.PadValue.null
+
+
+def test_tensor_row_sum_preserves_non_reduced_axis_validity():
+    """Reducing the last axis keeps the row axis's partial validity."""
+    # [64, 128] physical, valid [40, 128]: the *kept* row axis is partial.
+    call = ir.op.tensor.row_sum(_partial_tensor_var([64, 128], [40, 128]))
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert _const_int_values(result_type.shape) == [64, 1]
+    assert result_type.tensor_view is not None
+    # Rows stay partial (40 of 64); the reduced axis collapses to one valid cell.
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [40, 1]
+
+
+def test_tensor_row_sum_partial_reduced_axis_collapses_to_valid():
+    """A partially valid *reduced* axis folds to a fully valid result, not a partial one."""
+    # valid [64, 40] of [64, 128]: row_sum reduces the partial column axis.
+    call = ir.op.tensor.row_sum(_partial_tensor_var([64, 128], [64, 40]))
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert _const_int_values(result_type.shape) == [64, 1]
+    # The reduction folded exactly the 40 real columns into one cell, so every cell of the
+    # [64, 1] result is real. Full validity is canonical, so no explicit view survives.
+    assert result_type.tensor_view is None or len(result_type.tensor_view.valid_shape) == 0
+
+
+def test_tensor_col_sum_preserves_non_reduced_axis_validity():
+    """col_sum reduces axis=-2; the surviving column axis keeps its partial validity."""
+    call = ir.op.tensor.col_sum(_partial_tensor_var([64, 128], [64, 40]))
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert _const_int_values(result_type.shape) == [1, 128]
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [1, 40]
+
+
+def test_tensor_reduction_rejects_empty_valid_extent():
+    """A provably zero valid extent has no real data to reduce."""
+    with pytest.raises(ValueError, match="valid extent on axis 1 is 0"):
+        ir.op.tensor.row_sum(_partial_tensor_var([64, 128], [64, 0]))
+
+
+def test_tensor_op_rejects_rank_mismatched_valid_shape():
+    """A valid_shape whose rank differs from the physical shape is rejected, not read past.
+
+    Consumers index the effective valid shape by physical axis, so a short valid_shape would
+    read out of bounds. The bounds verifier reports the same violation, but only over an
+    already-built program — this rejects at construction.
+    """
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(64, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+    bad = ir.Var(
+        "t",
+        ir.TensorType(dims, DataType.FP32, None, ir.TensorView([], ir.TensorLayout.ND, valid_shape=[40])),
+        span,
+    )
+
+    # col_sum reduces axis 0 and reads the (missing) axis-1 extent.
+    with pytest.raises(ValueError, match="valid_shape rank"):
+        ir.op.tensor.col_sum(bad)
+    # A unary op would otherwise forward the malformed region onto its result.
+    with pytest.raises(ValueError, match="valid_shape rank"):
+        ir.op.tensor.exp(bad)
+
+
+def test_tensor_reduction_no_keep_dim_returns_bare_scalar():
+    """A fully reduced tensor yields a ScalarType — no view metadata is manufactured.
+
+    ``ir.op.tensor.row_sum`` does not surface ``keep_dim``, so the op call is built directly to
+    reach the fully-reduced path.
+    """
+    span = ir.Span.unknown()
+    tensor_var = ir.Var(
+        "t",
+        ir.TensorType(
+            [ir.ConstInt(64, DataType.INT32, span)],
+            DataType.FP32,
+            None,
+            ir.TensorView([], ir.TensorLayout.ND, valid_shape=[40]),
+        ),
+        span,
+    )
+
+    call = ir.create_op_call("tensor.row_sum", [tensor_var], {"keep_dim": False}, span)
+    assert isinstance(call.type, ir.ScalarType)
+    assert call.type.dtype == DataType.FP32
+
+
 def test_tensor_row_argmax():
     """tensor.row_argmax reduces the last axis (keepdim) with an int32 index output."""
     span = ir.Span.unknown()
@@ -1476,6 +1640,175 @@ def test_tensor_reshape_dynamic():
     assert isinstance(result_type, ir.TensorType)
 
 
+class TestTensorReinterpretViewIR:
+    """IR semantics for tensor.reinterpret_view before public DSL lowering."""
+
+    @staticmethod
+    def _var(
+        shape: list[int],
+        dtype: DataType,
+        view: ir.TensorView | None = None,
+    ) -> ir.Var:
+        return ir.Var("src", ir.TensorType(shape, dtype, tensor_view=view), ir.Span.unknown())
+
+    @staticmethod
+    def _shape_values(result_type: ir.TensorType) -> list[int]:
+        return [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)]
+
+    def test_registered_and_auto_shape_nd(self):
+        assert ir.is_op_registered("tensor.reinterpret_view")
+
+        call = tensor.reinterpret_view(self._var([8, 16], DataType.FP32), DataType.INT16)
+
+        assert call.op.name == ir.get_op("tensor.reinterpret_view").name
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.dtype == DataType.INT16
+        assert self._shape_values(call.type) == [8, 32]
+
+    def test_rank_one_auto_shape(self):
+        call = tensor.reinterpret_view(self._var([16], DataType.FP32), DataType.INT16)
+
+        assert isinstance(call.type, ir.TensorType)
+        assert self._shape_values(call.type) == [32]
+
+    def test_auto_shape_dn_scales_penultimate_axis(self):
+        view = ir.TensorView([], ir.TensorLayout.DN)
+        call = tensor.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)
+
+        assert isinstance(call.type, ir.TensorType)
+        assert self._shape_values(call.type) == [16, 16]
+        assert call.type.tensor_view is not None
+        assert call.type.tensor_view.layout == ir.TensorLayout.DN
+
+    def test_preserves_explicit_packed_stride_in_target_elements(self):
+        view = ir.TensorView([1, 8], ir.TensorLayout.DN)
+        call = tensor.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)
+
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.tensor_view is not None
+        assert [dim.value for dim in call.type.tensor_view.stride if isinstance(dim, ir.ConstInt)] == [1, 16]
+
+    def test_explicit_byte_equivalent_shape(self):
+        call = tensor.reinterpret_view(
+            self._var([8, 16], DataType.FP32),
+            DataType.INT16,
+            shape=[4, 64],
+        )
+
+        assert isinstance(call.type, ir.TensorType)
+        assert self._shape_values(call.type) == [4, 64]
+
+    def test_explicit_shape_does_not_require_auto_axis_divisibility(self):
+        call = tensor.reinterpret_view(
+            self._var([2, 3], DataType.INT16),
+            DataType.FP32,
+            shape=[1, 3],
+        )
+
+        assert isinstance(call.type, ir.TensorType)
+        assert self._shape_values(call.type) == [1, 3]
+
+    def test_dynamic_explicit_shape_equal_to_auto_shape(self):
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+        dim16 = ir.ConstInt(16, DataType.INDEX, span)
+        dim32 = ir.ConstInt(32, DataType.INDEX, span)
+        src = ir.Var("src", ir.TensorType([n, dim16], DataType.FP32), span)
+
+        call = tensor.reinterpret_view(src, DataType.INT16, shape=[n, dim32])
+
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.shape[0] is n
+        assert isinstance(call.type.shape[1], ir.ConstInt)
+        assert call.type.shape[1].value == 32
+
+    @pytest.mark.parametrize(
+        ("source_pad", "expected_pad"),
+        [
+            (ir.PadValue.null, ir.PadValue.null),
+            (ir.PadValue.zero, ir.PadValue.zero),
+            (ir.PadValue.max, ir.PadValue.null),
+            (ir.PadValue.min, ir.PadValue.null),
+        ],
+    )
+    def test_normalizes_dtype_dependent_padding(self, source_pad, expected_pad):
+        view = ir.TensorView([], ir.TensorLayout.ND, pad=source_pad)
+
+        call = tensor.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)
+
+        assert isinstance(call.type, ir.TensorType)
+        result_pad = call.type.tensor_view.pad if call.type.tensor_view is not None else ir.PadValue.null
+        assert result_pad == expected_pad
+
+    def test_wider_dtype_auto_shape(self):
+        call = tensor.reinterpret_view(self._var([8, 16], DataType.INT16), DataType.FP32)
+
+        assert isinstance(call.type, ir.TensorType)
+        assert self._shape_values(call.type) == [8, 8]
+
+    def test_rejects_nondivisible_wider_dtype(self):
+        with pytest.raises(ValueError, match=r"dimension 1 .*not divisible by 2"):
+            tensor.reinterpret_view(self._var([8, 15], DataType.INT16), DataType.FP32)
+
+    def test_rejects_mismatched_explicit_byte_size(self):
+        with pytest.raises(ValueError, match=r"equal source and target byte sizes.*512 bytes.*256 bytes"):
+            tensor.reinterpret_view(
+                self._var([8, 16], DataType.FP32),
+                DataType.INT16,
+                shape=[8, 16],
+            )
+
+    def test_rejects_same_dtype(self):
+        with pytest.raises(ValueError, match="requires source and target dtypes to differ"):
+            tensor.reinterpret_view(self._var([8, 16], DataType.FP32), DataType.FP32)
+
+    def test_rejects_unsupported_subbyte_dtype(self):
+        with pytest.raises(ValueError, match="does not support target dtype"):
+            tensor.reinterpret_view(self._var([8, 16], DataType.FP32), DataType.INT4)
+
+    def test_rejects_strided_tensor(self):
+        view = ir.TensorView([32, 1], ir.TensorLayout.ND)
+        with pytest.raises(ValueError, match="only supports packed tensors"):
+            tensor.reinterpret_view(self._var([8, 16], DataType.FP32, view), DataType.INT16)
+
+
+class TestTensorReinterpretViewDSL:
+    """Public ``pl.tensor.reinterpret_view`` wrapper and export coverage."""
+
+    @staticmethod
+    def _tensor() -> pl.Tensor:
+        source = ir.Var("src", ir.TensorType([8, 16], DataType.FP32), ir.Span.unknown())
+        return pl.Tensor(expr=source)
+
+    def test_auto_shape_wrapper(self):
+        result = pl.tensor.reinterpret_view(self._tensor(), pl.INT16)
+
+        assert isinstance(result, pl.Tensor)
+        call = result.unwrap()
+        assert isinstance(call, ir.Call)
+        assert call.op.name == ir.get_op("tensor.reinterpret_view").name
+        assert len(call.args) == 1
+        assert call.kwargs == {"dtype": DataType.INT16}
+        assert isinstance(call.type, ir.TensorType)
+        assert [dim.value for dim in call.type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
+
+    def test_explicit_shape_wrapper(self):
+        result = pl.tensor.reinterpret_view(self._tensor(), pl.INT16, shape=[4, 64])
+
+        call = result.unwrap()
+        assert isinstance(call, ir.Call)
+        assert len(call.args) == 2
+        shape_arg = call.args[1]
+        assert isinstance(shape_arg, ir.MakeTuple)
+        assert [dim.value for dim in shape_arg.elements if isinstance(dim, ir.ConstInt)] == [4, 64]
+        assert isinstance(call.type, ir.TensorType)
+        assert [dim.value for dim in call.type.shape if isinstance(dim, ir.ConstInt)] == [4, 64]
+
+    def test_exported_from_tensor_namespace(self):
+        assert "reinterpret_view" in pl.tensor.__all__
+        assert hasattr(pl.tensor, "reinterpret_view")
+
+
 def test_tensor_transpose():
     """Test tensor.transpose operation."""
     span = ir.Span.unknown()
@@ -1667,7 +2000,7 @@ def test_tensor_transpose_explicit_valid_shape_not_swapped():
     rt = call.type
     assert isinstance(rt, ir.TensorType)
     assert rt.tensor_view is not None
-    assert _const_int_values(rt.tensor_view.valid_shape) == [16, 8]
+    assert list(rt.tensor_view.valid_shape) == []
     # Layout is still toggled to DN (trailing-two-dim transpose), and the
     # explicit-strides path also records swapped row-major strides.
     assert rt.tensor_view.layout == ir.TensorLayout.DN
@@ -1913,6 +2246,301 @@ def test_tensor_slice_pad_without_valid_shape_warns():
         pl.tensor.slice(tensor_arg, [8, 16], [0, 0], pad_value=pl.PadValue.zero)
 
 
+# ---------------------------------------------------------------------------
+# tensor.slice window-read valid-region intersection
+#
+# available    = clamp(source_valid - offset, 0, window)
+# result_valid = min(requested_valid, available)
+# ---------------------------------------------------------------------------
+
+
+def _partial_tensor_var(shape, valid_shape, pad=ir.PadValue.null, name="t"):
+    """Build a tensor Var whose tensor_view narrows it to `valid_shape`."""
+    span = ir.Span.unknown()
+    view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=valid_shape, pad=pad)
+    return ir.Var(name, ir.TensorType(shape, DataType.FP32, tensor_view=view), span)
+
+
+def _valid_of(result_type):
+    """Effective valid extents: the explicit view when set, else the shape."""
+    view = result_type.tensor_view
+    if view is None or not view.valid_shape:
+        return [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)]
+    return [d.value if isinstance(d, ir.ConstInt) else d for d in view.valid_shape]
+
+
+def test_tensor_slice_full_source_stays_fully_valid():
+    """A window inside a fully-valid source needs no valid_shape at all."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 32], [8, 0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    # Full validity is the redundant encoding, so the view collapses away.
+    assert result_type.tensor_view is None
+
+
+def test_tensor_slice_partial_source_narrows_result():
+    """A window over padding inherits the source's narrower validity."""
+    # Source is 64x64 but only 40x50 is real data; take a 32x32 window at 0,0.
+    tensor_var = _partial_tensor_var([64, 64], [40, 50])
+
+    call = ir.op.tensor.slice(tensor_var, [32, 32], [0, 0])
+
+    # min(40, 32) = 32 and min(50, 32) = 32 -> the window is entirely real data.
+    assert _valid_of(call.type) == [32, 32]
+
+    # Push the window out to where the source runs out of real rows.
+    call2 = ir.op.tensor.slice(tensor_var, [32, 32], [24, 32])
+
+    # rows: clamp(40 - 24, 0, 32) = 16;  cols: clamp(50 - 32, 0, 32) = 18
+    assert _valid_of(call2.type) == [16, 18]
+
+
+def test_tensor_slice_window_past_valid_region_is_wholly_invalid():
+    """A window starting past the source's valid rows has zero valid rows."""
+    tensor_var = _partial_tensor_var([64, 64], [16, 64])
+
+    call = ir.op.tensor.slice(tensor_var, [16, 64], [32, 0])
+
+    # clamp(16 - 32, 0, 16) = 0 -- saturated at zero, never negative.
+    assert _valid_of(call.type) == [0, 64]
+
+
+def test_tensor_slice_intersects_rather_than_replaces_explicit_valid_shape():
+    """An explicit valid_shape narrows the result but cannot widen it."""
+    tensor_var = _partial_tensor_var([64, 64], [20, 64])
+
+    # Ask for more rows than the source has: the request cannot widen the result.
+    widening = ir.op.tensor.slice(tensor_var, [32, 32], [0, 0], valid_shape=[32, 32])
+    assert _valid_of(widening.type) == [20, 32]
+
+    # Ask for fewer: the request wins, because it is the smaller of the two.
+    narrowing = ir.op.tensor.slice(tensor_var, [32, 32], [0, 0], valid_shape=[8, 4])
+    assert _valid_of(narrowing.type) == [8, 4]
+
+
+def test_tensor_slice_folds_constants_without_min_max_nesting():
+    """Static intersections fold to a plain ConstInt, not a min/max tree."""
+    tensor_var = _partial_tensor_var([64, 64], [40, 64])
+
+    call = ir.op.tensor.slice(tensor_var, [32, 64], [16, 0], valid_shape=[32, 64])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    view = result_type.tensor_view
+    assert view is not None
+    # clamp(40 - 16, 0, 32) = 24, intersected with the request 32 -> 24.
+    assert isinstance(view.valid_shape[0], ir.ConstInt)
+    assert view.valid_shape[0].value == 24
+
+
+def test_tensor_slice_symbolic_offset_keeps_the_in_bounds_contract():
+    """An unprovable in-bounds relation is the caller's contract, not a guess."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+    off = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 64], [off, 0])
+
+    # A non-clamping slice asserts offset + shape <= source, so a fully-valid
+    # source yields a fully-valid window and no guard expression is built.
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+def test_tensor_slice_symbolic_offset_still_intersects_a_partial_source():
+    """A partial source narrows even when the offset is symbolic."""
+    span = ir.Span.unknown()
+    tensor_var = _partial_tensor_var([64, 64], [40, 64])
+    off = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 64], [off, 0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    view = result_type.tensor_view
+    assert view is not None
+    # Cannot be folded, so the runtime guard survives into the type.
+    assert not isinstance(view.valid_shape[0], ir.ConstInt)
+
+
+def test_tensor_slice_rejects_static_out_of_bounds_window():
+    """A non-clamping slice that provably reads past the source is rejected."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="reads past the end of dimension 0"):
+        ir.op.tensor.slice(tensor_var, [32, 64], [48, 0])
+
+
+def test_tensor_slice_padded_window_with_a_declared_valid_shape_is_accepted():
+    """A padded fixed-width window is fine when the declared extent really fits.
+
+    PTO codegen emits the view shape already clamped to ``min(shape, parent -
+    offset)`` -- the strided-Tensor runtime enforces that bound -- so the window
+    never overhangs at runtime. What must fit is the extent actually read, which
+    is what ``valid_shape`` names. This is the standard padded-tile idiom.
+    """
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([96, 64], DataType.FP32), span)
+
+    # A 64-row window at row 64 of a 96-row source, reading the 32 rows that exist.
+    call = ir.op.tensor.slice(tensor_var, [64, 64], [64, 0], valid_shape=[32, 64])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [64, 64]
+    assert _valid_of(result_type) == [32, 64]
+
+    # Reading more than exists is still rejected: 64 + 40 > 96.
+    with pytest.raises(ValueError, match="reads past the end of dimension 0"):
+        ir.op.tensor.slice(tensor_var, [64, 64], [64, 0], valid_shape=[40, 64])
+
+
+def test_tensor_slice_rejects_negative_offset():
+    """A provably negative offset starts outside the source."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+    neg = ir.ConstInt(-8, DataType.INDEX, span)
+
+    with pytest.raises(ValueError, match="provably negative"):
+        ir.op.tensor.slice(tensor_var, [16, 64], [neg, 0])
+
+
+def test_tensor_slice_rejects_valid_shape_rank_mismatch():
+    """valid_shape must have one extent per window dimension."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+
+    with pytest.raises(ValueError, match="same rank"):
+        ir.op.tensor.slice(tensor_var, [16, 64], [0, 0], valid_shape=[16])
+
+
+def test_tensor_slice_clamp_narrows_at_the_row_edge():
+    """clamp=True sanctions a ragged window and cuts validity to the source."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([96, 64], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [64, 64], [64, 0], clamp=True)
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    # clamp(96 - 64, 0, 64) = 32 real rows behind a 64-row window.
+    assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [64, 64]
+    assert _valid_of(result_type) == [32, 64]
+
+
+def test_tensor_slice_clamp_narrows_at_the_col_edge():
+    """The clamp applies per dimension, so the column edge behaves the same."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 40], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [64, 32], [0, 16], clamp=True)
+
+    # clamp(40 - 16, 0, 32) = 24 real columns behind a 32-column window.
+    assert _valid_of(call.type) == [64, 24]
+
+
+def test_tensor_slice_clamp_is_a_no_op_for_an_in_bounds_window():
+    """Clamping an in-bounds window changes nothing."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 32], [8, 0], clamp=True)
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+def test_tensor_slice_drop_dims_allowed_when_axis_stays_fully_valid():
+    """A unit axis that survives the intersection intact can still be dropped."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
+    row = ir.Var("r", ir.ScalarType(DataType.INDEX), span)
+
+    # The canonical scalar-index read x[r, :]: a unit window on axis 0, erased.
+    call = ir.op.tensor.slice(tensor_var, [1, 64], [row, 0], drop_dims=[0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [64]
+    assert result_type.tensor_view is None
+
+
+def test_tensor_slice_drop_dims_rejected_when_axis_is_not_provably_valid():
+    """Rank reduction erases an axis, so the axis must have nothing left to say."""
+    # Only 8 real rows, and the clamped window starts at row 8 -> zero valid rows.
+    tensor_var = _partial_tensor_var([64, 64], [8, 64])
+
+    with pytest.raises(ValueError, match="not provably 1"):
+        ir.op.tensor.slice(tensor_var, [1, 64], [16, 0], drop_dims=[0])
+
+
+def test_tensor_slice_inherits_source_pad_mode():
+    """A read view over padded bytes keeps saying they are padded."""
+    tensor_var = _partial_tensor_var([64, 64], [40, 64], pad=ir.PadValue.zero)
+
+    call = ir.op.tensor.slice(tensor_var, [32, 64], [0, 0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    view = result_type.tensor_view
+    assert view is not None
+    assert view.pad == ir.PadValue.zero
+
+
+def test_tensor_slice_explicit_pad_value_overrides_the_source():
+    """An explicit pad_value still wins over the inherited one."""
+    tensor_var = _partial_tensor_var([64, 64], [40, 64], pad=ir.PadValue.zero)
+
+    call = tensor.slice(tensor_var, [32, 64], [0, 0], valid_shape=[16, 64], pad_value=ir.PadValue.min)
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    view = result_type.tensor_view
+    assert view is not None
+    assert view.pad == ir.PadValue.min
+
+
+def test_tensor_slice_lower_rank_window_keeps_its_valid_shape():
+    """A 2D window over a 3D parent is a reinterpreting view, not a rectangle.
+
+    Its dim correspondence is materialized as strides by OptimizeOrchTensors, so
+    intersecting it here would target the wrong axes; it keeps what it was given.
+    """
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([4, 128, 5120], DataType.FP32), span)
+
+    call = ir.op.tensor.slice(tensor_var, [16, 64], [0, 0, 0])
+
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [16, 64]
+    assert result_type.tensor_view is None
+
+
+def test_tensor_slice_clamped_window_print_parse_roundtrip():
+    """A clamped ragged slice survives python_print -> pl.parse -> python_print."""
+    src = (
+        "import pypto.language as pl\n\n"
+        "@pl.program\n"
+        "class P:\n"
+        "    @pl.function\n"
+        "    def main(self, x: pl.Tensor[[96, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:\n"
+        "        y: pl.Tensor[[64, 64], pl.FP32] = "
+        "pl.tensor.slice(x, [64, 64], [64, 0], clamp=True)\n"
+        "        return y\n"
+    )
+    prog = pl.parse(src)
+    reparsed = pl.parse(ir.python_print(prog))
+    ir.assert_structural_equal(reparsed, prog)
+
+
 def test_tensor_fillpad_clears_valid_shape():
     """Test tensor.fillpad materializes a full-valid tensor view."""
     span = ir.Span.unknown()
@@ -1933,11 +2561,7 @@ def test_tensor_fillpad_clears_valid_shape():
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
-    assert result_type.tensor_view is not None
-    assert result_type.tensor_view.layout == ir.TensorLayout.ND
-    assert len(result_type.tensor_view.valid_shape) == 2
-    assert result_type.tensor_view.valid_shape[0] == dim8
-    assert result_type.tensor_view.valid_shape[1] == dim16
+    assert result_type.tensor_view is None
 
 
 def test_tensor_fillpad_expand():
@@ -1968,9 +2592,7 @@ def test_tensor_fillpad_expand():
     assert cols.value == 128
     assert result_type.tensor_view is not None
     assert result_type.tensor_view.pad == ir.PadValue.zero
-    vrows = result_type.tensor_view.valid_shape[0]
-    assert isinstance(vrows, ir.ConstInt)
-    assert vrows.value == 64
+    assert list(result_type.tensor_view.valid_shape) == []
 
 
 def test_tensor_fillpad_expand_shrink_raises():
@@ -2072,15 +2694,15 @@ def test_tensor_set_validshape_preserves_existing_view():
     assert len(result_type.tensor_view.valid_shape) == 2
 
 
-def test_pl_tensor_as_layout_wrapper():
-    """pl.tensor.as_layout wraps the IR builder and returns a Tensor."""
+def test_pl_tensor_view_wrapper():
+    """pl.tensor.view wraps the IR builder and returns a Tensor."""
     src = pl.create_tensor([8, 4], pl.FP32)
-    result = pl.tensor.as_layout(src, ir.TensorLayout.DN)
+    result = pl.tensor.view(src, layout=ir.TensorLayout.DN)
 
     assert isinstance(result, pl.Tensor)
     call = result.unwrap()
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.as_layout"
+    assert call.op.name == ir.get_op("tensor.view").name
 
     # ND [8, 4] -> DN flips the trailing pair to [4, 8] (RFC #1300 §4.2).
     out_type = call.type
@@ -2092,10 +2714,10 @@ def test_pl_tensor_as_layout_wrapper():
     assert dims == [4, 8]
 
 
-def test_pl_tensor_as_layout_in_all():
-    """as_layout is reachable as a static attribute of the pl.tensor namespace."""
-    assert "as_layout" in pl.tensor.__all__
-    assert hasattr(pl.tensor, "as_layout")
+def test_pl_tensor_view_in_all():
+    """view is reachable as a static attribute of the pl.tensor namespace."""
+    assert "view" in pl.tensor.__all__
+    assert hasattr(pl.tensor, "view")
 
 
 def test_tensor_reshape_with_valid_shape():
@@ -2135,7 +2757,7 @@ def test_tensor_transpose_with_valid_shape():
     assert result_type.dtype == DataType.FP32
     assert len(call.args) == 4
     assert result_type.tensor_view is not None
-    assert len(result_type.tensor_view.valid_shape) == 2
+    assert len(result_type.tensor_view.valid_shape) == 0
 
 
 class TestTensorScalarMemoryOps:
@@ -3057,9 +3679,26 @@ def test_tensor_gather_rejects_bad_dim():
         ir.op.tensor.gather(inp, dim=2, index=idx)
 
 
-def test_tensor_gather_rejects_non_int32_index():
-    inp, idx = _make_gather_inputs(idx_dtype=DataType.INT16)
-    with pytest.raises(Exception, match=r"index dtype to be INT32"):
+def test_tensor_gather_accepts_int16_index_with_16bit_input():
+    """INT16 index is accepted when the input is a 16-bit dtype (FP16/INT16)."""
+    inp, idx = _make_gather_inputs(src_dtype=DataType.FP16, idx_dtype=DataType.INT16)
+    call = ir.op.tensor.gather(inp, dim=-1, index=idx)
+    assert call.op.name == "tensor.gather"
+    assert isinstance(call.type, ir.TensorType)
+    assert call.type.dtype == DataType.FP16
+
+
+def test_tensor_gather_rejects_int16_index_with_32bit_input():
+    """INT16 index with a 32-bit input is unsafe (tgather b32 reads it as u32)."""
+    inp, idx = _make_gather_inputs(src_dtype=DataType.FP32, idx_dtype=DataType.INT16)
+    with pytest.raises(Exception, match=r"16-bit input"):
+        ir.op.tensor.gather(inp, dim=-1, index=idx)
+
+
+def test_tensor_gather_rejects_non_int_index_dtype():
+    """A non-integer index dtype (FP32) is rejected outright."""
+    inp, idx = _make_gather_inputs(idx_dtype=DataType.FP32)
+    with pytest.raises(Exception, match=r"index dtype INT32"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 

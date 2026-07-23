@@ -9,9 +9,13 @@
 
 """Tests for system operation DSL parsing and round-trip."""
 
+import re
+
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.ir.op import system_ops
+from pypto.pypto_core import DataType
 
 
 class TestSystemOpsParsing:
@@ -52,6 +56,65 @@ class TestSystemOpsParsing:
 
         reparsed = pl.parse_program(printed)
         assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cross_core_sync_static_round_trip(self):
+        """Static cross-core event ids and pipe enums survive Python printing."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.sync_set(event_id=3, pipe=pl.PipeType.MTE3, ffts_mode=1)
+                pl.system.sync_wait(event_id=3, pipe=pl.PipeType.MTE2)
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.sync_set(pipe=pl.PipeType.MTE3, event_id=3, ffts_mode=1)" in printed
+        assert "pl.system.sync_wait(pipe=pl.PipeType.MTE2, event_id=3)" in printed
+
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_set_ffts_round_trip(self):
+        """The A3 FFTS workspace setup survives Python printing and reparsing."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(
+                self,
+                ffts_workspace: pl.Tensor[[256], pl.INT64],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.set_ffts(ffts_workspace)
+                pl.system.sync_wait(event_id=3, pipe=pl.PipeType.MTE2)
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.set_ffts(ffts_workspace)" in printed
+
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cross_core_sync_dynamic_round_trip(self):
+        """An index SSA event id is printed as the dynamic sync operand."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], event_id: pl.Scalar[pl.INDEX]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.sync_set(event_id, pipe=pl.PipeType.MTE3)
+                pl.system.sync_wait(event_id, pipe=pl.PipeType.MTE2)
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.sync_set(event_id, pipe=pl.PipeType.MTE3)" in printed
+        assert "pl.system.sync_wait(event_id, pipe=pl.PipeType.MTE2)" in printed
+
+        reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Before, reparsed)
 
     def test_bar_v_round_trip(self):
@@ -105,6 +168,73 @@ class TestSystemOpsParsing:
         assert isinstance(reparsed, ir.Program)
         ir.assert_structural_equal(Before, reparsed)
 
+    def test_fence_round_trip(self):
+        """Test round-trip for pl.system.fence."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.fence()
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.fence()" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_round_trip_scalar(self):
+        """Round-trip for the scalar-write (all-ones shapes) form."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.cacheinvalid(x, [1], [4])
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.cacheinvalid(x, [1], [4])" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_round_trip_region(self):
+        """Round-trip for the partition-view (region) form."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.system.cacheinvalid(x, [16, 16], [0, 0])
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.cacheinvalid(x, [16, 16], [0, 0])" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_rejects_float_offset(self):
+        """A non-integer offset is rejected at the IR wrapper, not deep in codegen."""
+        span = ir.Span.unknown()
+        dim = ir.ConstInt(64, DataType.INT32, span)
+        tensor = ir.Var("x", ir.TensorType([dim], DataType.FP32), span)
+        with pytest.raises(TypeError, match="offsets must be integers"):
+            system_ops.cacheinvalid(tensor, [1], [3.5])  # type: ignore[list-item]  # intentionally wrong type
+
+    def test_cacheinvalid_rejects_rank_mismatch(self):
+        """offsets/shapes length must match the tensor rank."""
+        span = ir.Span.unknown()
+        dim = ir.ConstInt(16, DataType.INT32, span)
+        tensor = ir.Var("x", ir.TensorType([dim, dim], DataType.FP32), span)
+        with pytest.raises(ValueError, match="offsets must match tensor rank 2"):
+            system_ops.cacheinvalid(tensor, [1, 1], [0])
+
     def test_syncall_round_trip(self):
         """Test round-trip for pl.system.syncall with an explicit core_type."""
 
@@ -116,7 +246,7 @@ class TestSystemOpsParsing:
                 return x
 
         printed = Before.as_python()
-        assert 'pl.system.syncall(core_type="aiv_only")' in printed
+        assert re.search(r"""pl\.system\.syncall\(core_type=(["'])aiv_only\1\)""", printed)
 
         reparsed = pl.parse_program(printed)
         assert isinstance(reparsed, ir.Program)
@@ -133,7 +263,7 @@ class TestSystemOpsParsing:
                 return x
 
         printed = Before.as_python()
-        assert 'pl.system.syncall(core_type="mix")' in printed
+        assert re.search(r"""pl\.system\.syncall\(core_type=(["'])mix\1\)""", printed)
 
         reparsed = pl.parse_program(printed)
         assert isinstance(reparsed, ir.Program)

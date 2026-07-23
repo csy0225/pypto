@@ -44,16 +44,16 @@ For each InCore function (InCore, AIC, AIV):
 
 1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D
 2. **Transform statements**: Walk function body and convert >2D tile ops to 2D, preserving any dynamic `valid_shape` (see [Dynamic valid_shape](#dynamic-tile-dimensions-issue-1578))
+3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks and codegen-ready transpose forms
 
 Per-statement handling:
 
 | Tile op | Transformation |
 | ------- | -------------- |
-| `tile.load` (>2D) | Change result type to 2D directly (load produces a 2D tile from a rank>2 tensor window) |
+| `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shapes to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
 | `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2 (e.g. a user-written `tile.reshape` to 3D feeding `pl.assemble` into an N-D tensor view), insert a `tile.reshape` to flatten the tile operand to 2D first — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
 | `tile.store` (2D tensor) | Pass through unchanged |
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
-| `tile.sum`/`tile.max`/`tile.min` (>2D) | Remap axis to 1 (last axis of 2D) |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
 | `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below) |
 | `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, slicing the (already-flattened) accumulator per batch index. Memory-space decisions on the accumulator (Vec/Acc round-trips, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 17) — flatten emits no inline `tile.move` |
@@ -70,12 +70,11 @@ a capacity gate) **and** this operand's whole load collapses contiguously
 - **whole (default):** the operand is brought whole into Mat once and
   per-batch **sliced** — a row slice for a plain (row-batched `[B*rows, cols]`)
   operand, a column slice for a `tile.transpose_view` (column-batched
-  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its ND
-  source window here; the hardware ND2NZ "2-dim GlobalTensor" collapse to
-  `[B*N, K]` is owned by the `tile.load` codegen — it fires when the load's result
-  is an NZ Mat tile and emits the 2D `make_tensor_view` there — so this pass only
-  flattens the load's **result tile** to 2D. A broadcast operand reuses its single
-  page.
+  `[K, B*N]`) operand. A natural Mat load of a 3D `[B, N, K]` tensor keeps its
+  logical ND source semantics here, but this pass inserts the 2D `tensor.view`
+  (`[B*N, K]`) before the load so downstream `tile.load` codegen sees the same
+  flattened source window as every other consumer. The pass also flattens the
+  load's **result tile** to 2D. A broadcast operand reuses its single page.
 - **per batch** (the whole tile would overflow L1, **or** the whole load is
   non-contiguous): re-emit the operand from its underlying natural `tile.load`
   one batch at a time (a per-batch `[1, .., X, Y]` window → 2D `[X, Y]`, using the
@@ -180,7 +179,19 @@ chunk the dynamic dim with `pl.range`/`pl.parallel`, or reshape to 2D before the
 
 **Header**: `include/pypto/ir/transforms/passes.h`
 
-**Implementation**: `src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp`
+The implementation is split by responsibility:
+
+| Phase | File | Responsibility |
+| ----- | ---- | -------------- |
+| Coordination | `src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp` | Select InCore functions and sequence analysis before rewrite |
+| Analysis | `src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp` | Read-only precondition validation |
+| Rewrite orchestration | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp` | Recursive statement traversal and operation dispatch |
+| Rewrite utilities | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp` | Shared shape, index, and capacity helpers |
+| Batched matmul rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp` | Batched matmul and matmul-acc page lowering |
+| Transpose rewrite | `src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp` | Standalone N-D transpose lowering |
+| Verification | `src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp` | Independent `TileOps2D` postcondition verification |
+
+The phase entry points and rewrite component interface are private to the transform implementation; the public API remains `pass::FlattenTileNdTo2D()`.
 
 **Python binding**: `python/bindings/modules/passes.cpp`
 

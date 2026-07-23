@@ -10,6 +10,8 @@
  */
 
 #include <any>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -21,7 +23,6 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
-#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -63,9 +64,9 @@ namespace {
   auto src_type = As<DistributedTensorType>(src->GetType());
   INTERNAL_CHECK_SPAN(src_type && src_type->window_buffer_.has_value(), old_var->span_)
       << "LowerHostTensorCollectives: collective alias source must carry a materialized WindowBuffer";
-  auto new_type = std::make_shared<const DistributedTensorType>(
-      lhs_type->shape_, lhs_type->dtype_, lhs_type->memref_, lhs_type->tensor_view_,
-      std::make_optional(src_type->window_buffer_.value()));
+  auto new_type =
+      std::make_shared<const DistributedTensorType>(lhs_type->shape_, lhs_type->dtype_, lhs_type->memref_,
+                                                    lhs_type->tensor_view_, src_type->window_buffer_);
   return std::make_shared<Var>(old_var->name_hint_, new_type, old_var->span_);
 }
 
@@ -118,7 +119,7 @@ void CheckStaticSignalCapacity(const CallPtr& call, const ExprPtr& signal_expr, 
 
 [[nodiscard]] CallPtr MakeBuiltinCallWithAttrs(const std::string& builtin_name, const CallPtr& call,
                                                const std::vector<ExprPtr>& args,
-                                               std::vector<std::pair<std::string, std::any>> kwargs,
+                                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                                                const ExprPtr& device,
                                                std::vector<std::pair<std::string, std::any>> attrs,
                                                std::vector<ArgDirection> arg_directions) {
@@ -142,7 +143,7 @@ void CheckStaticSignalCapacity(const CallPtr& call, const ExprPtr& signal_expr, 
       {"op", op_value},
       {"dtype", src_type->dtype_},
   };
-  return MakeBuiltinCallWithAttrs("builtin.tensor.allreduce", call, call->args_, std::move(kwargs), device,
+  return MakeBuiltinCallWithAttrs("builtin.tensor.allreduce", call, call->args_, kwargs, device,
                                   std::move(attrs), {ArgDirection::InOut, ArgDirection::InOut});
 }
 
@@ -162,7 +163,7 @@ void CheckStaticSignalCapacity(const CallPtr& call, const ExprPtr& signal_expr, 
       {"root", root_value},
       {"dtype", target_type->dtype_},
   };
-  return MakeBuiltinCallWithAttrs("builtin.tensor.broadcast", call, call->args_, std::move(kwargs), device,
+  return MakeBuiltinCallWithAttrs("builtin.tensor.broadcast", call, call->args_, kwargs, device,
                                   std::move(attrs), {ArgDirection::InOut, ArgDirection::InOut});
 }
 
@@ -179,20 +180,51 @@ void CheckStaticSignalCapacity(const CallPtr& call, const ExprPtr& signal_expr, 
       {"op", op_value},
       {"dtype", target_type->dtype_},
   };
-  return MakeBuiltinCallWithAttrs("builtin.tensor.reduce_scatter", call, call->args_, std::move(kwargs),
-                                  device, std::move(attrs), {ArgDirection::InOut, ArgDirection::InOut});
+  return MakeBuiltinCallWithAttrs("builtin.tensor.reduce_scatter", call, call->args_, kwargs, device,
+                                  std::move(attrs), {ArgDirection::InOut, ArgDirection::InOut});
+}
+
+void CheckDistinctInputTargetWindows(const CallPtr& call, const char* op_name) {
+  // After MaterializeCommDomainScopes, window views carry WindowBuffer
+  // back-references. Same-expression aliasing is already rejected in the type
+  // deducers; this catches two distinct pld.window(...) views over one alloc.
+  auto input_wb = GetWindowBuffer(call->args_[0], "input");
+  auto target_wb = GetWindowBuffer(call->args_[1], "target");
+  CHECK_SPAN(input_wb.get() != target_wb.get(), call->span_)
+      << op_name
+      << " input and target must be different window allocations "
+         "(two pld.window views over the same alloc_window_buffer are a "
+         "cross-process data race under in-kernel TPUT)";
 }
 
 [[nodiscard]] CallPtr MakeBuiltinAllGather(const CallPtr& call, const ExprPtr& device) {
-  // Staged allgather: each rank's chunk is pre-staged in the shared window by
-  // publish_step.  The allgather AIV kernel requires concurrent cross-chip
-  // dispatch (TNOTIFY / TWAIT / TLOAD), but LowerHostTensorCollectives emits
-  // per-device builtins sequentially in a world_size loop.  A barrier on the
-  // signal suffices to synchronise visibility of the pre-staged data;
-  // consume_step uses pld.tile.remote_load to gather from all peers.
-  auto signal = call->args_[1];
-  return MakeBuiltinCallWithAttrs("builtin.tensor.barrier", call, {signal}, {}, device, {},
-                                  {ArgDirection::InOut});
+  // Emit namesake builtin: in-kernel TPUT push (this rank's chunk from the
+  // `input` staging window into every peer's `target` window) + barrier
+  // (TNOTIFY / TWAIT), all in a single AIV kernel. `input` and `target`
+  // must be two DISTINCT windows. All chips must run concurrently — the
+  // host orchestrator submits asynchronously.
+  CheckDistinctInputTargetWindows(call, "pld.tensor.allgather");
+  auto target_type = As<DistributedTensorType>(call->args_[1]->GetType());
+  return MakeBuiltinCallWithAttrs(
+      "builtin.tensor.allgather", call,
+      {call->args_[0], call->args_[1], call->args_[2]},  // (input, target, signal)
+      {{"dtype", target_type->dtype_}}, device, {{"dtype", target_type->dtype_}},
+      {ArgDirection::Input, ArgDirection::InOut, ArgDirection::InOut});
+}
+
+[[nodiscard]] CallPtr MakeBuiltinAllToAll(const CallPtr& call, const ExprPtr& device) {
+  // Emit namesake builtin: in-kernel TPUT push (this rank's chunks from the
+  // `input` staging window into every peer's `target` window) + barrier
+  // (TNOTIFY / TWAIT), all in a single AIV kernel. `input` and `target` must
+  // be two DISTINCT windows. All chips must run concurrently — the host
+  // orchestrator submits asynchronously.
+  CheckDistinctInputTargetWindows(call, "pld.tensor.all_to_all");
+  auto target_type = As<DistributedTensorType>(call->args_[1]->GetType());
+  return MakeBuiltinCallWithAttrs(
+      "builtin.tensor.all_to_all", call,
+      {call->args_[0], call->args_[1], call->args_[2]},  // (input, target, signal)
+      {{"dtype", target_type->dtype_}}, device, {{"dtype", target_type->dtype_}},
+      {ArgDirection::Input, ArgDirection::InOut, ArgDirection::InOut});
 }
 
 struct HostCollectiveRule {
@@ -253,12 +285,26 @@ struct HostCollectiveRule {
           &MakeBuiltinAllGather,
           [](const CallPtr& call) {
             return std::vector<WindowBufferPtr>{
-                GetWindowBuffer(call->args_[0], "allgather target"),
-                GetWindowBuffer(call->args_[1], "allgather signal"),
+                GetWindowBuffer(call->args_[0], "allgather input"),
+                GetWindowBuffer(call->args_[1], "allgather target"),
+                GetWindowBuffer(call->args_[2], "allgather signal"),
             };
           },
-          [](const CallPtr& call) { return call->args_[1]; },
-          [](const CallPtr& call) -> std::optional<ExprPtr> { return call->args_[0]; },
+          [](const CallPtr& call) { return call->args_[2]; },
+          [](const CallPtr& call) -> std::optional<ExprPtr> { return call->args_[1]; },
+      },
+      {
+          "pld.tensor.all_to_all",
+          &MakeBuiltinAllToAll,
+          [](const CallPtr& call) {
+            return std::vector<WindowBufferPtr>{
+                GetWindowBuffer(call->args_[0], "all_to_all input"),
+                GetWindowBuffer(call->args_[1], "all_to_all target"),
+                GetWindowBuffer(call->args_[2], "all_to_all signal"),
+            };
+          },
+          [](const CallPtr& call) { return call->args_[2]; },
+          [](const CallPtr& call) -> std::optional<ExprPtr> { return call->args_[1]; },
       },
   };
   for (const auto& rule : kRules) {

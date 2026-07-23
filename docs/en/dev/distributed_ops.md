@@ -33,7 +33,7 @@ There are **twelve ops** and **four ABI enums**:
 | `pld.tensor.broadcast` | replicate root rank's data to all ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
-| `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite |
+| `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 
@@ -264,28 +264,44 @@ keyword attributes.
 ### `pld.tensor.allreduce`
 
 ```text
-pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
-pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
+pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
+pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
 ```
 
 Reduces every participating rank's window-bound `src` slice in place and returns
-the same type as `src`. Host-orchestrator user code may omit `signal` outside
-`for` and `while` loops; the
-[`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md) pass
-inserts a private INT32 signal window with semantic shape `[world_size, 1]` for
-that call. The pass binds `world_size = pld.world_size()` as a standalone
-statement and uses that variable in the synthesized buffer size and window
-shape.
-All calls in loops are rejected because the current signal protocol is
-single-use. Explicit `signal` remains the
-internal form used by InCore lowering and by tests that intentionally construct
-the internal protocol. Comm-domain materialisation then keeps the signal buffer
-in the same domain as `src`, even when it is not passed to a user chip kernel.
-The public op currently accepts `ReduceOp.Sum` and rejects the reserved reduce
-variants (`Max`, `Min`, `Prod`) until their lowerings land. The host builtin
-lowering path currently supports the `Sum` + FP32 variant and accepts either a
-rank-1 `[world_size]` signal or the synthesized rank-2 `[world_size, 1]`
-signal.
+the same type as `src`. The `mode` keyword selects the lowering algorithm:
+
+For mesh lowering, a partial `TensorView.valid_shape` is preserved for packed ND
+targets when its valid box can be represented by collapsing the leading dimensions
+to one 2D rectangle; only that rectangle is reduced. Strided targets, DN partial
+views, and non-representable partial boxes are rejected explicitly.
+
+- **`"mesh"` (default)** — direct all-to-all exchange with O(P) HCCL windows.
+  Signal shape `[NR, 1]` (one cell per rank).  4-phase decomposition: notify-all
+  (Set 1) / wait-all (Ge 1) / remote_load+accumulate / store-back with a
+  post-reduce WAR-guard barrier (AtomicAdd 1 → Ge 2).
+- **`"ring"`** — NCCL-style chunked reduce-scatter + allgather schedule with
+  O(1) HCCL windows.  Signal shape `[2 * (NR − 1), NR]` (one row per ring
+  round, one cell per rank).  2(P−1) ring steps with per-round barriers
+  (AtomicAdd 1 → Ge 1).  Chunk size = `SIZE // NR`, and `SIZE` must be an exact
+  multiple of `NR`; `LowerCompositeOps` constant-folds the chunk size when both
+  `SIZE` and `NR` are compile-time constants.
+
+Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
+the [`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md)
+pass inserts a private INT32 signal window with semantic shape `[world_size, 1]`
+for that call (mesh mode only — `mode="ring"` requires an explicit signal). The
+pass binds `world_size = pld.world_size()` as a standalone statement and uses
+that variable in the synthesized buffer size and window shape. All calls in
+loops are rejected because the current signal protocol is single-use. Explicit
+`signal` remains the internal form used by InCore lowering and by tests that
+intentionally construct the internal protocol. Comm-domain materialisation then
+keeps the signal buffer in the same domain as `src`, even when it is not passed
+to a user chip kernel. The public op currently accepts `ReduceOp.Sum` and
+rejects the reserved reduce variants (`Max`, `Min`, `Prod`) until their
+lowerings land. The host builtin lowering path currently supports the `Sum` +
+FP32 variant and accepts either a rank-1 `[world_size]` signal or the
+synthesized rank-2 `[world_size, 1]` signal.
 
 ### `pld.system.notify` (TNOTIFY)
 
@@ -355,7 +371,8 @@ dispatches before the final `Simplify`.
   **P=4** on any four devices (e.g. `--device=0,1,2,3` or `--device=0-3`)),
   `test_l3_allgather.py`, `test_l3_reduce_scatter.py`, `test_l3_broadcast.py`
   (each likewise dynamic-NR, P=2/P=4),
-  `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_host_tensor_allreduce.py`,
+  `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_tensor_allreduce_ring_intrinsic.py`,
+  `test_l3_allreduce_ring.py` (hand-rolled ring RS+AG), `test_l3_host_tensor_allreduce.py`,
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
   under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
   enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and

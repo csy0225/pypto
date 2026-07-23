@@ -453,7 +453,7 @@ std::vector<StmtPtr> SpliceInlineCallAsAssign(const FunctionPtr& callee, const s
   return std::move(body.stmts);
 }
 
-// Splice a multi-return call without emitting `LHS = MakeTuple(values)`.
+// Splice a tuple-return call without emitting `LHS = MakeTuple(values)`.
 // Instead, hands back the cloned return values via `out_substitution` so the
 // caller (the InlineCallsMutator) can substitute downstream
 // `TupleGetItemExpr(LHS, i)` uses with `values[i]` directly.
@@ -471,11 +471,36 @@ std::vector<StmtPtr> SpliceInlineCallAsTupleSub(const FunctionPtr& callee, const
       << "Internal error: inline function '" << callee->name_
       << "' is called for its value but has no return statement (parser should reject "
          "value-use of a void inline function before InlineFunctions runs)";
-  INTERNAL_CHECK_SPAN(body.return_values.size() > 1, callee->span_)
-      << "Internal error: SpliceInlineCallAsTupleSub requires multi-return callee; got "
-      << body.return_values.size() << " return value for '" << callee->name_
-      << "' (caller dispatches single-return through SpliceInlineCallAsAssign)";
-  out_substitution = std::move(body.return_values);
+  if (body.return_values.size() > 1) {
+    out_substitution = std::move(body.return_values);
+    return std::move(body.stmts);
+  }
+
+  // Python may return a tuple through a temporary (`tmp = (a, b); return
+  // tmp`) rather than directly as `return a, b`. Inline it as individual
+  // elements too: leaving `lhs = tmp` would make the later TupleGetItemExpr
+  // uses invisible to tuple_subs_ and leave a MakeTuple for codegen.
+  INTERNAL_CHECK_SPAN(body.return_values.size() == 1, callee->span_)
+      << "Internal error: tuple-return inline function '" << callee->name_ << "' has no return value";
+  if (auto tuple = As<MakeTuple>(body.return_values[0])) {
+    out_substitution = tuple->elements_;
+    return std::move(body.stmts);
+  }
+  if (auto returned_var = As<Var>(body.return_values[0])) {
+    for (size_t i = body.stmts.size(); i-- > 0;) {
+      auto assign = As<AssignStmt>(body.stmts[i]);
+      if (assign && assign->var_.get() == returned_var.get()) {
+        if (auto tuple = As<MakeTuple>(assign->value_)) {
+          out_substitution = tuple->elements_;
+          body.stmts.erase(body.stmts.begin() + static_cast<std::ptrdiff_t>(i));
+          return std::move(body.stmts);
+        }
+      }
+    }
+  }
+  INTERNAL_CHECK_SPAN(false, callee->span_) << "Inline function '" << callee->name_
+                                            << "' returns a tuple through an unsupported expression; return "
+                                               "its elements directly or via a tuple literal";
   return std::move(body.stmts);
 }
 
@@ -494,6 +519,18 @@ std::vector<StmtPtr> SpliceInlineCallAsReturn(const FunctionPtr& callee, const s
          "value-use of a void inline function before InlineFunctions runs)";
   body.stmts.push_back(std::make_shared<const ReturnStmt>(std::move(body.return_values), call_site_span));
   return std::move(body.stmts);
+}
+
+bool InlineReturnsTuple(const FunctionPtr& callee) {
+  StmtPtr body = callee->body_;
+  if (auto seq = As<SeqStmts>(body)) {
+    if (seq->stmts_.empty()) return false;
+    body = seq->stmts_.back();
+  }
+  auto ret = As<ReturnStmt>(body);
+  if (!ret) return false;
+  return ret->value_.size() > 1 ||
+         (ret->value_.size() == 1 && ret->value_[0] && As<TupleType>(ret->value_[0]->GetType()));
 }
 
 // =============================================================================
@@ -748,13 +785,15 @@ class InlineCallsMutator : public IRMutator {
     return spliced;
   }
 
-  // Dispatch on callee return arity: single-return → `LHS = value` AssignStmt;
-  // multi-return → record `LHS → values` for downstream TupleGetItemExpr
-  // substitution and emit no LHS assignment.
+  // Dispatch on the trailing ReturnStmt: single-return → `LHS = value`
+  // AssignStmt; tuple-return → record `LHS → values` for downstream
+  // TupleGetItemExpr substitution and emit no LHS assignment.  Do not use
+  // Function::return_types_ here: an annotation such as ``tuple[T, Scalar]``
+  // is one TupleType entry even though the IR ReturnStmt has two values.
   std::vector<StmtPtr> SpliceAssignCallSite(const FunctionPtr& callee, const std::vector<ExprPtr>& args,
                                             const VarPtr& lhs, const Span& span,
                                             bool add_runtime_scope = false) {
-    if (callee->return_types_.size() > 1) {
+    if (InlineReturnsTuple(callee)) {
       std::vector<ExprPtr> sub;
       auto stmts = SpliceInlineCallAsTupleSub(callee, args, sub, add_runtime_scope, program_);
       tuple_subs_[lhs.get()] = std::move(sub);

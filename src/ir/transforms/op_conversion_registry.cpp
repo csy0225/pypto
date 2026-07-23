@@ -172,6 +172,7 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.expands", "tile.expands");
 
   RegisterSimple("tensor.reshape", "tile.reshape");
+  RegisterSimple("tensor.reinterpret_view", "tile.reinterpret_view");
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure
   // codegen detail, not a semantic operand: FlattenTileNdTo2D is the sole owner of scratch
@@ -1376,6 +1377,18 @@ void OpConversionRegistry::RegisterGatherOps() {
         //   out_row  = gather(inp_flat, flat_idx) → [1, I2]
         // ================================================================
         if (rank == 3 && norm_dim == 0) {
+          // The flat-index lowering computes `idx_row * S2 + offset` in INT32 and
+          // feeds that INT32 flat index into tile.gather. That only matches the
+          // tgather b32 form (32-bit src, indices read as u32); a 2-byte src would
+          // require the b16 form with 2-byte indices, which the flat index cannot
+          // satisfy. Reject 16-bit src here rather than emit a width-mismatched
+          // (silently corrupt) gather. Full 16-bit-src support would mirror the
+          // scatter lowering (INT16 range tile + tile.cast narrow).
+          CHECK_SPAN(input_dtype == DataType::FP32 || input_dtype == DataType::INT32, span)
+              << "tensor.gather: rank-3 gather on dim 0 uses an INT32 flat index that only "
+                 "matches the tgather b32 form (32-bit src); 16-bit src is not yet supported "
+                 "on this axis. Got input dtype "
+              << input_dtype.ToString();
           int64_t S0 = get_const(input_shape[0], "input.shape[0]");
           int64_t S2 = get_const(input_shape[2], "input.shape[2]");
           int64_t I0 = get_const(index_shape[0], "index.shape[0]");
@@ -1436,6 +1449,14 @@ void OpConversionRegistry::RegisterGatherOps() {
         // ================================================================
         CHECK_SPAN(rank == 3 && norm_dim == 1, span) << "tensor.gather: unsupported (rank, dim) combination, "
                                                      << "got rank=" << rank << " norm_dim=" << norm_dim;
+
+        // Same flat-index/INT32 limitation as the dim==0 case above — only the
+        // tgather b32 form (32-bit src) is reachable. See that case for rationale.
+        CHECK_SPAN(input_dtype == DataType::FP32 || input_dtype == DataType::INT32, span)
+            << "tensor.gather: rank-3 gather on dim 1 uses an INT32 flat index that only "
+               "matches the tgather b32 form (32-bit src); 16-bit src is not yet supported "
+               "on this axis. Got input dtype "
+            << input_dtype.ToString();
 
         {
           int64_t I0 = get_const(index_shape[0], "index.shape[0]");
@@ -2322,15 +2343,17 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
 // AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 18).
 //
-// Memory-space re-attachment. The tile-level split deducer (DeduceSplitReshape)
-// intentionally drops the boundary memory space (returns a TileType with a null
-// memref / null memory_space), because the deduction fixpoint must not inherit an
-// input-side layout. The AUTO path restores it in ReshapeTypeWithMemory:
-//   * C->V aiv_shard  -> the move's Vec DESTINATION memory.
-//   * V->C aic_gather -> the Vec half-tile SOURCE memory (inherit input side).
-// Both boundaries resolve to MemorySpace::Vec (verified against the AUTO oracle:
-// _shard_vec / _gather_vec in test_lower_auto_vector_split.py both assert Vec),
-// so this converter re-attaches Vec to the deduced half/full type.
+// Boundary memory space. The tile-level split deducer (DeduceSplitReshape)
+// intentionally leaves it null (returns a TileType with a null memref / null
+// memory_space), because the deduction fixpoint must not inherit an input-side
+// layout. OpRegistry::Create then fills that null from the CONSUMER-side memory
+// the tile op declares via set_output_memory (cross_core.cpp): Vec for the C->V
+// aiv_shard (AIV pops into UB), Mat for the V->C aic_gather (AIC pops into L1).
+// So this converter attaches nothing of its own — it just asserts the space
+// arrived. LowerAutoVectorSplit builds its boundary ops through the same Create,
+// which is what keeps the two paths from drifting apart; this converter used to
+// hard-code Vec for both directions, which made the gather's declared type
+// disagree with the Mat tpop ExpandMixedKernel actually emits.
 //
 // No InputSpaceReq. The realistic (region-only) operand is an on-chip tile — a
 // cube (Mat/Acc) matmul result for aiv_shard, a Vec vector-compute result for
@@ -2352,13 +2375,18 @@ void OpConversionRegistry::RegisterCrossCoreOps() {
       // args[0] is already tile-typed here (its producer lowered earlier in this
       // pass); the tile deducer forwards the "split" attr and halves/doubles the
       // split-axis extent.
+      // The boundary memory needs no re-attachment here: the split deducer leaves
+      // the space null, and Create fills it from the tile op's set_output_memory
+      // declaration (Vec for the shard, Mat for the gather). LowerAutoVectorSplit
+      // builds its aiv_shard / aic_gather through the same Create, so both paths
+      // read one declaration and cannot drift apart.
       auto call = op_reg.Create(tile_op, args, kwargs, span);
       auto tt = As<TileType>(call->GetType());
-      INTERNAL_CHECK_SPAN(tt, span) << "Internal error: " << tile_op << " must deduce a TileType";
-      // Re-attach the vector-side (Vec) boundary memory the split deducer drops.
-      auto typed =
-          std::make_shared<TileType>(tt->shape_, tt->dtype_, tt->memref_, tt->tile_view_, MemorySpace::Vec);
-      return ConversionResult{std::make_shared<Call>(call->op_, call->args_, call->kwargs_, typed, span)};
+      INTERNAL_CHECK_SPAN(tt && tt->memory_space_.has_value(), span)
+          << "Internal error: OpRegistry::Create left " << tile_op
+          << " without a memory space; it must fill the space-less deduced TileType from the op's "
+             "set_output_memory declaration";
+      return ConversionResult{call};
     };
   };
   RegisterCustom("tensor.aiv_shard", convert("tile.aiv_shard"));

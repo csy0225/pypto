@@ -10,7 +10,7 @@
 """Re-execute an existing ``build_output/<jit_dir>/`` directory.
 
 Debug-only entry point for the "I edited a kernel cpp by hand, now re-run
-with DFX (PMU / swimlane / dump_tensor / dep_gen / scope_stats) enabled" workflow.
+with DFX (PMU / swimlane / args_dump / dep_gen / scope_stats) enabled" workflow.
 
 Reuses :func:`pypto.runtime.runner.execute_compiled`, so the device-side
 execution path is identical to the normal :func:`pypto.runtime.run` flow.
@@ -227,7 +227,6 @@ def replay(
             list(tensors),
             platform=config.platform,
             device_id=config.device_id,
-            pto_isa_commit=config.pto_isa_commit,
             dfx=_DfxOpts.from_run_config(config),
         )
 
@@ -336,13 +335,13 @@ def _main(
     parser.add_argument("--pmu", type=int, default=0, metavar="LEVEL", help="PMU level")
     parser.add_argument("--swimlane", action="store_true", help="Enable L2 swimlane capture")
     parser.add_argument(
-        "--dump-tensor",
+        "--dump-args",
         nargs="?",
         type=int,
         const=1,
         default=0,
         metavar="LEVEL",
-        help="Per-task tensor dump level: bare flag = 1 (partial, dump_tag-marked), "
+        help="Per-task argument dump level: bare flag = 1 (partial, dump_tag-marked), "
         "2 = full (every task), absent = 0 (off)",
     )
     parser.add_argument("--dep-gen", action="store_true", help="Enable dep_gen profiling")
@@ -403,7 +402,7 @@ def _main(
         device_id=args.device_id,
         enable_pmu=args.pmu,
         enable_l2_swimlane=args.swimlane,
-        enable_dump_tensor=args.dump_tensor,
+        enable_dump_args=args.dump_args,
         enable_dep_gen=args.dep_gen,
         enable_scope_stats=args.scope_stats,
     )

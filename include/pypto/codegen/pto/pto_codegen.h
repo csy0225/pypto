@@ -312,6 +312,17 @@ class PTOCodegen : public CodegenBase {
   std::string GetTileBufTypeStringFromTileType(const std::shared_ptr<const ir::TileType>& tile_type) const;
 
   /**
+   * @brief tile_buf type string for a VIEW result (`pto.treshape`).
+   *
+   * Same as GetTileBufTypeStringFromTileType but renders STATIC valid dims when
+   * they are statically known. A view op takes no `valid_row` / `valid_col`
+   * operands, so ptoas builds its destination tile from the result type alone; a
+   * `v_row=?, v_col=?` result would leave the tile's valid extent at zero.
+   */
+  std::string GetViewTileBufTypeStringFromTileType(
+      const std::shared_ptr<const ir::TileType>& tile_type) const;
+
+  /**
    * @brief Allocate a new tile buffer for codegen (emitted at function scope)
    *
    * Used when an operation needs a distinct output buffer (e.g., reshape where
@@ -378,6 +389,19 @@ class PTOCodegen : public CodegenBase {
     std::string materialize_target_ssa;
     std::string materialize_target_type;
     std::optional<ir::MemorySpace> source_memory_space;
+    /// Column count of the tile the subview is taken of, and the subview's own
+    /// shape. The materialize target inherits the source's buffer, so the lazy
+    /// pto.textract writes into its own input: it is only safe when the window is
+    /// contiguous (view_rows == 1 or view_cols == source_cols) and the repack is
+    /// therefore an identity copy. See MaterializeSubviewOperandIfNeeded (#2010).
+    int64_t source_cols = 0;
+    int64_t view_rows = 0;
+    int64_t view_cols = 0;
+    /// Both slice offset components are ConstInt. A dynamic offset cannot be
+    /// folded into the inherited buffer's address, which then falls back to the
+    /// bare source base — so even a contiguous window would be extracted onto the
+    /// source's row 0. See MaterializeSubviewOperandIfNeeded (#1640).
+    bool const_offset = false;
     bool emitted = false;
   };
   void RegisterSubviewMaterialization(const std::string& subview_ssa, const SubviewMaterializationInfo& info);
@@ -536,6 +560,15 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetGMSlotBufferSSAForPipe(int pipe_id, int dir_mask);
 
   /**
+   * @brief Whether physical addresses are baked into the emitted PTO.
+   *
+   * False under `memory_planner=PtoAS` (--pto-level=level2), where ptoas
+   * PlanMemory owns local-memory placement: `pto.alloc_tile` omits `addr` and
+   * `pto.reserve_buffer` is emitted as `auto = true` with no `base`.
+   */
+  [[nodiscard]] bool EmitTileAddr() const { return emit_tile_addr_; }
+
+  /**
    * @brief Check if the current function is an AIC (Cube) function
    */
   [[nodiscard]] bool IsAICFunction() const;
@@ -687,6 +720,26 @@ class PTOCodegen : public CodegenBase {
   AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type);
 
   /**
+   * @brief The tile_buf handle already bound to the buffer `memref` denotes.
+   *
+   * Only meaningful under the PTOAS memory planner (`emit_tile_addr_ == false`),
+   * where variables denoting the same buffer must share one handle because
+   * there is no baked `addr` to alias through. Returns "" when addresses are
+   * baked, when `memref` is null, or when no handle is bound yet.
+   */
+  [[nodiscard]] std::string TryGetSharedTileBufHandle(const ir::MemRefPtr& memref) const;
+
+  /**
+   * @brief Declare `ssa_name`'s `pto.alloc_tile` in the function head.
+   *
+   * The head prologue is rendered after the body and prepended, so a handle
+   * declared here dominates every use — including uses inside `scf.if` branches
+   * and reads after the region. Returns false (and declares nothing) when the
+   * handle already has an `alloc_tile`.
+   */
+  bool DeclareTileBufAtHead(const std::string& ssa_name, const AllocTileFields& fields);
+
+  /**
    * @brief Emit alloc_tile for dynamically allocated tile buffers (e.g., reshape outputs)
    */
   void EmitExtraAllocTiles();
@@ -743,6 +796,15 @@ class PTOCodegen : public CodegenBase {
     /// PlanMemory keeps them one buffer. Views (same base, different
     /// offset/size) get distinct keys and are never merged.
     std::map<std::string, std::string> memref_identity_to_mlir;
+    /// MemRef-identity key -> the tile_buf type of the first var bound to it.
+    std::map<std::string, std::string> memref_identity_type;
+    /// MemRef-identity keys whose vars do NOT all share one tile_buf type — e.g.
+    /// a `[1, N]` row-major op result and its `[N, 1]` col-major reshape view,
+    /// which occupy the same bytes. Their shared handle carries exactly one type
+    /// (differently-typed reads become `pto.treshape` views of it), so it must
+    /// never be re-typed to suit another var. `TryGetSharedTileBufHandle` refuses
+    /// these identities.
+    std::set<std::string> memref_identity_mixed_types;
     /// alloc_tile SSA handles already emitted — dedups the alloc when several
     /// vars share one handle (PTOAS in-place aliasing).
     std::set<std::string> emitted_tile_alloc_names;
@@ -755,6 +817,7 @@ class PTOCodegen : public CodegenBase {
     std::string gm_slot_buffer_ssa;
     DataType gm_slot_buffer_dtype = DataType::FP32;
     std::map<std::pair<int, int>, std::string> gm_slot_buffer_region_by_pipe;
+    std::set<const ir::Var*> ffts_workspace_vars;
 
     /// SSA names of the synthetic SPMD block_idx/block_num params, appended at
     /// the func.func signature tail. Empty when the current function does not
@@ -805,6 +868,8 @@ class PTOCodegen : public CodegenBase {
       tile_var_allocs.clear();
       emitted_tile_alloc_vars.clear();
       memref_identity_to_mlir.clear();
+      memref_identity_type.clear();
+      memref_identity_mixed_types.clear();
       emitted_tile_alloc_names.clear();
 
       current_function.reset();
@@ -815,6 +880,7 @@ class PTOCodegen : public CodegenBase {
       gm_slot_buffer_ssa.clear();
       gm_slot_buffer_dtype = DataType::FP32;
       gm_slot_buffer_region_by_pipe.clear();
+      ffts_workspace_vars.clear();
 
       spmd_block_idx_arg.clear();
       spmd_block_num_arg.clear();

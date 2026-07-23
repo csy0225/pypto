@@ -6,6 +6,8 @@
 
 例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
 
+同样，判断一个 `ForStmt` iter_arg 是否需要物化 carry 变量，过去要在循环体上跑别名等价不动点。[`ClassifyIterArgCarry`](../passes/42-classify_iter_arg_carry.md) pass 现在把该判定（以及 TaskId fence 数组的 extent）打在 `ForStmt::attrs_` 上，codegen 直接读 `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>`，不再自行推导。
+
 ## 概述
 
 编排代码生成器（Orchestration Codegen）生成 PTO2 运行时 C++ 代码，用于管理昇腾硬件上的任务图执行。[PTO 代码生成](00-pto_codegen.md)产生 InCore 核函数代码（Tile 级计算），而编排代码生成器产生主机侧代码，负责：
@@ -186,13 +188,18 @@ Arg params_t1;
 params_t1.add_input(ext_output);  // result -> ext_output（无别名声明）
 ```
 
-结果别名到哪个 `Out`/`InOut` 参数是查表而非启发式：流水线 IR 满足
+结果别名到哪个 `Out`/`InOut` 参数是查表而非启发式——也不是分析。
 `ReturnParamsExplicit` 属性
-（[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)），
-`FindReturnedParamIndex` 通过 `ir::return_lineage` 以指针同一性把每个返回值解析到参数。旧的血缘追踪（Var 到 Var 别名、循环 carry、builtin 回
-写、tuple 调用的 `TupleGetItem`、Group/Spmd 包装函数）仅保留给手工解析的
-IR。当追踪不到任何参数时，仅在被调用者恰好只有一个 `Out`/`InOut` 时单返回
-值才回退到该唯一参数——多输出且无法追踪是内部错误，绝不猜测。
+（[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)）保证：
+每个"写回参数"的张量返回值**就是**该参数本身（指针同一性）。因此 codegen 直接
+从被调用者的 `ReturnStmt` 上读取"返回位置 → 参数下标"映射
+（`ir::return_lineage::ExplicitReturnedParamIndices`）：无需 SSA 遍历、无需递归
+进入被调用者、无需 `Program`。跨函数的血缘追踪器（`ReturnedParamIndices`）留在
+IR 层，只服务于在该属性建立**之前**运行的那些 pass。
+
+因此该属性是 codegen 的前置条件。当某个返回位置解析不到参数时，仅在被调用者恰好
+只有一个 `Out`/`InOut` 时单返回值才回退到该唯一参数——多输出的被调用者若其
+`ReturnStmt` 未直接引用参数，则是内部错误，绝不猜测。
 
 不参与重映射的情形：phi/循环 carry 的重赋值（它重新绑定外层 `if`/循环所拥有的左值）
 保留 `<name> = <src>;` 形式；源在读取者的 C++ 作用域中无效的张量（manual scope 局部
@@ -249,7 +256,28 @@ rt_submit_task(mixed_0, params_t0);
 | `tensor.slice` | `make_tensor_external(ptr + byte_offset, ...)` | 创建现有张量的视图 |
 | `tensor.transpose` | `Tensor xt = ext_x.transpose(axis1, axis2)` | 零拷贝交换两个维度的元数据（lower 到运行时 `Tensor::transpose`） |
 | `tensor.dim`（静态） | `int64_t d0 = 16` | 编译时常量维度值 |
-| `tensor.dim`（动态） | `int64_t d0 = (int64_t)orch_args.tensor(N).shapes[axis]` | 从 ChipStorageTaskArgs 获取运行时维度 |
+| `tensor.dim`（动态） | `int64_t d0 = (int64_t)orch_args.tensor(N).ref().shapes[axis]` | 从 ChipStorageTaskArgs 获取运行时维度。在编排（Orchestration）函数体内，解析器会将其折叠为已声明的 extent —— 见下文 |
+
+### 动态维度符号（Dynamic-dim symbols）
+
+`pl.dynamic("M")` 符号命名的是「声明它的那个张量实参」的运行时 extent。在 kernel 中它
+只是类型层面的占位符；但编排函数体可以把它当作**值**使用 —— 循环上界、`pl.create_tensor`
+的 extent，或折叠后的 `pl.tensor.dim`。因此函数体引用到的每个符号都会在入口处定义一次，
+从「首个声明该符号的参数」的描述符中读取：
+
+```cpp
+    // Dynamic-dim symbols (extent of the declaring argument)
+    int64_t M = (int64_t)orch_args.tensor(0).ref().shapes[0];
+```
+
+只有生成代码中真正出现的符号才会被定义；仅出现在参数类型中的符号不会产生定义
+（外部张量的 shape 从不会被打印）。
+
+由于符号**就是**该 extent，解析器会把编排函数体内的 `pl.tensor.dim(x, i)` 折叠为 `x`
+的类型已经命名的那个 extent —— 一个运行时 extent 只对应一个 IR 名字。若重新读取，会为
+同一个量再造出一个标量，而分析器无法证明它与该符号相等；由该副本构造出的所有 shape
+都会在结构上与由符号构造的 shape 不一致。该折叠**仅**适用于编排函数：Inline/InCore
+被调用方可能被传入形状不同的实参，因此在那里 `tensor.dim` 仍是真正的运行时读取。
 
 ## 完整示例
 

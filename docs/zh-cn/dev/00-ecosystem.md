@@ -135,6 +135,13 @@ Python DSL → IR（不可变树）→ Pass Pipeline（20+ passes）→ CodeGen
 
 **接口：** 定义指令 API 的 C++ 头文件库。下游消费者 `#include` pto-isa 头文件；硬件厂商提供支撑这些头文件的目标特定实现。
 
+PyPTO 使用 `runtime/pto_isa.pin` 中的提交来管理
+`build_output/_deps/pto-isa` 下的检出，从而与 runtime 子模块的构建保持一致。如需
+更改版本，应更新 runtime 侧的 pin。源码检出会读取子模块中的 pin，安装环境则读取
+随 `simpler_setup` 一同安装的相同 pin。如果 pin 文件不可用，PyPTO 会回退到
+pto-isa 远程仓库默认分支的最新提交。调用方提供的 `PTO_ISA_ROOT` 会直接使用，其
+版本由调用方自行管理。
+
 ### simpler — 任务运行时
 
 在 Ascend 硬件上执行编译后的程序。管理三程序执行模型：Host、AICPU kernel 和 AICore kernel。

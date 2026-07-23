@@ -31,7 +31,7 @@ from pypto.pypto_core.ir import (
     TileLayout,
 )
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
+from ..utils import _get_span_or_capture, _normalize_expr, _to_int32_scalar, _to_make_tuple, resolve_cast_mode
 from ._pad_value import normalize_pad_value
 
 
@@ -166,9 +166,15 @@ def load(
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     valid_shapes: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
+    clamp: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Copy data from tensor to specified memory level.
+
+    Only the valid extent is read, so the destination tile may be larger than the
+    region that exists in the source. The tile's valid region is the source's
+    valid region, shifted by ``offsets`` and cut to the tile — a load can never
+    report as real data bytes the source does not have.
 
     Args:
         tensor: Source tensor (TensorType)
@@ -180,8 +186,13 @@ def load(
             MakeTuple. When provided, sets TileView.valid_shape in the output TileType.
             When omitted, shapes is used as valid_shape. Useful for dynamic shapes where
             the actual valid data region differs from the allocated tile size.
-            Uses the same coordinate convention as shapes.
+            Uses the same coordinate convention as shapes. This is a *request*: it
+            narrows the tile, but cannot widen it past what the source has.
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
+        clamp: Sanction a read that runs off the end of the source. By default a
+            load asserts that ``offsets + valid_shapes`` stays inside the source
+            and is rejected when that provably fails; with ``clamp=True`` the
+            request is cut back to the source edge instead.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -204,6 +215,8 @@ def load(
     _validate_offsets_shapes(offsets_tuple, shapes_tuple)
 
     kwargs: dict[str, Any] = {"target_memory": target_memory}
+    if clamp:
+        kwargs["clamp"] = True
 
     valid_shapes_tuple = shapes_tuple
     if valid_shapes is not None:
@@ -595,15 +608,6 @@ def ci(
 
 
 arange = ci
-
-
-def _to_int32_scalar(value: int | Expr, span: Span) -> Expr:
-    """Normalize a seed value to an INT32 scalar expression."""
-    if isinstance(value, Expr):
-        if isinstance(value, ConstInt) and value.dtype != DataType.INT32:
-            return ConstInt(value.value, DataType.INT32, span)
-        return value
-    return ConstInt(value, DataType.INT32, span)
 
 
 def random(  # noqa: PLR0913
@@ -2185,85 +2189,16 @@ def minimums(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Ca
 # ============================================================================
 
 
-def sum(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Sum reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for sum reduction
-    """
-
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.sum", args, kwargs, actual_span)
-
-
-def max(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Max reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for max reduction
-    """
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.max", args, kwargs, actual_span)
-
-
-def min(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Min reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for min reduction
-    """
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.min", args, kwargs, actual_span)
-
-
 def row_max(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise max reduction of a tile.
+    """Row-wise max reduction of a tile (reduces along the last axis, maps to TROWMAX).
 
-    This is a convenience function equivalent to max(tile, axis=1, keepdim=True).
-    Output shape is [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile (TileType)
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2274,14 +2209,15 @@ def row_max(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
 
 def row_sum(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise sum reduction of a tile.
+    """Row-wise sum reduction of a tile (reduces along the last axis, maps to TROWSUM).
 
-    This is a convenience function equivalent to sum(tile, axis=1, keepdim=True).
-    Output shape is [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile (TileType)
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2292,34 +2228,38 @@ def row_sum(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
 
 def row_min(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise min reduction (reduces along axis=1, maps to TROWMIN).
+    """Row-wise min reduction (reduces along the last axis, maps to TROWMIN).
 
-    Reduces each row to a single value, producing output shape [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
-        tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tile: Input tile (TileType, e.g. [M, N])
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise min reduction (TileType [M, 1])
+        Call expression for row-wise min reduction (TileType, e.g. [M, 1])
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.row_min", [tile, tmp_tile], {}, actual_span)
 
 
 def row_prod(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise product reduction (reduces along axis=1, maps to TROWPROD).
+    """Row-wise product reduction (reduces along the last axis, maps to TROWPROD).
 
-    Reduces each row to a single value, producing output shape [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
-        tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tile: Input tile (TileType, e.g. [M, N])
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise product reduction (TileType [M, 1])
+        Call expression for row-wise product reduction (TileType, e.g. [M, 1])
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.row_prod", [tile, tmp_tile], {}, actual_span)
@@ -2402,7 +2342,7 @@ def row_argmax(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2419,7 +2359,7 @@ def row_argmin(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2535,6 +2475,9 @@ def slice(
 ) -> Call:
     """Create a slice of a tile with static shape and optional valid shape.
 
+    The result is never valid where the source tile is not: its valid region is
+    the source's valid region, shifted by ``offset`` and cut to the window.
+
     Args:
         tile: Input tile expression
         shape: Static shape dimensions, or a MakeTuple. Always full-rank — a
@@ -2542,9 +2485,11 @@ def slice(
             ``drop_dims`` to be erased from the result type.
         offset: Offset dimensions for the slice, or a MakeTuple
         valid_shape: Valid shape dimensions, or a MakeTuple. When omitted, shape
-            is reused as the valid shape.
+            is reused as the valid shape. This is a *request*: it narrows the
+            result, but cannot widen it past what the source has under the window.
         drop_dims: Optional axes to erase from the result type (numpy-style rank
-            reduction). Each listed axis must be a static unit dim of ``shape``.
+            reduction). Each listed axis must be a static unit dim of ``shape``,
+            and must still be fully valid after the intersection above.
             Because tiles are physically 2D, the result is clamped back to 2D
             (unit axes prepended) if reduction would take it below 2D.
             ``None`` / ``[]`` is fully backward compatible (drops nothing).
@@ -2553,12 +2498,16 @@ def slice(
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (normalized
             via :func:`normalize_pad_value`). ``PadValue.null`` is passed
             through unchanged and means "no padding". When omitted (``None``),
-            the kwarg is not forwarded — the deducer defaults to
-            ``PadValue.null``.
+            the source's padding mode carries through.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression creating a tile slice
+
+    Note:
+        Unlike :func:`pypto.ir.op.tensor.slice`, there is no ``clamp`` option: an
+        on-chip window has nothing that could clamp it, so ``offset + shape`` must
+        stay inside the source tile.
     """
     actual_span = _get_span_or_capture(span)
 
@@ -2659,6 +2608,32 @@ def reshape(
 
     args = [tile, shape_tuple]
     return _ir_core.create_op_call("tile.reshape", args, {}, actual_span)
+
+
+def reinterpret_view(
+    data: Expr,
+    dtype: DataType,
+    *,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Reinterpret a tile over the same bytes with a different dtype.
+
+    Args:
+        data: Input tile expression
+        dtype: Target element dtype
+        shape: Optional target shape. When omitted, the physically contiguous
+            dimension is scaled according to the source/target dtype byte ratio
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for a byte-preserving tile reinterpret view
+    """
+    actual_span = _get_span_or_capture(span)
+    args = [data]
+    if shape is not None:
+        args.append(_to_make_tuple(shape, actual_span))
+    return _ir_core.create_op_call("tile.reinterpret_view", args, {"dtype": dtype}, actual_span)
 
 
 def _normalize_axis_const(axis: int | ConstInt, span: Span, name: str) -> ConstInt:

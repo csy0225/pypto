@@ -43,16 +43,16 @@ program_2d = flatten_pass(program)
 
 1. **验证前置条件**：检查静态物理形状、最后轴归约、不允许对 >2D 使用 `tile.read`/`tile.write`/`tile.slice`
 2. **变换语句**：遍历函数体，将 >2D Tile 操作转换为 2D，并保留动态的 `valid_shape`（见[动态 valid_shape](#动态-tile-维度issue-1578)）
+3. **验证后置条件**：由独立的 `TileOps2D` 属性验证器 (property verifier) 检查改写后的 InCore IR 仅包含受支持的 Tile rank 与 codegen-ready transpose 形态
 
 按语句类型处理：
 
 | Tile 操作 | 变换方式 |
 | --------- | -------- |
-| `tile.load`（>2D） | 直接将结果类型改为 2D（load 从 rank>2 张量窗口产生 2D tile） |
+| `tile.load`（>2D） | 将结果 tile 重建为 2D。对于 natural NZ Mat load，还会在源张量上插入 shape-only 的 2D `tensor.view`，把 leading offsets/shapes/valid_shapes 折叠到 2D 源窗口，并要求该窗口按 row-major 连续可折叠。Vec load 和 transposed Mat load 保留原始 rank>2 源窗口，只展平结果 tile |
 | `tile.store`（rank>2 张量） | 在转换后 IR 中注入原始张量 rank 对应的分区 `shapes` 作为额外的第 4 个操作数，供后端 codegen 重建 `partition_view`；DSL 源码不变。若 tile 操作数本身仍是 rank>2(例如用户显式 `tile.reshape` 升到 3D 后再喂给 `pl.assemble` 写入 N-D 张量视图),pass 会先插入一个 `tile.reshape` 把 tile 操作数压回 2D —— codegen 要求 tile 必须是 2D,而原始 tile shape 仍由 `shapes` 分区操作数携带 |
 | `tile.store`（2D 张量） | 直接透传 |
 | `tile.create`/`tile.full`（>2D） | 直接使用展平的 2D 形状重建 |
-| `tile.sum`/`tile.max`/`tile.min`（>2D） | 将 axis 映射为 1（2D 的最后轴） |
 | `tile.transpose` | `pto.ttrans` scratch 物化的唯一归属。进入时为 3-arg（input, axis1, axis2）。**2D**：创建一块 scratch tile（shape = 源页，位于输入所在 memory），产出 codegen-ready 的 4-arg `tile.transpose(in, a1, a2, scratch)`。**>2D**（末两轴交换）：展开为逐 batch 的 2D transpose，每个都是 4-arg 形态，scratch 从扁平 `[batch*A, B]` 池中切片，再 assemble 进合并后的 2D 输出。交换 batch 轴属用户错误 |
 | `tile.batch_matmul` | 展开为逐 batch 的 2D `tile.matmul`，处理 batch broadcast。b_trans/a_trans 操作数以一个零拷贝 `tile.transpose_view`（覆盖在自然 load 之上）出现（不再 transpose-at-load、不搬数据）；tile 级算子本身无 transpose 语义。每个操作数处理方式一致（见下方操作数处理） |
 | `tile.batch_matmul_acc` | 展开为逐 batch 的 2D `tile.matmul_acc`，按 batch 索引切分（已展平的）累加器。累加器上的内存空间决策（Vec/Acc 来回搬运、上游 `tile.create` 的可重定向生产者改写、TileView 刷新）交由 `InferTileMemorySpace`（pass 17）负责 —— 本 pass 不再发射任何 `tile.move` |
@@ -67,10 +67,10 @@ batch 重发。
 
 - **整块（默认）**：操作数整块进 Mat 一次，再按 batch **切片** —— 普通
   （行批 `[B*rows, cols]`）操作数行切，`tile.transpose_view`（列批 `[K, B*N]`）
-  操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此**保留 ND 源窗口**；硬件
-  ND2NZ「2 维 GlobalTensor」塌成 `[B*N, K]` 的处理由 `tile.load` codegen 负责
-  —— 当 load 结果为 NZ Mat tile 时触发，并在那里发射 2D `make_tensor_view`，故本
-  pass 只把 load 的**结果 tile** 展平为 2D。广播操作数复用其单页。
+  操作数列切。3D `[B, N, K]` 张量的自然 Mat load 在此保留逻辑 ND 源语义，但本
+  pass 会在 load 前插入 2D `tensor.view`（`[B*N, K]`），让下游 `tile.load`
+  codegen 看到与其他消费者一致的展平源窗口。本 pass 同时把 load 的**结果 tile**
+  展平为 2D。广播操作数复用其单页。
 - **逐 batch**（整块会撑爆 L1，**或**整块 load 非连续）：从底层自然 `tile.load`
   **逐 batch 重发**（每 batch `[1, .., X, Y]` 窗口 → 2D `[X, Y]`，用 load 自身的
   窗口维度，故部分子 tile 也能正确重发），转置时再加逐 batch
@@ -157,7 +157,19 @@ for c, (o,) in pl.range(0, s_dim, CHUNK, init_values=(out,)):
 
 **头文件**：`include/pypto/ir/transforms/passes.h`
 
-**实现文件**：`src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp`
+实现按职责拆分：
+
+| 阶段 | 文件 | 职责 |
+| ---- | ---- | ---- |
+| 协调 | `src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp` | 选择 InCore 函数，并按 analysis → rewrite 顺序执行 |
+| 分析 (analysis) | `src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp` | 只读的前置条件验证 |
+| 改写协调 | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp` | 递归遍历语句并分派算子改写 |
+| 改写工具 | `src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp` | 共享形状、索引和容量辅助逻辑 |
+| 批量矩阵乘改写 | `src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp` | 批量矩阵乘与累加算子的分页降级 |
+| 转置改写 | `src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp` | 独立 N 维转置的降级 |
+| 验证 (verification) | `src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp` | 独立验证 `TileOps2D` 后置条件 |
+
+这些阶段入口和改写组件接口仅供 transform 内部使用；公共 API 仍为 `pass::FlattenTileNdTo2D()`。
 
 **Python 绑定**：`python/bindings/modules/passes.cpp`
 

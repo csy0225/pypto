@@ -44,6 +44,7 @@ from pypto.ir.op import tile_ops as T
 
 MS = ir.MemorySpace
 FP32 = DataType.FP32
+INT16 = DataType.INT16
 _IN = ir.ParamDirection.In
 _OUT = ir.ParamDirection.Out
 
@@ -118,19 +119,25 @@ def _get_subblock(var, span):
 def _shard_vec(tile, split, half_shape, span):
     """A C->V boundary ``tile.aiv_shard`` returning a HALF *Vec* tile.
 
-    The pass reattaches the move's Vec destination memory onto the deduced half
-    type, so the result is Vec — ``T.aiv_shard`` alone would inherit the cube
-    input's memory, hence the explicit result type here.
+    ``tile.aiv_shard`` declares Vec as its result memory (the consuming vector
+    lane), and ``OpRegistry::Create`` fills that onto the space-less deduced half
+    type — so the pass itself attaches nothing. This helper still has to state Vec
+    explicitly only because it builds the ``ir.Call`` directly, bypassing Create.
     """
     return ir.Call(
         ir.get_op("tile.aiv_shard"), [tile], {"split": split}, _tile(half_shape, None, MS.Vec), span
     )
 
 
-def _gather_vec(tile, split, full_shape, span):
-    """A V->C boundary ``tile.aic_gather`` returning a doubled *Vec* tile."""
+def _gather_mat(tile, split, full_shape, span):
+    """A V->C boundary ``tile.aic_gather`` returning a doubled *Mat* tile.
+
+    The boundary op's declared memory is the CONSUMING lane's space: aic_gather
+    carries a vector-produced half to AIC, where ExpandMixedKernel pops it into
+    Mat. (The mirror op, aiv_shard, declares Vec for the same reason.)
+    """
     return ir.Call(
-        ir.get_op("tile.aic_gather"), [tile], {"split": split}, _tile(full_shape, None, MS.Vec), span
+        ir.get_op("tile.aic_gather"), [tile], {"split": split}, _tile(full_shape, None, MS.Mat), span
     )
 
 
@@ -613,6 +620,168 @@ def test_reshape_of_already_split_input_halves_shape_arg():
     ir.assert_structural_equal(_lower(program), expected)
 
 
+def test_auto_reinterpret_view_of_split_input_scales_lane_local_shape():
+    """UP_DOWN: auto reinterpret keeps the tracked split axis and scales only the contiguous axis."""
+    span = ir.Span.unknown()
+    data = ir.Var("data", _tensor([16, 16]), span)
+    out_0 = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    load = T.load(data, [0, 0], [16, 16], target_memory=MS.Vec, span=span)
+    prev = ir.Var("prev", load.type, span)
+    reinterpret = T.reinterpret_view(prev, INT16, span=span)
+    bits = ir.Var("bits", reinterpret.type, span)
+    store = T.store(bits, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    program = _incore_program(
+        [(data, _IN), (out_0, _OUT)],
+        [
+            ir.AssignStmt(prev, load, span),
+            ir.AssignStmt(bits, reinterpret, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        [out_0.type],
+    )
+
+    sub = _sub_var()
+    e_data = ir.Var("data", _tensor([16, 16]), span)
+    e_out = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    e_load = T.load(e_data, [0 + sub * 8, 0], [8, 16], target_memory=MS.Vec, span=span)
+    e_prev = ir.Var("prev", e_load.type, span)
+    e_reinterpret = T.reinterpret_view(e_prev, INT16, span=span)
+    e_bits = ir.Var("bits", e_reinterpret.type, span)
+    e_store = T.store(e_bits, [0 + sub * 8, 0], e_out, span=span)
+    e_out_store = ir.Var("out_store", e_store.type, span)
+    expected = _expected_incore(
+        [(e_data, _IN), (e_out, _OUT)],
+        [
+            ir.AssignStmt(e_prev, e_load, span),
+            ir.AssignStmt(e_bits, e_reinterpret, span),
+            ir.AssignStmt(e_out_store, e_store, span),
+            ir.ReturnStmt([e_out_store], span),
+        ],
+        [e_out.type],
+        mode=ir.SplitMode.UP_DOWN,
+        sub=sub,
+    )
+    ir.assert_structural_equal(_lower(program), expected)
+
+
+def test_auto_equivalent_explicit_reinterpret_shape_is_halved_with_split_input():
+    """UP_DOWN: an explicit spelling of the auto shape is accepted and halved with the source."""
+    span = ir.Span.unknown()
+    data = ir.Var("data", _tensor([16, 16]), span)
+    out_0 = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    load = T.load(data, [0, 0], [16, 16], target_memory=MS.Vec, span=span)
+    prev = ir.Var("prev", load.type, span)
+    reinterpret = T.reinterpret_view(prev, INT16, shape=[16, 32], span=span)
+    bits = ir.Var("bits", reinterpret.type, span)
+    store = T.store(bits, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    program = _incore_program(
+        [(data, _IN), (out_0, _OUT)],
+        [
+            ir.AssignStmt(prev, load, span),
+            ir.AssignStmt(bits, reinterpret, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        [out_0.type],
+    )
+
+    sub = _sub_var()
+    e_data = ir.Var("data", _tensor([16, 16]), span)
+    e_out = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    e_load = T.load(e_data, [0 + sub * 8, 0], [8, 16], target_memory=MS.Vec, span=span)
+    e_prev = ir.Var("prev", e_load.type, span)
+    e_reinterpret = T.reinterpret_view(e_prev, INT16, shape=[8, 32], span=span)
+    e_bits = ir.Var("bits", e_reinterpret.type, span)
+    e_store = T.store(e_bits, [0 + sub * 8, 0], e_out, span=span)
+    e_out_store = ir.Var("out_store", e_store.type, span)
+    expected = _expected_incore(
+        [(e_data, _IN), (e_out, _OUT)],
+        [
+            ir.AssignStmt(e_prev, e_load, span),
+            ir.AssignStmt(e_bits, e_reinterpret, span),
+            ir.AssignStmt(e_out_store, e_store, span),
+            ir.ReturnStmt([e_out_store], span),
+        ],
+        [e_out.type],
+        mode=ir.SplitMode.UP_DOWN,
+        sub=sub,
+    )
+    ir.assert_structural_equal(_lower(program), expected)
+
+
+def test_arbitrary_explicit_reinterpret_shape_is_rejected_under_split():
+    """A byte-equivalent shape that redistributes dimensions has no safe physical split-axis mapping."""
+    span = ir.Span.unknown()
+    data = ir.Var("data", _tensor([16, 16]), span)
+    out_0 = ir.Var("out_0", ir.TensorType([8, 64], INT16), span)
+    load = T.load(data, [0, 0], [16, 16], target_memory=MS.Vec, span=span)
+    prev = ir.Var("prev", load.type, span)
+    reinterpret = T.reinterpret_view(prev, INT16, shape=[8, 64], span=span)
+    bits = ir.Var("bits", reinterpret.type, span)
+    store = T.store(bits, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    program = _incore_program(
+        [(data, _IN), (out_0, _OUT)],
+        [
+            ir.AssignStmt(prev, load, span),
+            ir.AssignStmt(bits, reinterpret, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        [out_0.type],
+    )
+
+    with pytest.raises(ValueError, match="must match its auto-inferred shape"):
+        _lower(program)
+
+
+def test_reinterpret_view_of_full_source_is_sliced_per_subblock():
+    """LEFT_RIGHT: an untracked full tile param is reinterpreted, then sliced per lane."""
+    span = ir.Span.unknown()
+    data = ir.Var("data", _tile([16, 16], mem=MS.Vec), span)
+    out_0 = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    reinterpret = T.reinterpret_view(data, INT16, span=span)
+    bits = ir.Var("bits", reinterpret.type, span)
+    store = T.store(bits, [0, 0], out_0, span=span)
+    out_store = ir.Var("out_store", store.type, span)
+    program = _incore_program(
+        [(data, _IN), (out_0, _OUT)],
+        [
+            ir.AssignStmt(bits, reinterpret, span),
+            ir.AssignStmt(out_store, store, span),
+            ir.ReturnStmt([out_store], span),
+        ],
+        [out_0.type],
+        mode=ir.SplitMode.LEFT_RIGHT,
+    )
+
+    sub = _sub_var()
+    e_data = ir.Var("data", _tile([16, 16], mem=MS.Vec), span)
+    e_out = ir.Var("out_0", ir.TensorType([16, 32], INT16), span)
+    e_reinterpret = T.reinterpret_view(e_data, INT16, span=span)
+    e_bits_full = ir.Var("bits", e_reinterpret.type, span)
+    e_slice = T.slice(e_bits_full, [16, 16], [0, sub * 16], span=span)
+    e_bits = ir.Var("bits_1", e_slice.type, span)
+    e_store = T.store(e_bits, [0, 0 + sub * 16], e_out, span=span)
+    e_out_store = ir.Var("out_store", e_store.type, span)
+    expected = _expected_incore(
+        [(e_data, _IN), (e_out, _OUT)],
+        [
+            ir.AssignStmt(e_bits_full, e_reinterpret, span),
+            ir.AssignStmt(e_bits, e_slice, span),
+            ir.AssignStmt(e_out_store, e_store, span),
+            ir.ReturnStmt([e_out_store], span),
+        ],
+        [e_out.type],
+        mode=ir.SplitMode.LEFT_RIGHT,
+        sub=sub,
+    )
+    ir.assert_structural_equal(_lower(program), expected)
+
+
 def test_reshape_migrates_split_axis_row_to_col_and_back():
     """UP_DOWN: a [N,1]<->[1,N] reshape migrates the split axis, not corrupts it (gh#1864).
 
@@ -807,11 +976,14 @@ def test_loop_iter_arg_keeps_split_tracking():
 def test_reduce_on_split_axis_rejected():
     """A reduce that collapses the split axis (dim0 under UP_DOWN) raises ValueError —
     a partial per-lane reduction is a miscompile. NEGATIVE test: a rejected
-    transform produces no ``After`` IR, so Before-After-Expected does not apply."""
+    transform produces no ``After`` IR, so Before-After-Expected does not apply.
+
+    ``col_sum`` is the axis-0 reduction (``pto.tcolsum``), so under UP_DOWN it
+    collapses exactly the split axis."""
     span = ir.Span.unknown()
     src = ir.Var("src", _tile([128, 128], mem=MS.Vec), span)
     out_0 = ir.Var("out_0", _tensor([128, 128]), span)
-    reduced = T.sum(src, axis=0, keepdim=True, span=span)
+    reduced = T.col_sum(src, span=span)
     rv = ir.Var("rv", reduced.type, span)
     store = T.store(rv, [0, 0], out_0, span=span)
     out_store = ir.Var("out_store", store.type, span)
@@ -849,12 +1021,13 @@ def test_vc_boundary_becomes_aic_gather_and_cube_placement_stays_full():
         [out_0.type],
     )
 
-    # V->C move becomes aic_gather (HALF -> FULL, doubled to [256, 128] Vec);
-    # the cube placement move keeps the FULL [128, 128] Mat tile.
+    # V->C move becomes aic_gather (HALF -> FULL, doubled to [256, 128] Mat —
+    # the consuming cube lane's space); the cube placement move keeps the FULL
+    # [128, 128] Mat tile.
     sub = _sub_var()
     e_vec = ir.Var("vec", _tile([128, 128], mem=MS.Vec), span)
     e_out = ir.Var("out_0", _tensor([128, 128]), span)
-    e_gather = _gather_vec(e_vec, 1, [256, 128], span)
+    e_gather = _gather_mat(e_vec, 1, [256, 128], span)
     e_gathered_mat = ir.Var("gathered_mat", e_gather.type, span)
     e_move = _move_call(e_gathered_mat, MS.Mat, _tile([128, 128], None, MS.Mat), span)
     e_gathered = ir.Var("gathered", e_move.type, span)

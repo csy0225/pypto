@@ -24,7 +24,7 @@ import re
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, codegen, ir
-from pypto.backend import BackendType
+from pypto.backend import BackendType, pto_backend
 from pypto.backend.pto_backend import (
     _emit_group_output,
     _format_error_report,
@@ -939,6 +939,18 @@ class TestPreprocessPtoasOutput:
         assert "TADDS(v2);" in result
         assert "TSTORE(v3);" in result
 
+    def test_drops_runtime_managed_ffts_base_write(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel(__gm__ int64_t* workspace) {\n"
+            "  uint64_t ffts_addr = (uint64_t) workspace;\n"
+            "  set_ffts_base_addr(ffts_addr);\n"
+            "  wait_flag_dev(3);\n"
+            "}\n"
+        )
+        assert "set_ffts_base_addr" not in result
+        assert "(uint64_t) workspace" in result
+        assert "wait_flag_dev(3)" in result
+
     def test_preserves_helpers(self):
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
@@ -1178,13 +1190,14 @@ class TestGenerateArgUnpacking:
         dim = ir.Neg(var, idx, span)
         ty = ir.TensorType([dim, ir.ConstInt(64, idx, span)], DataType.BF16)
 
+        # The param type alone drives the collector, so the body just hands it
+        # back: ``Neg(V_NEG)`` is provably non-positive, and any load out of it
+        # would be a read past the end of the tensor.
         ib = IRBuilder()
         with ib.function("dyn_unary_func", type=ir.FunctionType.InCore) as f:
             a = f.param("a", ty)
-            t = ib.let("t", tile.load(a, [0, 0], [16, 64]))
-            ret = ib.let("ret", t)
             f.return_type(ty)
-            ib.return_stmt(ret)
+            ib.return_stmt(a)
         func = f.get_result()
 
         with pytest.raises(ValueError, match="non-invertible"):
@@ -1619,8 +1632,15 @@ class TestGenerateSkipPtoas:
             assert not key.endswith(".cpp"), f"Unexpected .cpp extension: {key}"
 
 
-def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
-    """compile() should preserve generated files when some InCore functions fail."""
+def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path, monkeypatch):
+    """compile() should preserve generated files when some InCore functions fail.
+
+    The failure is injected at the per-kernel emit seam rather than provoked by a
+    real kernel body: every DSL-reachable tile op lowers, so no source-level
+    kernel reliably fails codegen. Injecting here still exercises the real
+    per-function error collection, the error report, and the PartialCodegenError
+    path that writes the kernels which did succeed.
+    """
 
     @pl.program
     class PartialFailureProgram:
@@ -1638,11 +1658,10 @@ def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
         def bad_kernel(
             self,
             a: pl.Tensor[[16, 16], pl.FP32],
-            output: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
             tile = pl.load(a, offsets=[0, 0], shapes=[16, 16])
-            result = pl.tile.sum(tile, axis=1)
-            out = pl.store(result, offsets=[0, 0], output_tensor=output)
+            out = pl.store(tile, offsets=[0, 0], output_tensor=output)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1650,6 +1669,15 @@ def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
             out = pl.create_tensor([16, 16], dtype=pl.FP32)
             out = self.good_kernel(a, out)
             return out
+
+    real_emit = pto_backend._emit_single_function_output
+
+    def emit_or_fail(result_files, func, *args, **kwargs):
+        if func.name == "bad_kernel":
+            raise RuntimeError("bad_kernel: injected codegen failure")
+        return real_emit(result_files, func, *args, **kwargs)
+
+    monkeypatch.setattr(pto_backend, "_emit_single_function_output", emit_or_fail)
 
     output_dir = tmp_path / "partial_codegen"
     with pytest.raises(RuntimeError, match="bad_kernel"):
@@ -1805,8 +1833,8 @@ def test_pto_codegen_for_loop_tile_iter_arg_no_ddr_alloc():
             for i, (acc_iter,) in pl.range(2, init_values=(init_tile,)):
                 offset: pl.Scalar[pl.INDEX] = i * 256
                 chunk: pl.Tile[[16, 256], pl.FP32] = pl.load(data, [0, offset], [16, 256])
-                tmp: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
-                    [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
                 partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
                 updated: pl.Tile[[16, 1], pl.FP32] = pl.tile.add(acc_iter, partial)
@@ -2140,8 +2168,8 @@ def test_pto_codegen_mixed_scalar_and_tile_iter_args():
             init_offset: pl.Scalar[pl.INDEX] = 0
             for i, (acc_iter, offset) in pl.range(2, init_values=(init_tile, init_offset)):
                 chunk: pl.Tile[[16, 256], pl.FP32] = pl.load(data, [0, offset], [16, 256])
-                tmp: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
-                    [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
                 partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
                 updated: pl.Tile[[16, 1], pl.FP32] = pl.tile.add(acc_iter, partial)
@@ -2582,6 +2610,188 @@ def test_pto_codegen_make_tensor_view_accepts_dynamic_shape_expressions():
     assert index_cast_lines, (
         f"Expected dynamic shape/stride expressions to be cast to index. Got:\n{mlir_code}"
     )
+
+
+def test_pto_codegen_tensor_view_aliases_input_base_ptr():
+    """tensor.view creates a view rooted at the input buffer and usable by downstream loads."""
+    span = ir.Span.unknown()
+    src_type = ir.TensorType([8, 16], DataType.FP32)
+    src = ir.Var("src", src_type, span)
+    out = ir.Var("out", src_type, span)
+
+    view_call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
+    view_var = ir.Var("src_dn", view_call.type, span)
+    tile_call = ir.op.tile.load(view_var, [0, 0], [16, 8])
+    tile_var = ir.Var("tile", tile_call.type, span)
+    store_call = ir.op.tile.store(tile_var, [0, 0], out)
+    result_var = ir.Var("result", store_call.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(view_var, view_call, span),
+            ir.AssignStmt(tile_var, tile_call, span),
+            ir.AssignStmt(result_var, store_call, span),
+            ir.ReturnStmt([result_var], span),
+        ],
+        span,
+    )
+    func = ir.Function("kernel", [src, out], [result_var.type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "TensorViewAliasTest", span)
+
+    mlir_code = _generate_mlir(program)
+    lines = _get_mlir_lines(mlir_code)
+    view_line = _single_line(lines, "pto.make_tensor_view %arg0, shape = [%c16_index, %c8_index]")
+    assert "strides = [%c1_index, %c16_index]" in view_line
+    assert "{layout = #pto.layout<dn>}" in view_line
+
+    view_ssa = view_line.split(" = ", 1)[0].strip()
+    assert any(f"pto.partition_view {view_ssa}" in line for line in lines), (
+        f"Expected tile.load to use the tensor.view result {view_ssa}. Got:\n{mlir_code}"
+    )
+
+
+def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
+    """A rank-3 tensor.view remains rooted at the input's raw GM pointer."""
+    span = ir.Span.unknown()
+    src_type = ir.TensorType([2, 16, 32], DataType.FP32)
+    src = ir.Var("src", src_type, span)
+
+    view_call = ir.op.tensor.view(src, [2, 16, 32])
+    view_var = ir.Var("src_view", view_call.type, span)
+    load_call = ir.op.tile.load(
+        view_var,
+        [0, 0, 0],
+        [2, 16, 32],
+        target_memory=pl.MemorySpace.Mat,
+    )
+    tile_var = ir.Var("tile", load_call.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(view_var, view_call, span),
+            ir.AssignStmt(tile_var, load_call, span),
+            ir.ReturnStmt([], span),
+        ],
+        span,
+    )
+    func = ir.Function("kernel", [src], [], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "TensorViewRank3MatLoadTest", span)
+
+    lines = _get_mlir_lines(_generate_mlir(program))
+    view_line = _single_line(lines, "strides = [%c512_index, %c32_index, %c1_index]")
+    assert "pto.make_tensor_view %arg0" in view_line
+    assert "shape = [%c2_index, %c16_index, %c32_index]" in view_line
+    assert "strides = [%c512_index, %c32_index, %c1_index]" in view_line
+
+
+def test_pto_codegen_tensor_view_default_pipeline_variants():
+    """Default pipeline preserves tensor.view metadata through PTO codegen."""
+
+    @pl.program
+    class TensorViewDefaultPipeline:
+        @pl.function(type=pl.FunctionType.InCore)
+        def shape_only(
+            self,
+            src: pl.Tensor[[2, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+        ) -> pl.Tensor[[4, 8], pl.FP32]:
+            viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[8, 1], layout=pl.TensorLayout.ND)] = (
+                pl.tensor.view(src, [4, 8])
+            )
+            tile = pl.load(viewed, [0, 0], [4, 8])
+            return pl.store(tile, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def layout_only(
+            self,
+            src: pl.Tensor[[8, 4], pl.FP32],
+            out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+        ) -> pl.Tensor[[4, 8], pl.FP32]:
+            viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[1, 4], layout=pl.TensorLayout.DN)] = (
+                pl.tensor.view(src, layout=pl.TensorLayout.DN)
+            )
+            tile = pl.load(viewed, [0, 0], [4, 8])
+            return pl.store(tile, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def shape_and_layout(
+            self,
+            src: pl.Tensor[[2, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+        ) -> pl.Tensor[[4, 8], pl.FP32]:
+            viewed: pl.Tensor[[4, 8], pl.FP32, pl.TensorView(stride=[1, 4], layout=pl.TensorLayout.DN)] = (
+                pl.tensor.view(src, [4, 8], layout=pl.TensorLayout.DN)
+            )
+            tile = pl.load(viewed, [0, 0], [4, 8])
+            return pl.store(tile, [0, 0], out)
+
+    def function_body(mlir: str, name: str) -> str:
+        start = mlir.index(f"func.func @{name}(")
+        end = mlir.find("\n  func.func @", start + 1)
+        return mlir[start:] if end == -1 else mlir[start:end]
+
+    def target_view_line(body: str, layout: str) -> str:
+        matched = [
+            line
+            for line in _get_mlir_lines(body)
+            if "pto.make_tensor_view %arg0" in line
+            and "shape = [%c4_index, %c8_index]" in line
+            and f"{{layout = #pto.layout<{layout}>}}" in line
+        ]
+        assert len(matched) == 1, f"Expected one target tensor view, got: {matched}"
+        return matched[0]
+
+    mlir_code = _generate_default_mlir(TensorViewDefaultPipeline)
+
+    shape_body = function_body(mlir_code, "shape_only")
+    shape_view = target_view_line(shape_body, "nd")
+    assert "shape = [%c4_index, %c8_index]" in shape_view
+    assert "strides = [%c8_index, %c1_index]" in shape_view
+    assert "{layout = #pto.layout<nd>}" in shape_view
+
+    for func_name in ("layout_only", "shape_and_layout"):
+        body = function_body(mlir_code, func_name)
+        view_line = target_view_line(body, "dn")
+        assert "shape = [%c4_index, %c8_index]" in view_line
+        assert "strides = [%c1_index, %c4_index]" in view_line
+        assert "{layout = #pto.layout<dn>}" in view_line
+        view_ssa = view_line.split(" = ", 1)[0].strip()
+        assert any(f"pto.partition_view {view_ssa}" in line for line in _get_mlir_lines(body))
+
+
+def test_pto_codegen_tensor_view_shape_and_layout():
+    """In-core tensor.view emits the deduced shape and layout strides."""
+    span = ir.Span.unknown()
+    src = ir.Var("src", ir.TensorType([2, 16], DataType.FP32), span)
+    out = ir.Var("out", ir.TensorType([4, 8], DataType.FP32), span)
+
+    view_call = ir.op.tensor.view(src, [4, 8], layout=ir.TensorLayout.DN)
+    view_var = ir.Var("src_view", view_call.type, span)
+    tile_call = ir.op.tile.load(view_var, [0, 0], [4, 8])
+    tile_var = ir.Var("tile", tile_call.type, span)
+    store_call = ir.op.tile.store(tile_var, [0, 0], out)
+    result_var = ir.Var("result", store_call.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(view_var, view_call, span),
+            ir.AssignStmt(tile_var, tile_call, span),
+            ir.AssignStmt(result_var, store_call, span),
+            ir.ReturnStmt([result_var], span),
+        ],
+        span,
+    )
+    func = ir.Function("kernel", [src, out], [result_var.type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "TensorViewShapeLayoutTest", span)
+
+    mlir_code = _generate_mlir(program)
+    lines = _get_mlir_lines(mlir_code)
+    view_line = _single_line(lines, "pto.make_tensor_view %arg0, shape = [%c4_index, %c8_index]")
+    assert "strides = [%c1_index, %c4_index]" in view_line
+    assert "{layout = #pto.layout<dn>}" in view_line
+
+    view_ssa = view_line.split(" = ", 1)[0].strip()
+    assert any(f"pto.partition_view {view_ssa}" in line for line in lines)
 
 
 if __name__ == "__main__":

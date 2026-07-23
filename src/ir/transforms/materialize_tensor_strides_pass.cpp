@@ -65,6 +65,25 @@ namespace {
 TypePtr MaterializeType(const TypePtr& type) {
   if (!type) return type;
 
+  if (auto dist_type = As<DistributedTensorType>(type)) {
+    if (!dist_type->tensor_view_.has_value()) {
+      return type;
+    }
+    const TensorView& view = *dist_type->tensor_view_;
+    if (!view.stride.empty()) {
+      return type;
+    }
+    if (view.layout == TensorLayout::NZ) {
+      return type;
+    }
+    auto materialized_stride =
+        tensor_view_semantics::BuildLogicalStridesFromLayout(dist_type->shape_, view.layout);
+    TensorView new_view(std::move(materialized_stride), view.layout, view.valid_shape, view.pad);
+    return std::make_shared<DistributedTensorType>(dist_type->shape_, dist_type->dtype_, dist_type->memref_,
+                                                   std::make_optional(std::move(new_view)),
+                                                   dist_type->window_buffer_);
+  }
+
   if (auto tensor_type = As<TensorType>(type)) {
     if (!tensor_type->tensor_view_.has_value()) {
       // Bare tensor — no view to materialize.
@@ -82,7 +101,7 @@ TypePtr MaterializeType(const TypePtr& type) {
     }
     auto materialized_stride =
         tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, view.layout);
-    TensorView new_view(std::move(materialized_stride), view.layout, view.valid_shape);
+    TensorView new_view(std::move(materialized_stride), view.layout, view.valid_shape, view.pad);
     return std::make_shared<TensorType>(tensor_type->shape_, tensor_type->dtype_, tensor_type->memref_,
                                         std::make_optional(std::move(new_view)));
   }
@@ -245,7 +264,8 @@ class MaterializeTensorStridesMutator : public IRMutator {
     // Note the 7-arg Submit ctor order is (op, args, deps, kwargs, attrs, ...).
     return std::make_shared<Submit>(submit->op_, submit->args_, submit->deps_, submit->kwargs_,
                                     submit->attrs_, std::move(new_return_type), submit->span_,
-                                    submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+                                    submit->core_num_, submit->sync_start_, submit->allow_early_resolve_,
+                                    submit->predicate_);
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {

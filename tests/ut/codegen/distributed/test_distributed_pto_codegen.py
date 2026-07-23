@@ -43,8 +43,10 @@ import re
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import backend, codegen, ir
+from pypto import DataType, backend, codegen, ir
 from pypto.backend import BackendType
+from pypto.ir.builder import IRBuilder
+from pypto.ir.op.distributed import system_ops as dist_system
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
@@ -298,6 +300,40 @@ def test_remote_load_uses_comm_layout_constants():
     assert "arith.divsi" in helper
 
 
+def test_remote_load_peer_view_preserves_explicit_tensor_view_layout_and_strides():
+    """remote_load reuses explicit TensorView metadata for the peer view."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[4, 8], pl.FP32],
+            out: pl.Tensor[[8, 4], pl.FP32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            viewed: pld.DistributedTensor[
+                [8, 4],
+                pl.FP32,
+                pl.TensorView(stride=[1, 8], layout=pl.TensorLayout.DN),
+            ] = pl.tensor.view(data, [8, 4], layout=pl.TensorLayout.DN)
+            t = pld.tile.remote_load(viewed, peer=peer, offsets=[0, 0], shape=[8, 4])
+            pl.store(t, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c8_index, %c4_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c8_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
+
+
 def test_notify_emits_comm_tnotify_with_attr():
     """notify codegen emits pto.comm.tnotify with #pto<notify_op …> attr."""
 
@@ -413,6 +449,110 @@ def test_get_comm_ctx_emits_no_mlir_aliases_ctx_arg():
     # The ctx ptr arg is still in the func header.
     header = next(line for line in mlir.splitlines() if "func.func @kernel" in line)
     assert "!pto.ptr<i64>" in header, header
+
+
+def test_plain_distributed_alias_preserves_comm_ctx():
+    """A direct AssignStmt alias keeps the source view, base pointer, and ctx."""
+    ty = ir.DistributedTensorType([16, 16], DataType.INT32)
+
+    ib = IRBuilder()
+    with ib.function("alias_wait", type=ir.FunctionType.InCore) as f:
+        data = f.param("data", ty)
+        f.param("data_ctx", ir.CommCtxType.get())
+        alias = ib.let("alias", data)
+        ib.eval_stmt(dist_system.wait(alias, [0, 0], 1, ir.WaitCmp.Eq))
+        ib.return_stmt()
+
+    program = ir.Program([f.get_result()], "alias_wait", ir.Span.unknown())
+    mlir = codegen.PTOCodegen().generate(program)
+    body = mlir.split("func.func @alias_wait", 1)[1]
+    assert "pto.comm.twait" in body, body
+
+
+def test_tensor_view_preserves_loop_carried_distributed_metadata():
+    """Post-loop views keep the distributed tensor's base pointer and ctx."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, data: pld.DistributedTensor[[16, 16], pl.INT32]):
+            for _i, (carried,) in pl.range(1, init_values=(data,)):
+                result = pl.yield_(carried)
+            viewed = pl.tensor.view(result, [16, 16])
+            pld.system.wait(viewed, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    mlir = _generate_mlir(P)
+    body = mlir.split("func.func @kernel", 1)[1]
+    assert body.count("pto.make_tensor_view %arg0") >= 2, body
+    assert "pto.comm.twait" in body, body
+
+
+def test_tensor_view_preserves_while_carried_distributed_metadata():
+    """The while-loop return alias keeps the distributed base pointer and ctx."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, data: pld.DistributedTensor[[16, 16], pl.INT32]):
+            limit: pl.Scalar[pl.INT64] = 1
+            for (carried,) in pl.while_(init_values=(data,)):
+                pl.cond(limit > 0)
+                result = pl.yield_(carried)
+            viewed = pl.tensor.view(result, [16, 16])
+            pld.system.wait(viewed, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    mlir = _generate_mlir(P)
+    body = mlir.split("func.func @kernel", 1)[1]
+    assert body.count("pto.make_tensor_view %arg0") >= 2, body
+    assert "pto.comm.twait" in body, body
+
+
+def test_tensor_view_preserves_if_merged_distributed_metadata():
+    """A distributed tensor merged by an if keeps its base pointer and ctx."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[16, 16], pl.INT32],
+            cond: pl.Scalar[pl.BOOL],
+        ):
+            result = data
+            if cond:
+                result = data
+            viewed = pl.tensor.view(result, [16, 16])
+            pld.system.wait(viewed, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    mlir = _generate_mlir(P)
+    body = mlir.split("func.func @kernel", 1)[1]
+    assert "scf.if" in body, body
+    assert body.count("pto.make_tensor_view %arg0") >= 2, body
+    assert "pto.comm.twait" in body, body
+
+
+def test_if_merged_distributed_metadata_rejects_conflicting_contexts():
+    """An in-place if cannot select data and context from different allocations."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            lhs: pld.DistributedTensor[[16, 16], pl.INT32],
+            rhs: pld.DistributedTensor[[16, 16], pl.INT32],
+            cond: pl.Scalar[pl.BOOL],
+        ):
+            result = lhs
+            if cond:
+                result = rhs
+            pld.system.wait(result, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    with pytest.raises(
+        ValueError,
+        match="Assigning a different DistributedTensor in each branch of an `if` is not supported",
+    ):
+        _generate_mlir(P)
 
 
 def test_rank_emits_pto_load_scalar_at_slot_2_plus_trunci():

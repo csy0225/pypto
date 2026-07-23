@@ -154,6 +154,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/fold_no_op_reshape_pass.cpp
     src/ir/transforms/stamp_tfree_split_pass.cpp
     src/ir/transforms/materialize_runtime_scopes_pass.cpp
+    src/ir/transforms/classify_iter_arg_carry_pass.cpp
     src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp
     src/ir/transforms/memory_reuse_pass.cpp
     src/ir/transforms/normalize_return_order_pass.cpp
@@ -185,7 +186,13 @@ set(PYPTO_SOURCES
     src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
-    src/ir/transforms/flatten_tile_nd_to_2d_pass.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/rewrite.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp
     src/ir/transforms/pass_context.cpp
     src/ir/transforms/passes.cpp
     src/ir/transforms/resolve_backend_op_layouts_pass.cpp
@@ -198,6 +205,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
+    src/ir/transforms/utils/buffer_root_collector.cpp
     src/ir/transforms/utils/core_affinity.cpp
     src/ir/transforms/utils/core_side_ops.cpp
     src/ir/transforms/utils/cross_core_pipe.cpp
@@ -244,6 +252,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_manual_deps_on_submit_only.cpp
     src/ir/verifier/verify_pipeline_resolved.cpp
     src/ir/verifier/verify_unroll_resolved.cpp
+    src/ir/verifier/verify_iter_arg_carry_classified.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
@@ -264,7 +273,6 @@ set(PYPTO_SOURCES
     src/codegen/codegen_preconditions.cpp
     src/codegen/codegen_base.cpp
     src/codegen/orchestration/orchestration_analysis.cpp
-    src/codegen/orchestration/iter_arg_carry_analyzer.cpp
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp

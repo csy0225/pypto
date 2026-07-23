@@ -33,6 +33,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/reinterpret_view_semantics.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
@@ -169,31 +170,52 @@ TypePtr DeduceTileSliceType(const std::vector<ExprPtr>& args,
     new_shape.push_back(shape_tuple->elements_[i]);
   }
 
-  std::vector<ExprPtr> valid_shape = new_shape;
+  // valid_shape (4th arg) is a *request*, given at the full pre-reduction rank.
+  // An empty tuple is the explicit "no valid_shape" form (so callers can pass
+  // drop_dims as the 5th arg without supplying a custom valid_shape).
+  std::vector<ExprPtr> requested_valid;
   if (args.size() >= 4) {
     auto valid_shape_tuple_type = As<TupleType>(args[3]->GetType());
-    CHECK(valid_shape_tuple_type) << "tile.slice requires valid_shape to be TupleType, but got "
-                                  << args[3]->GetType()->TypeName();
-    // An empty tuple is the explicit "no valid_shape" form (so callers can pass
-    // drop_dims as the 5th arg without supplying a custom valid_shape).
+    CHECK_SPAN(valid_shape_tuple_type, args[3]->span_)
+        << "tile.slice requires valid_shape to be TupleType, but got " << args[3]->GetType()->TypeName();
     if (!valid_shape_tuple_type->types_.empty()) {
       ValidateIndexTupleElements(valid_shape_tuple_type, "tile.slice", "valid_shape");
-      CHECK(valid_shape_tuple_type->types_.size() == shape_tuple_type->types_.size())
-          << "tile.slice requires valid_shape and shape to have the same rank, but got valid_shape rank "
-          << valid_shape_tuple_type->types_.size() << " and shape rank " << shape_tuple_type->types_.size();
-
-      valid_shape.clear();
-      valid_shape.reserve(valid_shape_tuple_type->types_.size());
-      if (auto valid_shape_tuple = As<MakeTuple>(args[3])) {
-        valid_shape = valid_shape_tuple->elements_;
-      } else {
-        for (size_t i = 0; i < valid_shape_tuple_type->types_.size(); ++i) {
-          valid_shape.emplace_back(
-              std::make_shared<TupleGetItemExpr>(args[3], static_cast<int>(i), args[3]->span_));
-        }
-      }
+      requested_valid = ExtractTupleElements(args[3], valid_shape_tuple_type->types_.size());
     }
   }
+
+  const std::vector<ExprPtr> offsets = ExtractTupleElements(args[2], offset_tuple_type->types_.size());
+
+  // A slice is a window into the source tile, so it can never be valid where the
+  // source is not, and its window must lie inside the source allocation.
+  //
+  // There is deliberately no `clamp` escape hatch here, unlike tensor.slice: an
+  // on-chip window has nothing that could clamp it. `pto.subview` is a pure view
+  // (CheckSubviewTileCompat does no bounds work) and the Mat/Vec fold in
+  // CanonicalizeTileSlice turns the window into a `tile.extract`, whose ISA
+  // TEXTRACT bounds are hard. A GM window can overhang because the emitted view
+  // shape is clamped and the strided-Tensor runtime enforces the bound; a tile
+  // window that overhangs is simply unrepresentable, so it stays an error.
+  //
+  // The window here is always full-rank: offset rank == shape rank is checked
+  // above, and a tile shape has the source's rank by construction. tensor.slice
+  // additionally guards for a lower-rank reinterpreting window, which tiles have
+  // no equivalent of.
+  std::vector<ExprPtr> valid_shape = InferWindowReadValidShape({
+      /*source_physical=*/tile_type->shape_,
+      /*source_valid=*/GetValidShape(tile_type),
+      /*offsets=*/offsets,
+      /*window=*/new_shape,
+      /*requested_valid=*/requested_valid,
+      /*kind=*/WindowReadKind::kExactWindow,
+      /*clamp=*/false,
+      /*op_name=*/"tile.slice",
+      /*bounds_remedy=*/
+      "An on-chip window has no clamping mechanism, so it must fit: keep offset + shape inside the "
+      "source tile, or clamp the read at the tensor boundary with pl.load(..., clamp=True) and slice "
+      "the resulting tile in bounds",
+      /*span=*/args[0]->span_,
+  });
 
   // Optional drop_dims (5th arg): axes erased from the result type, validated
   // against the full pre-reduction shape. Apply to both the static shape and the
@@ -202,6 +224,7 @@ TypePtr DeduceTileSliceType(const std::vector<ExprPtr>& args,
   const ExprPtr drop_dims_arg = args.size() == 5 ? args[4] : nullptr;
   const std::vector<int64_t> drop_dims = ParseSliceDropDims(drop_dims_arg, new_shape, "tile.slice");
   if (!drop_dims.empty()) {
+    ValidateDropDimsValidExtents(drop_dims, valid_shape, "tile.slice", args[0]->span_);
     new_shape = ApplyDropDims(new_shape, drop_dims);
     valid_shape = ApplyDropDims(valid_shape, drop_dims);
     if (new_shape.size() < 2) {
@@ -314,6 +337,61 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
   tile_view.blayout = InferTileLayoutFromShape(new_shape);
 
   return std::make_shared<TileType>(new_shape, tile_type->dtype_, std::nullopt, tile_view);
+}
+
+TypePtr DeduceTileReinterpretViewType(const std::vector<ExprPtr>& args,
+                                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tile.reinterpret_view";
+  CHECK(args.size() == 1 || args.size() == 2)
+      << kOpName << " requires 1 or 2 arguments (data[, shape]), but got " << args.size();
+
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK_SPAN(tile_type, args[0]->span_)
+      << kOpName << " requires data to be a TileType, but got " << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tile_type->shape_.empty(), args[0]->span_)
+      << kOpName << " requires a tile rank >= 1, but got " << tile_type->shape_.size();
+
+  const DataType target_dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  CHECK_SPAN(source_view.slayout == TileLayout::none_box, args[0]->span_)
+      << kOpName << " only supports flat tiles with slayout=none_box; boxed/fractal tiles are unsupported";
+  CHECK_SPAN(source_view.blayout == TileLayout::row_major || source_view.blayout == TileLayout::col_major,
+             args[0]->span_)
+      << kOpName << " requires row_major or col_major blayout";
+  CHECK_SPAN(source_view.blayout != TileLayout::col_major || tile_type->shape_.size() >= 2, args[0]->span_)
+      << kOpName << " requires rank >= 2 for col_major layout";
+  if (tile_type->tile_view_.has_value()) {
+    CHECK_SPAN(tile_type->tile_view_->stride.empty(), args[0]->span_)
+        << kOpName << " only supports packed tiles without explicit strides";
+    if (auto offset = As<ConstInt>(tile_type->tile_view_->start_offset)) {
+      CHECK_SPAN(offset->value_ == 0, args[0]->span_)
+          << kOpName << " only supports tiles with zero start_offset, got " << offset->value_;
+    } else {
+      CHECK_SPAN(!tile_type->tile_view_->start_offset, args[0]->span_)
+          << kOpName << " only supports tiles without a dynamic start_offset";
+    }
+  }
+
+  std::optional<std::vector<ExprPtr>> requested_shape;
+  if (args.size() == 2) {
+    requested_shape = reinterpret_view_semantics::ExtractShape(args[1], kOpName);
+    CHECK_SPAN(source_view.blayout != TileLayout::col_major || requested_shape->size() >= 2, args[1]->span_)
+        << kOpName << " requires target rank >= 2 for col_major layout";
+  }
+
+  const size_t contiguous_axis = source_view.blayout == TileLayout::col_major ? tile_type->shape_.size() - 2
+                                                                              : tile_type->shape_.size() - 1;
+  auto plan = reinterpret_view_semantics::Resolve(tile_type->shape_, source_view.valid_shape,
+                                                  tile_type->dtype_, target_dtype, contiguous_axis,
+                                                  requested_shape, kOpName, args[0]->span_);
+
+  TileView result_view = source_view;
+  result_view.valid_shape = std::move(plan.valid_shape);
+  result_view.pad = reinterpret_view_semantics::NormalizePad(source_view.pad);
+  result_view.stride.clear();
+  result_view.start_offset = nullptr;
+  return std::make_shared<TileType>(std::move(plan.shape), target_dtype, std::nullopt,
+                                    std::make_optional(std::move(result_view)), tile_type->memory_space_);
 }
 
 TypePtr DeduceTileTransposeType(const std::vector<ExprPtr>& args,
@@ -452,6 +530,18 @@ REGISTER_OP("tile.reshape")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileReshapeType(args, kwargs);
+    });
+
+REGISTER_OP("tile.reinterpret_view")
+    .set_op_category("TileOp")
+    .set_description("Zero-copy reinterpretation of a flat tile with a different dtype and equal byte size")
+    .add_argument("data", "Input tile (packed, flat TileType)")
+    .add_argument("shape", "Optional target shape; omitted to scale the physically contiguous dimension")
+    .set_attr<DataType>("dtype")
+    .set_output_memory_inherit_input()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileReinterpretViewType(args, kwargs);
     });
 
 REGISTER_OP("tile.transpose")
@@ -611,8 +701,23 @@ TypePtr DeduceTileExtractType(const std::vector<ExprPtr>& args,
   check_axis(0, "row", args[1]);
   check_axis(1, "col", args[2]);
 
+  // TEXTRACT repacks a window of src into a dense dst, so the window can only be
+  // valid where src is. A src carrying padding under the window narrows the
+  // result; a fully-valid src leaves dst fully valid and the view collapses away.
   TileView tile_view;
-  tile_view.valid_shape = dst_shape;
+  tile_view.valid_shape = InferWindowReadValidShape({
+      /*source_physical=*/src_type->shape_,
+      /*source_valid=*/GetValidShape(src_type),
+      /*offsets=*/{args[1], args[2]},
+      /*window=*/dst_shape,
+      /*requested_valid=*/{},
+      /*kind=*/WindowReadKind::kExactWindow,
+      /*clamp=*/false,
+      /*op_name=*/"tile.extract",
+      /*bounds_remedy=*/
+      "ISA TEXTRACT bounds are hard, so the window must fit inside the source tile",
+      /*span=*/args[0]->span_,
+  });
   tile_view.blayout = InferTileLayoutFromShape(dst_shape);
 
   // Override blayout/slayout for L0-resident destinations to match the
@@ -645,6 +750,13 @@ REGISTER_OP("tile.extract")
     .add_argument("shape", "Static destination shape (TupleType, 2D MakeTuple of ConstInt)")
     .set_attr<MemorySpace>("target_memory")
     .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
+    // pto.textract repacks a strided window of src (row pitch = src cols) into a
+    // dense dst (row pitch = dst cols) while reading src.  With dst on src's
+    // buffer that repack runs in place, and whether a row's write clobbers a
+    // source row the extract has not read yet depends on the DMA's internal
+    // ordering — an assumption the ISA does not give us.  Forbid the aliasing
+    // outright so MemoryReuse never places the output on an input buffer (#2010).
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileExtractType(args, kwargs);
@@ -690,10 +802,10 @@ TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
 
   // Inherit tile_view (with valid_shape = input shape) and memory_space from input,
   // same pattern as tile.assemble — ensures tile.store can read valid_shape downstream.
-  TileView tile_view;
-  if (input_type->tile_view_.has_value()) {
-    tile_view = *input_type->tile_view_;
-  }
+  // Seed from the EFFECTIVE view so an input that leaves `tile_view_` implicit keeps
+  // the layout its shape and memory space imply, rather than acquiring the raw
+  // TileView defaults. See DeduceTileSetValidShapeType for the same rule.
+  TileView tile_view = tile_view_semantics::GetEffectiveTileView(*input_type);
   if (tile_view.valid_shape.empty()) {
     tile_view.valid_shape = input_type->shape_;
   }
@@ -763,6 +875,12 @@ REGISTER_OP("tile.concat")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    // pto.tconcat is not in-place safe: dst's row stride (validCol0 + validCol1)
+    // differs from each src's, so if dst shares a base address with a src, the
+    // row-by-row forward copy overwrites source rows before they are read.  Mark
+    // it not_inplace_safe so MemoryReuse never coalesces the output onto a src
+    // buffer (same rationale as tile.transpose above).
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileConcatType(args, kwargs);
@@ -806,10 +924,13 @@ TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
   check_const_bound("valid_rows", args[1], tile_type->shape_[0]);
   check_const_bound("valid_cols", args[2], tile_type->shape_[1]);
 
-  TileView tile_view;
-  if (tile_type->tile_view_.has_value()) {
-    tile_view = *tile_type->tile_view_;
-  }
+  // The result aliases the source buffer, so it must carry the source's layout.
+  // Seed from the EFFECTIVE view: when the source leaves `tile_view_` implicit,
+  // its layout is the one its memory space implies (an Acc tile is col_major /
+  // row_major / fractal=1024, a [M, 1] Vec tile is col_major, ...). Default-
+  // constructing a TileView here would pin the raw row_major / none_box /
+  // fractal=512 defaults onto an alias of, e.g., an Acc accumulator.
+  TileView tile_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
   tile_view.valid_shape = {args[1], args[2]};
 
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);

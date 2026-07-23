@@ -22,27 +22,22 @@
 #include <optional>
 #include <sstream>
 #include <string>
-#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
-#include "pypto/backend/common/backend_handler.h"
-#include "pypto/backend/common/pto_ops_common.h"
 #include "pypto/codegen/codegen_base.h"
-#include "pypto/codegen/distributed/comm_layout.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/codegen/pto/pto_type_utils.h"
+#include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
-#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
-#include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
 
@@ -244,6 +239,9 @@ static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::Codege
       codegen::ExtractTileTypeInfo(*source_tile_type, codegen.GetTypeString(source_tile_type->dtype_));
   auto view_memory_space = source_tile_type->memory_space_.value();
   if (cross_space_acc_to_mat) {
+    INTERNAL_CHECK_SPAN(result_tile_type->memory_space_.has_value(), op->span_)
+        << "tile.assemble cross-space Acc->Mat result must carry a memory space for pto.subview result "
+           "typing";
     const int64_t window_rows = view_type_info.rows;
     const int64_t window_cols = view_type_info.cols;
     view_type_info =
@@ -789,8 +787,23 @@ static std::string MakeMrgSort1CodegenPTO(const std::string& pto_op_name, const 
   return "";
 }
 
+// Resolve the exact tile_buf type carried by a view source's emitted SSA.
+static std::string GetViewSourceType(codegen::PTOCodegen& codegen, const ir::ExprPtr& src_arg) {
+  std::string src_type = codegen.GetExprTypeAnnotation(src_arg);
+  if (src_type.empty()) {
+    // MemRef-less source (a view over a cross-core tpop slot): no SSA type was
+    // registered and GetExprTypeAnnotation's TileType arm requires a MemRef.
+    if (auto src_var = AsVarLike(src_arg)) {
+      if (auto tile_type = As<ir::TileType>(src_var->GetType())) {
+        src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
+      }
+    }
+  }
+  return src_type;
+}
+
 // Emit a metadata-only `pto.treshape` reinterpret of `src_arg` into the current
-// result. Shared by the tile.reshape and tile.transpose_view codegen lambdas:
+// result. Shared by tile reshape/view codegen lambdas:
 // both lower a MemRef-less view (e.g. over a cross-core tpop slot) to a
 // pto.treshape that READS the source SSA — no data movement. `result_type` is the
 // result var's TileType buf-type (empty if none); when present a fresh temp
@@ -800,12 +813,13 @@ static void EmitTreshapeView(codegen::PTOCodegen& codegen, const ir::ExprPtr& sr
                              std::string result_target, const std::string& result_type,
                              const std::string& temp_prefix) {
   std::string src = codegen.GetExprAsCode(src_arg);
-  std::string src_type;
-  if (auto src_var = AsVarLike(src_arg)) {
-    if (auto tile_type = As<ir::TileType>(src_var->GetType())) {
-      src_type = codegen.GetTileBufTypeStringFromTileType(tile_type);
-    }
-  }
+  // Annotate the operand with the type its SSA value was DEFINED with, which
+  // GetExprTypeAnnotation resolves through the SSA → tile_buf-type map. Deriving
+  // it from the IR TileType instead breaks whenever the def carries static valid
+  // dims that `ExtractTileTypeInfo` renders as `v_row=?, v_col=?`: a `pto.subview`
+  // def infers its valid from the slice `sizes`, so a reshape of a slice would
+  // print `valid=?x?` at the use and MLIR rejects the def/use type mismatch.
+  std::string src_type = GetViewSourceType(codegen, src_arg);
   if (!result_type.empty()) {
     result_target = codegen.NewNamedTemp(temp_prefix);
     codegen.SetCurrentResultBuf(result_target);
@@ -994,6 +1008,20 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     mat_info.materialize_target_ssa = result_target;
     mat_info.materialize_target_type = result_type;
     mat_info.source_memory_space = source_tile_type->memory_space_;
+    // Shapes and offset kind the materialization guard needs: the target buffer
+    // aliases the source, so the lazy pto.textract may only run when its repack
+    // is an identity copy — right destination address (const offset, #1640) and
+    // right destination layout (contiguous window, #2010).  source_cols stays 0
+    // ("unknown") if the source rank or column count is not statically known,
+    // which makes the shape half of the guard stand down rather than reject a
+    // shape it cannot reason about.
+    auto source_cols_const =
+        source_tile_type->shape_.size() == 2 ? ir::As<ir::ConstInt>(source_tile_type->shape_[1]) : nullptr;
+    mat_info.source_cols = source_cols_const ? source_cols_const->value_ : 0;
+    mat_info.view_rows = rows_const->value_;
+    mat_info.view_cols = cols_const->value_;
+    mat_info.const_offset = ir::As<ir::ConstInt>(offset_tuple->elements_[0]) != nullptr &&
+                            ir::As<ir::ConstInt>(offset_tuple->elements_[1]) != nullptr;
     codegen.RegisterSubviewMaterialization(view_ssa, mat_info);
 
     // Bind the slice's result variable to the subview SSA; the pre-emitted
@@ -1067,54 +1095,101 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     // per-var alloc model pre-declared it with the reshaped type at a shared
     // addr); a MemRef-less result has no alloc, so it must emit pto.treshape.
     std::string result_type;
+    // The emitted `pto.treshape` result carries STATIC valid dims: the op takes no
+    // valid_row / valid_col operands, so ptoas builds the destination tile from the
+    // result type alone and a `v_row=?` would leave its valid extent at zero.
+    std::string view_type;
     bool result_has_memref = false;
     if (auto result_var = codegen.GetCurrentResultVar()) {
       if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
         result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+        view_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile);
         result_has_memref = result_tile->memref_.has_value();
       }
     }
+    // The no-op check compares against the pre-declared alloc_tile, whose type is
+    // always the dynamic-valid form — so it must use `result_type`, not `view_type`.
     auto existing_type = codegen.GetSSATileBufType(result_target);
     if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
       return std::string("");
     }
 
     // Fallback: emit pto.treshape reading the source SSA.
-    EmitTreshapeView(codegen, op->args_[0], result_target, result_type, "reshape_buf");
+    EmitTreshapeView(codegen, op->args_[0], result_target, view_type, "reshape_buf");
+    return std::string("");
+  });
+
+  reg("tile.reinterpret_view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+        << "Internal error: tile.reinterpret_view requires 1 or 2 arguments (data[, shape]), but got "
+        << op->args_.size();
+    auto& codegen = AsPto(codegen_base);
+    const std::string result_target = codegen.GetCurrentResultTarget();
+
+    auto source_tile = ir::As<ir::TileType>(op->args_[0]->GetType());
+    auto result_var = codegen.GetCurrentResultVar();
+    auto result_tile = result_var ? ir::As<ir::TileType>(result_var->GetType()) : nullptr;
+    INTERNAL_CHECK_SPAN(source_tile && result_tile, op->span_)
+        << "Internal error: tile.reinterpret_view requires TileType source and result";
+
+    const std::string result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+    const bool result_has_memref = result_tile->memref_.has_value();
+    const std::string existing_type = codegen.GetSSATileBufType(result_target);
+
+    // With baked addresses, the result's own alloc_tile at the inherited
+    // address is already the typed alias. PTOAS-planner mode shares one handle,
+    // so it must materialize a typed SSA view below.
+    if (codegen.EmitTileAddr() && result_has_memref && !existing_type.empty() &&
+        existing_type == result_type) {
+      return std::string("");
+    }
+
+    // PTOAS treshape is the byte-preserving dtype/shape reinterpret primitive.
+    // Use it even when the shape is unchanged: pto.bitcast does not preserve the
+    // source tile payload on current A2/A3 runtimes.
+    const std::string view_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile);
+    EmitTreshapeView(codegen, op->args_[0], result_target, view_type, "reinterpret_view_buf");
     return std::string("");
   });
 
   reg("tile.transpose_view", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     // Zero-copy fractal-layout reinterpretation (NZ<->ZN).
-    //  - Alloc-backed result (the #1776 case): the result var owns a pre-declared
-    //    pto.alloc_tile carrying the transposed (ZN) type, aliased to the source
-    //    buffer's address through the shared MemRef. The two alloc_tile decls at
-    //    the same addr ARE the whole mechanism — emit nothing.
-    //  - MemRef-less result (a view over a cross-core tpop slot, which owns no
-    //    buffer): there is no alloc to alias, so reinterpret the slot in place
-    //    with pto.treshape reading the source SSA (a metadata-only op — no data
-    //    movement), exactly like tile.reshape over a tpop.
+    //  - The result var owns a pre-declared pto.alloc_tile already carrying the
+    //    transposed (ZN) type, aliased to the source buffer's address through the
+    //    shared MemRef (the #1776 case, PyPTO planner). The two alloc_tile decls
+    //    at the same addr ARE the whole mechanism — emit nothing.
+    //  - Otherwise there is no declaration carrying the transposed type, so
+    //    reinterpret the source in place with pto.treshape reading its SSA (a
+    //    metadata-only op — no data movement), exactly like tile.reshape. This
+    //    covers both a MemRef-less result (a view over a cross-core tpop slot,
+    //    which owns no buffer) and the PTOAS planner, where addr-less aliased
+    //    vars collapse onto ONE tile_buf handle: the second alloc_tile that
+    //    would have carried the transposed layout is never emitted.
     CHECK(op->args_.size() == 1) << "Operation:[tile.transpose_view] requires 1 argument (tile), but got "
                                  << op->args_.size();
     auto& codegen = AsPto(codegen_base);
     std::string result_target = codegen.GetCurrentResultTarget();
 
     std::string result_type;
+    std::string view_type;  // static valid dims — see tile.reshape above
     bool result_has_memref = false;
     if (auto result_var = codegen.GetCurrentResultVar()) {
       if (auto result_tile = ir::As<ir::TileType>(result_var->GetType())) {
         result_type = codegen.GetTileBufTypeStringFromTileType(result_tile);
+        view_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile);
         result_has_memref = result_tile->memref_.has_value();
       }
     }
-    // Alloc-backed: the pre-declared alloc_tile at the shared addr is the view.
-    if (result_has_memref) {
+    // The result's own alloc_tile already declares the transposed type: it IS
+    // the view, so emit nothing. Mirrors tile.reshape's no-op check.
+    auto existing_type = codegen.GetSSATileBufType(result_target);
+    if (result_has_memref && !existing_type.empty() && existing_type == result_type) {
       return std::string("");
     }
 
-    // MemRef-less: reinterpret the slot in place via pto.treshape reading the
-    // source SSA — exactly like tile.reshape over a tpop.
-    EmitTreshapeView(codegen, op->args_[0], result_target, result_type, "transpose_view_buf");
+    // No declaration carries the transposed type — reinterpret the source in
+    // place via pto.treshape reading its SSA, exactly like tile.reshape.
+    EmitTreshapeView(codegen, op->args_[0], result_target, view_type, "transpose_view_buf");
     return std::string("");
   });
 

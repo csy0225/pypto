@@ -24,14 +24,15 @@ from pypto.ir.op.system_ops import (
     bar_all,
     bar_m,
     bar_v,
+    fence,
     sync_dst,
     sync_src,
 )
 from pypto.ir.utils import _get_span_or_capture
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Call, ConstInt, MemorySpace, Span
+from pypto.pypto_core.ir import Call, ConstInt, MemorySpace, PipeType, Span
 
-from ..typing import Array, Scalar, Tensor, Tile
+from ..typing import Array, IntLike, Scalar, Tensor, Tile
 
 # pto::SYNCALL soft barrier reserves 8 int32 slots per participating core.
 _SYNCALL_SOFT_SLOT_INT32 = 8
@@ -40,9 +41,14 @@ __all__ = [
     "AUTO",
     "sync_src",
     "sync_dst",
+    "sync_set",
+    "sync_wait",
+    "set_ffts",
     "bar_v",
     "bar_m",
     "bar_all",
+    "fence",
+    "cacheinvalid",
     "syncall",
     "tpush_to_aiv",
     "tpush_to_aic",
@@ -57,6 +63,44 @@ __all__ = [
     "task_invalid",
     "task_dummy",
 ]
+
+
+def sync_set(
+    event_id: IntLike,
+    *,
+    pipe: PipeType,
+    ffts_mode: int | None = None,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Set a Cube/Vector cross-core event using a static or dynamic event id.
+
+    Set ``core_type`` to ``"aic"`` or ``"aiv"`` inside a mixed InCore kernel.
+    """
+    event_expr = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.sync_set(event_expr, pipe=pipe, ffts_mode=ffts_mode, core_type=core_type, span=span)
+
+
+def sync_wait(
+    event_id: IntLike,
+    *,
+    pipe: PipeType,
+    core_type: str | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Wait for a Cube/Vector cross-core event using a static or dynamic event id.
+
+    Set ``core_type`` to ``"aic"`` or ``"aiv"`` inside a mixed InCore kernel.
+    """
+    event_expr = event_id.unwrap() if isinstance(event_id, Scalar) else event_id
+    return _ir_ops.sync_wait(event_expr, pipe=pipe, core_type=core_type, span=span)
+
+
+def set_ffts(workspace: Tensor, *, span: Span | None = None) -> Call:
+    """Declare the A3 FFTS setup operand for explicit cross-core synchronization."""
+    if not isinstance(workspace, Tensor):
+        raise TypeError(f"set_ffts workspace must be a Tensor, got {type(workspace).__name__}")
+    return _ir_ops.set_ffts(workspace.unwrap(), span=span)
 
 
 _SYNCALL_SOFT_CORE_TYPES = ("aiv_only", "aic_only", "mix")
@@ -167,6 +211,34 @@ def syncall(
         scratch_l1 = _l1_scratch(scratch_l1)
         args = [gm_workspace.unwrap(), scratch.unwrap(), scratch_l1.unwrap(), used_const]
     return _ir_ops.syncall_soft(core_type, args, span=actual_span)
+
+
+def cacheinvalid(
+    tensor: Tensor,
+    shapes: Sequence[int | Scalar],
+    offsets: Sequence[int | Scalar],
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Invalidate the cache lines backing a tensor sub-region.
+
+    Codegen picks the lowering by the region size:
+
+    - ``shapes`` all 1 (scalar write): ``pto.addptr`` +
+      ``pto.cmo.cacheinvalid %write_ptr single_cache_line``.
+    - otherwise (tile store): ``pto.partition_view`` +
+      ``pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>``.
+
+    Args:
+        tensor: Target tensor whose sub-region is invalidated.
+        shapes: Per-dimension region sizes; length must equal the tensor rank
+            (all 1 selects the scalar-write / ptr form).
+        offsets: Per-dimension start offsets; length must equal the tensor rank.
+        span: Optional source span for debugging (auto-captured if not provided).
+    """
+    shp = [s.unwrap() if isinstance(s, Scalar) else s for s in shapes]
+    off = [o.unwrap() if isinstance(o, Scalar) else o for o in offsets]
+    return _ir_ops.cacheinvalid(tensor.unwrap(), shp, off, span=span)
 
 
 def tpush_to_aiv(tile: Tile, *, split: int, id: int | None = None, span: Span | None = None) -> Call:

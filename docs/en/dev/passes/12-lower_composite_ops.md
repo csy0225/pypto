@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce`, `allgather`, `reduce_scatter`, `broadcast`, `barrier`). New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
+Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
 
 ## Overview
 
@@ -18,7 +18,7 @@ The pass is **structural no-op** on programs that contain no registered composit
 
 **Invalidates**: nothing.
 
-The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates purely within the existing tile-op vocabulary (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) — it neither establishes nor breaks any `IRProperty`.
+The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus shape-only tensor views (`tensor.view`) used to expose canonical flattened windows; it neither establishes nor breaks any `IRProperty`.
 
 ## When It Runs
 
@@ -43,7 +43,7 @@ src/ir/transforms/lower_composite_ops_pass.cpp
 
 Adding a new composite op (all edits stay in `lower_composite_ops_pass.cpp`):
 
-1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (4-phase notify / wait / remote_load+accumulate / store).
+1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (4-phase notify / wait / remote_load+accumulate / store for mesh; `LowerTensorRingAllReduceRule` adds a chunked RS+AG ring schedule dispatched via a `mode` kwarg).
 2. Add a `{"<op>", &Lower<Op>Rule}` row to `kRules` inside `LookupCompositeRule`.
 
 No edits to the mutator are needed. When the table grows past a handful of entries — or a rule wants its own translation unit — promote it back to a standalone registry under `src/ir/transforms/composite_ops/`.
@@ -187,11 +187,13 @@ Running `LowerCompositeOps` twice produces identical IR after the first run: the
 
 ## `pld.tensor.*` distributed collectives
 
-The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe. The data-movement primitive differs by op: `allgather` and `broadcast` relocate window data with `pld.tile.get` (a GM→GM bulk copy through a VEC staging tile), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load` and accumulate with `tile.add`. The rules share the same signal-buffer discipline: a window-bound INT32 `signal` matrix is used as a cross-rank barrier, and the buffer is **single-shot per call**.
+The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe. The data-movement primitive differs by op: `allgather` uses `pld.tile.put` (TPUT-based, auto-chunks through a VEC staging tile), `broadcast` relocates window data with `pld.tile.get` (GM→GM copy), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load` and accumulate with `tile.add`. The rules share the same signal-buffer discipline: a window-bound INT32 `signal` matrix is used as a cross-rank barrier, and the buffer is **single-shot per call**.
 
 ### `pld.tensor.allreduce`
 
 The allreduce rule decomposes one composite call into two cross-rank barriers reusing the same `signal` cells: Phase 2a `Set 1` + Phase 2b `wait ≥1`, then Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`. By the time the call returns, every cell sits at `2` rather than its initial `0`.
+
+Mesh lowering collapses a packed target to `[product(leading dimensions), last dimension]`. If an ND target carries a partial `TensorView.valid_shape`, the pass preserves it and reduces only the corresponding 2D rectangle. Strided targets, DN partial views, and partial boxes that cannot be represented by this leading-dimension collapse are rejected explicitly.
 
 **Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale `2` in any cell would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's Phase 4 writes. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
 
@@ -201,15 +203,15 @@ Only `ReduceOp::kSum` is supported in the first version; the C++ deducer rejects
 
 ### `pld.tensor.allgather`
 
-Signature: `allgather(local_data, target, signal, out)`. `local_data` is this rank's chunk (`Tensor` or `Tile` `[1, SIZE]`), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area, `signal` is the INT32 barrier, and `out` is a plain `Tensor[1, NR*SIZE]` that receives the result. Decomposes into a recipe aligned with the simpler allgather reference (`simpler/examples/workers/l3/allgather_distributed/`):
+Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's chunk (`Tensor` or `Tile` `[1, SIZE]`), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area that also serves as the result, and `signal` is the INT32 barrier. Push-based decomposition:
 
-- Phase 0: `tile.load(local_data, [0, 0], [1, SIZE])` — emit a Tile from the plain input when `local_data` is a `Tensor`; skipped when it is already a Tile
-- Phase 1: `tile.store(stage_tile, [0, 0], target)` — stage this rank's chunk into its private HCCL window at local row 0
+- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking.  ``pld.tile.put`` reads directly from the ``local_data`` Tensor (or Tile) source — no explicit ``tile.load`` is emitted.
+- Phase 1: for `peer` in `0..NR-1`, `pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — push this rank's chunk into every peer's window at row `my_rank`. Self-store (`peer == my_rank`) uses HCCL identity mapping. `pld.tile.put` auto-chunks when SIZE exceeds the staging-tile capacity
 - Phase 2a: notify-all (`Set 1`)
 - Phase 2b: wait-all (`Ge 1`)
-- Phase 3: for `r` in `0..NR-1`, `pld.tile.get(out, peer=r, target, stage, dst_offsets=[0, r*SIZE], src_offsets=[0, 0], shape=[1, SIZE])` — transfer each peer's chunk directly into `out` at column offset `[0, r*SIZE]` through one shared `[1, SIZE]` VEC staging tile. No `tile.concat`; each transfer is `[1, SIZE]` so it fits in UB for any `NR`/`SIZE`. Returns the `out` **Tensor** `[1, NR*SIZE]`.
+- Return `target` — the window IS the gathered `[NR, SIZE]` result (window-as-result, `DistributedTensor`)
 
-Self-read falls out of the same `pld.tile.get` path via HCCL identity mapping (`CommRemotePtr` returns local pointer for `peer == my_rank`). Every rank produces the identical rank-ordered concatenation in `out`.
+Compared to the original pull-based allgather (4-arg with a separate `out` tensor), this push-based variant drops the `out` parameter and the per-peer `pld.tile.get` gather loop. Total HBM drops from `(NR+1)×SIZE` to `NR×SIZE`, at the cost of the window remaining occupied until the caller consumes the result.
 
 ### `pld.tensor.reduce_scatter`
 

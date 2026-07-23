@@ -190,8 +190,8 @@ bool IsRightAssociative(const ExprPtr& expr) {
  */
 class IRPythonPrinter : public IRVisitor {
  public:
-  explicit IRPythonPrinter(std::string prefix = "pl", bool concise = false)
-      : prefix_(std::move(prefix)), concise_(concise) {}
+  explicit IRPythonPrinter(std::string prefix = "pl", bool concise = false, bool explicit_layout = false)
+      : prefix_(std::move(prefix)), concise_(concise), explicit_layout_(explicit_layout) {}
   ~IRPythonPrinter() override = default;
 
   /**
@@ -281,8 +281,14 @@ class IRPythonPrinter : public IRVisitor {
   // redundant op-level ``split=`` kwarg on aiv_shard/aic_gather is suppressed
   // (the region's mode is the authoritative carrier; the parser re-stamps it).
   int split_aiv_scope_depth_ = 0;
-  std::string prefix_;                    // Prefix for type names (e.g., "pl" or "ir")
-  bool concise_;                          // When true, omit intermediate type annotations
+  std::string prefix_;  // Prefix for type names (e.g., "pl" or "ir")
+  bool concise_;        // When true, omit intermediate type annotations
+  // When true, print every tile's fully-resolved blayout/slayout/fractal from
+  // GetEffectiveTileView — including tiles whose canonical tile_view_ is nullopt
+  // (whose layout would otherwise be silently implicit). Makes a dump
+  // self-describing for tile layouts (opt-in debugging aid, issue #2088); the
+  // concise canonical form stays the default.
+  bool explicit_layout_;
   ProgramPtr current_program_ = nullptr;  // Track when printing within Program (for self.method() calls)
 
   // Per-function rename map: Var pointer → unique printed name.
@@ -372,6 +378,14 @@ class IRPythonPrinter : public IRVisitor {
   // this bool off the scope and threads it onto the synthesised ``Submit`` —
   // it must survive a print/reparse roundtrip while the scope still exists.
   bool PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op);
+
+  // Emit ``predicate=(<expr>)`` if the scope carries ``kAttrPredicate``;
+  // returns true when printed. Same contract as
+  // PrintScopeAllowEarlyResolveAttr — the outliner reads the predicate off the
+  // scope and threads it onto the synthesised ``Submit``, so it must survive a
+  // print/reparse roundtrip while the scope still exists. The comparison Expr
+  // prints itself, so there is no bespoke syntax.
+  bool PrintScopePredicateAttr(const ScopeStmtPtr& op);
 
   // Emit ``windowize=True`` for an explicitly opted-in InCore scope.
   bool PrintScopeWindowizeAttr(const ScopeStmtPtr& op);
@@ -512,9 +526,10 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
   // ``As<TensorType>`` is precise-match and would not fire for the subclass,
   // so dispatch on DistributedTensorType first and pass it through the
   // TensorType base for shared field access.
+  auto dt_tensor = As<DistributedTensorType>(type);
   TensorTypePtr tensor_type;
   std::string tensor_head;
-  if (auto dt_tensor = As<DistributedTensorType>(type)) {
+  if (dt_tensor) {
     tensor_type = dt_tensor;
     tensor_head = "pld.DistributedTensor";
   } else if (auto plain_tensor = As<TensorType>(type)) {
@@ -542,6 +557,21 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     // Add optional memref as positional arg
     if (tensor_type->memref_.has_value()) {
       oss << ", " << PrintMemRef(*tensor_type->memref_.value());
+    }
+
+    // Fully-resolved dump (issue #2088): a DistributedTensorType carries a
+    // WindowBuffer back-reference that the concise form drops, so two same
+    // shape/dtype distributed tensors viewing *different* window buffers print
+    // identically. Surface the buffer name so a dump distinguishes them. This is
+    // an informational marker (a quoted string): the subscript DSL has no
+    // window_buffer slot and Python forbids keyword subscripts, so it is emitted
+    // as a trailing string element. The parser strips it (type_resolver +
+    // DistributedTensorMeta) and re-derives the real reference from
+    // pld.tensor.window, so EXPLICIT dumps still reparse to identical IR — which
+    // validate_ir relies on (it reloads every dump). Emitted only under
+    // explicit_layout_.
+    if (explicit_layout_ && dt_tensor && dt_tensor->window_buffer_.has_value()) {
+      oss << ", \"window_buffer=" << dt_tensor->window_buffer_.value()->name_hint_ << "\"";
     }
 
     oss << "]";
@@ -577,14 +607,23 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
       oss << ", " << prefix_ << ".Mem." << mem_str;
     }
 
-    if (tile_type->tile_view_.has_value()) {
-      // PrintTileView elides every default field and returns "" when the explicit
-      // view happens to match the implicit one — possible only on incoherent IR
-      // (canonical IR stores that as nullopt and never reaches this branch).
-      // Fall back to an empty TileView() literal so the output stays parseable
-      // and TileTypeCoherence can flag the real bug.
-      auto view_str =
-          PrintTileView(tile_type->tile_view_.value(), tile_type->shape_, tile_type->memory_space_);
+    // Pick the view to render, then print once. explicit_layout_ resolves an
+    // absent canonical view (tile_view_ == nullopt) to its implicit form via
+    // GetEffectiveTileView so the annotation states its real blayout/slayout/
+    // fractal (issue #2088) — PrintTileView forces those fields in that mode, so
+    // it never returns "" for the explicit view. The concise branch only renders
+    // a present view; when a present view happens to match the implicit one
+    // (possible only on incoherent IR — canonical IR stores that as nullopt), the
+    // empty-string fallback keeps the output parseable so TileTypeCoherence can
+    // flag the real bug.
+    std::optional<TileView> view;
+    if (explicit_layout_) {
+      view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+    } else if (tile_type->tile_view_.has_value()) {
+      view = tile_type->tile_view_.value();
+    }
+    if (view.has_value()) {
+      auto view_str = PrintTileView(*view, tile_type->shape_, tile_type->memory_space_);
       oss << ", " << (view_str.empty() ? prefix_ + ".TileView()" : view_str);
     }
 
@@ -900,6 +939,55 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     stream_ << op_name << "(";
   }
 
+  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
+  // via an explicit allowlist. Most attrs are re-derived by the parser or have
+  // bespoke syntax. ``pipeline_membership`` has neither and must survive until
+  // MemoryReuse consumes it. Keep this helper available to special call forms
+  // below so an early return cannot silently drop the attr.
+  auto print_serialized_attrs = [&](bool need_comma) {
+    std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
+    for (const auto& kv : op->attrs_) {
+      if (kv.first == kPipelineMembershipAttr) serialized_attrs.push_back(&kv);
+    }
+    if (serialized_attrs.empty()) return;
+
+    stream_ << (need_comma ? ", " : "") << "attrs={";
+    bool first_key = true;
+    for (const auto* kv : serialized_attrs) {
+      stream_ << (first_key ? "" : ", ");
+      first_key = false;
+      stream_ << std::quoted(kv->first) << ": ";
+      PrintAttrValue(kv->second, op->span_);
+    }
+    stream_ << "}";
+  };
+
+  // reinterpret_view keeps dtype as the second public-API input and shape as a
+  // keyword-only optional input, while the IR stores shape positionally and
+  // dtype in kwargs. Print the public ordering explicitly so both tensor and
+  // tile forms round-trip through their DSL wrappers.
+  if ((IsOp(op, "tile.reinterpret_view") || IsOp(op, "tensor.reinterpret_view")) &&
+      (op->args_.size() == 1 || op->args_.size() == 2)) {
+    VisitExpr(op->args_[0]);
+    bool found_dtype = false;
+    for (const auto& [key, value] : op->kwargs_) {
+      if (key != "dtype") continue;
+      stream_ << ", dtype=" << prefix_ << "."
+              << DataTypeToString(AnyCast<DataType>(value, op->op_->name_ + " dtype"));
+      found_dtype = true;
+      break;
+    }
+    INTERNAL_CHECK_SPAN(found_dtype, op->span_)
+        << "Internal error: " << op->op_->name_ << " is missing its required dtype kwarg";
+    if (op->args_.size() == 2) {
+      stream_ << ", shape=";
+      VisitExpr(op->args_[1]);
+    }
+    print_serialized_attrs(/*need_comma=*/true);
+    stream_ << ")";
+    return;
+  }
+
   // Special handling for tile.full / tensor.full: print as keyword args to match Python API
   // IR stores: args_=[shape, value_expr], kwargs_={"dtype": dtype}
   // Python API: full(shape, dtype, value) — print as full(shape, dtype=.., value=..)
@@ -925,6 +1013,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     } else {
       VisitExpr(val_expr);
     }
+    print_serialized_attrs(/*need_comma=*/true);
     stream_ << ")";
     return;
   }
@@ -940,10 +1029,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     std::string core_type = "mix";
     std::string mode = "soft";
     for (const auto& [key, val] : op->kwargs_) {
-      if (key == "core_type")
+      if (key == "core_type") {
         core_type = AnyCast<std::string>(val, "syncall core_type");
-      else if (key == "mode")
+      } else if (key == "mode") {
         mode = AnyCast<std::string>(val, "syncall mode");
+      }
     }
     const size_t used_idx = op->args_.size() - 1;
     stream_ << "mode=\"" << mode << "\", core_type=\"" << core_type << "\", gm_workspace=";
@@ -962,6 +1052,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       stream_ << ", scratch_l1=";
       VisitExpr(op->args_[2]);
     }
+    print_serialized_attrs(/*need_comma=*/true);
     stream_ << ")";
     return;
   }
@@ -1037,7 +1128,8 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     if (value.type() == typeid(int)) {
       int int_val = AnyCast<int>(value, "printing kwarg: " + key);
       // Print pipe kwargs as PipeType enum names for readability
-      if (key == "set_pipe" || key == "wait_pipe") {
+      if (key == "set_pipe" || key == "wait_pipe" ||
+          (key == "pipe" && (IsOp(op, "system.sync_set") || IsOp(op, "system.sync_wait")))) {
         stream_ << prefix_ << ".PipeType." << PipeTypeToString(static_cast<PipeType>(int_val));
       } else if (key == "mode") {
         stream_ << "'" << CastModeToString(int_val) << "'";
@@ -1095,32 +1187,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     }
   }
 
-  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
-  // via an explicit allowlist. Most op-call attrs are either re-derived by the
-  // parser (e.g. ``dummy_task`` on ``system.task_dummy``) or surfaced through a
-  // bespoke kwarg (``deps=`` / ``device=``), so emitting them generically would
-  // either duplicate that surface or expose an internal marker the round-trip
-  // tests don't expect. ``pipeline_membership`` (set by LowerPipelineLoops, read
-  // by MemoryReuse) has no such surface and MUST round-trip, else the structural
-  // equality check after those passes fails. The matching reader is
-  // ``ast_parser`` (``_parse_op_attrs`` -> ``set_call_attrs``).
-  {
-    std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
-    for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr) serialized_attrs.push_back(&kv);
-    }
-    if (!serialized_attrs.empty()) {
-      stream_ << (need_comma ? ", " : "") << "attrs={";
-      bool first_key = true;
-      for (const auto* kv : serialized_attrs) {
-        stream_ << (first_key ? "" : ", ");
-        first_key = false;
-        stream_ << std::quoted(kv->first) << ": ";
-        PrintAttrValue(kv->second, op->span_);
-      }
-      stream_ << "}";
-    }
-  }
+  print_serialized_attrs(need_comma);
 
   stream_ << ")";
 }
@@ -1211,6 +1278,16 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
   // launch spec, so emit it for a plain pl.submit too (not nested above).
   if (op->allow_early_resolve_) {
     stream_ << ", allow_early_resolve=True";
+  }
+
+  // Dispatch predicate — emitted as ``predicate=(<expr>)``; the comparison Expr
+  // prints itself, and the parser recovers it by parsing the kwarg as an
+  // ordinary expression, so the round trip needs no bespoke syntax.
+  if (op->predicate_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->predicate_, op->span_) << "Submit predicate is null";
+    stream_ << ", predicate=(";
+    VisitExpr(*op->predicate_);
+    stream_ << ")";
   }
 
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:
@@ -1716,6 +1793,15 @@ bool IRPythonPrinter::PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op) {
   return true;
 }
 
+bool IRPythonPrinter::PrintScopePredicateAttr(const ScopeStmtPtr& op) {
+  auto pred = op->GetAttr<ExprPtr>(kAttrPredicate, nullptr);
+  if (!pred) return false;
+  stream_ << ", predicate=(";
+  VisitExpr(pred);
+  stream_ << ")";
+  return true;
+}
+
 bool IRPythonPrinter::PrintScopeWindowizeAttr(const ScopeStmtPtr& op) {
   if (!op->GetAttr<bool>("windowize", false)) return false;
   stream_ << ", windowize=True";
@@ -1854,6 +1940,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     }
     PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
+    PrintScopePredicateAttr(op);
     stream_ << ")";
     PrintScopeTaskIdVarSuffix(op);
     stream_ << ":\n";
@@ -1892,6 +1979,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
       PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
     }
     PrintScopeAllowEarlyResolveAttr(op);
+    PrintScopePredicateAttr(op);
     stream_ << "):\n";
     IncreaseIndent();
     // Emit the InCore body skipping the get_block_idx binding we just
@@ -1921,6 +2009,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
   PrintScopeAllowEarlyResolveAttr(op);
+  PrintScopePredicateAttr(op);
   stream_ << "):\n";
   IncreaseIndent();
   PrintStmtBlock(op->body_);
@@ -2714,8 +2803,9 @@ std::string IRPythonPrinter::PrintMemRef(const MemRef& memref) {
 
 std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std::vector<ExprPtr>& tile_shape,
                                            const std::optional<MemorySpace>& memory_space) {
-  // Caller already gated on has_value(); a present view is non-implicit by the
-  // TileType canonical-encoding invariant, so always render the explicit form.
+  // Caller already gated on has_value() (or passed the resolved effective view in
+  // explicit_layout_ mode); a present view is non-implicit by the TileType
+  // canonical-encoding invariant, so always render the explicit form.
   std::ostringstream oss;
   oss << prefix_ << ".TileView(";
 
@@ -2725,11 +2815,19 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
     first = false;
   };
 
-  // Compute the implicit view so we can elide fields that match it.
-  TileView implicit_view = tile_view_semantics::GetImplicitTileView(tile_shape, memory_space);
+  // Compute the implicit view so we can elide layout fields that match it — but
+  // only in concise mode. Under explicit_layout_ the blayout/slayout/fractal
+  // guards short-circuit on `explicit_layout_ ||` and never read it, so skipping
+  // it avoids a wasted GetImplicitTileView (already folded into the effective
+  // view the caller resolved for absent-view tiles).
+  TileView implicit_view;
+  if (!explicit_layout_) {
+    implicit_view = tile_view_semantics::GetImplicitTileView(tile_shape, memory_space);
+  }
 
   // valid_shape — omit if it matches the parent tile's shape
-  bool valid_shape_matches = tile_view_semantics::ShapeExprListsEquivalent(tile_view.valid_shape, tile_shape);
+  bool valid_shape_matches = tile_view.valid_shape.empty() ||
+                             tile_view_semantics::ShapeExprListsEquivalent(tile_view.valid_shape, tile_shape);
   if (!valid_shape_matches) {
     maybe_comma();
     oss << "valid_shape=[";
@@ -2759,7 +2857,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // blayout — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.blayout != implicit_view.blayout) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.blayout != implicit_view.blayout) {
     maybe_comma();
     oss << "blayout=" << prefix_ << ".TileLayout.";
     switch (tile_view.blayout) {
@@ -2776,7 +2875,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // slayout — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.slayout != implicit_view.slayout) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.slayout != implicit_view.slayout) {
     maybe_comma();
     oss << "slayout=" << prefix_ << ".TileLayout.";
     switch (tile_view.slayout) {
@@ -2793,7 +2893,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // fractal — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.fractal != implicit_view.fractal) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.fractal != implicit_view.fractal) {
     maybe_comma();
     oss << "fractal=" << tile_view.fractal;
   }
@@ -2910,13 +3011,14 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
 // ================================
 // Public API
 // ================================
-std::string PythonPrint(const IRNodePtr& node, const std::string& prefix, bool concise) {
-  IRPythonPrinter printer(prefix, concise);
+std::string PythonPrint(const IRNodePtr& node, const std::string& prefix, bool concise,
+                        bool explicit_layout) {
+  IRPythonPrinter printer(prefix, concise, explicit_layout);
   return printer.Print(node);
 }
 
-std::string PythonPrint(const TypePtr& type, const std::string& prefix) {
-  IRPythonPrinter printer(prefix);
+std::string PythonPrint(const TypePtr& type, const std::string& prefix, bool explicit_layout) {
+  IRPythonPrinter printer(prefix, /*concise=*/false, explicit_layout);
   return printer.Print(type);
 }
 

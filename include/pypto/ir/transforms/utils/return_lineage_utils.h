@@ -32,7 +32,12 @@ namespace return_lineage {
 /// ``tensor.set_validshape``), TupleGetItem of a user-call result, and
 /// user calls (single- and tuple-result) — recursing into callees with
 /// memoization and a cycle guard. Group/Spmd wrappers with no top-level
-/// ReturnStmt resolve through their unique returning inner call.
+/// ReturnStmt resolve through their unique returning inner call; a wrapper that
+/// *does* return, but returns the forwarded tuple of a multi-result inner call
+/// (``result = self.inner(...); return result``), is expanded position-by-
+/// position through that call — only when the wrapper declares that many flat
+/// return positions, so a single ``pl.Tuple[...]`` return (one TupleType in
+/// ``return_types_``) keeps its 1-arity map.
 ///
 /// @return index into ``func->params_``, or nullopt when not a param writeback.
 std::optional<size_t> ReturnedParamIndex(const FunctionPtr& func, const ProgramPtr& program);
@@ -43,6 +48,48 @@ std::optional<size_t> ReturnedParamIndex(const FunctionPtr& func, const ProgramP
 ///         and is not a wrapper resolvable through its inner call; otherwise
 ///         one entry per return position (nullopt = not a param writeback).
 std::vector<std::optional<size_t>> ReturnedParamIndices(const FunctionPtr& func, const ProgramPtr& program);
+
+/// Read the return->param map straight off @p func's ReturnStmt.
+///
+/// `NormalizeReturnOrder` rewrites every tensor param-writeback return value to
+/// reference its param directly, and `IRProperty::ReturnParamsExplicit` verifies
+/// it. Once that property holds the map is a *local structural fact*: return
+/// position `j` writes back param `i` exactly when `ReturnStmt->value_[j]` is
+/// `func->params_[i]` by pointer identity. No SSA walk, no callee recursion, no
+/// `Program`.
+///
+/// Every consumer at or after `NormalizeReturnOrder` — orchestration codegen,
+/// `ClassifyIterArgCarry` — must use this rather than `ReturnedParamIndices`:
+/// it is a 1-to-1 read of the IR, so it cannot silently disagree with what the
+/// IR actually says. Reserve `ReturnedParamIndices` for callers that run
+/// *before* the property is established (`ExpandMixedKernel`, the scope
+/// outliner), for `NormalizeReturnOrder` itself, and for the property verifier,
+/// which must re-derive independently to have anything to check.
+///
+/// Scalar return positions are never canonicalized, so they resolve here only
+/// when the value literally *is* a scalar param. That is deliberate: propagating
+/// param lineage onto a scalar return once made codegen emit `const Tensor&` for
+/// an `int64_t` (issue #1580).
+///
+/// @return one entry per return position (nullopt = not a param writeback);
+///         empty when @p func has no ReturnStmt.
+std::vector<std::optional<size_t>> ExplicitReturnedParamIndices(const FunctionPtr& func);
+
+/// First-position convenience wrapper over ExplicitReturnedParamIndices.
+std::optional<size_t> ExplicitReturnedParamIndex(const FunctionPtr& func);
+
+/// Locate the topmost ReturnStmt of @p body, or nullptr when there is none.
+///
+/// Fast-paths the common shape (a `SeqStmts` whose last statement is the
+/// return) and falls back to a pre-order walk for bodies that nest it — split
+/// AIV kernels keep theirs inside the split body.
+///
+/// The two paths agree because a function body carries at most one ReturnStmt
+/// by the time this runs: `CtrlFlowTransform` rewrites early returns into
+/// structured control flow, so returns are function-terminal. A body holding
+/// both a nested and a trailing ReturnStmt would make "topmost" ambiguous — the
+/// fast path would pick the trailing one, a pre-order walk the nested one.
+ReturnStmtPtr FindFirstReturn(const StmtPtr& body);
 
 /// Trace @p var defined in @p body back to one of @p params (pointer identity).
 ///

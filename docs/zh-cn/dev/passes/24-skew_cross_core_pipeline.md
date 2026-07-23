@@ -58,7 +58,7 @@ D = max(2, stage - 1)
 
 ## 约束
 
-- skew 仅支持静态边界（`start`、`stop`、`step` 为编译期常量）。动态边界的跨核循环回退到 unroll 路径。
+- skew 仅支持静态边界（`start`、`stop`、`step` 为编译期常量）。动态边界的跨核循环降级为 `ForKind::Sequential`。
 - 生产者 skew 的稳态区**保留为循环**（不完全展开），使 `AllocateMemoryAddr` 分配的 matmul `Acc` 双缓冲仍有循环可交替。
 - 有意**不**做消费者侧预取：它会破坏 codegen 的 `tpop → tfree` FIFO 槽位追踪（以 SSA 变量身份为键，无法跨 iter_arg），且提前整整一个迭代发出阻塞式 `tpop` 只会 stall。
 
@@ -70,6 +70,35 @@ D = max(2, stage - 1)
   喂给对端核（property verifier 不建模 FIFO 顺序），因此保守地降级是正确的，但损失了
   重叠收益。未来应将整个 FIFO 组一起 skew（让每条消息都提前一个往返），使多次往返的
   生产者也能重叠。
+
+## 示例
+
+```python
+# 生产者角色，stage=2（默认 → depth-2）—— 做 skew：先发 2 个 produce，再消费 2 个
+# 变换前: for i in pl.pipeline(0, 8, 1, stage=2):  (qk; tpush; tpop; sv; store)
+# 变换后: produce(0); produce(1)                   # 序言（预热 2 个 QK）
+#         for k in pl.range(2, 8, 2):              # 稳态（Sequential，按 2 展开）
+#             produce(k); produce(k+1)             # cube QK[k], QK[k+1]  -> tpush, tpush
+#             consume(k-2); consume(k-1)           # tpop, SV[k-2]; tpop, SV[k-1]
+#         consume(6); consume(7)                   # 尾声
+# 两个 QK 与两个 SV 使用不同的 Mat buffer，因此 MemoryReuse 无法把它们压到同一块
+# 上而把 cube 串行化（即 fa_fused_aic 的过度复用问题）。
+```
+
+```python
+# 奇数 trip（depth-2 不可行：3 % 2 != 0）→ 回退到 depth-1
+# 变换前: for i in pl.pipeline(0, 3, 1, stage=2):
+# 变换后: produce(0)                              # 序言
+#         for i in pl.range(1, 3, 1):             # 稳态（Sequential）
+#             produce(i); consume(i-1)            # cube QK[i] 与 vector softmax[i-1] 重叠
+#         consume(2)                              # 尾声
+```
+
+```python
+# 消费者角色 / 多次往返 —— 降级为 Sequential
+# 变换前: for i in pl.pipeline(0, 4, 1, stage=2):  (tpop; softmax; tpush; store)
+# 变换后: for i in pl.range(0, 4, 1):              # body 不变，FIFO 顺序保留
+```
 
 ## 相关
 

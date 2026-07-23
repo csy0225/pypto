@@ -88,19 +88,129 @@ def _validate_pipeline(pipeline: bool, chunk_rows: int, chunk_cols: int, op_name
         )
 
 
-def alloc_window_buffer(size: IntLike, *, name: str = "") -> Ptr:
-    """Declare a per-rank HCCL window-buffer in a comm-domain scope slot of ``size`` bytes.
-
-    Mirrors ``tile.alloc(memory_space, size)``: pure allocation semantics, no
-    shape / dtype concept on the buffer itself. The result is the
-    allocation-identity token that ``pld.tensor.window`` consumes.
+def _validate_window_buffer_shape(shape: list[int | Expr]) -> None:
+    """Validate that a window-buffer shape is non-empty and static dims are positive.
 
     Args:
-        size: Per-rank allocation size in **bytes**. Accepts an ``int``
-            literal, a DSL ``Scalar``, or a raw :class:`ir.Expr`.
+        shape: Normalized shape — elements are ``int`` or :class:`ir.Expr`.
+
+    Raises:
+        ValueError: If ``shape`` is empty or any statically-known dimension
+            is non-positive.
+    """
+    if not shape:
+        raise ValueError("pld.tensor.alloc_window_buffer shape must be non-empty")
+    for i, d in enumerate(shape):
+        if isinstance(d, int):
+            if d <= 0:
+                raise ValueError(
+                    f"pld.tensor.alloc_window_buffer shape dimension[{i}] is {d}; "
+                    "all dimensions must be positive"
+                )
+        elif isinstance(d, _ir.ConstInt):
+            if d.value <= 0:
+                raise ValueError(
+                    f"pld.tensor.alloc_window_buffer shape dimension[{i}] is {d.value}; "
+                    "all dimensions must be positive"
+                )
+
+
+def _compute_window_buffer_bytes(shape: list[int | Expr], dtype: DataType) -> int | Expr:
+    """Compute byte size for a shape+dtype ``alloc_window_buffer`` call.
+
+    When all shape dimensions are statically known (Python ``int`` or
+    :class:`ir.ConstInt`) the product is computed eagerly as a Python
+    ``int`` (no IR nodes emitted).  Otherwise (any dimension is a dynamic
+    :class:`ir.Expr`) a chain of :class:`ir.Mul` nodes is emitted.
+
+    Args:
+        shape: Normalized shape — elements are ``int`` or :class:`ir.Expr`.
+        dtype: Element data type (byte size via ``dtype.get_byte()``).
+
+    Returns:
+        Byte size as ``int`` (static) or ``ir.Expr`` (dynamic).
+    """
+    _validate_window_buffer_shape(shape)
+
+    # Fold pure-static: Python ints AND ir.ConstInt — both are compile-time
+    # constants.  Per the parser, integer literals arrive as ConstInt(INDEX),
+    # not raw Python int, so we must check both.
+    static_total = 1
+    for d in shape:
+        if isinstance(d, int):
+            static_total *= d
+        elif isinstance(d, _ir.ConstInt):
+            static_total *= d.value
+        else:
+            break
+    else:
+        # All dims folded — return an eager Python int.
+        return static_total * dtype.get_byte()
+
+    # Dynamic path: at least one genuinely dynamic dim.
+    span = _ir.Span.unknown()
+    # Seed from the first dim instead of ConstInt(1) to avoid a redundant
+    # Mul(1, dim0) identity in the emitted IR.
+    first = shape[0]
+    if isinstance(first, int):
+        result: Expr = _ir.ConstInt(first, DataType.INT64, span)
+    elif isinstance(first, _ir.ConstInt):
+        result = _ir.ConstInt(first.value, DataType.INT64, span)
+    else:
+        result = first
+    for dim in shape[1:]:
+        if isinstance(dim, int):
+            dim_expr = _ir.ConstInt(dim, DataType.INT64, span)
+        elif isinstance(dim, _ir.ConstInt):
+            dim_expr = _ir.ConstInt(dim.value, DataType.INT64, span)
+        else:
+            dim_expr = dim
+        result = _ir.Mul(result, dim_expr, DataType.INT64, span)
+    byte_expr: Expr = _ir.ConstInt(dtype.get_byte(), DataType.INT64, span)
+    return _ir.Mul(result, byte_expr, DataType.INT64, span)
+
+
+@overload
+def alloc_window_buffer(size: IntLike, *, name: str = "") -> Ptr: ...
+
+
+@overload
+def alloc_window_buffer(shape: Sequence[IntLike], *, dtype: DataType, name: str = "") -> Ptr: ...
+
+
+def alloc_window_buffer(  # type: ignore[no-redef]
+    size: IntLike | Sequence[IntLike], *, dtype: DataType | None = None, name: str = ""
+) -> Ptr:
+    """Declare a per-rank HCCL window-buffer in a comm-domain scope slot.
+
+    Two forms:
+
+    * **Canonical byte form:**
+      ``alloc_window_buffer(size, *, name=...)`` — ``size`` is the per-rank
+      allocation size in **bytes**.  Accepts an ``int`` literal, a DSL
+      ``Scalar``, or a raw :class:`ir.Expr`.
+
+    * **Shape+dtype convenience overload:**
+      ``alloc_window_buffer(shape, *, dtype=..., name=...)`` — ``shape`` is a
+      list / tuple of per-rank dimensions.  The byte size is computed
+      automatically as ``product(shape) × dtype.get_byte()`` and the call
+      normalizes to the canonical byte form.  ``dtype`` is required when
+      ``shape`` is a sequence and rejected otherwise.
+
+    Both forms return the singleton :class:`ir.PtrType` allocation-identity
+    token that ``pld.tensor.window`` consumes.  The two-phase
+    ``alloc → window`` design is preserved — a single buffer can back multiple
+    ``window()`` views across loop iterations.
+
+    Args:
+        size: (Canonical form) Per-rank allocation size in **bytes**.
+        shape: (Convenience form) Per-rank shape as a sequence of per-dimension
+            sizes — ``int``, DSL ``Scalar``, or raw :class:`ir.Expr`.
+        dtype: (Convenience form, required) Element data type. Must be
+            ``None`` (default) in the canonical byte form.
         name: Unique buffer identifier. The parser injects this from the LHS
             of the surrounding assignment
-            (``buf = pld.tensor.alloc_window_buffer(N)``); users **must not**
+            (``buf = pld.tensor.alloc_window_buffer(...)``); users **must not**
             pass it explicitly.
 
     Returns:
@@ -112,16 +222,32 @@ def alloc_window_buffer(size: IntLike, *, name: str = "") -> Ptr:
 
     Raises:
         ValueError: If ``name`` is empty (the parser must have injected it).
+        ValueError: If ``shape`` is a sequence but ``dtype`` is not provided.
+        ValueError: If ``size`` is scalar but ``dtype`` is provided.
     """
     if not name:
         raise ValueError(
             "pld.tensor.alloc_window_buffer must appear as the RHS of a simple assignment "
             "(its result must be bound to a named variable)"
         )
+
     if isinstance(size, (list, tuple)):
+        if dtype is None:
+            raise ValueError(
+                "pld.tensor.alloc_window_buffer requires dtype= when the first argument is a shape "
+                "(list / tuple of per-rank dimensions)"
+            )
+        shape_normalized: list[int | Expr] = _normalize_intlike(size)
+        byte_size: int | Expr = _compute_window_buffer_bytes(shape_normalized, dtype)
+        call = _ir_tensor.alloc_window_buffer(_unwrap(byte_size), name=name)
+        return Ptr(expr=call)
+
+    if dtype is not None:
         raise ValueError(
-            "pld.tensor.alloc_window_buffer size must be a scalar (int / Expr in bytes), not a list/tuple"
+            "pld.tensor.alloc_window_buffer dtype= is only valid when the first argument is a shape "
+            "(list / tuple), not a scalar byte size"
         )
+
     call = _ir_tensor.alloc_window_buffer(_unwrap(size), name=name)
     return Ptr(expr=call)
 
@@ -360,7 +486,9 @@ def get(
 
 
 @overload
-def allreduce(target: DistributedTensor, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensor: ...
+def allreduce(
+    target: DistributedTensor, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh"
+) -> DistributedTensor: ...
 
 
 @overload
@@ -369,6 +497,7 @@ def allreduce(
     signal: DistributedTensor,
     *,
     op: ReduceOp = ReduceOp.Sum,
+    mode: str = "mesh",
 ) -> DistributedTensor: ...
 
 
@@ -377,6 +506,7 @@ def allreduce(
     signal: DistributedTensor | object = _ALLREDUCE_SIGNAL_MISSING,
     *,
     op: ReduceOp = ReduceOp.Sum,
+    mode: str = "mesh",
 ) -> DistributedTensor:
     """In-place cross-rank allreduce of a window-bound DistributedTensor.
 
@@ -387,26 +517,45 @@ def allreduce(
     .. code-block:: python
 
         pub = pld.tensor.allreduce(pub, sig, op=pld.ReduceOp.Sum)
+        pub = pld.tensor.allreduce(pub, sig, op=pld.ReduceOp.Sum, mode="ring")
 
-    LowerCompositeOps expands the explicit-signal InCore form into the 4-phase
-    notify/wait/remote_load+accumulate/store decomposition; the kernel sees
-    only the lowered primitives. Host-orchestrator code can omit ``signal``
+    LowerCompositeOps expands the explicit-signal InCore form into either:
+    (a) the 4-phase notify/wait/remote_load+accumulate/store decomposition
+    for ``mode="mesh"`` (default); or (b) the NCCL-style 2(P−1)-step
+    chunked reduce-scatter + allgather ring schedule for ``mode="ring"``.
+    In both modes the kernel sees only the lowered primitives.
+    Host-orchestrator code can omit ``signal``
     outside ``for`` and ``while`` loops; the compiler synthesizes a private
-    INT32 signal window of shape ``[pld.world_size(), 1]`` for that call.
+    INT32 signal window of shape ``[pld.world_size(), 1]`` for that call
+    (mesh mode only — ring mode on the HOST rail is delivered by a
+    subsequent host builtin).
 
-    **Signal buffers are single-shot per call.** The lowering uses two
-    barrier waves on the same cells (Set 1 → wait ≥1, then AtomicAdd 1
-    → wait ≥2), so by the time the call returns every cell sits at
-    ``2`` rather than its initial ``0``. **Do not reuse the same signal
-    buffer for a back-to-back allreduce** — the second call's first
-    wait would pass immediately on the stale ``≥1``, breaking the
-    barrier and racing Phase 3 against the previous reduction's
-    Phase 4. Explicit-signal callers issuing multiple allreduces must allocate
-    a fresh signal buffer (``alloc_window_buffer`` + ``window``) for each
-    allreduce call. All allreduce calls in ``for`` and ``while`` loops are
-    rejected because the current signal protocol cannot provide a fresh signal
-    for every dynamic iteration. A self-resetting variant is blocked on a
-    runtime fix — PTOAS issue #797.
+    Mesh signal shape is ``[NR, 1]``; ring signal shape is
+    ``[2 * (NR − 1), NR]`` (one row per ring round). Both are single-shot
+    per call.
+
+    Mesh lowering preserves a packed ND target ``TensorView.valid_shape`` when
+    its valid box can be represented by collapsing leading dimensions to one
+    2D rectangle, and reduces only that rectangle. Strided targets, DN partial
+    views, and non-representable partial boxes are rejected explicitly.
+
+    **Mesh barrier protocol:** two waves on the same cells —
+    ``Set(1) → WaitGe(1)`` for the first wave (Phases 2a/2b), then
+    ``AtomicAdd(1) → WaitGe(2)`` for the post-reduce WAR guard
+    (Phases 3.5a/3.5b). By the time the call returns every cell sits at
+    ``2`` rather than its initial ``0``.
+
+    **Ring barrier protocol:** per-round ``AtomicAdd(0→1) → WaitGe(1)``
+    monotonic on a ``[2*(NR−1), NR]`` signal — each ring step writes
+    a fresh row, so cells end at non-zero values but the monotonic
+    advance is per-row, not per-cell reuse.
+
+    **Do not reuse the same signal buffer for a back-to-back allreduce**
+    — allocate a fresh signal buffer (``alloc_window_buffer`` + ``window``)
+    for each allreduce call. All allreduce calls in ``for`` and ``while``
+    loops are rejected because the current signal protocol cannot provide a
+    fresh signal for every dynamic iteration. A self-resetting variant is
+    blocked on a runtime fix — PTOAS issue #797.
 
     Args:
         target: Window-bound :class:`pld.DistributedTensor` holding per-rank
@@ -420,12 +569,27 @@ def allreduce(
             (keyword-only). Defaults to :attr:`pld.ReduceOp.Sum`. First-version
             lowering accepts only ``Sum``; ``Max`` / ``Min`` / ``Prod`` are
             reserved enum values and will be rejected at the C++ deducer.
+        mode: Algorithm selector (keyword-only). ``"mesh"`` (default) for
+            direct all-to-all exchange; ``"ring"`` for the NCCL-style
+            chunked reduce-scatter + allgather ring schedule. ``"ring"``
+            requires an explicit ``signal`` — host signal synthesis is
+            mesh-only, so omitting the signal with ``mode="ring"`` is
+            rejected.
 
     Returns:
         The rebound :class:`pld.DistributedTensor` view of ``target`` —
         identical shape / dtype / window-buffer binding, post-reduce content.
     """
     if signal is _ALLREDUCE_SIGNAL_MISSING:
+        # Host signal synthesis only produces a mesh-shaped [world_size, 1]
+        # signal. Ring mode needs a [2*(NR-1), NR] signal, so it must be
+        # passed explicitly — reject the synthesized-signal path for it.
+        if mode != "mesh":
+            raise ValueError(
+                f'pld.tensor.allreduce mode="{mode}" requires an explicit signal; '
+                "host signal synthesis only supports mesh mode. Pass a window-bound "
+                'signal, e.g. pld.tensor.allreduce(target, signal, mode="ring").'
+            )
         (target_expr,) = _unwrap_distributed_tensors("pld.tensor.allreduce", target=target)
         call = _ir_tensor.allreduce(target_expr, op=op)
         return DistributedTensor(expr=call)
@@ -437,7 +601,7 @@ def allreduce(
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allreduce", target=target, signal=signal
     )
-    call = _ir_tensor.allreduce(target_expr, signal_expr, op)
+    call = _ir_tensor.allreduce(target_expr, signal_expr, op, mode=mode)
     return DistributedTensor(expr=call)
 
 
@@ -513,51 +677,41 @@ def broadcast(
 
 def allgather(
     local_data: Tensor | DistributedTensor,
-    target: DistributedTensor | None = None,
-    signal: DistributedTensor | None = None,
-    out: Tensor | None = None,
-) -> Tensor | DistributedTensor:
-    """Gather data from all ranks, either as an InCore composite or HOST builtin.
+    target: DistributedTensor,
+    signal: DistributedTensor,
+) -> DistributedTensor:
+    """All-gather: gather data from all ranks (push-based).
 
-        **InCore composite (4 args):** ``pld.tensor.allgather(local_data, target, signal, out)`` —
-        ``local_data`` is a plain Tensor [1, SIZE] with this rank's chunk.
-        The intrinsic handles ``pl.load``, stage-in, notify/wait, and per-peer
-        ``remote_load`` into ``out``.
+    Unified 3-arg form: ``pld.tensor.allgather(input, target, signal)``.
+    ``input`` is this rank's single ``[1, SIZE]`` chunk; every rank pushes it
+    into every peer's ``target`` row ``my_rank`` via TPUT, then synchronises
+    with a notify/wait barrier.  Returns ``target`` in-place (window-as-result
+    — same idiom as ``all_to_all`` / ``reduce_scatter`` / ``broadcast``).
 
-        **HOST builtin (2 args):** ``pld.tensor.allgather(data, signal)`` —
-        each rank's chunk is already staged in ``data[my_rank, :]`` via a prior
-    publish step.  The host lowering emits ``builtin.tensor.barrier`` per chip
-            (the allgather AIV kernel requires concurrent cross-chip dispatch;
-            a barrier synchronises pre-staged window data).
+    ``input`` must be a DIFFERENT buffer from ``target`` — never pass the same
+    window for both.  On the HOST path ``input`` is a ``[1, SIZE]`` staging
+    window populated by an earlier publish step; on the InCore path it is a
+    plain :class:`pl.Tensor` ``[1, SIZE]`` — both are accepted.  HOST vs InCore
+    is a function-context property resolved by the lowering passes.
 
-        Args:
-            local_data: For InCore: :class:`pl.Tensor` [1, SIZE].  For HOST:
-                window-bound :class:`pld.DistributedTensor` [NR, SIZE] with
-                pre-staged chunks.
-            target: InCore only: :class:`pld.DistributedTensor` [NR, SIZE] staging window.
-            signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
-            out: InCore only: :class:`pl.Tensor` [1, NR*SIZE] output.
+    Args:
+        local_data: This rank's single chunk — ``[1, SIZE]`` :class:`pl.Tensor`
+            (InCore) or ``[1, SIZE]`` :class:`pld.DistributedTensor` staging
+            window (HOST).  Must differ from ``target``.
+        target: :class:`pld.DistributedTensor` ``[NR, SIZE]`` result window.
+            After the call, ``target[src, :]`` holds the chunk from rank
+            ``src``.
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` barrier tensor.
 
-        Returns:
-            InCore: the ``out`` :class:`pl.Tensor`.  HOST: the rebound
-            :class:`pld.DistributedTensor`.
+    Returns:
+        The ``target`` :class:`pld.DistributedTensor` (window-as-result).
     """
-    if isinstance(target, DistributedTensor) and signal is None and out is None:
-        # 2-arg HOST builtin path: allgather(data, signal)
-        # Positional mapping: data→local_data, signal→target
-        data_expr, signal_expr = _unwrap_distributed_tensors(
-            "pld.tensor.allgather", target=local_data, signal=target
-        )
-        call = _ir_tensor.allgather(data_expr, signal_expr)
-        return DistributedTensor(expr=call)
-    # 4-arg InCore composite path
     target_expr, signal_expr = _unwrap_distributed_tensors(
         "pld.tensor.allgather", target=target, signal=signal
     )
-    local_data_expr = _unwrap(local_data)
-    out_expr = _unwrap(out)
-    call = _ir_tensor.allgather(local_data_expr, target_expr, signal_expr, out_expr)
-    return Tensor(expr=call)
+    input_expr = _unwrap(local_data)
+    call = _ir_tensor.allgather(input_expr, target_expr, signal_expr)
+    return DistributedTensor(expr=call)
 
 
 def reduce_scatter(
@@ -596,21 +750,28 @@ def reduce_scatter(
 
 
 def all_to_all(
-    input: Tensor,
+    input: Tensor | DistributedTensor,
     target: DistributedTensor,
     signal: DistributedTensor,
 ) -> DistributedTensor:
     """All-to-all: symmetric personalized exchange (push-based).
 
-    3-arg InCore composite: ``pld.tensor.all_to_all(input, target, signal)``
+    3-arg form: ``pld.tensor.all_to_all(input, target, signal)``.
     Every rank pushes its per-destination chunks directly to every peer's
-    window via ``pld.tensor.put`` (TPUT), then synchronises with a notify/wait
+    ``target`` window via TPUT, then synchronises with a notify/wait
     barrier.  Returns ``target`` in-place (window-as-result — same idiom as
     ``reduce_scatter`` / ``broadcast``).
 
+    ``input`` must be a DIFFERENT buffer from ``target`` — never pass the same
+    window for both.  For the HOST-level builtin dispatch, ``input`` is
+    typically a second window (e.g. a :class:`pld.DistributedTensor` staged
+    by an earlier InCore step) rather than the InCore composite's plain
+    :class:`pl.Tensor` — both are accepted.
+
     Args:
-        input: :class:`pl.Tensor` [NR, SIZE] with per-destination chunks.
-            ``input[dest, :]`` is the chunk destined for rank ``dest``.
+        input: [NR, SIZE] Tensor or DistributedTensor with per-destination
+            chunks, distinct from ``target``.  ``input[dest, :]`` is the
+            chunk destined for rank ``dest``.
         target: :class:`pld.DistributedTensor` [NR, SIZE] window that receives
             the result in-place.  After the call,
             ``target[src, :]`` holds the chunk received from rank ``src``.

@@ -75,22 +75,24 @@ enum class IOCategory : int {
 /// of name strings avoids string comparisons in the hot path and makes the set
 /// of recognized ops explicit at pass construction.
 struct IOCategoryOps {
-  OpPtr tile_load;     ///< Read: tensor → tile data movement
-  OpPtr tile_read;     ///< Read: extract scalar from a tile
-  OpPtr tile_store;    ///< Write: tile → tensor data movement
-  OpPtr tile_write;    ///< Write: put scalar into a tile
-  OpPtr tile_extract;  ///< Sub-tile extract — load-like only when L1→L0 (see IsL1ToL0ExtractCall)
+  OpPtr tile_load;      ///< Read: tensor → tile data movement
+  OpPtr tile_read;      ///< Read: extract scalar from a tile
+  OpPtr tile_store;     ///< Write: tile → tensor data movement
+  OpPtr tile_write;     ///< Write: put scalar into a tile
+  OpPtr tile_extract;   ///< Sub-tile extract — load-like only when L1→L0 (see IsL1ToL0ExtractCall)
+  OpPtr tile_assemble;  ///< Acc→Mat sub-tile drain (Mat-scratch path) — drain-like only under dbC
 
   static IOCategoryOps Build() {
     const auto& registry = OpRegistry::GetInstance();
     return {
         registry.GetOp("tile.load"),  registry.GetOp("tile.read"),    registry.GetOp("tile.store"),
-        registry.GetOp("tile.write"), registry.GetOp("tile.extract"),
+        registry.GetOp("tile.write"), registry.GetOp("tile.extract"), registry.GetOp("tile.assemble"),
     };
   }
 
   [[nodiscard]] bool IsLoadLike(const OpPtr& op) const { return op == tile_load || op == tile_read; }
   [[nodiscard]] bool IsStoreLike(const OpPtr& op) const { return op == tile_store || op == tile_write; }
+  [[nodiscard]] bool IsAssemble(const OpPtr& op) const { return op == tile_assemble; }
 
   /// True when @p call is a `tile.extract` whose source lives in L1 (Mat) and
   /// whose destination lives in L0a/L0b (Left/Right) — i.e. the ISA TEXTRACT
@@ -124,14 +126,27 @@ struct IOCategoryOps {
 ///   each store adjacent to its producing compute rather than floating it below
 ///   the next iteration's compute — the one-accumulator schedule. See
 ///   ``kPipelineOverlapStoresAttr``.
-IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops, bool overlap_stores) {
-  const IOCategory store_tier = overlap_stores ? IOCategory::Store : IOCategory::TileCompute;
+/// @param double_buffer_c When true, store-like ops are categorized as ``Store``
+///   regardless of ``overlap_stores`` (``ReorderRegion`` then lifts them to a tier
+///   above all compute — the dbC=2 co-live schedule). See
+///   ``kPipelineDoubleBufferCAttr``.
+IOCategory CategorizeStmt(const StmtPtr& stmt, const IOCategoryOps& ops, bool overlap_stores,
+                          bool double_buffer_c) {
+  const IOCategory store_tier =
+      (overlap_stores || double_buffer_c) ? IOCategory::Store : IOCategory::TileCompute;
   if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
     if (auto call = std::dynamic_pointer_cast<const Call>(assign->value_)) {
       // tile.read keeps Load even though its LHS is scalar — it's I/O against
       // a tile and belongs in the load tier alongside tile.load.
       if (ops.IsLoadLike(call->op_)) return IOCategory::Load;
       if (ops.IsStoreLike(call->op_)) return store_tier;
+      // tile.assemble is the Acc→Mat drain of the Mat-scratch path. Under dbC it is
+      // drain-like (Store tier → lifted above all compute in ReorderRegion) so the
+      // two Mat-scratch accumulators stay co-live, mirroring tile.store on the
+      // direct-store path. Without dbC it stays TileCompute (its chain dependency
+      // already orders it after its producing matmul) — the one-accumulator
+      // Mat-scratch schedule is unchanged.
+      if (double_buffer_c && ops.IsAssemble(call->op_)) return IOCategory::Store;
       // tile.extract is load-like only when it represents an L1→L0 transfer
       // (Mat source, Left/Right target). Other extract shapes stay in
       // TileCompute — see IsL1ToL0ExtractCall doc for rationale.
@@ -199,16 +214,21 @@ class CanonicalizeIOOrderMutator : public IRMutator {
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
     const bool is_pipeline = (op->kind_ == ForKind::Pipeline);
     const bool saved_overlap = overlap_stores_;
+    const bool saved_dbc = double_buffer_c_;
     if (is_pipeline) {
       inside_pipeline_depth_++;
       // Default true: stores float to the Store tier (output ping-pong). A loop
       // opts into the one-accumulator schedule with overlap_stores=false.
       overlap_stores_ = op->GetAttr<bool>(kPipelineOverlapStoresAttr, true);
+      // Default false: only dbC=2 loops lift stores above all compute (co-live
+      // two-accumulator schedule). See kPipelineDoubleBufferCAttr.
+      double_buffer_c_ = op->GetAttr<bool>(kPipelineDoubleBufferCAttr, false);
     }
     auto visited = IRMutator::VisitStmt_(op);
     if (is_pipeline) {
       inside_pipeline_depth_--;
       overlap_stores_ = saved_overlap;
+      double_buffer_c_ = saved_dbc;
     }
 
     if (!is_pipeline) return visited;
@@ -218,7 +238,9 @@ class CanonicalizeIOOrderMutator : public IRMutator {
     demoted->kind_ = ForKind::Sequential;
     // Strip both pipeline markers — they have served their purpose (gated this
     // reorder) and must not survive past this pass.
-    demoted->attrs_ = StripAttr(StripAttr(demoted->attrs_, kPipelineStagesAttr), kPipelineOverlapStoresAttr);
+    demoted->attrs_ =
+        StripAttr(StripAttr(StripAttr(demoted->attrs_, kPipelineStagesAttr), kPipelineOverlapStoresAttr),
+                  kPipelineDoubleBufferCAttr);
     return demoted;
   }
 
@@ -245,6 +267,12 @@ class CanonicalizeIOOrderMutator : public IRMutator {
   /// (saved/restored across nested pipelines). False ⇒ keep stores in the
   /// compute tier (one-accumulator schedule). See `kPipelineOverlapStoresAttr`.
   bool overlap_stores_ = true;
+
+  /// dbC=2 policy of the nearest enclosing `ForKind::Pipeline` loop
+  /// (saved/restored across nested pipelines). True ⇒ lift stores to a tier above
+  /// all compute so both iterations' L0C accumulators stay co-live (the
+  /// double-buffered-L0C ping-pong). See `kPipelineDoubleBufferCAttr`.
+  bool double_buffer_c_ = false;
 
   /// Stable, priority-aware topological sort.
   ///
@@ -277,7 +305,7 @@ class CanonicalizeIOOrderMutator : public IRMutator {
     std::unordered_map<const Stmt*, size_t> idx_of;
     idx_of.reserve(sort_count);
     for (size_t i = 0; i < sort_count; ++i) {
-      cats[i] = CategorizeStmt(stmts[i], io_ops_, overlap_stores_);
+      cats[i] = CategorizeStmt(stmts[i], io_ops_, overlap_stores_, double_buffer_c_);
       idx_of.emplace(stmts[i].get(), i);
     }
 
@@ -335,23 +363,33 @@ class CanonicalizeIOOrderMutator : public IRMutator {
     };
 
     // Ready-set as a min-heap keyed by (tier, stage, sub, original_index):
-    //   tier 0 ScalarCompute, tier 1 Load, tier 2 TileCompute/Store.
-    // Scalars (address arith) lift to the top so sibling-clone loads become
-    // ready together; loads then cluster (prefetch / double-buffering). Within
-    // the compute/store tier we order by *stage* first, then compute (sub 0)
-    // before store (sub 1) — so a replicated ``pl.pipeline`` body emits
-    // ``load… compute_s0 store_s0 compute_s1 store_s1`` rather than
+    //   tier 0 ScalarCompute, tier 1 Load, tier 2 TileCompute/Store, tier 3 Store
+    //   (dbC=2 only). Scalars (address arith) lift to the top so sibling-clone
+    // loads become ready together; loads then cluster (prefetch / double-
+    // buffering). Within the compute/store tier we order by *stage* first, then
+    // compute (sub 0) before store (sub 1) — so a replicated ``pl.pipeline`` body
+    // emits ``load… compute_s0 store_s0 compute_s1 store_s1`` rather than
     // ``load… compute_s0 compute_s1 store_s0 store_s1``. Storing each stage's
     // output right after its compute frees that output buffer before the next
     // stage, cutting on-chip pressure and the cross-iteration load↔store
     // coupling. The original index is the final tiebreaker (stable FIFO).
+    //
+    // Exception — dbC=2 (double_buffer_c_): stores lift to tier 3, *above* all
+    // compute, so both iterations' matmuls precede both stores
+    // (``compute_s0 compute_s1 store_s0 store_s1``). This keeps the two L0C
+    // accumulators co-live for the double-buffered-L0C ping-pong (the chooser
+    // budgeted them at L0C/2 and the ptoas planner places them on distinct
+    // offsets). Tier-3 stores carry no stage — they order by index among stores.
     using HeapKey = std::tuple<int, std::string, int, size_t>;
     std::priority_queue<HeapKey, std::vector<HeapKey>, std::greater<>> ready;
     std::vector<int> tier(sort_count);
     std::vector<int> sub(sort_count);
     std::vector<std::string> stage(sort_count);
     for (size_t i = 0; i < sort_count; ++i) {
-      tier[i] = (cats[i] == IOCategory::ScalarCompute) ? 0 : (cats[i] == IOCategory::Load) ? 1 : 2;
+      tier[i] = (cats[i] == IOCategory::ScalarCompute)               ? 0
+                : (cats[i] == IOCategory::Load)                      ? 1
+                : (cats[i] == IOCategory::Store && double_buffer_c_) ? 3
+                                                                     : 2;
       sub[i] = (cats[i] == IOCategory::Store) ? 1 : 0;
       if (tier[i] == 2) stage[i] = stage_key(stmts[i]);
     }

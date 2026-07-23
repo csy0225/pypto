@@ -497,9 +497,9 @@ void BindIR(nb::module_& m) {
   tile_type_class.def(
       "get_effective_tile_view",
       [](const TileType& self) { return tile_view_semantics::GetEffectiveTileView(self); },
-      "Return the effective TileView: the stored tile_view if present, else the implicit "
-      "view derived from (shape, memory_space). An implicit view is stored as None under "
-      "canonicalization, so callers that need to inspect layout fields should use this.");
+      "Return an effective TileView copy. A stored view keeps its metadata while an empty "
+      "valid_shape expands to shape; an absent view uses the implicit fields derived from "
+      "(shape, memory_space). Callers needing semantic fields should use this method.");
   BindFields<TileType>(tile_type_class);
 
   // ArrayType - on-core fixed-size 1-D homogeneous array (C-stack local)
@@ -898,19 +898,22 @@ void BindIR(nb::module_& m) {
       "__init__",
       [](Submit* self, const OpPtr& op, const std::vector<ExprPtr>& args, const std::vector<ExprPtr>& deps,
          const nb::dict& kwargs_dict, const nb::object& attrs_or_none, const TypePtr& type, const Span& span,
-         const std::optional<ExprPtr>& core_num, bool sync_start, bool allow_early_resolve) {
+         const std::optional<ExprPtr>& core_num, bool sync_start, bool allow_early_resolve,
+         const std::optional<ExprPtr>& predicate) {
         auto kwargs = ConvertKwargsDict(kwargs_dict);
         auto attrs = ConvertAttrsFromPython(attrs_or_none);
         new (self) Submit(op, args, deps, std::move(kwargs), std::move(attrs), type, span, core_num,
-                          sync_start, allow_early_resolve);
+                          sync_start, allow_early_resolve, predicate);
       },
       nb::arg("op"), nb::arg("args"), nb::arg("deps"), nb::arg("kwargs"), nb::arg("attrs").none(),
       nb::arg("type"), nb::arg("span"), nb::arg("core_num") = nb::none(), nb::arg("sync_start") = false,
-      nb::arg("allow_early_resolve") = false,
+      nb::arg("allow_early_resolve") = false, nb::arg("predicate") = nb::none(),
       "Create a Submit expression with kwargs and explicit attrs map and type. "
       "The optional core_num (an INDEX/INT Expr) and sync_start carry the SPMD launch spec "
       "for pl.spmd_submit; omit them for a plain pl.submit. "
       "allow_early_resolve opts this task in as a speculative early-dispatch producer. "
+      "predicate is an optional comparison Expr (e.g. Gt(tensor.read(t, [i]), 0)) the scheduler "
+      "evaluates at the dispatch point; omit it for an unconditional dispatch. "
       "Reserved attrs keys: 'arg_directions' -> list[ArgDirection].");
 
   BindFields<Submit>(submit_class);
@@ -1704,29 +1707,34 @@ void BindIR(nb::module_& m) {
   // Python-style printer function - unified API for IRNode
   ir.def(
       "python_print",
-      [](const IRNodePtr& node, const std::string& prefix, bool concise, bool format) {
-        return MaybeFormat(PythonPrint(node, prefix, concise), format);
+      [](const IRNodePtr& node, const std::string& prefix, bool concise, bool format, bool explicit_layout) {
+        return MaybeFormat(PythonPrint(node, prefix, concise, explicit_layout), format);
       },
       nb::arg("node"), nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
+      nb::arg("explicit_layout") = false,
       "Print IR node (Expr, Stmt, Function, or Program) in Python IR syntax.\n\n"
       "Args:\n"
       "    node: IR node to print\n"
       "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
       "    concise: If true, omit intermediate type annotations (default false)\n"
-      "    format: If true, apply registered format callback (default true)");
+      "    format: If true, apply registered format callback (default true)\n"
+      "    explicit_layout: If true, print every tile's fully-resolved\n"
+      "        blayout/slayout/fractal (including tiles whose canonical view is\n"
+      "        absent) so the output is self-describing for layouts (default false)");
 
   // Python-style printer function for Type objects - use separate name to avoid overload ambiguity
   ir.def(
       "python_print_type",
-      [](const TypePtr& type, const std::string& prefix, bool format) {
-        return MaybeFormat(PythonPrint(type, prefix), format);
+      [](const TypePtr& type, const std::string& prefix, bool format, bool explicit_layout) {
+        return MaybeFormat(PythonPrint(type, prefix, explicit_layout), format);
       },
-      nb::arg("type"), nb::arg("prefix") = "pl", nb::arg("format") = true,
+      nb::arg("type"), nb::arg("prefix") = "pl", nb::arg("format") = true, nb::arg("explicit_layout") = false,
       "Print Type object in Python IR syntax.\n\n"
       "Args:\n"
       "    type: Type to print\n"
       "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
-      "    format: If true, apply registered format callback (default true)");
+      "    format: If true, apply registered format callback (default true)\n"
+      "    explicit_layout: If true, print fully-resolved tile layouts (default false)");
 
   // Register a Python callable to format printed IR output (e.g., ruff).
   // Pass None to unregister. The callback receives a code string and returns formatted code.

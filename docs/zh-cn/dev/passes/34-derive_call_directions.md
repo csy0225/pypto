@@ -1,6 +1,6 @@
 # DeriveCallDirections Pass
 
-对每个 `Function` body 运行的单阶段 pass：它基于被调用方的 `ParamDirection` 和缓冲区血缘，为每个跨函数 `Call` 推导每个参数的 `ArgDirection`，并将解析后的向量写入 `Call.attrs["arg_directions"]`。它**不**触碰 manual scope 的依赖边。
+该 pass 先把每个 Group/Spmd wrapper 的有效 `ParamDirection` 物化进其签名，再遍历每个 `Function` body，基于被调用方的 `ParamDirection` 和缓冲区血缘为每个跨函数 `Call` 推导每个参数的 `ArgDirection`，并将解析后的向量写入 `Call.attrs["arg_directions"]`。它**不**触碰 manual scope 的依赖边。
 
 ## Overview
 
@@ -50,7 +50,17 @@ program_with_dirs = derive_pass(program)
 
 ## Algorithm
 
-该 pass 是一个 `ProgramPass`。对每个 `Function` body 运行三个子阶段。
+该 pass 是一个 `ProgramPass`。它先在全 program 范围内改写 Group/Spmd wrapper 的签名（阶段 0），再对每个 `Function` body 运行三个子阶段。
+
+### 0. Wrapper 方向物化（materialization）
+
+Group/Spmd wrapper 把自己的形参 1:1 转发给内层 kernel 调用，但它自身的 `param_directions_` 对被内层 kernel 写入的形参仍可能标记为 `In`——scope outliner 只根据它抽取出的 body 推断方向，而后续 pass（`ExpandMixedKernel`、`SplitVectorKernel`）在围绕新拆分出的 callee 重建 wrapper body 时并不会回头修正签名。
+
+`MaterializeWrapperDirections` 对整个 program 调用一次 `ComputeWrapperEffectiveDirections`（`include/pypto/ir/transforms/utils/wrapper_call_utils.h`），再把每个结果写回 `Function::param_directions_`。对每个 wrapper，该辅助函数遍历其内层调用，用 `Var` 指针身份把每个实参匹配回 wrapper 形参，再按格 `InOut` > `Out` > `In` 归并内层 callee 的方向。归并从每个 wrapper 的声明方向起算且只会提升，因此绝不会削弱一个已声明的写者。嵌套乃至**相互递归**的 wrapper 通过对该单调传递函数在工作表上迭代求**最小不动点**来解决——因此结果不依赖 wrapper 的访问顺序（`A → B → A` 无论先从哪个起算都收敛到同一结果）。每个 wrapper body 只被遍历一次，且每次提升只让一个形参在格上上升一步，故循环次数被 wrapper 形参总数的两倍所界。
+
+每个 wrapper 都基于**阶段 0 之前的 program 快照**求解，因此结果不依赖函数 map 的遍历顺序。
+
+这确立了一条不变量：**`callee->param_directions_` 是所有 callee 种类的唯一真相源**。下面三个子阶段，以及 `AutoDeriveTaskDependencies`、`CallDirectionsResolved` 验证器和 orchestration codegen，都直接读该字段而不再重算有效方向——这正是让 codegen 保持严格 1-to-1 翻译的关键。验证器会在它检查的每个 program 上重新校验该不变量。
 
 ### 1. 缓冲区根收集
 
@@ -65,7 +75,7 @@ program_with_dirs = derive_pass(program)
 
 ### 3. 方向重写
 
-`CallDirectionMutator` 遍历每个非 builtin `Call`。对 Group/Spmd 被调用方，通过 `ComputeGroupEffectiveDirections`（`orchestration_analysis.h`）恢复每个位置的有效方向；其它被调用方使用其声明的 `param_directions_`。`sequential_depth_` 计数器在非 `Parallel` 的 `For` 和 `While` 上递增，驱动下面的 *R-seq* 提升。
+`CallDirectionMutator` 遍历每个非 builtin `Call`，直接读取 callee 的 `param_directions_`——由于阶段 0 已物化 Group/Spmd wrapper，该字段对所有 callee 种类都是正确的。`sequential_depth_` 计数器在非 `Parallel` 的 `For` 和 `While` 上递增，驱动下面的 *R-seq* 提升。
 
 对每个位置参数，mutator 按下表挑选方向。被调用方的 `Out` 依次尝试三条提升规则——R-seq → R-prior → R-enclosing；都不触发时保持 `OutputExisting`：
 
@@ -140,9 +150,10 @@ inline const PassProperties kDeriveCallDirectionsProperties{
 
 **实现**：`src/ir/transforms/derive_call_directions_pass.cpp`
 
+- `MaterializeWrapperDirections` —— 阶段 0：把 Group/Spmd 的有效方向写回 `Function::param_directions_`
 - `PriorWriterCollector` —— 每作用域的首 writer 分析（自底向上缓存 + 自顶向下扫描）
 - `CallDirectionMutator` —— `IRMutator`，用解析后的 `arg_directions` 向量重写每个非 builtin `Call`
-- 复用 `include/pypto/codegen/orchestration/orchestration_analysis.h` 中的 `BufferRootCollector` 与 `ComputeGroupEffectiveDirections`
+- 复用 `include/pypto/ir/transforms/utils/wrapper_call_utils.h` 中的 `ComputeWrapperEffectiveDirections`，以及 `include/pypto/codegen/orchestration/orchestration_analysis.h` 中的 `BufferRootCollector`
 
 **Property verifier**：`src/ir/verifier/verify_call_directions.cpp`（工厂位于 `include/pypto/ir/verifier/verifier.h`）
 
@@ -159,7 +170,12 @@ passes.def("derive_call_directions", &pass::DeriveCallDirections,
 
 **Tests**：`tests/ut/ir/transforms/test_derive_call_directions.py`
 
-- `TestDeriveDirectionMatrix` —— 对 (callee_dir, origin) → ArgDirection 映射表的每个单元各一个测试，包括 R-seq（`pl.range`、`while`）和 R-prior（顶层 + 分支 / 顶层之后的 parallel）边界情形
+所有 transform 测试都采用 Before/After/Expected 模式——推导结果完整写在 `Expected` 程序里，并用 `ir.assert_structural_equal` 比较，绝不通过检查单个 IR 字段来断言。在 `Expected` 中，方向以 `attrs={"arg_directions": [pl.adir.<name>, ...]}` 呈现；`pl.no_dep` 标记以配套的 `"arg_direction_overrides": [<index>, ...]` 呈现；phase 0 的 wrapper 方向固化则体现为 wrapper 自身参数上的 `pl.Out` / `pl.InOut`。
+
+- `TestDeriveDirectionMatrix` —— 对 (callee_dir, origin) → ArgDirection 映射表的每个单元各一个测试，包括 R-seq（`pl.range`、`while`）、R-prior（顶层 + 分支 / 顶层之后的 parallel）和 R-enclosing 边界情形
 - `TestDeriveIdempotent` —— 两次运行该 pass 得到结构相等的 IR
 - `TestDerivePreservesExplicit` —— 预填充的 `arg_directions` 不被覆盖
-- `TestVerifyPositive` / `TestVerifyNegative` —— `CallDirectionsResolved` property verifier 接受该 pass 的输出，并拒绝格式错误的 `arg_directions` 赋值
+- `TestDeriveSubmit` / `TestDeriveSpmdSubmit` —— `Submit` 类型、`deps_` 和 SPMD launch spec 均被保留；方向只对调用方提供的 args 前缀推导
+- `TestNoDepOverride` —— `pl.no_dep(arg)` 用 `NoDep` 覆盖被标记槽位上推导出的方向（在 callee 的 `In`、`Out`、`InOut` 参数上均合法）
+- `TestMaterializeWrapperDirections` —— phase 0 将 Group/Spmd 的有效方向写回签名，涵盖嵌套链、不降级以及互递归不动点等情形
+- `TestVerifyPositive` / `TestVerifyNegative` / `TestVerifyWrapperDirections` —— `CallDirectionsResolved` property verifier 接受该 pass 的输出，并拒绝格式错误的 `arg_directions` 赋值和陈旧的 wrapper 签名
