@@ -151,13 +151,45 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
   // EmitCastToIndex (no-op when already index-typed).
   std::string peer_ssa = codegen.EmitCastToIndex(peer_expr, codegen.GetExprAsCode(peer_expr));
 
-  // (1) Call the per-dtype offset helper. Registering here causes the helper
-  //     definition to be emitted at module-flush time — any new op that calls
-  //     EmitCommRemoteView is wired up automatically, no codegen-side opt-in.
-  const std::string func_name = codegen.RegisterCommRemoteOffsetHelper(target.type->dtype_);
+  // (1) Peer-vs-local element offset from the CommContext window bases, emitted
+  //     INLINE (was a func.call to @CommRemoteOffset_<dtype>). PTOAS >= v0.50's
+  //     pto-memory-consistency pass rejects a func.call to a callee containing
+  //     memory-consistency ops (the CommContext pto.load_scalar reads) from a
+  //     caller that also carries tnotify/twait/fence — so inline the math here.
+  namespace cl = pypto::codegen::distributed::comm_layout;
+  const int64_t k_rank_idx = static_cast<int64_t>(cl::kRankIdOffset / cl::kWindowSlotStride);
+  const int64_t k_win_idx = static_cast<int64_t>(cl::kWindowsInOffset / cl::kWindowSlotStride);
+  const size_t elem_bits = target.type->dtype_.GetBit();
+  CHECK(elem_bits >= 8 && elem_bits % 8 == 0)
+      << "Distributed remote ops only support byte-sized element types, got "
+      << target.type->dtype_.ToString() << " (" << elem_bits << " bits)";
+  const int64_t elem_size_bytes = static_cast<int64_t>(elem_bits / 8);
+  const std::string c_r = codegen.NewTemp();
+  codegen.Emit(c_r + " = arith.constant " + std::to_string(k_rank_idx) + " : index");
+  const std::string c_w = codegen.NewTemp();
+  codegen.Emit(c_w + " = arith.constant " + std::to_string(k_win_idx) + " : index");
+  const std::string rk_pair = codegen.NewTemp();
+  codegen.Emit(rk_pair + " = pto.load_scalar " + target.ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
+  const std::string rk_i32 = codegen.NewTemp();
+  codegen.Emit(rk_i32 + " = arith.trunci " + rk_pair + " : i64 to i32");
+  const std::string rk_idx = codegen.NewTemp();
+  codegen.Emit(rk_idx + " = arith.index_cast " + rk_i32 + " : i32 to index");
+  const std::string lb_off = codegen.NewTemp();
+  codegen.Emit(lb_off + " = arith.addi " + c_w + ", " + rk_idx + " : index");
+  const std::string lbase = codegen.NewTemp();
+  codegen.Emit(lbase + " = pto.load_scalar " + target.ctx_ssa + "[" + lb_off + "] : !pto.ptr<i64> -> i64");
+  const std::string pb_off = codegen.NewTemp();
+  codegen.Emit(pb_off + " = arith.addi " + c_w + ", " + peer_ssa + " : index");
+  const std::string pbase = codegen.NewTemp();
+  codegen.Emit(pbase + " = pto.load_scalar " + target.ctx_ssa + "[" + pb_off + "] : !pto.ptr<i64> -> i64");
+  const std::string dbytes = codegen.NewTemp();
+  codegen.Emit(dbytes + " = arith.subi " + pbase + ", " + lbase + " : i64");
+  const std::string esize = codegen.NewTemp();
+  codegen.Emit(esize + " = arith.constant " + std::to_string(elem_size_bytes) + " : i64");
+  const std::string delems_i = codegen.NewTemp();
+  codegen.Emit(delems_i + " = arith.divsi " + dbytes + ", " + esize + " : i64");
   std::string delems = codegen.NewTemp();
-  codegen.Emit(delems + " = func.call @" + func_name + "(" + target.ctx_ssa + ", " + peer_ssa +
-               ") : (!pto.ptr<i64>, index) -> index");
+  codegen.Emit(delems + " = arith.index_cast " + delems_i + " : i64 to index");
 
   // (2) addptr from the local pointer by the returned element offset.
   std::string peer_ptr = codegen.NewTemp();
@@ -397,6 +429,10 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   std::ostringstream tnotify;
   tnotify << "pto.comm.tnotify(" << partition_view << ", " << value_ssa << " : " << partition_type << ", "
           << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";
+  // PTOAS >= v0.50 memory-consistency (publisher): release payload writes with a
+  // cacheinvalid marker + full-GM fence before publishing the signal.
+  codegen.Emit("pto.cmo.cacheinvalid all #pto.address_space<gm>");
+  codegen.Emit("pto.fence.barrier_all #pto.fence_scope<gm>");
   codegen.Emit(tnotify.str());
   return "";
 }
@@ -455,6 +491,9 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   twait << "pto.comm.twait(" << partition_view << ", " << expected_ssa << " : " << partition_type << ", "
         << expected_type << ") {cmp = #pto<wait_cmp " << cmp_attr << ">}";
   codegen.Emit(twait.str());
+  // PTOAS >= v0.50 memory-consistency (consumer): invalidate GM cache after the
+  // wait, before any cacheable GM load of the peer data just signalled ready.
+  codegen.Emit("pto.cmo.cacheinvalid all #pto.address_space<gm>");
   return "";
 }
 

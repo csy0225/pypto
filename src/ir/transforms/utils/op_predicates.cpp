@@ -56,7 +56,8 @@ bool IsBufferAliasingViewOp(const std::string& op_name) {
 
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
-         op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0;
+         op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0 ||
+         op_name.rfind("pld.", 0) == 0;  // pld.<cat>.<op> 3-segment (#1399)
 }
 
 }  // namespace op_predicates

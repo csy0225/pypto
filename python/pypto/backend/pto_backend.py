@@ -1434,6 +1434,9 @@ def _collect_chip_task_functions(
         _ir_core.FunctionType.AIV,
         _ir_core.FunctionType.Group,
         _ir_core.FunctionType.Spmd,
+        # keep called Orchestration sub-orchs in the split chip sub-program
+        # (step3p5 whole_chip_orch nested orch; upstream #1313 OrchestrationReferencesResolved)
+        _ir_core.FunctionType.Orchestration,
     )
 
     result: list[_ir_core.Function] = [orch_func]
