@@ -1201,6 +1201,18 @@ class DistributedWorker(Worker):
 
     def _reset_persistent_domains(self, orch: Any, domains: dict[str, tuple[tuple[Any, ...], Any]]) -> None:
         """Restore retained windows to the zero-filled fresh-allocation state."""
+        if self._w.device_memset_available:
+            for _spec, handle in domains.values():
+                self._w.memset_all(
+                    {
+                        int(worker_id): (
+                            int(handle[worker_id].local_window_base),
+                            int(handle[worker_id].actual_window_size),
+                        )
+                        for worker_id in handle.workers
+                    }
+                )
+            return
         assert self._persistent_zero is not None
         zero_ptr = int(self._persistent_zero.data_ptr())
         chunk_size = int(self._persistent_zero.numel())
