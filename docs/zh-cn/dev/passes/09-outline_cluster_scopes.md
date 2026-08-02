@@ -33,7 +33,7 @@ program_outlined = outline_pass(program)
 1. **扫描 Cluster 作用域**：在 Opaque/Orchestration 函数中查找所有 `ClusterScopeStmt` 节点
 2. **提取 Cluster 作用域**：将每个 Cluster 作用域体提取为 `Function(func_type=Group)`
 3. **扫描 standalone Spmd 作用域**：在变换后的函数体中查找所有未嵌套在 Cluster 内部的 `SpmdScopeStmt` 节点
-4. **提取 standalone Spmd 作用域**：将每个 standalone Spmd 作用域体提取为 `Function(func_type=Spmd)`，并把 `core_num` / `sync_start` 复制到函数 attrs
+4. **提取 standalone Spmd 作用域**：将每个 standalone Spmd 作用域体提取为 `Function(func_type=Spmd)`，并把 `core_num` / `sync_start` 复制到函数 attrs。如果该作用域会 lower 为 `Submit`（例如捕获 TaskId 或启用提前派发），还会把启动操作数保留在该 `Submit` 上，使后续调用方 SSA 改写和 orchestration-helper 内联能够正确重命名动态 bound
 5. **展开 Group 内嵌 Spmd**：对于 `pl.cluster(): with pl.spmd(...): ...`，保留单一 Group 函数，并把 `core_num` / `sync_start` 提升到 Group attrs
 6. **替换作用域**：将作用域语句替换为对提取函数的调用 + 输出赋值
 7. **添加到程序**：将提取的函数前置到程序的函数列表中

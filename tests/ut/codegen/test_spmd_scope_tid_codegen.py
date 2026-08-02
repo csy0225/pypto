@@ -9,10 +9,10 @@
 
 """Orchestration codegen for ``with pl.spmd(...) as tid:`` — the SPMD producer-TaskId capture.
 
-A captured SPMD dispatch lowers to an ``ir.Submit`` whose own ``core_num`` is None
-(it rides on the outlined ``Spmd`` Function attrs), so the launch spec must come
-through ``EffectiveLaunchSpec``'s function-attr fallback. These tests pin that
-fallback plus producer-TaskId capture and explicit ``deps=`` emission.
+A captured SPMD dispatch lowers to an ``ir.Submit`` carrying its own
+``core_num`` launch operand. The outlined ``Spmd`` Function retains the same
+attribute as a fallback for legacy/plain-Call paths. These tests pin both
+launch-spec rails plus producer-TaskId capture and explicit ``deps=`` emission.
 """
 
 import re
@@ -62,12 +62,12 @@ class TestSpmdScopeTaskIdCodegen:
                 return codegen.generate_orchestration(program, func).code
         raise ValueError("No orchestration function found in program")
 
-    def test_as_tid_launch_spec_via_function_attr_fallback(self):
+    def test_as_tid_launch_spec_via_submit_operand(self):
         """A tid-bearing Spmd dispatch still emits set_block_num / set_require_sync_start.
 
-        The Submit's ``core_num`` is None (SubmitToCallView emits no core_num attr),
-        so this proves ``EffectiveLaunchSpec`` falls back to the Spmd Function's
-        ``core_num`` / ``sync_start`` attrs.
+        The Submit carries ``core_num`` / ``sync_start`` directly so caller-side
+        SSA/inlining can rewrite dynamic launch operands without depending on an
+        outlined Function attr that belongs to another lexical scope.
         """
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
@@ -108,11 +108,100 @@ class TestSpmdScopeTaskIdCodegen:
         spmd_func = transformed.get_function("main_spmd_0")
         assert spmd_func is not None
         assert spmd_func.func_type == pl.FunctionType.Spmd
-        assert "core_num" in spmd_func.attrs  # launch spec rides on the Spmd Function
+        assert "core_num" in spmd_func.attrs  # retained as a legacy/fallback rail
 
         code = self._codegen(transformed)
         assert "params_t0.launch_spec.set_block_num(4);" in code, code
         assert "params_t0.launch_spec.set_require_sync_start(true);" in code, code
+
+    def test_dynamic_bound_survives_inline_orchestration_helper(self):
+        """Dynamic ``core_num`` follows the helper scalar through CHIP inlining.
+
+        Regression for a canonical attention failure where the outlined Spmd
+        Function retained the helper-local name while ``InlineOrchestrationHelpers``
+        alpha-renamed the actual scalar in the caller. Codegen then emitted an
+        undeclared identifier in ``set_block_num(...)``.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tile_a = pl.load(a, [0, 0], [16, 16])
+                out = pl.store(tile_a, [0, 0], out)
+                return out
+
+            @pl.function(
+                type=pl.FunctionType.Orchestration,
+                level=pl.Level.CHIP,
+                attrs={"inline_orchestration": True},
+            )
+            def helper(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                task_counts: pl.Tensor[[1], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                dynamic_tasks = pl.cast(
+                    pl.tensor.read(task_counts, [0]),
+                    pl.INDEX,
+                )
+                for _ in pl.spmd(dynamic_tasks, allow_early_resolve=True):
+                    out = self.kernel(a, out)
+                return out
+
+            @pl.function(
+                type=pl.FunctionType.Orchestration,
+                level=pl.Level.CHIP,
+            )
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                task_counts: pl.Tensor[[1], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out = self.helper(a, out, task_counts)
+                return out
+
+            @pl.function(
+                level=pl.Level.HOST,
+                role=pl.Role.Orchestrator,
+            )
+            def host_main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                task_counts: pl.Tensor[[1], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out = self.main(a, out, task_counts)
+                return out
+
+        # A dynamic Spmd function attr references a caller-local scalar and is
+        # therefore not independently round-trippable before CHIP helper
+        # inlining. The Submit operand added by the outliner is the
+        # round-trippable/caller-owned representation this regression verifies.
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            transformed = passes.convert_to_ssa()(P)
+            transformed = passes.normalize_stmt_structure()(transformed)
+            transformed = passes.flatten_call_expr()(transformed)
+            transformed = passes.outline_incore_scopes()(transformed)
+            transformed = passes.outline_cluster_scopes()(transformed)
+            transformed = passes.inline_orchestration_helpers()(transformed)
+            transformed = passes.infer_tile_memory_space()(transformed)
+            transformed = passes.expand_mixed_kernel()(transformed)
+            code = self._codegen(transformed)
+
+        scalar_decl = re.search(r"int64_t (dynamic_tasks\w*) =", code)
+        assert scalar_decl is not None, code
+        launch_bound = re.search(r"launch_spec\.set_block_num\(([^)]*)\);", code)
+        assert launch_bound is not None, code
+        assert launch_bound.group(1) == scalar_decl.group(1), code
 
     def test_as_tid_deps_emit_set_dependencies_and_capture_task_id(self):
         """A captured dispatch feeding a downstream ``deps=[tid]`` dispatch emits a

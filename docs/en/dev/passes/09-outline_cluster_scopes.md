@@ -33,7 +33,7 @@ program_outlined = outline_pass(program)
 1. **Scan for Cluster Scopes**: Find all `ClusterScopeStmt` nodes in Opaque/Orchestration functions
 2. **Outline Cluster Scopes**: Extract each Cluster body into `Function(func_type=Group)`
 3. **Scan for Standalone Spmd Scopes**: On the transformed body, find `SpmdScopeStmt` nodes that are not nested inside a Cluster
-4. **Outline Standalone Spmd Scopes**: Extract each standalone Spmd body into `Function(func_type=Spmd)` and copy `core_num` / `sync_start` into function attrs
+4. **Outline Standalone Spmd Scopes**: Extract each standalone Spmd body into `Function(func_type=Spmd)` and copy `core_num` / `sync_start` into function attrs. If the scope lowers to a `Submit` (for example, TaskId capture or early dispatch), also preserve the launch operands on that `Submit` so later caller-side SSA rewrites and orchestration-helper inlining can rename dynamic bounds correctly
 5. **Unwrap Nested Spmd in Group**: For `pl.cluster(): with pl.spmd(...): ...`, keep a single Group function and move `core_num` / `sync_start` onto the Group attrs
 6. **Replace Scope**: Replace each outlined scope with a Call to the outlined function + output assignments
 7. **Add to Program**: Prepend outlined functions to the program's function list

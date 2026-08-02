@@ -846,8 +846,9 @@ class TestOutlineSpmdScopeTaskId:
         submits = self._submit_values(orch)
         assert len(submits) == 1
         submit = submits[0]
-        # core_num rides on the Spmd Function attrs, NOT on the Submit.
-        assert submit.core_num is None
+        # The Submit carries the launch operand so later caller-side SSA and
+        # orchestration inlining can rewrite a dynamic bound.
+        assert submit.core_num is not None
         # No explicit deps on a lone captured dispatch.
         assert len(submit.deps) == 0
 
@@ -939,8 +940,7 @@ class TestOutlineSpmdScopeTaskId:
         orch = self._funcs_by_type(After, ir.FunctionType.Orchestration)[0]
         (submit,) = self._submit_values(orch)
         assert submit.allow_early_resolve is True
-        # core_num rides on the Spmd Function attrs, not on the Submit.
-        assert submit.core_num is None
+        assert submit.core_num is not None
 
 
 class TestOutlinedReturnParamsExplicit:

@@ -93,6 +93,60 @@ class TestOrchestrationMore:
         assert m_name in size_decl.group(1), (m_name, size_decl.group(1))
         assert code.index(f"int64_t {m_name} =") < code.index("gm_pipe_buffer"), code
 
+    def test_dynamic_gm_pipe_buffer_alloc_follows_loop_carried_launch_bound(self):
+        """A GM pipe buffer sized by a loop-carried SPMD bound stays after the loop.
+
+        The orchestration pre-scan sees loop-carried result Vars through a
+        ``ForStmt``, not an ``AssignStmt``.  Hoisting by direct Var-pointer
+        membership therefore used to emit the workspace before the result's C++
+        declaration.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        K = 64
+        N = 16
+        ROW_TILE = 16
+
+        @pl.program
+        class LoopCarriedPipeProgram:
+            @pl.function(type=pl.FunctionType.Opaque)
+            def main(
+                self,
+                work: pl.Tensor[[4], pl.INT32],
+                a: pl.Tensor[[64, K], pl.FP32],
+                b: pl.Tensor[[K, N], pl.FP32],
+                out: pl.Tensor[[64, N], pl.FP32],
+            ) -> pl.Tensor[[64, N], pl.FP32]:
+                active_tasks = pl.cast(0, pl.INDEX)
+                for i in pl.range(4):
+                    active_tasks = active_tasks + pl.cast(pl.read(work, [i]), pl.INDEX)
+                for task in pl.spmd(active_tasks, name_hint="hc"):
+                    m0 = task * ROW_TILE
+                    a_slice = pl.slice(a, [ROW_TILE, K], [m0, 0])
+                    a_add = pl.add(a_slice, 1.0)
+                    c_tile = pl.matmul(a_add, b)
+                    c_vec = pl.add(c_tile, 1.0)
+                    out = pl.assemble(out, c_vec, [m0, 0])
+                return out
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            program = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(
+                LoopCarriedPipeProgram
+            )
+        orch_func = next(
+            f for f in program.functions.values() if f.func_type == ir.FunctionType.Orchestration
+        )
+        code = codegen.generate_orchestration(program, orch_func).code
+
+        size_decl = re.search(r"gm_pipe_buffer_\w+_ci_shapes\[1\] = \{(.+?)\};", code)
+        assert size_decl is not None, code
+        launch_bound = re.search(r"launch_spec\.set_block_num\(([^)]+)\);", code)
+        assert launch_bound is not None, code
+        bound_name = launch_bound.group(1)
+        assert bound_name in size_decl.group(1), (bound_name, size_decl.group(1))
+        assert code.index(f"int64_t {bound_name}") < code.index("gm_pipe_buffer"), code
+
     def test_for_loop_with_slice(self):
         """Test for loop + tensor.slice: simplified paged attention pattern.
 

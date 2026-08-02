@@ -459,7 +459,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
                                                     const std::string& default_dim_expr) const override {
     auto size_it = tensor_create_size_expr_by_emit_name_.find(result_var);
     if (size_it != tensor_create_size_expr_by_emit_name_.end()) {
-      return size_it->second;
+      std::string size_expr = std::to_string(size_it->second.workspace_elems);
+      if (size_it->second.core_num) {
+        size_expr = "static_cast<uint32_t>((" + size_expr + ") * (" +
+                    RenderLaunchCoreNum(size_it->second.core_num) + "))";
+      }
+      return size_expr;
     }
     return CodegenBase::GetTensorCreateSizeExpr(result_var, default_dim_expr);
   }
@@ -1925,6 +1930,36 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return ReorderTensorsBeforeScalars(params);
   }
 
+  void EmitTensorCreateCode(const CallPtr& call, const std::string& emit_var) {
+    auto& registry = OrchestrationOpRegistry::GetInstance();
+    auto codegen_func = registry.Get("tensor.create");
+    INTERNAL_CHECK_SPAN(codegen_func.has_value(), call->span_)
+        << "Misplaced tensor op 'tensor.create' in Orchestration function";
+
+    current_result_var_ = emit_var;
+    std::string gen_code = (*codegen_func)(call, *this);
+    std::istringstream iss(gen_code);
+    std::string line;
+    while (std::getline(iss, line)) {
+      if (!line.empty()) {
+        EmitIndentedLine(line);
+      }
+    }
+    EmitAllocBatch({emit_var});
+  }
+
+  void EmitDeferredGMPipeCreatesForCall(const CallPtr& call) {
+    if (!call) return;
+    for (const auto& arg : call->args_) {
+      auto arg_var = AsVarLike(arg);
+      if (!arg_var) continue;
+      auto it = deferred_gm_pipe_creates_.find(arg_var.get());
+      if (it == deferred_gm_pipe_creates_.end()) continue;
+      if (!emitted_deferred_gm_pipe_creates_.insert(arg_var.get()).second) continue;
+      EmitTensorCreateCode(it->second.call, it->second.emit_name);
+    }
+  }
+
   void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var, const VarPtr& assign_var) {
     const std::string& op_name = call->op_->name_;
 
@@ -1945,20 +1980,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
       emit_var = ReserveVarEmitName(assign_var.get());
     }
 
+    if (IsOp(call, "tensor.create")) {
+      EmitTensorCreateCode(call, emit_var);
+      return;
+    }
+
     current_result_var_ = emit_var;
-
     std::string gen_code = (*codegen_func)(call, *this);
-
     std::istringstream iss(gen_code);
     std::string line;
     while (std::getline(iss, line)) {
       if (!line.empty()) {
         EmitIndentedLine(line);
       }
-    }
-
-    if (IsOp(call, "tensor.create")) {
-      EmitAllocBatch({emit_var});
     }
   }
 
@@ -2817,7 +2851,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   struct GMPipeCreateUse {
     FunctionPtr callee;
-    std::string core_num_expr;
     ExprPtr core_num_node;
   };
 
@@ -2864,11 +2897,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // direct ``pl.spmd_submit(self.aic_or_aiv_kernel, ..., core_num=N)``
       // (N blocks launched, 1-block workspace).
       auto core_num_expr = EffectiveLaunchSpec(call, callee_func).first;
-      std::string rendered_core_num;
-      if (core_num_expr) {
-        rendered_core_num = RenderLaunchCoreNum(core_num_expr);
-      }
-      return GMPipeCreateUse{callee_func, rendered_core_num, core_num_expr};
+      return GMPipeCreateUse{callee_func, core_num_expr};
     }
     return std::nullopt;
   }
@@ -2888,6 +2917,25 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
     if (auto cast_expr = As<Cast>(expr)) {
       return ExprRefsAnyOf(cast_expr->operand_, vars);
+    }
+    return false;
+  }
+
+  static bool ExprContainsVar(const ExprPtr& expr) {
+    if (!expr) {
+      return false;
+    }
+    if (AsVarLike(expr)) {
+      return true;
+    }
+    if (auto bin = As<BinaryExpr>(expr)) {
+      return ExprContainsVar(bin->left_) || ExprContainsVar(bin->right_);
+    }
+    if (auto un = As<UnaryExpr>(expr)) {
+      return ExprContainsVar(un->operand_);
+    }
+    if (auto cast_expr = As<Cast>(expr)) {
+      return ExprContainsVar(cast_expr->operand_);
     }
     return false;
   }
@@ -2962,16 +3010,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
         int64_t workspace_elems = GetGMPipeWorkspaceElements(create_use->callee);
         INTERNAL_CHECK(workspace_elems > 0)
             << "Internal error: injected gm_pipe_buffer tensor.create found without initialize_pipe ops";
-        std::string size_expr = std::to_string(workspace_elems);
-        const std::string& core_num_expr = create_use->core_num_expr;
-        if (!core_num_expr.empty()) {
-          size_expr = "static_cast<uint32_t>((" + size_expr + ") * (" + core_num_expr + "))";
-        }
-        tensor_create_size_expr_by_emit_name_[emit_var] = size_expr;
-        // Keep the create in body order when core_num is computed from a body-local.
-        if (ExprRefsAnyOf(create_use->core_num_node, locally_defined)) {
+        tensor_create_size_expr_by_emit_name_[emit_var] =
+            TensorCreateSizeOverride{workspace_elems, create_use->core_num_node};
+        // Keep dynamically-sized GM-pipe workspaces in body order.  The
+        // launch bound can be a loop-carried SSA result whose defining
+        // ForStmt is not an AssignStmt in this flat pre-scan; pointer-only
+        // membership in ``locally_defined`` then misses it and hoists the
+        // allocation above the bound's declaration.  Any Var-bearing launch
+        // expression is cheap and safe to allocate at its call site, where
+        // orchestration emit-name/SSA mappings are already established.
+        if (ExprContainsVar(create_use->core_num_node)) {
           declared_var_ptrs_.erase(assign->var_.get());
           locally_defined.insert(assign->var_.get());
+          deferred_gm_pipe_creates_[assign->var_.get()] = DeferredGMPipeCreate{emit_var, call};
+          batched_create_stmts_.insert(stmt.get());
           continue;
         }
       }
@@ -3055,6 +3107,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   void GenerateFunctionCallCode(const CallPtr& call, const std::string& result_var,
                                 bool capture_plain_task_id = false) {
+    // Dynamic GM-pipe sizing can depend on loop/branch carries. Emit the
+    // workspace immediately before the consuming launch, after those carries
+    // have established their final C++ emit-name mappings.
+    EmitDeferredGMPipeCreatesForCall(call);
+
     const std::string& callee_name = call->op_->name_;
 
     FunctionPtr callee_func = program_->GetFunction(callee_name);
@@ -3964,7 +4021,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_set<const Stmt*> batched_create_stmts_;
   std::unordered_set<const Var*> effective_uses_;
   std::unordered_map<std::string, int64_t> gm_pipe_workspace_elements_by_callee_;
-  std::unordered_map<std::string, std::string> tensor_create_size_expr_by_emit_name_;
+  struct DeferredGMPipeCreate {
+    std::string emit_name;
+    CallPtr call;
+  };
+  std::unordered_map<const Var*, DeferredGMPipeCreate> deferred_gm_pipe_creates_;
+  std::unordered_set<const Var*> emitted_deferred_gm_pipe_creates_;
+  struct TensorCreateSizeOverride {
+    int64_t workspace_elems;
+    ExprPtr core_num;
+  };
+  std::unordered_map<std::string, TensorCreateSizeOverride> tensor_create_size_expr_by_emit_name_;
   std::unordered_map<std::string, std::string> dist_param_to_ctx_param_;
   /// Memoizes ``ExplicitReturnedParamIndices`` per callee Function. Tuple/submit
   /// alias generation runs once per call site, but distinct call sites may

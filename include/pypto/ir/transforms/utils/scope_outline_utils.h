@@ -1119,6 +1119,12 @@ class ScopeOutliner : public IRMutator {
     // ``attrs_``. The dep-free path keeps the plain Call shape.
     ExprPtr synthesised_call_expr;
     if (scope_task_id_var) {
+      std::optional<ExprPtr> submit_core_num;
+      bool submit_sync_start = false;
+      if (auto spmd = As<SpmdScopeStmt>(op)) {
+        submit_core_num = spmd->core_num_;
+        submit_sync_start = spmd->sync_start_;
+      }
       std::vector<ExprPtr> submit_deps;
       submit_deps.reserve(scope_dep_edges.size());
       for (const auto& v : scope_dep_edges) {
@@ -1137,7 +1143,7 @@ class ScopeOutliner : public IRMutator {
       synthesised_call_expr = std::make_shared<Submit>(
           global_var, call_args, std::move(submit_deps), std::vector<std::pair<std::string, std::any>>{},
           std::move(submit_attrs), call_return_type ? call_return_type : std::make_shared<UnknownType>(),
-          op->span_, /*core_num=*/std::nullopt, /*sync_start=*/false,
+          op->span_, /*core_num=*/std::move(submit_core_num), /*sync_start=*/submit_sync_start,
           /*allow_early_resolve=*/scope_allow_early_resolve,
           /*predicate=*/scope_predicate ? std::optional<ExprPtr>(scope_predicate) : std::nullopt);
     } else {
