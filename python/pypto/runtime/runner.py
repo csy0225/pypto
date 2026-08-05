@@ -115,6 +115,15 @@ class RunConfig:
             is intentionally skipped because the simulator does not yet ship the
             task metadata the converter needs. Mirrors runtime's
             ``--enable-l2-swimlane`` flag.
+        l2_swimlane_reuse_dep_gen: Prepared-worker-only capture mode. When
+            ``True``, an onboard :class:`DistributedWorker` reuses the
+            ``deps.json`` files produced by an immediately preceding
+            ``enable_dep_gen`` dispatch and captures swimlane timing with
+            dependency generation disabled. This avoids perturbing collective
+            timing while retaining the prepared worker and its device-resident
+            inputs. Requires ``enable_l2_swimlane=True`` and
+            ``enable_dep_gen=False``. One-shot execution already performs a
+            clean two-pass capture and ignores this prepared-worker hint.
         enable_dump_args: Per-task argument dump **level** written into
             ``<work_dir>/dfx_outputs/args_dump/``. Inspect with
             ``python -m simpler_setup.tools.dump_viewer``. Mirrors
@@ -231,6 +240,7 @@ class RunConfig:
     save_kernels_dir: str | None = None
     codegen_only: bool = False
     enable_l2_swimlane: bool = False
+    l2_swimlane_reuse_dep_gen: bool = False
     enable_dump_args: int = 0  # 0=off, 1=partial (dump_tag-marked), 2=full
     enable_pmu: int = 0
     enable_dep_gen: bool = False
@@ -271,6 +281,14 @@ class RunConfig:
         if not self.platform.startswith(expected_arch):
             sim_suffix = "sim" if self.platform.endswith("sim") else ""
             self.platform = f"{expected_arch}{sim_suffix}"
+
+        if self.l2_swimlane_reuse_dep_gen:
+            if not self.enable_l2_swimlane:
+                raise ValueError("l2_swimlane_reuse_dep_gen requires enable_l2_swimlane=True")
+            if self.enable_dep_gen:
+                raise ValueError("l2_swimlane_reuse_dep_gen requires enable_dep_gen=False")
+            if self.platform.endswith("sim"):
+                raise ValueError("l2_swimlane_reuse_dep_gen is only supported on onboard platforms")
 
         # Any DFX flag requires kernel artefacts to be retained so the
         # ``<work_dir>/dfx_outputs/`` directory survives the run.

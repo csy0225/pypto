@@ -595,6 +595,55 @@ def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
                 shutil.rmtree(disp_dir, ignore_errors=True)
 
 
+def _prepare_reused_dep_gen_dirs(dfx_base: Path) -> list[Path]:
+    """Validate a prepared-worker dep-gen capture and discard stale timings.
+
+    A prepared worker cannot safely re-fork between dependency generation and
+    swimlane capture. The caller therefore performs two dispatches on the same
+    worker: first ``enable_dep_gen``, then swimlane-only timing. This helper
+    preserves the task graph from the first dispatch while ensuring the second
+    dispatch cannot accidentally reuse an old records file.
+
+    Returns:
+        Dispatch directories containing the reusable task graph.
+
+    Raises:
+        RuntimeError: No dispatch graph exists, or any discovered dispatch
+            directory lacks ``deps.json``.
+    """
+    dispatch_dirs = sorted(
+        disp_dir
+        for rank_dir in dfx_base.glob(_RANK_DIR_GLOB)
+        if rank_dir.is_dir()
+        for disp_dir in rank_dir.glob(_DISPATCH_DIR_GLOB)
+        if disp_dir.is_dir()
+    )
+    if not dispatch_dirs:
+        raise RuntimeError(
+            "l2_swimlane_reuse_dep_gen requires an existing prepared-worker "
+            f"dependency capture under {dfx_base}; run the same dispatch once "
+            "with enable_dep_gen=True first"
+        )
+
+    missing = [disp_dir for disp_dir in dispatch_dirs if not (disp_dir / "deps.json").is_file()]
+    if missing:
+        rels = ", ".join(str(path.relative_to(dfx_base)) for path in missing)
+        raise RuntimeError(f"l2_swimlane_reuse_dep_gen found dispatch directories without deps.json: {rels}")
+
+    # Keep deps.json/name_map.json, but remove outputs whose presence would make
+    # an incomplete second dispatch look valid. The runtime recreates records;
+    # the offline converter recreates merged files.
+    for disp_dir in dispatch_dirs:
+        for stale in (
+            disp_dir / "l2_swimlane_records.json",
+            disp_dir / "critical_path_report.md",
+        ):
+            stale.unlink(missing_ok=True)
+        for stale in disp_dir.glob("merged_swimlane_*.json"):
+            stale.unlink(missing_ok=True)
+    return dispatch_dirs
+
+
 def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
@@ -864,6 +913,7 @@ def execute_distributed(
         deps_cfg = dataclasses.replace(
             config,
             enable_l2_swimlane=False,
+            l2_swimlane_reuse_dep_gen=False,
             enable_dep_gen=True,
             enable_pmu=0,
             enable_scope_stats=False,
@@ -872,7 +922,11 @@ def execute_distributed(
         _run_once(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
 
         print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
-        timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
+        timing_cfg = dataclasses.replace(
+            config,
+            enable_dep_gen=False,
+            l2_swimlane_reuse_dep_gen=False,
+        )
         _run_once(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
     else:
         _run_once(_make_call_config(dc, config, dfx_base=dfx_base))
@@ -1750,14 +1804,24 @@ class DistributedWorker(Worker):
         call_config = state["call_config"]
         if config is not None:
             dfx_base = compiled.output_dir / "dfx_outputs"
-            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
-            # This worker reuses one output_dir across dispatches, so stale
-            # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared
-            # before this run rewrites ``d0, d1, ...`` (see _clear_dfx_dispatch_dirs).
             from .runner import _DfxOpts  # noqa: PLC0415
 
-            if _DfxOpts.from_run_config(config).any():
-                _clear_dfx_dispatch_dirs(dfx_base)
+            dfx_enabled = _DfxOpts.from_run_config(config).any()
+            reuse_dep_gen = bool(config.l2_swimlane_reuse_dep_gen)
+            if dfx_enabled:
+                if reuse_dep_gen:
+                    _prepare_reused_dep_gen_dirs(dfx_base)
+                else:
+                    # This worker reuses one output_dir across dispatches, so
+                    # stale ``rank*/d{k}`` dirs from an earlier, larger run
+                    # must be cleared before this run rewrites d0, d1, ...
+                    _clear_dfx_dispatch_dirs(dfx_base)
+            call_config = _make_call_config(
+                compiled._distributed_config,
+                config,
+                dfx_base=dfx_base,
+                co_enable_swimlane_dep_gen=not reuse_dep_gen,
+            )
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)
@@ -1795,13 +1859,12 @@ class DistributedWorker(Worker):
         self._dispatch_prepared(state, tensors, call_config)
 
         # Offline post-pass (reads the per-dispatch records on disk; no worker needed).
-        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
-        # worker reuses its forked chip children across dispatches, so it cannot
-        # re-fork between a deps pass and a timing pass without tripping the
-        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
-        # single-pass (dep_gen co-enabled), so the on-disk records include
-        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
-        # clean two-pass swimlane timing.
+        # Unlike the one-shot path, a prepared worker cannot re-fork between a
+        # deps pass and a timing pass without tripping the per-child
+        # ``halHostRegister`` cap (rc 8). By default it therefore co-enables
+        # dep_gen. ``l2_swimlane_reuse_dep_gen`` opts into an explicit
+        # same-worker two-dispatch protocol: a preceding dep-gen dispatch leaves
+        # deps.json in place, and this dispatch captures timing only.
         if config is not None and config.enable_l2_swimlane:
             _collect_l3_swimlane(compiled.output_dir, compiled.platform)
 

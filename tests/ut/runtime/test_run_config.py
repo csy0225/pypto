@@ -147,6 +147,42 @@ class TestRunConfigDfxFlags:
     def test_dfx_opts_any_false_when_all_off(self):
         assert _DfxOpts().any() is False
 
+    def test_prepared_swimlane_dep_reuse_contract(self):
+        cfg = RunConfig(
+            platform="a2a3",
+            enable_l2_swimlane=True,
+            l2_swimlane_reuse_dep_gen=True,
+        )
+        assert cfg.l2_swimlane_reuse_dep_gen is True
+        assert cfg.any_dfx_enabled() is True
+
+    def test_prepared_swimlane_dep_reuse_requires_swimlane(self):
+        with pytest.raises(
+            ValueError,
+            match="requires enable_l2_swimlane=True",
+        ):
+            RunConfig(
+                platform="a2a3",
+                l2_swimlane_reuse_dep_gen=True,
+            )
+
+    def test_prepared_swimlane_dep_reuse_rejects_same_pass_dep_gen(self):
+        with pytest.raises(ValueError, match="requires enable_dep_gen=False"):
+            RunConfig(
+                platform="a2a3",
+                enable_l2_swimlane=True,
+                enable_dep_gen=True,
+                l2_swimlane_reuse_dep_gen=True,
+            )
+
+    def test_prepared_swimlane_dep_reuse_is_onboard_only(self):
+        with pytest.raises(ValueError, match="only supported on onboard"):
+            RunConfig(
+                platform="a2a3sim",
+                enable_l2_swimlane=True,
+                l2_swimlane_reuse_dep_gen=True,
+            )
+
 
 class TestRunConfigRingSizing:
     """Verify per-task ring-sizing overrides on ``RunConfig``.

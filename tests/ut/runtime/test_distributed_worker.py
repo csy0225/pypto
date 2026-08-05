@@ -38,6 +38,7 @@ from pypto.runtime.distributed_runner import (
     _clear_dfx_dispatch_dirs,
     _collect_l3_swimlane,
     _make_call_config,
+    _prepare_reused_dep_gen_dirs,
     _submit_chip,
 )
 from pypto.runtime.runner import RunConfig
@@ -182,6 +183,43 @@ class TestPerTaskRingSizing:
         # rt.run(...) honors the same per-dispatch ring sizing as rt(...).
         assert m["make_call_config"].call_count == 2
         assert m["make_call_config"].call_args.args[1] is rc
+        rt.close()
+
+    def test_prepared_swimlane_reuses_deps_without_co_enabling_dep_gen(
+        self,
+        patched_setup,
+        tmp_path,
+    ):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        dep_dir = tmp_path / "dfx_outputs" / "rank0" / "d0"
+        dep_dir.mkdir(parents=True)
+        (dep_dir / "deps.json").write_text("{}", encoding="utf-8")
+        (dep_dir / "l2_swimlane_records.json").write_text("stale", encoding="utf-8")
+        rt = DistributedWorker(compiled)
+
+        rc = RunConfig(
+            platform="a2a3",
+            enable_l2_swimlane=True,
+            l2_swimlane_reuse_dep_gen=True,
+        )
+        with (
+            patch(
+                "pypto.runtime.distributed_runner._clear_dfx_dispatch_dirs",
+            ) as clear,
+            patch(
+                "pypto.runtime.distributed_runner._collect_l3_swimlane",
+            ),
+        ):
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=rc)
+
+        clear.assert_not_called()
+        rebuild = m["make_call_config"].call_args
+        assert rebuild.kwargs["co_enable_swimlane_dep_gen"] is False
+        assert (dep_dir / "deps.json").is_file()
+        assert not (dep_dir / "l2_swimlane_records.json").exists()
         rt.close()
 
 
@@ -1336,6 +1374,41 @@ class TestClearDfxDispatchDirs:
     def test_missing_base_is_noop(self, tmp_path):
         # No dfx_outputs yet (first dispatch) -> nothing to clear, no error.
         _clear_dfx_dispatch_dirs(tmp_path / "dfx_outputs")
+
+
+class TestPrepareReusedDepGenDirs:
+    """The prepared two-dispatch path preserves graphs and drops stale timing."""
+
+    def test_preserves_deps_and_removes_timing_outputs(self, tmp_path):
+        dfx = tmp_path / "dfx_outputs"
+        dispatches = [dfx / "rank0" / "d0", dfx / "rank1" / "d0"]
+        for disp in dispatches:
+            disp.mkdir(parents=True)
+            (disp / "deps.json").write_text("{}", encoding="utf-8")
+            (disp / "name_map.json").write_text("{}", encoding="utf-8")
+            (disp / "l2_swimlane_records.json").write_text("old", encoding="utf-8")
+            (disp / "merged_swimlane_old.json").write_text("old", encoding="utf-8")
+            (disp / "critical_path_report.md").write_text("old", encoding="utf-8")
+
+        found = _prepare_reused_dep_gen_dirs(dfx)
+
+        assert found == dispatches
+        for disp in dispatches:
+            assert (disp / "deps.json").is_file()
+            assert (disp / "name_map.json").is_file()
+            assert not (disp / "l2_swimlane_records.json").exists()
+            assert not (disp / "merged_swimlane_old.json").exists()
+            assert not (disp / "critical_path_report.md").exists()
+
+    def test_requires_an_existing_dep_capture(self, tmp_path):
+        with pytest.raises(RuntimeError, match="run the same dispatch once"):
+            _prepare_reused_dep_gen_dirs(tmp_path / "dfx_outputs")
+
+    def test_rejects_partial_dep_capture(self, tmp_path):
+        dfx = tmp_path / "dfx_outputs"
+        (dfx / "rank0" / "d0").mkdir(parents=True)
+        with pytest.raises(RuntimeError, match="without deps.json"):
+            _prepare_reused_dep_gen_dirs(dfx)
 
 
 class TestCollectL3Swimlane:
