@@ -15,7 +15,9 @@ import ctypes
 import importlib.util
 import inspect
 import json
+import os
 import queue
+import time
 import sys
 import threading
 import types
@@ -1255,33 +1257,96 @@ class DistributedWorker(Worker):
 
     def _reset_persistent_domains(self, orch: Any, domains: dict[str, tuple[tuple[Any, ...], Any]]) -> None:
         """Restore retained windows to the zero-filled fresh-allocation state."""
+        trace_path = os.environ.get("PYPTO_PERSISTENT_RESET_TRACE")
+        trace_domains: list[dict[str, Any]] = []
+        reset_start_ns = time.perf_counter_ns()
         if self._w.device_memset_available:
-            for _spec, handle in domains.values():
-                self._w.memset_all(
+            for generated_name, (spec, handle) in domains.items():
+                worker_ranges = {
+                    int(worker_id): (
+                        int(handle[worker_id].local_window_base),
+                        int(handle[worker_id].actual_window_size),
+                    )
+                    for worker_id in handle.workers
+                }
+                call_start_ns = time.perf_counter_ns()
+                self._w.memset_all(worker_ranges)
+                call_elapsed_ns = time.perf_counter_ns() - call_start_ns
+                trace_domains.append(
                     {
-                        int(worker_id): (
-                            int(handle[worker_id].local_window_base),
-                            int(handle[worker_id].actual_window_size),
-                        )
-                        for worker_id in handle.workers
+                        "generated_name": str(generated_name),
+                        "workers": [int(worker_id) for worker_id in handle.workers],
+                        "requested_window_size": int(spec[1]),
+                        "actual_window_sizes": {
+                            str(worker_id): int(size)
+                            for worker_id, (_base, size) in worker_ranges.items()
+                        },
+                        "buffers": [
+                            {
+                                "name": str(name),
+                                "dtype": str(dtype),
+                                "count": int(count),
+                                "nbytes": int(nbytes),
+                            }
+                            for name, dtype, count, nbytes in spec[2]
+                        ],
+                        "memset_all_us": call_elapsed_ns / 1000.0,
                     }
                 )
-            return
-        assert self._persistent_zero is not None
-        zero_ptr = int(self._persistent_zero.data_ptr())
-        chunk_size = int(self._persistent_zero.numel())
-        for _spec, handle in domains.values():
-            for worker_id in handle.workers:
-                context = handle[worker_id]
-                window_size = int(context.actual_window_size)
-                for offset in range(0, window_size, chunk_size):
-                    nbytes = min(chunk_size, window_size - offset)
-                    orch.copy_to(
-                        int(worker_id),
-                        int(context.local_window_base) + offset,
-                        zero_ptr,
-                        nbytes,
-                    )
+            reset_elapsed_ns = time.perf_counter_ns() - reset_start_ns
+        else:
+            assert self._persistent_zero is not None
+            zero_ptr = int(self._persistent_zero.data_ptr())
+            chunk_size = int(self._persistent_zero.numel())
+            for generated_name, (spec, handle) in domains.items():
+                call_start_ns = time.perf_counter_ns()
+                for worker_id in handle.workers:
+                    context = handle[worker_id]
+                    window_size = int(context.actual_window_size)
+                    for offset in range(0, window_size, chunk_size):
+                        nbytes = min(chunk_size, window_size - offset)
+                        orch.copy_to(
+                            int(worker_id),
+                            int(context.local_window_base) + offset,
+                            zero_ptr,
+                            nbytes,
+                        )
+                call_elapsed_ns = time.perf_counter_ns() - call_start_ns
+                trace_domains.append(
+                    {
+                        "generated_name": str(generated_name),
+                        "workers": [int(worker_id) for worker_id in handle.workers],
+                        "requested_window_size": int(spec[1]),
+                        "actual_window_sizes": {
+                            str(worker_id): int(handle[worker_id].actual_window_size)
+                            for worker_id in handle.workers
+                        },
+                        "buffers": [
+                            {
+                                "name": str(name),
+                                "dtype": str(dtype),
+                                "count": int(count),
+                                "nbytes": int(nbytes),
+                            }
+                            for name, dtype, count, nbytes in spec[2]
+                        ],
+                        "copy_zero_us": call_elapsed_ns / 1000.0,
+                    }
+                )
+            reset_elapsed_ns = time.perf_counter_ns() - reset_start_ns
+        if trace_path:
+            seq = int(getattr(self, "_persistent_reset_trace_seq", 0))
+            self._persistent_reset_trace_seq = seq + 1
+            record = {
+                "schema": "pypto.persistent-reset-trace.v1",
+                "seq": seq,
+                "device_memset_available": bool(self._w.device_memset_available),
+                "domain_count": len(trace_domains),
+                "reset_body_us": reset_elapsed_ns / 1000.0,
+                "domains": trace_domains,
+            }
+            with open(trace_path, "a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(record, sort_keys=True) + "\n")
 
     def _finish_persistent_request(self, orch: Any) -> None:
         """Drain one request and run the non-domain ``Worker.run`` cleanup."""
