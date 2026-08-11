@@ -1262,10 +1262,90 @@ class DistributedWorker(Worker):
         reset_start_ns = time.perf_counter_ns()
         if self._w.device_memset_available:
             for generated_name, (spec, handle) in domains.items():
+                _K8_CONTROL = (
+                    "dense_attn_signal_stack_buf",
+                    "dense_mlp_signal_stack_buf",
+                    "moe_attn_signal_stack_buf",
+                    "moe_meta_arrived_stack_buf",
+                    "moe_data_arrived_stack_buf",
+                    "moe_sh_signal_stack_buf",
+                    "moe_combine_arrived_stack_buf",
+                )
+                _K8_DATA = (
+                    "dense_attn_tmp_stack_buf",
+                    "dense_mlp_tmp_stack_buf",
+                    "moe_attn_tmp_stack_buf",
+                    "moe_recv_meta_stack_buf",
+                    "moe_recv_x_stack_buf",
+                    "moe_recv_aux_stack_buf",
+                    "moe_recv_route_stack_buf",
+                    "moe_sh_tmp_stack_buf",
+                    "moe_routed_y_buf_stack_buf",
+                )
+                _K8_CONTROL_BYTES_PINNED = 47616
+
+                # (base name, nbytes) in carve order.  The SSA suffix is
+                # stripped inline rather than in a nested helper so that the
+                # pre-flight AST name checker stays single-scope.
+                _k8_items = []
+                for _name, _dtype, _count, _nbytes in spec[2]:
+                    _full = str(_name)
+                    _marker = "__ssa_v"
+                    _idx = _full.rfind(_marker)
+                    if _idx != -1 and _full[_idx + len(_marker):].isdigit():
+                        _full = _full[:_idx]
+                    _k8_items.append((_full, int(_nbytes)))
+                _k8_bases = [_b for _b, _nb in _k8_items]
+                # Only the WholeDecode window is audited.  Any other persistent
+                # program keeps the original full-window clear: an unrecognised
+                # buffer set is not an error there, it just means the prefix
+                # optimisation does not apply to that domain.
+                _k8_applies = sorted(_k8_bases) == sorted(_K8_CONTROL + _K8_DATA)
+                _k8_carved = 0
+                _k8_control_bytes = 0
+                if _k8_applies:
+                    _k8_seen_control: list[str] = []
+                    _k8_seen_data = 0
+                    for base, nbytes in _k8_items:
+                        if base in _K8_CONTROL:
+                            if _k8_seen_data:
+                                raise RuntimeError(
+                                    f"K8 prefix reset: control buffer {base!r} appears after "
+                                    f"{_k8_seen_data} data buffer(s); the model must declare "
+                                    "all control buffers first"
+                                )
+                            _k8_seen_control.append(base)
+                            _k8_control_bytes += nbytes
+                        else:
+                            _k8_seen_data += 1
+                        _k8_carved += nbytes
+                    if len(_k8_seen_control) != len(_K8_CONTROL):
+                        raise RuntimeError(
+                            f"K8 prefix reset: expected {len(_K8_CONTROL)} control buffers, "
+                            f"saw {_k8_seen_control}"
+                        )
+                    if _k8_control_bytes != _K8_CONTROL_BYTES_PINNED:
+                        raise RuntimeError(
+                            f"K8 prefix reset: control bytes {_k8_control_bytes} != pinned "
+                            f"{_K8_CONTROL_BYTES_PINNED}; the model revision changed, re-audit"
+                        )
+                    if _k8_carved != int(spec[1]):
+                        raise RuntimeError(
+                            f"K8 prefix reset: carved {_k8_carved} != requested window "
+                            f"{int(spec[1])}"
+                        )
+                    for worker_id in handle.workers:
+                        actual = int(handle[worker_id].actual_window_size)
+                        if actual != _k8_carved:
+                            raise RuntimeError(
+                                f"K8 prefix reset: actual window {actual} != carved "
+                                f"{_k8_carved} on worker {worker_id}"
+                            )
                 worker_ranges = {
                     int(worker_id): (
                         int(handle[worker_id].local_window_base),
-                        int(handle[worker_id].actual_window_size),
+                        int(_k8_control_bytes) if _k8_applies
+                        else int(handle[worker_id].actual_window_size),
                     )
                     for worker_id in handle.workers
                 }
@@ -1278,8 +1358,8 @@ class DistributedWorker(Worker):
                         "workers": [int(worker_id) for worker_id in handle.workers],
                         "requested_window_size": int(spec[1]),
                         "actual_window_sizes": {
-                            str(worker_id): int(size)
-                            for worker_id, (_base, size) in worker_ranges.items()
+                            str(worker_id): int(handle[worker_id].actual_window_size)
+                            for worker_id in handle.workers
                         },
                         "buffers": [
                             {
@@ -1291,6 +1371,13 @@ class DistributedWorker(Worker):
                             for name, dtype, count, nbytes in spec[2]
                         ],
                         "memset_all_us": call_elapsed_ns / 1000.0,
+                        "k8_prefix_applied": bool(_k8_applies),
+                        "k8_control_bytes": int(_k8_control_bytes) if _k8_applies else None,
+                        "k8_control_range_count": 1,
+                        "k8_control_ranges": [
+                            [int(_r[0]), int(_r[1])] for _r in [next(iter(worker_ranges.values()))]
+                        ] if _k8_applies else None,
+                        "k8_full_window_bytes": int(_k8_carved) if _k8_applies else None,
                     }
                 )
             reset_elapsed_ns = time.perf_counter_ns() - reset_start_ns
