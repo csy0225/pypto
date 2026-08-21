@@ -1,0 +1,142 @@
+# 诊断系统：警告与性能提示
+
+Pass 流水线统一的建议性诊断通道。通过同一套注册表、Instrument 与输出路径，承载警告（疑似用户错误）和性能提示（建议性调优提示）。
+
+## 概述
+
+| 组件 | 作用 |
+| ---- | ---- |
+| **`Diagnostic` 结构体** | 携带 severity（`Error` / `Warning` / `PerfHint`）、`rule_name`、`error_code`、`hint_code`、消息、span。 |
+| **`DiagnosticCheck` 枚举** | 标识具体的检查项（如 `UnusedVariable`、`TileInnermostDimGranularity`）。 |
+| **`DiagnosticCheckRegistry`** | 将检查项映射到 verifier 工厂；每次注册都声明 severity、phase 和 hint 码。 |
+| **`DiagnosticInstrument`** | 运行已注册检查并分发输出的 `PassInstrument`。 |
+| **`DiagnosticPhase`** | 检查触发时机：`PrePipeline`、`PostPass` 或 `PostPipeline`。每个检查独立声明。 |
+
+Severity 与 phase 解耦：`Warning` 可以在 `PrePipeline` 触发，`PerfHint` 可以在 `PostPipeline` 触发——按检查注册，而非按 severity。
+
+## Severity 等级
+
+| Severity | 何时使用 | 输出 | 抑制方式 |
+| -------- | -------- | ---- | -------- |
+| `Error` | IR 不合法 | 抛出 `VerificationError` | 不可抑制 |
+| `Warning` | 疑似用户错误或 pass bug | 完整输出至 stderr（`LOG_WARN`） | `disabled_diagnostics` 集合 |
+| `PerfHint` | 建议性调优提示 | 上下文中存在 `ReportInstrument` 时（经 `compile()` / `pl.jit` 时恒为真）每条 hint 写入 `${ReportInstrument.output_dir}/perf_hints.log`，stderr 仅打印一行指向该文件的 `LOG_INFO` 摘要；若无 `ReportInstrument`，则每条 hint 完整输出至 stderr（`LOG_INFO`）。 | `disabled_diagnostics` 集合 |
+
+`PYPTO_LOG_LEVEL` release 默认值为 `INFO`，因此 `[perf_hint] N hints …` 摘要行（无 `ReportInstrument` 时为完整的 `[perf_hint PH…] …` 行）开箱可见。设置 `PYPTO_LOG_LEVEL=warn` 可在 stderr 上静音性能提示。上下文中存在 `ReportInstrument` 时，无论日志级别如何逐条详情仍写入 `perf_hints.log`（文件输出独立）；若无 `ReportInstrument` 则没有该文件，静音 stderr 会彻底丢弃性能提示。
+
+## 触发流程
+
+```text
+PassPipeline::Run(program)
+ ├─ phase != None：运行 PrePipeline 检查  → EmitDiagnostics
+ ├─ 对每个 pass：
+ │    ├─ 执行 pass
+ │    ├─ phase != None：运行 PostPass 检查 → EmitDiagnostics
+ ├─ phase != None：运行 PostPipeline 检查  → EmitDiagnostics
+ └─ ctx.RunAfterPipeline(program)         （instrument 钩子）
+```
+
+`EmitDiagnostics` 将 Warning 以完整形式经 `LOG_WARN` 输出。对 PerfHint：上下文中存在 `ReportInstrument` 时把每条 hint 附加到 `perf_hints.log`，并向 stderr 输出一行 `LOG_INFO` 摘要（`[perf_hint] N hints across M sites; see <path>`）；否则每条 hint 完整经 `LOG_INFO` 输出。
+
+## 注册新的检查项
+
+```cpp
+// 1. 实现 PropertyVerifier 子类（src/ir/verifier/...）
+class MyCheck : public PropertyVerifier {
+ public:
+  void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diags) override;
+  std::string GetName() const override { return "MyCheck"; }
+};
+PropertyVerifierPtr CreateMyCheckVerifier() { return std::make_shared<MyCheck>(); }
+
+// 2. 添加枚举值（include/pypto/ir/verifier/diagnostic_check_registry.h）
+enum class DiagnosticCheck : uint32_t { ..., MyCheck = N };
+
+// 3. 在 DiagnosticCheckRegistry::DiagnosticCheckRegistry() 中注册
+Register(DiagnosticCheck::MyCheck,
+         DiagnosticSeverity::PerfHint,
+         DiagnosticPhase::PostPipeline,
+         "PHnnn",
+         CreateMyCheckVerifier);
+```
+
+注册表会将注册时声明的 severity 和 hint 码盖到 verifier 产生的每个 diagnostic 上。
+
+## 性能提示（issue #1180）
+
+性能提示是对可能未充分利用目标硬件的代码模式的最佳努力建议。默认在 `DiagnosticPhase::PostPipeline` 启用，在 IR 完全 lower 后运行。
+
+### 各 backend 阈值
+
+`BackendHandler` 暴露：
+
+| 方法 | Ascend910B | Ascend950 |
+| ---- | ---------- | --------- |
+| `GetGmAccessGranularityBytes()` | 512 | 128 |
+| `GetL2CacheLineBytes()` | 512 | 512 |
+| `GetRecommendedInnermostDimBytes()` | 512 | 128 |
+
+新增 backend 时实现这些虚函数；perf-hint 检查通过 `PassContext::Current()->GetBackendHandler()` 读取。
+
+### 第一项检查：`TileInnermostDimGranularity` (PH001)
+
+检查每个 `tile.load` / `tile.store` 操作。当最内层维度的字节数（`shape[-1] * sizeof(dtype)`）低于 `GetRecommendedInnermostDimBytes()` 时发出 diagnostic，指向源代码 span。该检查适用于**所有内存空间，包括 cube 私有空间**（issue #2309）：本检查只考察 `tile.load` / `tile.store`，而它们的非 tile 一侧是 `TensorType`——始终位于片外——因此无论 tile 落在哪个空间，二者都是 GM↔片上传输，其 GM 侧总是以最内层维度的粒度穿越 L2。真正的片内搬移（`tile.move` / `tile.extract`，如 Mat→L0）才是 cube 私有的，而本检查根本不考察它们。早期版本以 L2 局部性为由跳过 `Mat`/`Left`/`Right`/`Acc` tile；由于任何片内传输都不会到达本检查，该跳过只可能压制真阳性——典型的就是 `b_trans` matmul 的 GM→Mat 权重加载，其加载窗口是调用方 `[N, K]` 切片的转置（每行 128 B，而建议值为 512 B，实测有 16–25% 的性能损失）。
+
+每条 hint 还会报告**传输规模**——`moves <total>B as <rows> x <row>B rows`——其中 `rows` 是该次传输发出的短总线事务数量。规模是同一最内层尺寸下区分 hint 轻重的依据：`[1024, 64]` 权重面板与 `[16, 64]` 激活面板在 span、op、dtype、最内层尺寸和内存空间上完全一致，只在流量上相差 64 倍。有三点需要注意：
+
+- 这些数字取自**有效 valid shape**，而非物理分配。两个 op 的 `pto.partition_view` 都按 `valid_shape` 定尺寸，因此带 padding 的 tile 或尾块搬运的数据少于其分配量；对这类 tile，报告的行宽会小于标题中的物理最内层维度。
+- 总量为 `rows × row_bytes`，先对每行向上取整再相乘。若对整个 tile 一次性取整，会把位打包传输低估一个打包倍数，并与紧邻的行数据自相矛盾——`[16, 1]` 的 bool tile 搬运的是 16 行 × 1B，而不是打包后的 2B。
+- 当任一 valid 维度为符号量时省略该子句。
+
+命中按 `(file, line, col, op, dtype, innermost_bytes, innermost_elems, target_memory, rows, row_bytes, transfer_bytes)` 站点**去重**——即消息渲染的全部事实，因此两条打印结果不同的传输绝不会折叠到彼此的文本上（在位打包下元素数与字节数各自独立地重要：`int4[1]` 与 `int4[2]` 都向上取整为 1 字节）——循环展开 / 分片展开在同一源 span 产生的多个*相同* tile 传输会折叠为一条带出现次数的 hint；而共享同一 span 的不同传输（dtype/大小/内存空间不同）各自保留自己的 hint，使计数不会产生误导。位于无效 / 未知 span 的命中会单独发出，而非折叠在一起。消息会回显其评估的 `(dtype[innermost], target_memory)` 元组，便于将字节数与 IR 对照。上下文中存在 `ReportInstrument` 时全部写入 `perf_hints.log`，stderr 仅见摘要行；否则每条 hint 输出到 stderr。
+
+> **源 span 限制：** span 为流水线后 IR 文本位置（`<string>:line:col`），并非原始 DSL `pl.at` / 切片表达式，也未命名控制内层维度的 chunk 常量。回溯到用户源代码并命名内层维度常量需要将 DSL 源 span 通过 parser/IR 传递到 tile op 上——目前 `TileType`、`Call` op、`Span` 都未携带该元数据（issue #1305 第 2/3 项）。
+
+示例：stderr 摘要 + `perf_hints.log` 内容（`examples/intermediate/05_assemble.py`，Ascend910B）。注意前两行——op、span、dtype、最内层尺寸与内存空间完全相同，仅靠传输规模区分：
+
+```text
+# stderr：
+[perf_hint] 4 hints across 4 sites; see /tmp/build/perf_hints.log
+
+# /tmp/build/perf_hints.log：
+[perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost dim = 64B (tile fp32[16], target_memory=Mat); moves 1024B as 16 x 64B rows; recommended >= 512B for backend a2a3 (L2 cache line = 512B). Consider increasing tile shape on the innermost axis. at examples/intermediate/05_assemble.py:70:5
+[perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost dim = 64B (tile fp32[16], target_memory=Mat); moves 2048B as 32 x 64B rows; recommended >= 512B for backend a2a3 (L2 cache line = 512B). Consider increasing tile shape on the innermost axis. at examples/intermediate/05_assemble.py:70:5
+[perf_hint PH001] TileInnermostDimGranularity: tile.load has innermost dim = 128B (tile fp32[32], target_memory=Mat); moves 4096B as 32 x 128B rows; recommended >= 512B for backend a2a3 (L2 cache line = 512B). Consider increasing tile shape on the innermost axis. at examples/intermediate/05_assemble.py:70:5
+[perf_hint PH001] TileInnermostDimGranularity: tile.store has innermost dim = 128B (tile fp32[32], target_memory=Vec); moves 4096B as 32 x 128B rows; recommended >= 512B for backend a2a3 (L2 cache line = 512B). Consider increasing tile shape on the innermost axis. at examples/intermediate/05_assemble.py:83:9
+```
+
+**Hint 数量。** 由于 cube 空间的传输现已纳入检查范围，暂存大量小 GM→Mat 面板的 kernel 会看到比以往更多的 PH001 行。这些 hint 仅为建议性质，写入 `perf_hints.log`（stderr 只有一行摘要）；请按 `moves …` 子句排序取舍，若某个 kernel 的 tiling 是有意为之，可用 `disabled_diagnostics` 整体关闭该检查。
+
+## 用户面 API
+
+```python
+# 无 report instrument：每条 perf hint 在 pipeline 末尾完整输出到 stderr
+with passes.PassContext([]):
+    pipeline.run(program)
+
+# 有 report instrument（compile() / pl.jit 的默认行为）：完整详情写入与其他 report
+# 同目录的 perf_hints.log，stderr 仅得到一行摘要
+with passes.PassContext([passes.ReportInstrument("/tmp/build")]):
+    pipeline.run(program)
+# → /tmp/build/perf_hints.log （stderr："[perf_hint] N hints across M sites; see …"）
+
+# 抑制单个 hint
+disabled = passes.DiagnosticCheckSet()
+disabled.insert(passes.DiagnosticCheck.TileInnermostDimGranularity)
+with passes.PassContext([], disabled_diagnostics=disabled):
+    pipeline.run(program)
+
+# 关闭整个通道
+with passes.PassContext([], diagnostic_phase=passes.DiagnosticPhase.NONE):
+    pipeline.run(program)
+```
+
+`compile()` 与 `run()` 通过 `diagnostic_phase` / `disabled_diagnostics` 关键字参数接收同样的配置。
+
+## 环境变量
+
+| 变量 | 效果 | 默认 |
+| ---- | ---- | ---- |
+| `PYPTO_LOG_LEVEL` | stderr 输出阈值（`debug`/`info`/`warn`/`error`/`fatal`/`event`/`none`） | `info`（release）/ `debug`（非 release） |
+| `PYPTO_WARNING_LEVEL` | 默认 `DiagnosticPhase`（`none`/`pre_pipeline`/`post_pass`/`post_pipeline`） | `pre_pipeline` |
+| `PYPTO_VERIFY_LEVEL` | 校验级别——与诊断系统正交 | `basic` |

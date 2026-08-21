@@ -217,7 +217,7 @@ def build_paged_attention_spmd_program(
                         [b * q_tile, 0],
                         [q_tile, block_size],
                         target_memory=pl.MemorySpace.Vec,
-                        valid_shapes=[q_tile, valid_len],
+                        valid_shape=[q_tile, valid_len],
                     )
                     s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
                     scaled = pl.mul(s_padded, scale_value)
@@ -747,7 +747,7 @@ def main():
     )
     parser.add_argument("-d", "--device", type=int, default=default_device)
     parser.add_argument(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         action="store_true",
         default=False,
         help="Enable on-device runtime profiling and generate swimlane JSON",
@@ -797,7 +797,7 @@ def main():
         strategy=OptimizationStrategy.Default,
         dump_passes=True,
         backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
-        enable_l2_swimlane=args.enable_l2_swimlane,
+        enable_chip_swimlane=args.enable_chip_swimlane,
     )
     compiled = run(program, config=run_config)
     output = compiled(*input_tensors, config=run_config)

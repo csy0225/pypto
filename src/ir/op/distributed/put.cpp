@@ -79,6 +79,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/comm.h"
+#include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
@@ -118,10 +119,15 @@ void ValidatePutContract(const ExprPtr& dst, const ExprPtr& peer, const ExprPtr&
       << " vs src " << src->GetType()->TypeName();
   comm_op::ValidateTransferShapeContract(dst_type->shape_, src_type->shape_, op_name, require_same_shape);
 
-  auto atomic_value = GetRequiredKwarg<int>(kwargs, "atomic", op_name);
-  CHECK(atomic_value == static_cast<int>(AtomicType::kNone) ||
-        atomic_value == static_cast<int>(AtomicType::kAdd))
-      << op_name << " atomic must be AtomicType.None_ or AtomicType.Add (got int " << atomic_value << ")";
+  // TPUT's atomic combine runs on the ordinary store pipe: pto-isa's comm TPut
+  // streams the transfer through the staging tile and lands each chunk with
+  // TSTORE_IMPL<..., AtomicAdd> -> SetAtomicAdd<GM dtype>. So put accepts the
+  // same hardware atomic-add dtypes as tile.store / remote_store, keyed on the
+  // GM *destination* dtype (equal to src's, enforced above). The bf16 profile
+  // split is backend-specific and lives in the AtomicAddDtypeValid verifier.
+  const int atomic_value = GetRequiredKwarg<int>(kwargs, "atomic", op_name);
+  comm_op::ValidateAtomicValue(atomic_value, op_name);
+  comm_op::ValidateAtomicAddDtype(atomic_value, dst_type->dtype_, op_name);
 }
 
 TypePtr DeducePutType(const std::vector<ExprPtr>& args,
@@ -205,6 +211,17 @@ TypePtr DeducePutTileType(const std::vector<ExprPtr>& args,
 // ============================================================================
 // pld.tensor.put - synchronous cross-rank bulk write into a peer rank's slice
 // ============================================================================
+//
+// Core placement: VECTOR. pto-isa TPUT streams GM -> UB -> remote GM through a
+// VEC staging tile, and ptoas hard-enforces it (verifyCommStagingTileLike
+// requires AddressSpace::VEC), so the op can only execute on the vector core.
+// The tile-level form would also land on VECTOR incidentally, via
+// ClassifyCallAffinity's first-tile-argument rule finding that Vec staging
+// tile; declaring the affinity makes the ISA constraint explicit rather than a
+// side effect of operand inspection. The tensor-level form has no tile operand
+// at all and would otherwise classify SHARED — and it is still live when
+// ClassifyCallAffinity runs before ConvertTensorToTileOps materializes the
+// staging tile.
 
 REGISTER_OP("pld.tensor.put")
     .set_description(
@@ -233,7 +250,18 @@ REGISTER_OP("pld.tensor.put")
     .set_attr<int>("chunk_rows")
     .set_attr<int>("chunk_cols")
     .set_attr<bool>("pipeline")
+    .set_core_affinity(core_affinity::CoreAffinity::VECTOR)
     .no_memory_spec()
+    // A plain push overwrites the region it lands on; an atomic one accumulates
+    // into it, and accumulating reads the slot first.
+    .set_arg_effect(0,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
+                                     static_cast<int>(AtomicType::kNone)
+                                 ? ArgEffect::Write
+                                 : ArgEffect::ReadWrite;
+                    })
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type(DeducePutType);
 
 // ============================================================================
@@ -261,7 +289,18 @@ REGISTER_OP("pld.tile.put")
         "Optional per-dim offsets (MakeTuple) into the local src; present only in the subregion form")
     .add_argument("shape", "Optional per-dim transfer shape (MakeTuple); present only in the subregion form")
     .set_attr<int>("atomic")
+    .set_core_affinity(core_affinity::CoreAffinity::VECTOR)
     .no_memory_spec()
+    // A plain push overwrites the region it lands on; an atomic one accumulates
+    // into it, and accumulating reads the slot first.
+    .set_arg_effect(0,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
+                                     static_cast<int>(AtomicType::kNone)
+                                 ? ArgEffect::Write
+                                 : ArgEffect::ReadWrite;
+                    })
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type(DeducePutTileType);
 
 }  // namespace ir

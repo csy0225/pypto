@@ -25,6 +25,12 @@ from pypto.language.typing import Scalar
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 
+# A `pl.add` / `pl.cast` wrapper lowers to the tensor or the tile form depending on the operand
+# kind, so these tests accept either. Built through the getter so a renamed operator fails at
+# import rather than silently emptying the collected-call list.
+_ADD_OPS = frozenset({ir.get_op("tensor.add").name, ir.get_op("tile.add").name})
+_CAST_OPS = frozenset({ir.get_op("tensor.cast").name, ir.get_op("tile.cast").name})
+
 
 class TestWrapperErrorsThroughParser:
     """Wrapper errors surface as InvalidOperationError with op name + span."""
@@ -70,6 +76,47 @@ class TestWrapperErrorsThroughParser:
                 )
                 return result
 
+    def test_matmul_b_trans_on_tile_operands_raises_at_the_call_site(self):
+        """A Tensor-only matmul flag must not be silently dropped on the Tile path.
+
+        Regression for issue #2264: migrating a kernel's matmul operands from
+        Tensor to Tile (``pl.create_l1`` -> ``pl.create_tile``, tensor slice ->
+        ``pl.load``) changed the dispatch target while the
+        ``pl.matmul(..., b_trans=True)`` line was left untouched. The flag
+        stopped being honoured and, with a square B, compiled ``A @ B`` instead
+        of ``A @ B^T`` with no diagnostic at any stage.
+        """
+        with pytest.raises(InvalidOperationError) as exc_info:
+
+            @pl.function(auto_scope=False)
+            def main(
+                a: pl.Tensor[[32, 128], pl.BF16],
+                b: pl.Tensor[[128, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[32, 128], pl.FP32]],
+            ) -> pl.Tensor[[32, 128], pl.FP32]:
+                with pl.scope():
+                    at = pl.load(a, [0, 0], [32, 128], target_memory=pl.MemorySpace.Mat)
+                    bt = pl.load(b, [0, 0], [128, 128], target_memory=pl.MemorySpace.Mat)
+                    # The Tile @overload already rejects this statically
+                    # ("Literal[True] is not assignable to Literal[False]");
+                    # suppressed on purpose so the test can prove the *runtime*
+                    # now rejects it too, which is what #2264 was about.
+                    c: pl.Tile[[32, 128], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(
+                        at,
+                        bt,
+                        b_trans=True,  # pyright: ignore[reportArgumentType]
+                        out_dtype=pl.FP32,
+                    )
+                    out = pl.store(c, [0, 0], out)
+                return out
+
+        msg = exc_info.value.message  # type: ignore[attr-defined]
+        assert "pl.matmul" in msg
+        assert "b_trans" in msg
+        # The error must name the tile-level alternative, not just refuse.
+        assert "transpose_view" in msg
+        assert exc_info.value.span is not None  # type: ignore[attr-defined]
+
 
 class TestSpanPropagatesIntoWrapperConstructedNodes:
     """Span pinned by parser surfaces on IR nodes constructed inside wrappers."""
@@ -99,7 +146,7 @@ class TestSpanPropagatesIntoWrapperConstructedNodes:
                 super().visit_call(op)
 
         _Collect().visit_program(Prog)
-        add_calls = [c for c in found_calls if c.op.name in ("tensor.add", "tile.add")]
+        add_calls = [c for c in found_calls if c.op.name in _ADD_OPS]
         assert add_calls, "expected at least one tensor.add or tile.add Call in IR"
 
         for call in add_calls:
@@ -123,6 +170,11 @@ class TestDirectWrapperCallsStillWork:
         s2 = Scalar(expr=_ir.ConstInt(4, DataType.INT32, _ir.Span.unknown()))
         result = pl.add(s1, s2)
         assert isinstance(result, Scalar)
+        # Lowered through Scalar.__add__ to an IR Add over the two constants
+        expr = result.expr
+        assert isinstance(expr, _ir.Add)
+        assert isinstance(expr.left, _ir.ConstInt) and expr.left.value == 3
+        assert isinstance(expr.right, _ir.ConstInt) and expr.right.value == 4
 
 
 class TestFullPythonCallingConvention:
@@ -158,9 +210,9 @@ class TestFullPythonCallingConvention:
 
         class _Collect(ir.IRVisitor):
             def visit_call(self, op):
-                if op.op.name == "tile.load":
+                if op.op.name == ir.get_op("tile.load").name:
                     load_calls.append(op)
-                elif op.op.name == "tile.add":
+                elif op.op.name == ir.get_op("tile.add").name:
                     add_calls.append(op)
                 super().visit_call(op)
 
@@ -189,7 +241,7 @@ class TestFullPythonCallingConvention:
 
         class _Collect(ir.IRVisitor):
             def visit_call(self, op):
-                if op.op.name in ("tensor.cast", "tile.cast"):
+                if op.op.name in _CAST_OPS:
                     cast_calls.append(op)
                 super().visit_call(op)
 

@@ -24,6 +24,7 @@ import re
 
 import pypto.language as pl
 import pytest
+from _pto_loc_common import strip_loc
 from pypto import ir as _ir
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
@@ -40,7 +41,7 @@ def _run_passes(program, planner: passes.MemoryPlanner):
 def _emit_pto(program, planner: passes.MemoryPlanner) -> str:
     """Run the default pipeline under `planner` and return the emitted PTO MLIR."""
     optimized = _run_passes(program, planner)
-    emit_tile_addr = planner == passes.MemoryPlanner.PYPTO
+    emit_tile_addr = planner != passes.MemoryPlanner.PTOAS
     result = codegen.PTOCodegen().generate(optimized, emit_tile_addr=emit_tile_addr)
     return result if isinstance(result, str) else "".join(result.values())
 
@@ -55,13 +56,23 @@ def _emit_incore_pto(program, planner: passes.MemoryPlanner) -> str:
     incore = [f for f in optimized.functions.values() if f.func_type != pl.FunctionType.Orchestration]
     assert len(incore) == 1, f"expected one in-core function, got {[f.name for f in incore]}"
     single = _ir.Program([incore[0]], incore[0].name, optimized.span)
-    return codegen.PTOCodegen().generate(single, emit_tile_addr=planner == passes.MemoryPlanner.PYPTO)
+    return codegen.PTOCodegen().generate(single, emit_tile_addr=planner != passes.MemoryPlanner.PTOAS)
 
 
 def _sole_line(mlir: str, needle: str) -> str:
+    """The unique line containing `needle`, without its trailing MLIR location.
+
+    `_result_type` / `_operand_type` slice from the end of the line, so the
+    `loc("file":line:col)` suffix codegen appends must come off here.
+    """
     lines = [ln for ln in mlir.splitlines() if needle in ln]
     assert len(lines) == 1, f"expected exactly one {needle!r} line, got {lines}:\n{mlir}"
-    return lines[0]
+    return strip_loc(lines[0])
+
+
+def _tile_buf_types(op_line: str) -> list[str]:
+    """Return every tile_buf type annotation carried by one PTO operation."""
+    return re.findall(r"!pto\.tile_buf<[^>]+>", op_line)
 
 
 # ── reserve_buffer: base resolution deferred to ptoas ────────────────────────
@@ -118,16 +129,59 @@ def test_reserve_buffer_defers_base_to_ptoas():
         assert "base" not in line, line
 
 
-def test_reserve_buffer_bakes_resolved_base_under_pypto_planner():
-    """Default planner: AllocateMemoryAddr resolves `base`, emitted as manual mode."""
-    mlir = _emit_pto(AutoReserveBufferProgram, passes.MemoryPlanner.PYPTO)
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+def test_reserve_buffer_bakes_resolved_base_under_pypto_planner(planner):
+    """PyPTO-owned planners resolve `base` and emit manual mode."""
+    mlir = _emit_pto(AutoReserveBufferProgram, planner)
     for name in ("c2v_slot_buffer", "v2c_slot_buffer"):
         line = _sole_line(mlir, f'pto.reserve_buffer {{name = "{name}"')
         assert "auto = false" in line, line
         assert "base = 0" in line, line
 
 
-# ── reshape of a subview: def/use tile_buf types must agree ──────────────────
+# Shared in-place handle: the definition type is immutable
+
+
+@pl.program
+class InplaceFillPadProgram:
+    """Fill a dynamically valid tile in place, then consume its shared handle."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[16, 16], pl.FP32],
+        valid_rows: pl.Scalar[pl.INDEX],
+        valid_cols: pl.Scalar[pl.INDEX],
+        out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+    ) -> pl.Tensor[[16, 16], pl.FP32]:
+        src: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16], valid_shape=[valid_rows, valid_cols])
+        padded: pl.Tile[[16, 16], pl.FP32] = pl.tile.fillpad_inplace(src, pad_value=0)
+        return pl.store(padded, [0, 0], out)
+
+
+def test_inplace_alias_keeps_shared_handle_definition_type():
+    """An alias result must not re-type the already-defined shared tile_buf SSA.
+
+    PTOAS mode collapses ``src`` and ``padded`` onto one handle because
+    ``tile.fillpad_inplace`` reuses its input MemRef. The result TileType carries
+    new pad metadata, but MLIR SSA types are fixed by the original alloc_tile
+    definition, so every later use of that handle must retain the definition's
+    annotation.
+    """
+    mlir = _emit_pto(InplaceFillPadProgram, passes.MemoryPlanner.PTOAS)
+    alloc = _sole_line(mlir, "= pto.alloc_tile")
+    fillpad = _sole_line(mlir, "pto.tfillpad")
+    store = _sole_line(mlir, "pto.tstore")
+
+    alloc_types = _tile_buf_types(alloc)
+    fillpad_types = _tile_buf_types(fillpad)
+    store_types = _tile_buf_types(store)
+    assert len(alloc_types) == 1 and len(fillpad_types) == 2 and len(store_types) == 1, mlir
+    assert fillpad_types == [alloc_types[0], alloc_types[0]], f"{alloc}\n{fillpad}"
+    assert store_types == alloc_types, f"{alloc}\n{store}"
+
+
+# Reshape of a subview: def/use tile_buf types must agree
 
 PAD, VALID, D = 16, 5, 128
 
@@ -146,6 +200,21 @@ class SubviewReshapeProgram:
         v: pl.Tile[[VALID, D], pl.FP32] = pl.tile.slice(t, [VALID, D], [0, 0])
         r: pl.Tile[[1, VALID * D], pl.FP32] = pl.reshape(v, [1, VALID * D])
         return pl.store(r, [0, 0], out)
+
+
+@pl.program
+class NonzeroSubviewProgram:
+    """A nonzero row slice whose MemRef keeps a relative byte offset."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        x: pl.Tensor[[8, 8], pl.FP32],
+        out: pl.Out[pl.Tensor[[2, 8], pl.FP32]],
+    ) -> pl.Tensor[[2, 8], pl.FP32]:
+        src: pl.Tile[[8, 8], pl.FP32] = pl.load(x, [0, 0], [8, 8])
+        sub: pl.Tile[[2, 8], pl.FP32] = pl.tile.slice(src, [2, 8], [3, 0])
+        return pl.store(sub, [0, 0], out)
 
 
 def _result_type(op_line: str) -> str:
@@ -176,11 +245,37 @@ def test_reshape_of_subview_annotates_the_subview_def_type():
     assert _operand_type(treshape) == _result_type(subview), f"{subview}\n{treshape}"
 
 
-def test_reshape_of_subview_folds_away_under_pypto_planner():
-    """Default planner: the reshape result is pre-declared at the shared baked
+@pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+def test_reshape_of_subview_folds_away_under_pypto_planner(planner):
+    """PyPTO-owned planners pre-declare the result at the shared baked
     address, so it is a re-view and no `pto.treshape` is emitted at all."""
-    mlir = _emit_pto(SubviewReshapeProgram, passes.MemoryPlanner.PYPTO)
+    mlir = _emit_pto(SubviewReshapeProgram, planner)
     assert "pto.treshape" not in mlir, mlir
+
+
+def test_dsa_rp_writeback_preserves_nonzero_view_offset():
+    """Physical placement shifts a view by its original relative byte offset."""
+
+    reset_for_testing()
+    set_backend_type(BackendType.Ascend910B)
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+        optimized = passes.allocate_memory_addr()(
+            passes.materialize_semantic_aliases()(passes.init_mem_ref()(NonzeroSubviewProgram))
+        )
+    function = next(f for f in optimized.functions.values() if f.name == "kernel")
+    offsets: dict[str, int] = {}
+
+    class _Collector(_ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):  # type: ignore[override]
+            tile_type = stmt.var.type
+            if isinstance(tile_type, _ir.TileType) and tile_type.memref is not None:
+                offset = tile_type.memref.byte_offset_
+                assert isinstance(offset, _ir.ConstInt)
+                offsets[stmt.var.name_hint] = offset.value
+            super().visit_assign_stmt(stmt)
+
+    _Collector().visit_stmt(function.body)
+    assert offsets["sub"] - offsets["src"] == 3 * 8 * 4
 
 
 # ── reinterpret_view: byte-preserving treshape ──────────────────────────────

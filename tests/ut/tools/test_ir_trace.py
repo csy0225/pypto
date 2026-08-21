@@ -1,0 +1,1684 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Tests for IR pass snapshot discovery."""
+
+import errno
+import importlib.metadata
+import json
+import shutil
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import textwrap
+import tokenize
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pypto
+import pytest
+from pypto.tools.ir_trace.cli import main
+from pypto.tools.ir_trace.diff import build_trace, highlight_python
+from pypto.tools.ir_trace.discovery import discover_snapshots
+from pypto.tools.ir_trace.html import render_html
+from pypto.tools.ir_trace.model import IRTraceError
+
+
+def _write_dump(root: Path, files: dict[str, str]) -> Path:
+    dump = root / "passes_dump"
+    dump.mkdir()
+    for name, text in files.items():
+        (dump / name).write_text(text, encoding="utf-8")
+    return dump
+
+
+def _run_viewer_behavior(report: str, assertions: str) -> subprocess.CompletedProcess[str]:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise the embedded viewer behavior")
+    assert node is not None
+
+    payload = report.split('<script id="trace-data" type="application/json">', 1)[1].split("</script>", 1)[0]
+    viewer_script = report.rsplit("<script>", 1)[1].split("</script>", 1)[0]
+    harness = textwrap.dedent(
+        f"""
+        class Element {{
+          constructor(tagName = "div") {{
+            this.tagName = tagName.toUpperCase();
+            this.checked = true;
+            this.children = [];
+            this.className = "";
+            this.dataset = {{}};
+            this.disabled = false;
+            this.hidden = false;
+            this.listeners = {{}};
+            this.scrollLeft = 0;
+            this.scrollTop = 0;
+            this.scrollWidth = 0;
+            this.style = {{}};
+            this.textContent = "";
+            this.value = "";
+          }}
+          addEventListener(name, callback) {{ this.listeners[name] = callback; }}
+          appendChild(child) {{ this.children.push(child); return child; }}
+          remove() {{}}
+          replaceChildren(...children) {{ this.children = children; }}
+          select() {{}}
+          setAttribute(name, value) {{ this[name] = value; }}
+        }}
+
+        const ids = [
+          "trace-data", "source-name", "changed-filter", "noop-filter", "pass-list", "summary",
+          "pass-title", "before-pane", "after-pane", "before-title", "after-title", "warnings-panel",
+          "copy-before", "copy-after", "expand-all", "collapse-all", "theme-toggle", "diff-grid",
+          "function-select", "layout-side-by-side", "layout-stacked"
+        ];
+        const elements = Object.fromEntries(ids.map((id) => [id, new Element()]));
+        elements["trace-data"].textContent = {json.dumps(payload)};
+        const documentListeners = {{}};
+        const document = {{
+          body: new Element("body"),
+          documentElement: new Element("html"),
+          addEventListener(name, callback) {{ documentListeners[name] = callback; }},
+          createElement(tagName) {{ return new Element(tagName); }},
+          execCommand() {{ throw new Error("copy fallback must not run without a selected trace"); }},
+          getElementById(id) {{ return elements[id]; }}
+        }};
+        const window = {{
+          matchMedia() {{ return {{ matches: false }}; }},
+          requestAnimationFrame(callback) {{ callback(); return 1; }}
+        }};
+        Object.defineProperty(
+          globalThis,
+          "navigator",
+          {{ value: {{ clipboard: null }}, configurable: true }}
+        );
+
+        {viewer_script}
+        {assertions}
+        """
+    )
+    return subprocess.run([node, "-e", harness], check=False, capture_output=True, text=True)
+
+
+def test_cli_writes_default_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main([str(dump)]) == 0
+    assert (tmp_path / "ir_trace.html").read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_cli_reports_domain_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    assert main([str(tmp_path / "missing")]) == 1
+    assert "pypto-ir-trace: error: input directory does not exist" in capsys.readouterr().err
+
+
+def test_cli_reports_directory_enumeration_error_without_path_or_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    original_iterdir = Path.iterdir
+
+    def fail_dump_enumeration(path: Path) -> Iterator[Path]:
+        if path == dump:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_dump_enumeration)
+
+    assert main([str(dump)]) == 1
+    error = capsys.readouterr().err
+    assert "pypto-ir-trace: error: failed to enumerate passes_dump: Permission denied" in error
+    assert str(tmp_path) not in error
+    assert "Traceback" not in error
+
+
+@pytest.mark.parametrize("path_name", ["01_after_TestPass.py", "01_after_TestPass.log"])
+def test_cli_reports_snapshot_read_error_without_path_or_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    path_name: str,
+):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "a\n",
+            "01_after_TestPass.py": "b\n",
+            "01_after_TestPass.log": "warning\n",
+        },
+    )
+    original_read_text = Path.read_text
+
+    def fail_snapshot_read(
+        path: Path,
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> str:
+        if path.name == path_name:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return original_read_text(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", fail_snapshot_read)
+
+    assert main([str(dump)]) == 1
+    error = capsys.readouterr().err
+    assert f"pypto-ir-trace: error: failed to read {path_name}: Input/output error" in error
+    assert str(tmp_path) not in error
+    assert "Traceback" not in error
+
+
+def test_cli_writes_explicit_report(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "custom.html"
+
+    assert main([str(dump), "--output", str(output), "--context", "0"]) == 0
+    assert output.read_text(encoding="utf-8").startswith("<!doctype html>")
+
+
+def test_cli_rejects_negative_context(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    assert main([str(tmp_path / "passes_dump"), "--context", "-1"]) == 2
+    assert (
+        "pypto-ir-trace: error: argument --context: must be non-negative, got -1" in capsys.readouterr().err
+    )
+
+
+def test_cli_reports_missing_output_directory(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "missing" / "trace.html"
+
+    assert main([str(dump), "--output", str(output)]) == 1
+    assert (
+        f"pypto-ir-trace: error: output directory does not exist: {output.parent}" in capsys.readouterr().err
+    )
+    assert not output.exists()
+
+
+def test_cli_cleans_up_temporary_file_when_replacement_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "trace.html"
+    output.write_text("existing report", encoding="utf-8")
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("replacement failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    assert main([str(dump), "--output", str(output)]) == 1
+    assert "pypto-ir-trace: error: failed to write" in capsys.readouterr().err
+    assert output.read_text(encoding="utf-8") == "existing report"
+    assert list(tmp_path.glob(".trace.html.*.tmp")) == []
+
+
+def test_cli_cleans_up_owned_temporary_file_when_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "trace.html"
+    output.write_text("existing report", encoding="utf-8")
+
+    with tempfile.NamedTemporaryFile() as probe:
+        handle_type = type(probe)
+
+    def fail_write(_handle: object, _content: str) -> int:
+        raise OSError("write failed")
+
+    monkeypatch.setattr(handle_type, "write", fail_write, raising=False)
+
+    assert main([str(dump), "--output", str(output)]) == 1
+    assert "pypto-ir-trace: error: failed to write" in capsys.readouterr().err
+    assert output.read_text(encoding="utf-8") == "existing report"
+    assert list(tmp_path.glob(".trace.html.*.tmp")) == []
+
+
+def test_cli_cleanup_failure_does_not_mask_primary_write_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "trace.html"
+    output.write_text("existing report", encoding="utf-8")
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("replacement failed")
+
+    def fail_unlink(_path: Path, *, missing_ok: bool = False) -> None:
+        raise OSError(f"cleanup failed (missing_ok={missing_ok})")
+
+    with monkeypatch.context() as cleanup_failure:
+        cleanup_failure.setattr(Path, "replace", fail_replace)
+        cleanup_failure.setattr(Path, "unlink", fail_unlink)
+        assert main([str(dump), "--output", str(output)]) == 1
+
+    error = capsys.readouterr().err
+    assert "pypto-ir-trace: error: failed to write" in error
+    assert "replacement failed" in error
+    assert "cleanup failed" not in error
+    assert output.read_text(encoding="utf-8") == "existing report"
+    for temporary in tmp_path.glob(".trace.html.*.tmp"):
+        temporary.unlink()
+
+
+def _console_script() -> Path:
+    return Path(sysconfig.get_path("scripts")) / "pypto-ir-trace"
+
+
+def _import_comes_from_installed_distribution() -> bool:
+    """Report whether the imported ``pypto`` is the installed distribution.
+
+    A source checkout on ``PYTHONPATH`` shadows any installed copy, so the mere
+    presence of distribution metadata does not mean the console script on the
+    ``sysconfig`` scripts path belongs to the package under test. Comparing the
+    imported package directory against the distribution's own location tells
+    the two apart.
+    """
+    try:
+        distribution = importlib.metadata.distribution("pypto")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    installed_root = Path(str(distribution.locate_file("pypto"))).resolve()
+    return Path(pypto.__file__).resolve().parent == installed_root
+
+
+def _entry_point_commands() -> list[Any]:
+    """Build the argv prefix of every entry point this environment can launch.
+
+    The module entry point works everywhere, including a source checkout that
+    only sets ``PYTHONPATH``. The console script exists only once pip has
+    installed the project, so it is added when present; a missing script in an
+    installed run is a packaging regression caught by the dedicated test below.
+    """
+    commands = [pytest.param([sys.executable, "-m", "pypto.tools.ir_trace"], id="module")]
+    if _console_script().is_file():
+        commands.append(pytest.param([str(_console_script())], id="console-script"))
+    return commands
+
+
+def test_installed_distribution_provides_the_console_script():
+    if not _import_comes_from_installed_distribution():
+        pytest.skip("source-only run: the imported pypto is not the installed distribution")
+    assert _console_script().is_file(), (
+        "the installed pypto distribution must ship the pypto-ir-trace console script; "
+        "check [project.scripts] in pyproject.toml and wheel generation"
+    )
+
+
+@pytest.mark.parametrize("command", _entry_point_commands())
+def test_entry_points_preserve_main_exit_codes(command: list[str], tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {"00_frontend.py": "a\n", "01_after_TestPass.py": "b\n"},
+    )
+    output = tmp_path / "trace.html"
+
+    success = subprocess.run(
+        [*command, str(dump), "--output", str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    domain_error = subprocess.run(
+        [*command, str(tmp_path / "missing")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    argument_error = subprocess.run(
+        [*command, str(dump), "--context", "-1"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert success.returncode == 0
+    assert output.read_text(encoding="utf-8").startswith("<!doctype html>")
+    assert domain_error.returncode == 1
+    assert "pypto-ir-trace: error: input directory does not exist" in domain_error.stderr
+    assert argument_error.returncode == 2
+    assert "argument --context: must be non-negative, got -1" in argument_error.stderr
+
+
+def test_build_trace_counts_and_aligns_replace(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "a\nb\nc\n",
+            "01_after_TestPass.py": "a\nx\ny\nc\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    assert (trace.inserted, trace.deleted, trace.changed) == (2, 1, True)
+    assert trace.changed
+    assert len(trace.sections) == 1
+    assert trace.sections[0].function_key is None
+    assert trace.hunks == trace.sections[0].hunks
+    assert sum(len(hunk.rows) for hunk in trace.hunks) == sum(
+        len(hunk.rows) for section in trace.sections for hunk in section.hunks
+    )
+    assert len(trace.hunks) == 1
+    assert not trace.hunks[0].collapsed
+    changed_rows = [row for hunk in trace.hunks for row in hunk.rows if row.kind != "equal"]
+    assert [(row.kind, row.before_number, row.after_number) for row in changed_rows] == [
+        ("replace", 2, 2),
+        ("insert", None, 3),
+    ]
+
+
+def test_build_trace_extracts_decorated_and_qualified_function_regions(tmp_path: Path):
+    source = textwrap.dedent(
+        """\
+        header = 1
+
+        @pl.program
+        def first():
+            def inner():
+                return 1
+            return inner()
+
+        class Program:
+            @staticmethod
+            def run():
+                return 2
+
+        class Other:
+            def run():
+                return 3
+
+        async def fetch():
+            return 4
+
+        tail = 4
+        """
+    )
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": source,
+            "01_after_TestPass.py": source,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=20)[0]
+    functions = [section for section in trace.sections if section.function_key is not None]
+
+    assert [(section.function_key, section.function_name) for section in functions] == [
+        ("first", "first"),
+        ("Program.run", "run"),
+        ("Other.run", "run"),
+        ("fetch", "fetch"),
+    ]
+    assert functions[0].hunks[0].rows[0].before_number == 3
+    assert "program" in functions[0].hunks[0].rows[0].before_html
+    assert all(section.function_key != "inner" for section in trace.sections)
+
+
+def test_build_trace_falls_back_to_whole_file_when_function_extraction_fails(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "def broken(:\n    pass\n",
+            "01_after_TestPass.py": "def valid():\n    pass\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    assert [(section.function_key, section.function_name) for section in trace.sections] == [(None, None)]
+    assert [row.kind for hunk in trace.sections[0].hunks for row in hunk.rows] == ["replace", "equal"]
+
+
+def test_build_trace_falls_back_when_qualified_function_keys_are_duplicated(tmp_path: Path):
+    source = textwrap.dedent(
+        """\
+        class Program:
+            def run():
+                return 1
+
+            def run():
+                return 2
+        """
+    )
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": source,
+            "01_after_TestPass.py": source,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    assert [(section.function_key, section.function_name) for section in trace.sections] == [(None, None)]
+
+
+def test_build_trace_aligns_insertions_inside_their_function(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        def first():
+            a = pl.tile.sqrt(x)
+            b = pl.tile.recip(a)
+
+        def second():
+            c = pl.tile.sqrt(y)
+            d = pl.tile.recip(c)
+        """
+    )
+    after = textwrap.dedent(
+        """\
+        def first():
+            a = pl.tile.sqrt(x)
+            b = pl.tile.recip(a)
+
+        def second():
+            reshaped = pl.tile.reshape(y, [1, 16])
+            c = pl.tile.sqrt(y)
+            normalized = pl.tile.reshape(c, [16, 1])
+            d = pl.tile.recip(c)
+        """
+    )
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=20)[0]
+    first = next(section for section in trace.sections if section.function_key == "first")
+    second = next(section for section in trace.sections if section.function_key == "second")
+
+    assert all(row.kind == "equal" for hunk in first.hunks for row in hunk.rows)
+    changed = [row for hunk in second.hunks for row in hunk.rows if row.kind != "equal"]
+    assert [(row.kind, row.before_number, row.after_number) for row in changed] == [
+        ("insert", None, 6),
+        ("insert", None, 8),
+    ]
+
+
+def test_build_trace_emits_added_and_deleted_functions_as_one_sided_sections(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        def stable():
+            return 1
+
+        def removed():
+            return 2
+
+        def tail():
+            return 3
+        """
+    )
+    after = textwrap.dedent(
+        """\
+        def stable():
+            return 1
+
+        def added():
+            return 4
+
+        def tail():
+            return 3
+        """
+    )
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=20)[0]
+    functions = [section for section in trace.sections if section.function_key is not None]
+
+    assert [section.function_key for section in functions] == ["stable", "removed", "added", "tail"]
+    removed = next(section for section in functions if section.function_key == "removed")
+    added = next(section for section in functions if section.function_key == "added")
+    assert {row.kind for hunk in removed.hunks for row in hunk.rows} == {"delete"}
+    assert {row.kind for hunk in added.hunks for row in hunk.rows} == {"insert"}
+    assert (removed.inserted, removed.deleted) == (0, 2)
+    assert (added.inserted, added.deleted) == (2, 0)
+    assert (trace.inserted, trace.deleted) == (
+        sum(section.inserted for section in trace.sections),
+        sum(section.deleted for section in trace.sections),
+    )
+
+    before_numbers = [
+        row.before_number
+        for section in trace.sections
+        for hunk in section.hunks
+        for row in hunk.rows
+        if row.before_number is not None
+    ]
+    after_numbers = [
+        row.after_number
+        for section in trace.sections
+        for hunk in section.hunks
+        for row in hunk.rows
+        if row.after_number is not None
+    ]
+    assert before_numbers == list(range(1, len(before.splitlines()) + 1))
+    assert after_numbers == list(range(1, len(after.splitlines()) + 1))
+
+
+def test_build_trace_pairs_reordered_functions_by_exact_key(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        def alpha():
+            return "alpha"
+
+        def beta():
+            return "old"
+        """
+    )
+    after = textwrap.dedent(
+        """\
+        def beta():
+            return "new"
+
+        def alpha():
+            return "alpha"
+        """
+    )
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=20)[0]
+    functions = [section for section in trace.sections if section.function_key is not None]
+
+    assert [section.function_key for section in functions] == ["alpha", "beta"]
+    assert all(
+        any(row.before_number is not None for hunk in section.hunks for row in hunk.rows)
+        and any(row.after_number is not None for hunk in section.hunks for row in hunk.rows)
+        for section in functions
+    )
+    beta = next(section for section in functions if section.function_key == "beta")
+    assert any(row.kind == "replace" for hunk in beta.hunks for row in hunk.rows)
+
+
+def test_build_trace_aligns_matching_operations_around_inserted_lines(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": ("t5: pl.Tile = pl.tile.sqrt(variance)\ninv: pl.Tile = pl.tile.recip(t5)\n"),
+            "01_after_ResolveBackendOpLayouts.py": (
+                "sqrt_in: pl.Tile = pl.tile.reshape(variance, [1, 16])\n"
+                "sqrt_out: pl.Tile = pl.tile.sqrt(sqrt_in)\n"
+                "t5: pl.Tile = pl.tile.reshape(sqrt_out, [16, 1])\n"
+                "recip_in: pl.Tile = pl.tile.reshape(t5, [1, 16])\n"
+                "recip_out: pl.Tile = pl.tile.recip(recip_in)\n"
+                "inv: pl.Tile = pl.tile.reshape(recip_out, [16, 1])\n"
+            ),
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+    rows = [row for hunk in trace.hunks for row in hunk.rows if row.kind != "equal"]
+
+    assert [(row.kind, row.before_number, row.after_number) for row in rows] == [
+        ("insert", None, 1),
+        ("replace", 1, 2),
+        ("insert", None, 3),
+        ("insert", None, 4),
+        ("replace", 2, 5),
+        ("insert", None, 6),
+    ]
+    assert "diff-delete" in rows[1].before_html
+    assert "diff-insert" in rows[1].after_html
+    assert "diff-delete" in rows[4].before_html
+    assert "diff-insert" in rows[4].after_html
+    assert all("diff-delete" not in row.before_html for row in rows if row.kind == "insert")
+    assert all("diff-insert" not in row.after_html for row in rows if row.kind == "insert")
+
+
+def test_build_trace_aligns_dedented_control_flow_rows(tmp_path: Path):
+    before = """\
+def run():
+    if enabled:
+        seed = pl.system.task_dummy()
+        with pl.scope(mode=pl.ScopeMode.MANUAL):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                for index in pl.range(4):
+                    if index >= limit:
+                        value = pl.tile.sqrt(source)
+                    result = pl.tile.recip(value)
+"""
+    after = """\
+def run():
+    seed = pl.system.task_dummy()
+    with pl.scope(mode=pl.ScopeMode.MANUAL):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            for index in pl.range(4):
+                if limit <= index:
+                    value = pl.tile.sqrt(source)
+                result = pl.tile.recip(value)
+"""
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_Simplify.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=20)[0]
+    section = next(section for section in trace.sections if section.function_key == "run")
+    rows = [row for hunk in section.hunks for row in hunk.rows]
+
+    assert [(row.kind, row.before_number, row.after_number) for row in rows] == [
+        ("equal", 1, 1),
+        ("delete", 2, None),
+        ("replace", 3, 2),
+        ("replace", 4, 3),
+        ("replace", 5, 4),
+        ("replace", 6, 5),
+        ("replace", 7, 6),
+        ("replace", 8, 7),
+        ("replace", 9, 8),
+    ]
+
+
+def test_build_trace_marks_each_changed_substring_in_replace_row(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "value = old_name + 1\n",
+            "01_after_TestPass.py": "value = new_name + 2\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+    row = next(row for hunk in trace.hunks for row in hunk.rows if row.kind == "replace")
+
+    assert row.before_html.count("diff-delete") == 2
+    assert '<span class="diff-delete">old</span>' in row.before_html
+    assert '<span class="tok-number diff-delete">1</span>' in row.before_html
+    assert row.after_html.count("diff-insert") == 2
+    assert '<span class="diff-insert">new</span>' in row.after_html
+    assert '<span class="tok-number diff-insert">2</span>' in row.after_html
+
+
+def test_build_trace_keeps_intraline_highlights_safe_when_tokenization_fails(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "value = (<old>\n",
+            "01_after_TestPass.py": "value = (<new>\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+    row = next(row for hunk in trace.hunks for row in hunk.rows if row.kind == "replace")
+
+    assert "<old>" not in row.before_html and "<new>" not in row.after_html
+    assert '&lt;<span class="diff-delete">old</span>&gt;' in row.before_html
+    assert '&lt;<span class="diff-insert">new</span>&gt;' in row.after_html
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "kind", "before_number", "after_number"),
+    [
+        ("a\nc\n", "a\nb\nc\n", "insert", None, 2),
+        ("a\nb\nc\n", "a\nc\n", "delete", 2, None),
+    ],
+)
+def test_build_trace_aligns_insert_and_delete(
+    tmp_path: Path,
+    before: str,
+    after: str,
+    kind: str,
+    before_number: int | None,
+    after_number: int | None,
+):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    rows = [row for hunk in trace.hunks for row in hunk.rows if row.kind == kind]
+    assert [(row.before_number, row.after_number) for row in rows] == [(before_number, after_number)]
+    assert (trace.inserted, trace.deleted) == (int(kind == "insert"), int(kind == "delete"))
+
+
+def test_build_trace_keeps_noop_and_normalizes_line_endings(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "a\r\nb\r\n",
+            "01_after_TestPass.py": "a\nb",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    assert not trace.changed
+    assert (trace.inserted, trace.deleted) == (0, 0)
+    assert [row.kind for hunk in trace.hunks for row in hunk.rows] == ["equal", "equal"]
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "changed_number"),
+    [
+        ("old\na\nb\nc\nd\n", "new\na\nb\nc\nd\n", 1),
+        ("a\nb\nc\nd\nold\n", "a\nb\nc\nd\nnew\n", 5),
+    ],
+)
+def test_build_trace_folds_file_edge_equal_rows(tmp_path: Path, before: str, after: str, changed_number: int):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=1)[0]
+
+    visible_rows = [row for hunk in trace.hunks if not hunk.collapsed for row in hunk.rows]
+    assert any(
+        row.kind == "replace" and row.before_number == changed_number and row.after_number == changed_number
+        for row in visible_rows
+    )
+    assert any(hunk.collapsed for hunk in trace.hunks)
+
+
+def test_build_trace_collapses_middle_equal_rows_with_zero_context(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "old\na\nb\nold\n",
+            "01_after_TestPass.py": "new\na\nb\nnew\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=0)[0]
+
+    collapsed = [hunk for hunk in trace.hunks if hunk.collapsed]
+    assert [[row.before_number for row in hunk.rows] for hunk in collapsed] == [[2, 3]]
+
+
+@pytest.mark.parametrize(
+    ("middle", "collapsed_count"),
+    [
+        ("a\nb\nc\nd", 0),
+        ("a\nb\nc\nd\ne", 1),
+    ],
+)
+def test_build_trace_only_folds_long_middle_equal_runs(tmp_path: Path, middle: str, collapsed_count: int):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": f"old\n{middle}\nold\n",
+            "01_after_TestPass.py": f"new\n{middle}\nnew\n",
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=2)[0]
+
+    assert sum(hunk.collapsed for hunk in trace.hunks) == collapsed_count
+
+
+def test_build_trace_rejects_negative_context(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "before\n",
+            "01_after_TestPass.py": "after\n",
+        },
+    )
+
+    with pytest.raises(IRTraceError, match="context must be non-negative, got -1"):
+        build_trace(discover_snapshots(dump), context=-1)
+
+
+def test_highlight_python_escapes_script_text_and_marks_tokens():
+    highlighted = highlight_python('value = "<script>"  # <script>\n')
+
+    assert len(highlighted) == 1
+    assert "<script>" not in highlighted[0]
+    assert "&lt;script&gt;" in highlighted[0]
+    assert 'class="tok-string"' in highlighted[0]
+    assert 'class="tok-comment"' in highlighted[0]
+
+
+def test_highlight_python_escapes_unicode_line_separators():
+    highlighted = highlight_python("value = '\u2028\u2029'\n")
+
+    assert highlighted[0].count("&#x2028;") == 1
+    assert highlighted[0].count("&#x2029;") == 1
+    assert "\u2028" not in highlighted[0]
+    assert "\u2029" not in highlighted[0]
+
+
+def test_build_trace_preserves_unicode_line_separators_from_discovery(tmp_path: Path):
+    source = "value = '\u2028\u2029'\n"
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": source,
+            "01_after_TestPass.py": source,
+        },
+    )
+
+    trace = build_trace(discover_snapshots(dump), context=3)[0]
+
+    assert not trace.changed
+    assert len(trace.hunks) == 1
+    assert len(trace.hunks[0].rows) == 1
+    row = trace.hunks[0].rows[0]
+    assert "&#x2028;" in row.before_html and "&#x2029;" in row.before_html
+    assert "&#x2028;" in row.after_html and "&#x2029;" in row.after_html
+
+
+def test_highlight_python_escapes_every_line_after_tokenization_error():
+    text = "if True:\n  value = (<script>\n"
+
+    highlighted = highlight_python(text)
+
+    assert highlighted == ("if True:", "  value = (&lt;script&gt;")
+    assert all("<script>" not in line for line in highlighted)
+
+
+def test_highlight_python_falls_back_to_escaped_text_on_syntax_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fail_tokenization(_readline: object) -> None:
+        raise SyntaxError("invalid token stream")
+
+    monkeypatch.setattr(tokenize, "generate_tokens", fail_tokenization)
+
+    assert highlight_python("value = <script>\n") == ("value = &lt;script&gt;",)
+
+
+def test_highlight_python_escapes_unicode_line_separators_after_tokenization_error():
+    highlighted = highlight_python("value = (<script>\u2028\u2029")
+
+    assert highlighted == ("value = (&lt;script&gt;&#x2028;&#x2029;",)
+
+
+def test_render_html_is_deterministic_self_contained_and_safe(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "value = '</script><b>&'\n",
+            "01_after_TestPass.py": "value = '<script>'\n",
+            "01_after_TestPass.log": "warning </script>\u2028\u2029\n",
+        },
+    )
+    traces = build_trace(discover_snapshots(dump), context=3)
+
+    first = render_html(traces, source_name="passes_dump")
+
+    assert first == render_html(traces, source_name="passes_dump")
+    assert first.startswith("<!doctype html>")
+    assert "http://" not in first and "https://" not in first
+    assert "</script><b>" not in first
+    assert "\\u003c/script\\u003e" in first
+    assert "\\u003e" in first
+    assert "\\u0026" in first
+    assert "\\u2028" in first and "\\u2029" in first
+
+
+def test_render_html_payload_has_only_portable_trace_data(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        header = 1
+
+        def first():
+            return "old"
+
+        def second():
+            return "tail"
+        """
+    )
+    after = before.replace('return "old"', 'return "new"')
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_ChangedPass.py": after,
+            "01_after_ChangedPass.log": "lowering warning\n",
+            "02_after_NoopPass.py": after,
+        },
+    )
+    traces = build_trace(discover_snapshots(dump), context=0)
+
+    report = render_html(traces, source_name=str(dump))
+    encoded = report.split('<script id="trace-data" type="application/json">', 1)[1].split("</script>", 1)[0]
+    payload = json.loads(encoded)
+
+    assert str(tmp_path) not in report
+    assert payload["sourceName"] == "passes_dump"
+    assert (payload["changedCount"], payload["noopCount"]) == (1, 1)
+    assert [(item["index"], item["name"], item["changed"]) for item in payload["passes"]] == [
+        (1, "ChangedPass", True),
+        (2, "NoopPass", False),
+    ]
+    assert payload["passes"][0]["warning"] == "lowering warning\n"
+    assert payload["passes"][1]["warning"] is None
+    assert payload["passes"][0]["beforeName"] == "00_frontend.py"
+    assert payload["passes"][0]["afterName"] == "01_after_ChangedPass.py"
+    assert payload["passes"][0]["beforeText"] == before
+    assert payload["passes"][0]["afterText"] == after
+    item = payload["passes"][0]
+    assert "hunks" not in item
+    assert [section["functionKey"] for section in item["sections"] if section["functionKey"]] == [
+        "first",
+        "second",
+    ]
+    assert sum(section["inserted"] for section in item["sections"]) == item["inserted"]
+    assert sum(section["deleted"] for section in item["sections"]) == item["deleted"]
+    assert any(hunk["collapsed"] for section in item["sections"] for hunk in section["hunks"])
+    assert {
+        row["kind"] for section in item["sections"] for hunk in section["hunks"] for row in hunk["rows"]
+    } == {
+        "equal",
+        "replace",
+    }
+    serialized_row_count = sum(len(hunk["rows"]) for section in item["sections"] for hunk in section["hunks"])
+    canonical_row_count = sum(len(hunk.rows) for section in traces[0].sections for hunk in section.hunks)
+    assert serialized_row_count == canonical_row_count
+    assert "timestamp" not in encoded.lower()
+    assert '"path"' not in encoded.lower()
+
+
+def test_render_html_contains_layout_and_interaction_contract(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "before\n",
+            "01_after_ChangedPass.py": "after\n",
+            "01_after_ChangedPass.log": "warning\n",
+            "02_after_NoopPass.py": "after\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    for element_id in (
+        "pass-list",
+        "changed-filter",
+        "noop-filter",
+        "summary",
+        "pass-title",
+        "before-pane",
+        "after-pane",
+        "warnings-panel",
+        "copy-before",
+        "copy-after",
+        "expand-all",
+        "collapse-all",
+        "theme-toggle",
+        "diff-grid",
+        "function-select",
+        "layout-side-by-side",
+        "layout-stacked",
+    ):
+        assert f'id="{element_id}"' in report
+
+    assert "grid-template-columns: 18rem minmax(0, 1fr)" in report
+    assert "grid-template-columns: minmax(0, 1fr) minmax(0, 1fr)" in report
+    assert "height: 100%;" in report
+    assert "height: 100vh;" in report
+    assert "overflow: hidden;" in report
+    assert ".sidebar {" in report and "overflow-y: auto;" in report
+    assert ".main {" in report and "display: flex;" in report
+    assert '.diff-grid[data-layout="stacked"]' in report
+    assert "grid-template-rows: minmax(0, 1fr) minmax(0, 1fr)" in report
+    assert ".code-pane {" in report and "flex: 1;" in report
+    assert "@media (max-width: 800px)" in report
+    assert ':root[data-theme="light"]' in report
+    assert ':root[data-theme="dark"]' in report
+    assert "var(--" in report
+    assert "--insert-highlight:" in report and "--delete-highlight:" in report
+    assert ".code-line.after.replace { background: var(--insert-bg); }" in report
+    assert ".code-line.before.replace { background: var(--delete-bg); }" in report
+    assert ".code-canvas" in report
+    assert "width: max-content" in report
+    assert "min-width: 100%" in report
+    assert ".code-canvas .code-line" in report
+    assert ".diff-insert { background: var(--insert-highlight); }" in report
+    assert ".diff-delete { background: var(--delete-highlight); }" in report
+    assert "line.className = `code-line ${side} ${row.kind}`" in report
+    assert 'matchMedia("(prefers-color-scheme: dark)")' in report
+    assert 'document.getElementById("source-name").textContent = data.sourceName' in report
+
+    for function_name in (
+        "visiblePasses",
+        "selectPass",
+        "renderSidebar",
+        "renderDiff",
+        "synchronizeCodeCanvasWidths",
+        "copySnapshot",
+        "setAllHunks",
+        "toggleTheme",
+    ):
+        assert f"function {function_name}(" in report
+
+    assert 'document.getElementById("changed-filter")' in report
+    assert 'document.getElementById("noop-filter")' in report
+    assert 'document.addEventListener("keydown"' in report
+    assert 'event.key === "j"' in report and 'event.key === "ArrowDown"' in report
+    assert 'event.key === "k"' in report and 'event.key === "ArrowUp"' in report
+    assert 'target.tagName === "INPUT"' in report
+    assert 'target.tagName === "BUTTON"' not in report
+    assert "data.passes.find((trace) => trace.changed) || data.passes[0]" in report
+    assert "navigator.clipboard.writeText(text)" in report
+    assert 'document.createElement("textarea")' in report
+    assert 'trace[side + "Text"]' in report
+    assert "trace.warning" in report
+
+
+def test_viewer_filters_by_function_and_remembers_selection_across_passes(tmp_path: Path):
+    first = textwrap.dedent(
+        """\
+        def common():
+            return "before"
+
+        def first_only():
+            return 1
+        """
+    )
+    second = first.replace('return "before"', 'return "middle"')
+    third = textwrap.dedent(
+        """\
+        def common():
+            return "after"
+        """
+    )
+    fourth = third.replace('return "after"', 'return "final"')
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": first,
+            "01_after_First.py": second,
+            "02_after_Second.py": third,
+            "03_after_Third.py": fourth,
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        f"""
+        const selector = elements["function-select"];
+        if (selector.disabled) throw new Error("function selector started disabled");
+        if (selector.children[0].value !== "" || selector.children[0].textContent !== "Whole file") {{
+          throw new Error("Whole file was not the first function option");
+        }}
+        if (selector.children.map((option) => option.value).join(",") !== ",common,first_only") {{
+          throw new Error("function options did not preserve source order");
+        }}
+
+        selector.value = "first_only";
+        selector.listeners.change();
+        if (selectedFunctionKey !== "first_only") throw new Error("function selection was not recorded");
+        const selectedRows = elements["before-pane"].children[0].children.filter(
+          (child) => child.className.includes("code-line")
+        );
+        if (selectedRows.length !== 2) throw new Error("function view rendered unrelated sections");
+
+        let copied = null;
+        navigator.clipboard = {{ writeText(text) {{ copied = text; return Promise.resolve(); }} }};
+        copySnapshot("before");
+        if (copied !== {json.dumps(first)}) throw new Error("function view did not copy the full snapshot");
+
+        selectPass(2);
+        if (selectedFunctionKey !== "first_only") {{
+          throw new Error("available function selection was not retained");
+        }}
+        selectPass(3);
+        if (selectedFunctionKey !== null || selector.value !== "") {{
+          throw new Error("missing function did not fall back to Whole file");
+        }}
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_disambiguates_duplicate_short_function_names(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        class First:
+            def run():
+                return 1
+
+        class Second:
+            def run():
+                return 2
+
+        def unique():
+            return 3
+        """
+    )
+    after = before.replace("return 2", "return 4")
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        const labels = elements["function-select"].children.map((option) => option.textContent);
+        if (labels.join(",") !== "Whole file,First.run,Second.run,unique") {
+          throw new Error(`unexpected function labels: ${labels.join(",")}`);
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_switches_layout_without_resetting_pass_or_function(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "def run():\n    return 1\n",
+            "01_after_First.py": "def run():\n    return 2\n",
+            "02_after_Second.py": "def run():\n    return 3\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        if (selectedLayout !== "side-by-side" || elements["diff-grid"].dataset.layout !== "side-by-side") {
+          throw new Error("side-by-side was not the default layout");
+        }
+        elements["function-select"].value = "run";
+        elements["function-select"].listeners.change();
+        elements["layout-stacked"].listeners.click();
+        if (selectedLayout !== "stacked" || elements["diff-grid"].dataset.layout !== "stacked") {
+          throw new Error("stacked layout was not applied");
+        }
+        if (elements["layout-stacked"]["aria-pressed"] !== "true") {
+          throw new Error("stacked pressed state was not applied");
+        }
+        selectPass(2);
+        if (selectedLayout !== "stacked" || selectedFunctionKey !== "run") {
+          throw new Error("pass selection reset layout or function state");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_expands_hunks_only_for_the_selected_function(tmp_path: Path):
+    before = textwrap.dedent(
+        """\
+        def first():
+            before = 1
+            return before
+
+        def second():
+            before = 2
+            return before
+        """
+    )
+    after = before.replace("before = 1", "after = 1").replace("before = 2", "after = 2")
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": before,
+            "01_after_TestPass.py": after,
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        const trace = currentTrace();
+        const firstIndex = trace.sections.findIndex((section) => section.functionKey === "first");
+        const secondIndex = trace.sections.findIndex((section) => section.functionKey === "second");
+        elements["function-select"].value = "first";
+        elements["function-select"].listeners.change();
+        setAllHunks(true);
+        const firstKeys = Array.from(expandedHunks);
+        if (firstKeys.length === 0 || firstKeys.some((key) => !key.startsWith(`1:${firstIndex}:`))) {
+          throw new Error("Expand all changed hunks outside the selected function");
+        }
+
+        elements["function-select"].value = "second";
+        elements["function-select"].listeners.change();
+        setAllHunks(true);
+        if (!Array.from(expandedHunks).some((key) => key.startsWith(`1:${secondIndex}:`))) {
+          throw new Error("section identity was missing from expanded hunk keys");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_clears_details_when_filters_hide_every_pass(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "before\n",
+            "01_after_ChangedPass.py": "after\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        if (selectedIndex !== 1) throw new Error("changed pass was not initially selected");
+        elements["changed-filter"].checked = false;
+        elements["changed-filter"].listeners.change();
+        if (selectedIndex !== null) throw new Error("hidden pass remained selected");
+        if (elements["pass-title"].textContent !== "No passes match the filters.") {
+          throw new Error("empty filter detail message was not rendered");
+        }
+        if (!elements["copy-before"].disabled || !elements["expand-all"].disabled) {
+          throw new Error("snapshot controls remained enabled");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_selects_closest_visible_pass_when_filter_hides_selection(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "a\n",
+            "01_after_NoopBefore.py": "a\n",
+            "02_after_ChangedTwo.py": "b\n",
+            "03_after_ChangedThree.py": "c\n",
+            "04_after_ChangedFour.py": "d\n",
+            "05_after_NoopAfter.py": "d\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        selectPass(4);
+        elements["changed-filter"].checked = false;
+        elements["changed-filter"].listeners.change();
+        if (selectedIndex !== 5) throw new Error("closest visible pass was not selected");
+
+        elements["changed-filter"].checked = true;
+        elements["changed-filter"].listeners.change();
+        selectPass(3);
+        elements["changed-filter"].checked = false;
+        elements["changed-filter"].listeners.change();
+        if (selectedIndex !== 1) throw new Error("lower-index pass did not win an equal-distance tie");
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_keyboard_navigation_works_from_focused_pass_button(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "a\n",
+            "01_after_First.py": "b\n",
+            "02_after_Second.py": "c\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        let prevented = false;
+        documentListeners.keydown({
+          target: new Element("select"),
+          key: "j",
+          preventDefault() { prevented = true; }
+        });
+        if (selectedIndex !== 1) throw new Error("focused function selector triggered pass navigation");
+        if (prevented) throw new Error("ignored selector key prevented the browser default");
+
+        documentListeners.keydown({
+          target: new Element("button"),
+          key: "j",
+          preventDefault() { prevented = true; }
+        });
+        if (selectedIndex !== 2) throw new Error("focused pass button blocked keyboard navigation");
+        if (!prevented) throw new Error("handled navigation did not prevent the browser default");
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_synchronizes_both_scroll_axes_in_both_directions(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "before\n",
+            "01_after_ChangedPass.py": "after\n",
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        const before = elements["before-pane"];
+        const after = elements["after-pane"];
+        before.scrollTop = 120;
+        before.scrollLeft = 45;
+        before.listeners.scroll();
+        if (after.scrollTop !== 120 || after.scrollLeft !== 45) {
+          throw new Error("before-to-after scroll synchronization failed");
+        }
+
+        after.scrollTop = 300;
+        after.scrollLeft = 80;
+        after.listeners.scroll();
+        if (before.scrollTop !== 300 || before.scrollLeft !== 80) {
+          throw new Error("after-to-before scroll synchronization failed");
+        }
+
+        setLayout("stacked");
+        before.scrollTop = 450;
+        before.scrollLeft = 125;
+        before.listeners.scroll();
+        if (after.scrollTop !== 450 || after.scrollLeft !== 125) {
+          throw new Error("stacked before-to-after scroll synchronization failed");
+        }
+
+        after.scrollTop = 600;
+        after.scrollLeft = 160;
+        after.listeners.scroll();
+        if (before.scrollTop !== 600 || before.scrollLeft !== 160) {
+          throw new Error("stacked after-to-before scroll synchronization failed");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_viewer_equalizes_code_canvas_widths(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "short = pl.tile.sqrt(value)\n",
+            "01_after_ChangedPass.py": (
+                "much_longer_name: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.sqrt(value)\n"
+            ),
+        },
+    )
+    report = render_html(build_trace(discover_snapshots(dump), context=0), source_name=dump.name)
+
+    result = _run_viewer_behavior(
+        report,
+        """
+        const renderedBeforePane = elements["before-pane"];
+        const renderedAfterPane = elements["after-pane"];
+        if (renderedBeforePane.children.length !== 1 || renderedAfterPane.children.length !== 1) {
+          throw new Error("each pane did not render one shared code canvas");
+        }
+
+        const beforeCanvas = renderedBeforePane.children[0];
+        const afterCanvas = renderedAfterPane.children[0];
+        beforeCanvas.scrollWidth = 420;
+        afterCanvas.scrollWidth = 960;
+        synchronizeCodeCanvasWidths(beforeCanvas, afterCanvas);
+        if (beforeCanvas.style.width !== "960px" || afterCanvas.style.width !== "960px") {
+          throw new Error("code canvases did not use the widest content width");
+        }
+        if (!beforeCanvas.children.some((child) => child.className.includes("code-line"))) {
+          throw new Error("before lines were not rendered inside the shared canvas");
+        }
+        if (!afterCanvas.children.some((child) => child.className.includes("code-line"))) {
+          throw new Error("after lines were not rendered inside the shared canvas");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_empty_viewer_disables_snapshot_controls():
+    result = _run_viewer_behavior(
+        render_html((), source_name="passes_dump"),
+        """
+        for (const id of ["copy-before", "copy-after", "expand-all", "collapse-all"]) {
+          if (!elements[id].disabled) throw new Error(`${id} remained enabled`);
+        }
+        if (!elements["function-select"].disabled) {
+          throw new Error("empty function selector remained enabled");
+        }
+        if (elements["pass-title"].textContent !== "No passes in this report.") {
+          throw new Error("empty report detail message was not rendered");
+        }
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_empty_viewer_copy_is_a_safe_noop():
+    result = _run_viewer_behavior(
+        render_html((), source_name="passes_dump"),
+        """
+        copySnapshot("before");
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_discover_orders_snapshots_and_attaches_warning(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "02_after_UnrollLoops.py": "after two\n",
+            "00_frontend.py": "frontend\n",
+            "01_after_InlineFunctions.log": "unused variable\n",
+            "01_after_InlineFunctions.py": "after one\n",
+            "fa_fused_EXTRACT.py": "ignored\n",
+        },
+    )
+
+    snapshots = discover_snapshots(dump)
+
+    assert [snapshot.index for snapshot in snapshots] == [0, 1, 2]
+    assert [snapshot.pass_name for snapshot in snapshots] == [None, "InlineFunctions", "UnrollLoops"]
+    assert snapshots[1].warning_text == "unused variable\n"
+    assert snapshots[2].warning_text is None
+
+
+def test_discover_rejects_zero_index_pass_snapshot(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "frontend\n",
+            "00_after_InlineFunctions.py": "after zero\n",
+        },
+    )
+
+    with pytest.raises(IRTraceError, match="00_after_InlineFunctions.py"):
+        discover_snapshots(dump)
+
+
+@pytest.mark.parametrize("path_name", ["01_after_InlineFunctions.py", "01_after_InlineFunctions.log"])
+def test_discover_rejects_non_file_snapshot_paths(tmp_path: Path, path_name: str):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "frontend\n",
+            "01_after_InlineFunctions.py": "after one\n",
+        },
+    )
+    if path_name.endswith(".py"):
+        (dump / path_name).unlink()
+    (dump / path_name).mkdir()
+
+    with pytest.raises(IRTraceError, match=path_name):
+        discover_snapshots(dump)
+
+
+def test_discover_reports_gap_between_neighboring_snapshots(tmp_path: Path):
+    dump = _write_dump(
+        tmp_path,
+        {
+            "00_frontend.py": "frontend\n",
+            "01_after_InlineFunctions.py": "after one\n",
+            "03_after_ConvertToSSA.py": "after three\n",
+        },
+    )
+
+    with pytest.raises(IRTraceError) as error:
+        discover_snapshots(dump)
+
+    assert str(error.value) == (
+        f"missing snapshot index 02 in {dump} between "
+        "01_after_InlineFunctions.py and 03_after_ConvertToSSA.py"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_message"),
+    [
+        ("missing_directory", "does not exist"),
+        ("not_directory", "not a directory"),
+        ("missing_frontend", "00_frontend.py"),
+        ("no_pass_snapshots", "no pass snapshots"),
+        ("starts_at_two", "01"),
+        ("index_gap", "02"),
+        ("duplicate_index", "01"),
+        ("malformed_name", "02_ConvertToSSA.py"),
+        ("invalid_snapshot_utf8", "01_after_InlineFunctions.py"),
+        ("invalid_warning_utf8", "01_after_InlineFunctions.log"),
+    ],
+)
+def test_discover_rejects_invalid_dump_inputs(tmp_path: Path, case: str, expected_message: str):
+    if case == "missing_directory":
+        dump = tmp_path / "missing"
+    elif case == "not_directory":
+        dump = tmp_path / "not-a-directory"
+        dump.write_text("not a directory", encoding="utf-8")
+    elif case == "missing_frontend":
+        dump = _write_dump(tmp_path, {"01_after_InlineFunctions.py": "after one\n"})
+    elif case == "no_pass_snapshots":
+        dump = _write_dump(tmp_path, {"00_frontend.py": "frontend\n"})
+    elif case == "starts_at_two":
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "02_after_UnrollLoops.py": "after two\n",
+            },
+        )
+    elif case == "index_gap":
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "01_after_InlineFunctions.py": "after one\n",
+                "03_after_ConvertToSSA.py": "after three\n",
+            },
+        )
+    elif case == "duplicate_index":
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "01_after_InlineFunctions.py": "after one\n",
+                "01_after_UnrollLoops.py": "also after one\n",
+            },
+        )
+    elif case == "malformed_name":
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "02_ConvertToSSA.py": "malformed\n",
+            },
+        )
+    elif case == "invalid_snapshot_utf8":
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "01_after_InlineFunctions.py": "after one\n",
+            },
+        )
+        (dump / "01_after_InlineFunctions.py").write_bytes(b"\xff")
+    else:
+        dump = _write_dump(
+            tmp_path,
+            {
+                "00_frontend.py": "frontend\n",
+                "01_after_InlineFunctions.py": "after one\n",
+            },
+        )
+        (dump / "01_after_InlineFunctions.log").write_bytes(b"\xff")
+
+    with pytest.raises(IRTraceError, match=expected_message):
+        discover_snapshots(dump)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

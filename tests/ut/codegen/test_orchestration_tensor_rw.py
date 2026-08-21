@@ -122,8 +122,8 @@ class TestTensorReadWriteOffsetCodegen:
 
         code = _generate_orch_code(Prog)
         # Read uses get_tensor_data<T>; write goes through the symmetric
-        # set_tensor_data<T> API so the runtime can spin-wait on producers /
-        # tracked INOUT consumers before writing.
+        # set_tensor_data<T> API so the runtime owns access validation and any
+        # producer/consumer synchronization.
         assert "float val = get_tensor_data<float>(ext_t, 2, indices_val);" in code
         assert "uint32_t indices_t[2] = {1, 3};" in code
         assert "set_tensor_data<float>(ext_t, 2, indices_t, val);" in code
@@ -330,7 +330,7 @@ class TestTensorReadWriteOffsetCodegen:
         assert "kv_proj__windowed" in code, code
 
         declared_names = re.findall(
-            r"^\s*(?:const\s+Tensor&|Tensor|PTO2TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
+            r"^\s*(?:const\s+ChipTensor&|ChipTensor|PTO2TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
             code,
             flags=re.MULTILINE,
         )
@@ -339,9 +339,11 @@ class TestTensorReadWriteOffsetCodegen:
             f"generated C++ redeclared names {sorted(duplicate_declarations)}:\n{code}"
         )
 
-        mutable_tensor_names = set(re.findall(r"^\s*Tensor\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE))
+        mutable_tensor_names = set(
+            re.findall(r"^\s*ChipTensor\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE)
+        )
         const_alias_names = set(
-            re.findall(r"^\s*const\s+Tensor&\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE)
+            re.findall(r"^\s*const\s+ChipTensor&\s+([A-Za-z_]\w*)\s*=", code, flags=re.MULTILINE)
         )
         assert not (mutable_tensor_names & const_alias_names), code
 
@@ -586,6 +588,57 @@ class TestTensorReadWriteOffsetCodegen:
         assert "params_t0.launch_spec.set_block_num(4);" in code
         assert "params_t0.launch_spec.set_require_sync_start(true);" in code
 
+    def test_spmd_launch_width_from_runtime_query(self):
+        """``pl.spmd(pl.system.available_cluster_count())`` sizes the launch on device.
+
+        The width is a property of the run, not of the program, so it lowers to
+        the orchestration helper rather than a baked literal.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class SpmdQueryProgram:
+            @pl.function(type=pl.FunctionType.InCore, attrs={"split": pl.SplitMode.UP_DOWN})
+            def kernel(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                tile_a_l1 = pl.load(a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_b_l1 = pl.load(b, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
+                tile_a_l0a = pl.move(tile_a_l1, target_memory=pl.MemorySpace.Left)
+                tile_b_l0b = pl.move(tile_b_l1, target_memory=pl.MemorySpace.Right)
+                tile_mm = pl.matmul(tile_a_l0a, tile_b_l0b)
+                tile_bias = pl.load(bias, [0, 0], [64, 64])
+                tile_out = pl.add(tile_mm, tile_bias)
+                out = pl.store(tile_out, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[64, 64], pl.FP32],
+                b: pl.Tensor[[64, 64], pl.FP32],
+                bias: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(pl.system.available_cluster_count(), sync_start=True):
+                    out = self.kernel(a, b, bias, out)
+                return out
+
+        transformed = passes.expand_mixed_kernel()(
+            passes.infer_tile_memory_space()(
+                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdQueryProgram))
+            )
+        )
+        code = _generate_orch_code(transformed)
+
+        assert "params_t0.launch_spec.set_block_num(rt_available_cluster_count());" in code, code
+        assert "params_t0.launch_spec.set_require_sync_start(true);" in code, code
+
     def test_spmd_mixed_multi_out_single_return_alias_targets_actual_return(self):
         """SPMD mixed kernel with multiple Out params + single return must alias the
         call-site result SSA to the Out parameter that the kernel actually returns,
@@ -685,7 +738,7 @@ class TestTensorReadWriteOffsetCodegen:
         # If the codegen emits an explicit SSA alias for the SPMD result,
         # it must bind to ext_out and never to ext_scratch.
         out_alias_lines = [
-            line for line in code.splitlines() if line.lstrip().startswith("const Tensor& out__")
+            line for line in code.splitlines() if line.lstrip().startswith("const ChipTensor& out__")
         ]
         for line in out_alias_lines:
             assert "ext_out" in line and "ext_scratch" not in line, (
@@ -750,15 +803,11 @@ class TestTensorReadWriteOffsetCodegen:
                 final = self.consumer(out, final)
                 return final
 
-        # VerificationLevel.NONE: tuple destructuring inside `with pl.spmd(N):`
-        # desugars to a multi-statement body the printer emits verbatim but the
-        # parser rejects (same known roundtrip gap as test_spmd_multi_assemble).
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = passes.expand_mixed_kernel()(
-                passes.infer_tile_memory_space()(
-                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutReturnLast))
-                )
+        transformed = passes.expand_mixed_kernel()(
+            passes.infer_tile_memory_space()(
+                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiOutReturnLast))
             )
+        )
 
         code = _generate_orch_code(transformed)
 
@@ -778,7 +827,9 @@ class TestTensorReadWriteOffsetCodegen:
             )
 
         # Any explicit SSA alias for the result must bind to ext_out as well.
-        alias_lines = [line for line in code.splitlines() if line.lstrip().startswith("const Tensor& out")]
+        alias_lines = [
+            line for line in code.splitlines() if line.lstrip().startswith("const ChipTensor& out")
+        ]
         for line in alias_lines:
             assert "ext_pre" not in line and "ext_post" not in line, (
                 f"SPMD return alias bound to the wrong output:\n{line}\n\nFull code:\n{code}"
@@ -822,18 +873,11 @@ class TestTensorReadWriteOffsetCodegen:
                     out0, out1 = self.kernel(a, b0, b1, out0, out1)
                 return out0, out1
 
-        # NOTE: bypass tracks a known print->parse round-trip limitation — a
-        # multi-output `out0, out1 = self.kernel(...)` inside `with pl.spmd(N):`
-        # desugars to a 3-statement body the printer emits verbatim, which the
-        # parser then rejects (spmd body must be a single statement). The IR is
-        # valid (passes BEFORE_AND_AFTER property verification); only roundtrip
-        # fails. Remove NONE once the printer/parser round-trips this shape.
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            transformed = passes.expand_mixed_kernel()(
-                passes.infer_tile_memory_space()(
-                    passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiAssembleProgram))
-                )
+        transformed = passes.expand_mixed_kernel()(
+            passes.infer_tile_memory_space()(
+                passes.outline_cluster_scopes()(passes.convert_to_ssa()(SpmdMultiAssembleProgram))
             )
+        )
         code = _generate_orch_code(transformed)
 
         assert "add_output(ext_out0)" in code and "add_output(ext_out1)" in code, (
@@ -943,6 +987,86 @@ class TestTensorReadWriteOffsetCodegen:
             f"large=(1024*8+2048*8) / f32), got {shape_values}. Generated code:\n{code}"
         )
 
+    def test_gm_pipe_buffer_bidirectional_reserves_two_rings(self):
+        """A bidirectional pipe is TWO rings in GM, so its workspace is 2 * slot_num * slot_size.
+
+        The C2V ring lives at the workspace base and the V2C ring at
+        base + slot_num * slot_size (pto-isa `TPipe`, A2A3 GM layout). Sizing a
+        bidirectional pipe as a single ring leaves the whole V2C ring past the end
+        of the allocation.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class BidirGMPipeProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube(self):
+                c2v_peer = pl.import_peer_buffer(name="bidir_c2v", peer_func="vector")
+                v2c_buf = pl.reserve_buffer(name="bidir_v2c", size=2048, base=pl.AUTO)
+                pl.aic_initialize_pipe(c2v_peer, v2c_buf, dir_mask=3, slot_size=512)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def vector(self):
+                c2v_buf = pl.reserve_buffer(name="bidir_c2v", size=2048, base=pl.AUTO)
+                v2c_peer = pl.import_peer_buffer(name="bidir_v2c", peer_func="cube")
+                pl.aiv_initialize_pipe(c2v_buf, v2c_peer, dir_mask=3, slot_size=512)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def group(self):
+                self.cube()
+                self.vector()
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self):
+                self.group()
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(BidirGMPipeProgram)
+
+        code = _generate_orch_code(transformed)
+        shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
+        # 2 rings * 4 slots * 512 B / sizeof(float) == 1024 elements.
+        assert shape_values == ["1024"], (
+            "Expected a bidirectional GM workspace of 2 * 4 * 512 B, got "
+            f"{shape_values} elements. Generated code:\n{code}"
+        )
+
+    def test_gm_pipe_buffer_honours_explicit_slot_num(self):
+        """Workspace sizing follows the slot_num the pipe was actually initialized with."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class DeepGMPipeProgram:
+            @pl.function(type=pl.FunctionType.AIC)
+            def cube(self):
+                buf = pl.reserve_buffer(name="deep_v2c", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), buf, dir_mask=2, slot_size=512, slot_num=16)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def vector(self):
+                peer = pl.import_peer_buffer(name="deep_v2c", peer_func="cube")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), peer, dir_mask=2, slot_size=512, slot_num=16)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def group(self):
+                self.cube()
+                self.vector()
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self):
+                self.group()
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(DeepGMPipeProgram)
+
+        code = _generate_orch_code(transformed)
+        shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
+        # 1 ring * 16 slots * 512 B / sizeof(float) == 2048 elements; the dir_mask
+        # default of 8 slots would under-allocate by half.
+        assert shape_values == ["2048"], (
+            f"Expected slot_num=16 to be honoured when sizing, got {shape_values}. Generated code:\n{code}"
+        )
+
     def test_submit_dispatched_pipe_group_sizes_workspace_and_resolves_callees(self):
         """Submitted pipe kernels with different signatures share one Group ABI (#2097)."""
         backend.reset_for_testing()
@@ -1010,7 +1134,8 @@ class TestTensorReadWriteOffsetCodegen:
         code = result.code
 
         shape_values = re.findall(r"gm_pipe_buffer_\d+_ci_shapes\[1\]\s*=\s*\{(\d+)\};", code)
-        assert shape_values == ["512"], code
+        # dir_mask=3 is two rings: 2 * 4 slots * 512 B / sizeof(float) == 1024 elements.
+        assert shape_values == ["1024"], code
         assert "rt_submit_task" in code, code
         assert result.func_name_to_signature["cube_side"] == result.func_name_to_signature["vec_side"]
         expected_mixed = (

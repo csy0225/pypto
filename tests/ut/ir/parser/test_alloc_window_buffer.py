@@ -32,7 +32,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import DataType
+from pypto.language.parser.diagnostics import ParserSyntaxError
 from pypto.pypto_core import ir
+
+_OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER = ir.get_op("pld.tensor.alloc_window_buffer").name
 
 
 def _get_host_orch(program: ir.Program, name: str = "host_orch") -> ir.Function:
@@ -46,7 +49,7 @@ def _find_alloc_assignment(func: ir.Function) -> ir.AssignStmt:
 
     def walk(stmt: ir.Stmt) -> ir.AssignStmt | None:
         if isinstance(stmt, ir.AssignStmt):
-            if isinstance(stmt.value, ir.Call) and stmt.value.op.name == "pld.tensor.alloc_window_buffer":
+            if isinstance(stmt.value, ir.Call) and stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER:
                 return stmt
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
@@ -81,6 +84,35 @@ def test_alloc_window_buffer_lhs_is_plain_ptr_var():
     # The buffer's runtime-unique identifier comes from the LHS variable name
     # via Var.name_hint.
     assert var.name_hint == "buf"
+
+
+def test_alloc_window_buffer_rejected_outside_host_function():
+    """``pld.alloc_window_buffer()`` is host-only — calling it from a
+    CORE_GROUP-level function body is a parse error."""
+    with pytest.raises(ParserSyntaxError, match="HOST"):
+
+        @pl.program
+        class P:  # noqa: F841
+            @pl.function
+            def kernel(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    buf = pld.alloc_window_buffer(1024)  # noqa: F841
+                return x
+
+
+def test_alloc_window_buffer_rejected_in_nested_device_scope_within_host_function():
+    """Even inside a HOST orchestrator, ``pld.alloc_window_buffer()`` must be
+    rejected when nested inside a device-side scope (InCore / SPMD), since
+    the call is not lowerable there."""
+    with pytest.raises(ParserSyntaxError, match="InCore"):
+
+        @pl.program
+        class P:  # noqa: F841
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self):
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    buf = pld.alloc_window_buffer(1024)  # noqa: F841
+                return 0
 
 
 def test_alloc_window_buffer_call_carries_name_kwarg():
@@ -120,7 +152,7 @@ def test_alloc_window_buffer_returns_singleton_ptr_type():
 
     def walk(stmt: ir.Stmt) -> None:
         if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
-            if stmt.value.op.name == "pld.tensor.alloc_window_buffer":
+            if stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER:
                 allocs.append(stmt)
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
@@ -149,13 +181,13 @@ def test_alloc_window_buffer_long_form():
     func = _get_host_orch(P)
     stmt = _find_alloc_assignment(func)
     assert isinstance(stmt.value, ir.Call)
-    assert stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+    assert stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     assert stmt.value.kwargs["name"] == "buf"
 
 
 def test_alloc_window_buffer_rejects_non_name_lhs():
     """Tuple-unpacking / subscript / attribute LHS is rejected — name must be a bare identifier."""
-    with pytest.raises(Exception, match="must appear as the RHS of a simple assignment"):
+    with pytest.raises(ParserSyntaxError, match="must appear as the RHS of a simple assignment"):
 
         @pl.program
         class P:  # noqa: F841
@@ -166,7 +198,7 @@ def test_alloc_window_buffer_rejects_non_name_lhs():
 
 
 def test_alloc_window_buffer_rejects_duplicate_names():
-    with pytest.raises(Exception, match="already declared"):
+    with pytest.raises(ParserSyntaxError, match="already declared"):
 
         @pl.program
         class P:  # noqa: F841
@@ -179,7 +211,7 @@ def test_alloc_window_buffer_rejects_duplicate_names():
 
 def test_alloc_window_buffer_rejects_user_kwargs():
     """``dtype=`` is rejected on the scalar byte form — it is only valid with the shape form."""
-    with pytest.raises(Exception, match="dtype= is only valid when the first argument is a shape"):
+    with pytest.raises(ParserSyntaxError, match="dtype= is only valid when the first argument is a shape"):
 
         @pl.program
         class P:  # noqa: F841
@@ -191,7 +223,7 @@ def test_alloc_window_buffer_rejects_user_kwargs():
 
 def test_alloc_window_buffer_rejects_explicit_name_kwarg():
     """``name`` is parser-injected from the LHS and can't be passed explicitly."""
-    with pytest.raises(Exception, match="'name' kwarg cannot be passed explicitly"):
+    with pytest.raises(ParserSyntaxError, match="'name' kwarg cannot be passed explicitly"):
 
         @pl.program
         class P:  # noqa: F841
@@ -203,7 +235,7 @@ def test_alloc_window_buffer_rejects_explicit_name_kwarg():
 
 def test_alloc_window_buffer_rejects_bare_call_outside_assignment():
     """Without an assignment LHS there is no globally-unique name to bind to."""
-    with pytest.raises(Exception, match="must appear as the RHS of a simple assignment"):
+    with pytest.raises(ParserSyntaxError, match="must appear as the RHS of a simple assignment"):
 
         @pl.program
         class P:  # noqa: F841
@@ -215,7 +247,7 @@ def test_alloc_window_buffer_rejects_bare_call_outside_assignment():
 
 def test_alloc_window_buffer_rejects_list_without_dtype():
     """A list/tuple without ``dtype=`` is rejected — the shape form requires dtype."""
-    with pytest.raises(Exception, match="requires dtype="):
+    with pytest.raises(ParserSyntaxError, match="requires dtype="):
 
         @pl.program
         class P:  # noqa: F841
@@ -240,7 +272,7 @@ def test_alloc_window_buffer_shaped_static():
     stmt = _find_alloc_assignment(func)
     assert isinstance(stmt.value, ir.Call)
     call = stmt.value
-    assert call.op.name == "pld.tensor.alloc_window_buffer"
+    assert call.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     assert call.kwargs["name"] == "buf"
     assert "dtype" not in call.kwargs
     assert len(call.args) == 1
@@ -265,7 +297,7 @@ def test_alloc_window_buffer_shaped_long_form():
     stmt = _find_alloc_assignment(func)
     assert isinstance(stmt.value, ir.Call)
     call = stmt.value
-    assert call.op.name == "pld.tensor.alloc_window_buffer"
+    assert call.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     assert call.kwargs["name"] == "buf"
     assert len(call.args) == 1
     # Static shape must fold to a single ConstInt byte-size arg.
@@ -276,7 +308,7 @@ def test_alloc_window_buffer_shaped_long_form():
 
 def test_alloc_window_buffer_rejects_empty_shape():
     """An empty shape list is rejected with a clear error."""
-    with pytest.raises(Exception, match="shape must be non-empty"):
+    with pytest.raises(ParserSyntaxError, match="shape must be non-empty"):
 
         @pl.program
         class P:  # noqa: F841
@@ -288,7 +320,7 @@ def test_alloc_window_buffer_rejects_empty_shape():
 
 def test_alloc_window_buffer_rejects_non_positive_static_dim():
     """Zero and negative static dimensions are rejected with a clear error."""
-    with pytest.raises(Exception, match="all dimensions must be positive"):
+    with pytest.raises(ParserSyntaxError, match="all dimensions must be positive"):
 
         @pl.program
         class P:  # noqa: F841
@@ -297,7 +329,7 @@ def test_alloc_window_buffer_rejects_non_positive_static_dim():
                 buf = pld.alloc_window_buffer([0, 128], dtype=pl.FP32)  # noqa: F841
                 return buf
 
-    with pytest.raises(Exception, match="all dimensions must be positive"):
+    with pytest.raises(ParserSyntaxError, match="all dimensions must be positive"):
 
         @pl.program
         class P:  # noqa: F841
@@ -322,7 +354,7 @@ def test_alloc_window_buffer_shaped_dynamic():
     stmt = _find_alloc_assignment(func)
     assert isinstance(stmt.value, ir.Call)
     call = stmt.value
-    assert call.op.name == "pld.tensor.alloc_window_buffer"
+    assert call.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     assert call.kwargs["name"] == "buf"
     assert "dtype" not in call.kwargs
     assert len(call.args) == 1

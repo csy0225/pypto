@@ -32,6 +32,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -64,11 +65,36 @@ bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const
                      [&name](const auto& kwarg) { return kwarg.first == name; });
 }
 
+/// Carry the assignment's MemRef onto a type re-deduced by `OpRegistry::Create`.
+///
+/// Re-deducing yields authoritative shape / dtype / view metadata but never a
+/// MemRef — op type deduction does not produce one. So the assignment's MemRef
+/// is strictly additional information, not a stale override, and the re-created
+/// op denotes the same storage. Dropping it would silently un-bind the two
+/// things that legitimately put a MemRef on a tile before InitMemRef: a user
+/// allocation (`pl.Tile[..., pl.MemRef("ping"), ...]`) and a re-parsed
+/// post-allocation dump. Same merge ConvertToSSA applies to an LHS MemRef.
+///
+/// The MemRef is read from the *assigned Var*, not from the RHS Call: ConvertToSSA
+/// merges it into the Var's type only, and op type deduction leaves the Call's
+/// type MemRef-less. Sourcing it from `call->GetType()` silently matches nothing.
+TypePtr WithCarriedMemRef(const TypePtr& deduced, const AssignStmtPtr& assign) {
+  if (!assign || !assign->var_) return deduced;
+  auto memref = GetTypeMemRef(assign->var_->GetType());
+  if (!memref.has_value() || GetTypeMemRef(deduced).has_value()) return deduced;
+  return CloneTypeWithMemRef(deduced, memref);
+}
+
 /**
  * @brief Recursively transform statements, flattening >2D tile ops to 2D.
+ *
+ * Every node this synthesizes is attributed to the statement it was synthesized
+ * for (see `span` in the rewrite loop) — never to the enclosing function — so
+ * post-pass diagnostics, IR traces and `loc()` point at the offending source
+ * line rather than the `def` line.
  */
 std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenContext& ctx,
-                                   const OpRegistry& op_registry, const Span& span) {
+                                   const OpRegistry& op_registry) {
   std::vector<StmtPtr> result;
 
   // Pre-scan: identify operand chains (tile.load -> tile.transpose_view/reshape)
@@ -322,6 +348,11 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
   for (size_t stmt_index = 0; stmt_index < stmts.size(); ++stmt_index) {
     const auto& stmt = stmts[stmt_index];
+    // Statement-level nodes below each carry their own source node's span
+    // (`ret->span_`, `assign->span_`, `for_stmt->body_->span_`, ...). Ops rebuilt
+    // from an RHS `Call` use that Call's tighter span — see `span`, bound once the
+    // Call is in hand.
+
     // ReturnStmt: substitute return values
     if (auto ret = As<ReturnStmt>(stmt)) {
       std::vector<ExprPtr> new_values;
@@ -346,7 +377,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
     // SeqStmts: recurse
     if (auto seq = As<SeqStmts>(stmt)) {
-      auto inner = TransformBody(seq->stmts_, ctx, op_registry, span);
+      auto inner = TransformBody(seq->stmts_, ctx, op_registry);
       result.insert(result.end(), inner.begin(), inner.end());
       continue;
     }
@@ -355,7 +386,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     // since ScopeStmt is abstract and MutableCopy needs a concrete type.
     if (auto scope = As<ScopeStmt>(stmt)) {
       auto body_stmts = FlattenToStmts(scope->body_);
-      auto inner = TransformBody(body_stmts, ctx, op_registry, span);
+      auto inner = TransformBody(body_stmts, ctx, op_registry);
       auto new_body = SeqStmts::Flatten(std::move(inner), scope->body_->span_);
       auto rewrite = [&](auto&& concrete) -> StmtPtr {
         auto new_scope = MutableCopy(concrete);
@@ -386,7 +417,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
       auto then_ctx = ctx;
       auto then_stmts = FlattenToStmts(if_stmt->then_body_);
-      auto new_then = TransformBody(then_stmts, then_ctx, op_registry, span);
+      auto new_then = TransformBody(then_stmts, then_ctx, op_registry);
       // Extract yield types before moving the vector
       auto yield_types = FindYieldTypes(new_then);
       auto new_then_body = SeqStmts::Flatten(std::move(new_then), if_stmt->then_body_->span_);
@@ -395,7 +426,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       std::optional<StmtPtr> new_else_body;
       if (if_stmt->else_body_.has_value()) {
         auto else_stmts = FlattenToStmts(*if_stmt->else_body_);
-        auto new_else = TransformBody(else_stmts, else_ctx, op_registry, span);
+        auto new_else = TransformBody(else_stmts, else_ctx, op_registry);
         new_else_body = SeqStmts::Flatten(std::move(new_else), (*if_stmt->else_body_)->span_);
       }
 
@@ -447,7 +478,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       }
 
       auto body_stmts = FlattenToStmts(for_stmt->body_);
-      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry, span);
+      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), for_stmt->body_->span_);
 
       // Update return_vars types to match iter_arg types (positional matching)
@@ -494,7 +525,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
       auto new_cond = Substitute(while_stmt->condition_, body_ctx.var_map);
       auto body_stmts = FlattenToStmts(while_stmt->body_);
-      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry, span);
+      auto new_body_stmts = TransformBody(body_stmts, body_ctx, op_registry);
       auto new_body = SeqStmts::Flatten(std::move(new_body_stmts), while_stmt->body_->span_);
 
       // Update return_vars types to match iter_arg types (positional matching)
@@ -527,7 +558,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         // Re-create tile ops via OpRegistry for proper type deduction
         if (auto call = As<Call>(new_expr)) {
           if (call->op_ && call->op_->name_.substr(0, 5) == "tile.") {
-            auto new_call = op_registry.Create(call->op_->name_, call->args_, call->kwargs_, span);
+            auto new_call = op_registry.Create(call->op_->name_, call->args_, call->kwargs_, call->span_);
             result.push_back(std::make_shared<EvalStmt>(new_call, eval->span_));
             continue;
           }
@@ -571,7 +602,41 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       continue;
     }
 
+    // Everything below rebuilds ops derived from this RHS `Call`, so they take the
+    // Call's own span rather than the statement's. The two differ whenever the RHS
+    // does not start at the assignment — always by column (`t = pl.tile.exp(x)`),
+    // and by line for a parenthesized or wrapped RHS.
+    //
+    // Invariant: `span` is for expressions and ops ONLY. Every `AssignStmt` built
+    // below — including the auxiliary ones the lowering paths insert (the rank-N
+    // Mat load's `tensor.view`, the rank-N store's `tile.reshape`, the transpose
+    // scratch `tile.create`) — must pass `assign->span_`, so statement-level
+    // verifiers and `INTERNAL_CHECK_SPAN(..., assign->span_)` consumers keep
+    // reporting the statement rather than the operator inside it.
+    const Span& span = call->span_;
+
     const auto& op_name = call->op_->name_;
+
+    // remote_load is a non-"tile." op that nevertheless produces a TileType
+    // whose valid_shape can embed variables remapped by this pass. Rebuild both
+    // the call and its defining Var together; otherwise a later Substitute on
+    // the consumer remaps only the Var's type and creates a definition-less
+    // clone (printed as __FREE_VAR).
+    if (IsOp(call, "pld.tile.remote_load")) {
+      auto new_value = As<Call>(Substitute(assign->value_, ctx.var_map));
+      INTERNAL_CHECK_SPAN(new_value, assign->span_)
+          << "FlattenTileNdTo2D: remote_load substitution must remain a Call";
+      if (new_value.get() == call.get()) {
+        result.push_back(stmt);
+        ctx.Insert(assign->var_, assign->var_);
+      } else {
+        auto new_var =
+            std::make_shared<Var>(assign->var_->name_hint_, new_value->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_value, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+      }
+      continue;
+    }
 
     // ---- tile.load on >2D tile: flatten the result tile to 2D (hardware tiles
     //      are always 2D), keeping the tensor-rank source window for codegen —
@@ -605,7 +670,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         auto [merged, last] = ComputeMergedShape(result_tile->shape_, "tile.load result");
 
         auto flat_shape_exprs = Make2DShapeExprs(merged, last, span);
-        // Preserve any TileView (blayout/slayout/fractal/pad) the source tile
+        // Preserve any TileView (blayout/slayout/fractal/pad/compact) the source tile
         // already carried — e.g. LowerCompositeOps tags a transposed-load Mat
         // rhs with TileView(blayout=row_major, slayout=col_major) so the
         // downstream TLOAD matches the DN2ZN pattern. The implicit Mat default
@@ -623,12 +688,20 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
             flat_valid = ComputeMergedValidShape(orig_tv.valid_shape, span);
           }
           flat_tile_view = TileView(flat_valid, /*stride=*/{}, /*start_offset=*/nullptr, orig_tv.blayout,
-                                    orig_tv.slayout, orig_tv.fractal, orig_tv.pad);
+                                    orig_tv.slayout, orig_tv.fractal, orig_tv.pad, orig_tv.compact);
         } else {
           flat_tile_view = tile_view_semantics::GetImplicitTileView(flat_shape_exprs, flat_memory_space);
         }
-        auto flat_tile_type = std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_, std::nullopt,
-                                                         flat_tile_view, flat_memory_space);
+        // Carry the MemRef through: the flattened tile is the same storage, and a
+        // parse-time declared allocation rides this field to InitMemRef.
+        // Dropping it would silently un-bind every ND user-bound tile. The binding
+        // sits on the assigned Var; `result_tile` is the RHS Call's deduced type,
+        // which never carries a MemRef — see WithCarriedMemRef.
+        auto bound_memref = GetTypeMemRef(assign->var_->GetType());
+        auto flat_tile_type =
+            std::make_shared<TileType>(flat_shape_exprs, result_tile->dtype_,
+                                       bound_memref.has_value() ? bound_memref : result_tile->memref_,
+                                       flat_tile_view, flat_memory_space);
 
         // A natural Mat load lowers to ND2NZ, which requires a 2D GlobalTensor.
         // Materialize that source-window collapse in IR with tensor.view; plain
@@ -645,19 +718,19 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
           auto shapes_tuple = As<MakeTuple>(sub_args[2]);
           INTERNAL_CHECK_SPAN(offsets_tuple && shapes_tuple, span)
               << "FlattenTileNdTo2D: tile.load offsets and shapes must be tuples";
-          auto valid_shapes_tuple = shapes_tuple;
+          auto valid_shape_tuple = shapes_tuple;
           if (sub_args.size() >= 4) {
-            valid_shapes_tuple = As<MakeTuple>(sub_args[3]);
-            INTERNAL_CHECK_SPAN(valid_shapes_tuple, span)
-                << "FlattenTileNdTo2D: tile.load valid_shapes must be a tuple";
+            valid_shape_tuple = As<MakeTuple>(sub_args[3]);
+            INTERNAL_CHECK_SPAN(valid_shape_tuple, span)
+                << "FlattenTileNdTo2D: tile.load valid_shape must be a tuple";
           }
           INTERNAL_CHECK_SPAN(offsets_tuple->elements_.size() == tensor_type->shape_.size() &&
                                   shapes_tuple->elements_.size() == tensor_type->shape_.size() &&
-                                  valid_shapes_tuple->elements_.size() == tensor_type->shape_.size(),
+                                  valid_shape_tuple->elements_.size() == tensor_type->shape_.size(),
                               span)
               << "FlattenTileNdTo2D: tile.load offset/shape ranks must match tensor rank";
           INTERNAL_CHECK_SPAN(tile_conversion_utils::IsRowMajorCollapseContiguous(
-                                  valid_shapes_tuple->elements_, tensor_type->shape_),
+                                  valid_shape_tuple->elements_, tensor_type->shape_),
                               span)
               << "FlattenTileNdTo2D: tile.load NZ 2D source-window collapse requires the valid "
                  "sub-box of the leading dims to be contiguous in row-major order";
@@ -665,7 +738,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
           auto view_call = CreateCollapsedTensorView(tensor, tensor_type, span);
           auto view_var =
               std::make_shared<Var>(assign->var_->name_hint_ + "_view2d", view_call->GetType(), span);
-          result.push_back(std::make_shared<AssignStmt>(view_var, view_call, span));
+          result.push_back(std::make_shared<AssignStmt>(view_var, view_call, assign->span_));
 
           auto row_offset = CollapseLeadingOffsetsToRow(offsets_tuple->elements_, tensor_type->shape_, span);
           sub_args[0] = view_var;
@@ -673,12 +746,12 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
               std::vector<ExprPtr>{row_offset, offsets_tuple->elements_.back()}, span);
           sub_args[2] =
               std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(shapes_tuple->elements_, span), span);
-          auto flat_valid_shapes =
-              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(valid_shapes_tuple->elements_, span), span);
+          auto flat_valid_shape =
+              std::make_shared<MakeTuple>(CollapseLeadingDimsTo2D(valid_shape_tuple->elements_, span), span);
           if (sub_args.size() >= 4) {
-            sub_args[3] = flat_valid_shapes;
+            sub_args[3] = flat_valid_shape;
           } else {
-            sub_args.push_back(flat_valid_shapes);
+            sub_args.push_back(flat_valid_shape);
           }
         }
 
@@ -686,15 +759,18 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         if (pending_batch_matmul_mat) {
           flat_kwargs.emplace_back("target_memory", MemorySpace::Mat);
         }
-        auto flat_call =
-            std::make_shared<Call>(call->op_, sub_args, flat_kwargs, flat_tile_type, call->span_);
+        auto flat_call = std::make_shared<Call>(call->op_, sub_args, flat_kwargs, call->attrs_,
+                                                flat_tile_type, call->span_);
         auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, flat_tile_type, assign->var_->span_);
         result.push_back(std::make_shared<AssignStmt>(flat_var, flat_call, assign->span_));
         ctx.Insert(assign->var_, flat_var);
         continue;
       }
       // ≤2D tile.load: honor any pending var_map substitutions
-      auto new_call = op_registry.Create(op_name, sub_args, call->kwargs_, span);
+      auto deduced_call = op_registry.Create(op_name, sub_args, call->kwargs_, span);
+      auto loaded_type = WithCarriedMemRef(deduced_call->GetType(), assign);
+      auto new_call = std::make_shared<Call>(deduced_call->op_, deduced_call->args_, deduced_call->kwargs_,
+                                             call->attrs_, loaded_type, deduced_call->span_);
       auto new_var =
           std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
       result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
@@ -729,7 +805,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         auto reshape_shape = MakeShapeTupleFromInts({merged, last}, span);
         auto reshape_call = op_registry.Create("tile.reshape", {new_args[0], reshape_shape}, span);
         auto flat_var = std::make_shared<Var>("flat_tile", reshape_call->GetType(), span);
-        result.push_back(std::make_shared<AssignStmt>(flat_var, reshape_call, span));
+        result.push_back(std::make_shared<AssignStmt>(flat_var, reshape_call, assign->span_));
         new_args[0] = flat_var;
       }
 
@@ -777,9 +853,11 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
           new_args.push_back(Substitute(call->args_[i], ctx.var_map));
         }
 
-        auto new_call = op_registry.Create(op_name, new_args, call->kwargs_, span);
-        auto flat_var =
-            std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+        auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
+        auto created_type = WithCarriedMemRef(deduced->GetType(), assign);
+        auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_,
+                                               deduced->attrs_, created_type, deduced->span_);
+        auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, created_type, assign->var_->span_);
         result.push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
         ctx.Insert(assign->var_, flat_var);
         continue;
@@ -846,7 +924,7 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         };
         auto scratch_create = op_registry.Create("tile.create", {scratch_shape}, scratch_kw, span);
         auto scratch_var = std::make_shared<Var>("transpose_tmp", scratch_create->GetType(), span);
-        result.push_back(std::make_shared<AssignStmt>(scratch_var, scratch_create, span));
+        result.push_back(std::make_shared<AssignStmt>(scratch_var, scratch_create, assign->span_));
 
         auto t_call =
             op_registry.Create("tile.transpose", {in, call->args_[1], call->args_[2], scratch_var}, span);
@@ -868,6 +946,54 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       continue;
     }
 
+    // ---- tile.assemble into a >2D target: fold the ND offset into the flattened
+    //      (row, col) space. The target/source tiles are rewritten to 2D by their
+    //      defining ops, but the offset is a literal MakeTuple that no Substitute
+    //      touches, so the generic path below would leave an ND offset on a 2D
+    //      tile — which codegen reads positionally (row = elements[0], col =
+    //      elements[1], the rest ignored) and would place the write at the wrong
+    //      address. Same row-major fold tile.load applies to its tensor-rank
+    //      offsets. ----
+    if (IsOp(call, "tile.assemble")) {
+      // Pre-substitution types are the ND ones the user wrote; the fold is
+      // expressed in that ND coordinate space (cf. the tile.store branch above).
+      auto orig_target_type = As<TileType>(call->args_[0]->GetType());
+      if (IsNdTile(orig_target_type)) {
+        // Substitute the offset tuple too, not just the tile operands: its elements
+        // are index expressions that may reference Vars this pass remapped, and
+        // folding the pre-substitution elements would carry a stale SSA reference
+        // into the rebuilt call. The tile.store branch above substitutes every arg
+        // for the same reason.
+        auto offset_tuple = As<MakeTuple>(Substitute(call->args_[2], ctx.var_map));
+        INTERNAL_CHECK_SPAN(offset_tuple, span)
+            << "Internal error: tile.assemble offset must be a literal tuple";
+        INTERNAL_CHECK_SPAN(offset_tuple->elements_.size() == orig_target_type->shape_.size(), span)
+            << "Internal error: ND tile.assemble offset rank must match the target rank "
+               "(guaranteed by PreconditionAnalysis)";
+
+        std::vector<ExprPtr> new_args = {
+            Substitute(call->args_[0], ctx.var_map),
+            Substitute(call->args_[1], ctx.var_map),
+            std::make_shared<MakeTuple>(
+                std::vector<ExprPtr>{
+                    CollapseLeadingOffsetsToRow(offset_tuple->elements_, orig_target_type->shape_, span),
+                    offset_tuple->elements_.back()},
+                span),
+        };
+
+        auto deduced = op_registry.Create("tile.assemble", new_args, call->kwargs_, span);
+        auto new_call =
+            std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+                                   WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
+        auto new_var =
+            std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_call, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+        continue;
+      }
+      // Already-2D target: fall through to the generic re-create path below.
+    }
+
     // ---- All other tile ops (including tile.reshape) and non-tile ops: substitute args ----
     {
       std::vector<ExprPtr> new_args;
@@ -884,10 +1010,14 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
       } else {
         // Re-create tile ops via OpRegistry for proper type deduction with 2D args;
         // non-tile ops keep the original type.
-        auto new_call =
-            (op_name.substr(0, 5) == "tile.")
-                ? op_registry.Create(op_name, new_args, call->kwargs_, span)
-                : std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->GetType(), call->span_);
+        CallPtr new_call;
+        if (op_name.substr(0, 5) == "tile.") {
+          auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
+          new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+                                            WithCarriedMemRef(deduced->GetType(), assign), deduced->span_);
+        } else {
+          new_call = std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->GetType(), call->span_);
+        }
 
         auto new_var =
             std::make_shared<Var>(assign->var_->name_hint_, new_call->GetType(), assign->var_->span_);
@@ -903,14 +1033,15 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 }  // namespace rewrite_internal
 
 FunctionPtr Rewrite(const FunctionPtr& func) {
-  const auto& span = func->span_;
   auto& op_registry = OpRegistry::GetInstance();
 
   rewrite_internal::FlattenContext ctx;
 
   auto body_stmts = FlattenToStmts(func->body_);
-  auto new_stmts = rewrite_internal::TransformBody(body_stmts, ctx, op_registry, span);
-  auto new_body = SeqStmts::Flatten(std::move(new_stmts), span);
+  auto new_stmts = rewrite_internal::TransformBody(body_stmts, ctx, op_registry);
+  // The body SeqStmts wrapper spans the whole function; the ops inside it carry
+  // their own statements' spans (see TransformBody).
+  auto new_body = SeqStmts::Flatten(std::move(new_stmts), func->span_);
 
   // return_types_ are unchanged: InCore functions return tensors (not tiles),
   // and this pass only flattens tile ops. Tensor types are never modified.

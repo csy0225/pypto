@@ -9,6 +9,7 @@
 
 import re
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
@@ -167,7 +168,7 @@ def test_allocate_memory_addr_rejects_overlapping_reserve_buffer_ranges():
     with pytest.raises(
         # Message is now emitted by the shared reserve_buffer_utils resolver (used by both
         # AllocateMemoryAddr and MemoryReuse), so match the pass-agnostic substring.
-        Exception,
+        pypto.InternalError,
         match=re.escape("overlapping reserve_buffer ranges"),
     ):
         program = passes.init_mem_ref()(Before)
@@ -216,7 +217,8 @@ def test_allocate_memory_addr_reuses_right_buffer_when_moves_sink_to_consumer():
             mem_mat_6: pl.Ptr = pl.tile.alloc(pl.Mem.Mat, 16384)
             mem_left_7: pl.Ptr = pl.tile.alloc(pl.Mem.Left, 1024)
             mem_right_8: pl.Ptr = pl.tile.alloc(pl.Mem.Right, 16384)
-            mem_acc_9: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 1024)
+            # Logical M=4 still occupies one 16-row physical L0C block.
+            mem_acc_9: pl.Ptr = pl.tile.alloc(pl.Mem.Acc, 4096)
             lhs_tile: pl.Tile[[4, 128], pl.BF16, pl.MemRef(mem_mat_4, 0, 1024), pl.Mem.Mat] = pl.tile.load(
                 lhs, [0, 0], [4, 128], [4, 128], target_memory=pl.Mem.Mat
             )
@@ -233,13 +235,13 @@ def test_allocate_memory_addr_reuses_right_buffer_when_moves_sink_to_consumer():
             rhs0_tile_Right: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_right_8, 0, 16384), pl.Mem.Right] = (
                 pl.tile.move(rhs0_tile, target_memory=pl.Mem.Right)
             )
-            _acc0: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 1024), pl.Mem.Acc] = pl.tile.matmul(
+            _acc0: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
                 lhs_tile_Left, rhs0_tile_Right
             )
             rhs1_tile_Right: pl.Tile[[128, 64], pl.BF16, pl.MemRef(mem_right_8, 0, 16384), pl.Mem.Right] = (
                 pl.tile.move(rhs1_tile, target_memory=pl.Mem.Right)
             )
-            acc1: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 1024), pl.Mem.Acc] = pl.tile.matmul(
+            acc1: pl.Tile[[4, 64], pl.FP32, pl.MemRef(mem_acc_9, 0, 4096), pl.Mem.Acc] = pl.tile.matmul(
                 lhs_tile_Left, rhs1_tile_Right
             )
             result: pl.Tensor[[4, 64], pl.FP32, pl.MemRef("mem_ddr_3", 0, 1024)] = pl.tile.store(
@@ -271,6 +273,25 @@ def test_allocate_memory_addr_empty_function():
 
     After = passes.allocate_memory_addr()(Before)
     ir.assert_structural_equal(After, Expected)
+
+
+def test_allocate_memory_addr_dsa_rp_accepts_singleton_return_body():
+    """DSA-RP accepts an InitMemRef output with no top-level statement sequence."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(self, output: pl.Tensor[[64, 64], pl.FP32]) -> pl.Tensor[[64, 64], pl.FP32]:
+            return output
+
+    initialized = passes.init_mem_ref()(Before)
+    func = next(iter(initialized.functions.values()))
+    assert isinstance(func.body, ir.ReturnStmt)
+
+    with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+        after = passes.allocate_memory_addr()(initialized)
+
+    ir.assert_structural_equal(after, initialized)
 
 
 def test_allocate_memory_addr_allocs_are_prepended_to_body():
@@ -520,12 +541,128 @@ def test_allocated_memory_addr_verifier_errors_when_vec_exceeds_safe_cap():
         pipeline = passes.PassPipeline()
         pipeline.add_pass(passes.allocate_memory_addr())
         with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.AFTER)]):
-            with pytest.raises(ValueError, match=r"Vec buffer usage .* exceeds platform limit"):
+            with pytest.raises(pypto.Error, match=r"Vec buffer usage .* exceeds platform limit"):
                 pipeline.run(program)
     finally:
         reset_for_testing()
         if prior_type is not None:
             set_backend_type(prior_type)
+
+
+def _overflowing_mat_program(buffer_name):
+    """AIC function reserving 512KB under ``buffer_name`` plus one 8192-byte Mat
+    tile above it — Mat high-water 532480 > the 524288 limit.
+
+    Named ``kernel_aic`` on purpose: ExpandMixedKernel names the cube half
+    ``<mixed kernel>_aic`` and BuildAutomaticPipeSetup names its ring
+    ``<mixed kernel>_v2c_slot_buffer``, so only that pairing is the real pipe ring.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def kernel_aic(
+            self,
+            input_a: pl.Tensor[[64, 64], pl.BF16],
+            out_0: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+        ) -> pl.Tensor[[64, 64], pl.BF16]:
+            _ = pl.reserve_buffer(name=buffer_name, size=524288)
+            tile_a: pl.Tile[[64, 64], pl.BF16] = pl.load(
+                input_a, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat
+            )
+            result: pl.Tensor[[64, 64], pl.BF16] = pl.store(tile_a, [0, 0], out_0)
+            return result
+
+    return Before
+
+
+def _overflow_message(program):
+    """Run init_mem_ref + allocate_memory_addr and return the capacity diagnostic.
+
+    A reserve-buffer overflow is caught by AllocateMemoryAddresses' own in-pass
+    ``CHECK`` (it owns the only exact footprint), which raises ``pypto::ValueError``
+    -> a builtin ``ValueError``. That is a different exception type from the
+    ``AllocatedMemoryAddr`` verifier's ``pypto.Error`` used by the tile-only
+    overflow test above — the two checks report the same condition through
+    different mechanisms, so each test asserts the type its own path raises.
+    """
+    program = passes.init_mem_ref()(program)
+    pipeline = passes.PassPipeline()
+    pipeline.add_pass(passes.allocate_memory_addr())
+    with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.AFTER)]):
+        with pytest.raises(ValueError) as exc:
+            pipeline.run(program)
+    return str(exc.value)
+
+
+def test_overflow_diagnostic_attributes_the_cross_core_pipe_ring(ascend_backend):
+    """An overflow dominated by a reserve_buffer must SAY so.
+
+    A reserve_buffer is not a MemRef — every tile is allocated above it — so it is
+    counted in the high-water mark yet invisible in the per-tile accounting an
+    author can inspect. For the automatic cross-core pipe ring (named by
+    BuildPipeBufferName) the diagnostic must also name pl.cross_core_slot, the
+    knob that actually shrinks those bytes.
+    """
+    message = _overflow_message(_overflowing_mat_program("kernel_v2c_slot_buffer"))
+    assert re.search(r"Mat buffer usage \(532480 bytes\) exceeds platform limit \(524288 bytes\)", message)
+    # Stated as the allocation FLOOR, not as "bytes the buffers occupy": an
+    # explicitly based buffer or an alignment gap makes the floor exceed the
+    # summed sizes, and the floor is what this overflow was charged.
+    assert "The first 524288 bytes of that space are reserved by system.reserve_buffer" in message
+    assert "cross-core pipe ring" in message
+    assert "pl.cross_core_slot(slot_num=N)" in message
+
+
+def test_overflow_diagnostic_omits_ring_knob_for_a_hand_authored_buffer(ascend_backend):
+    """A reserve_buffer that is NOT the automatic pipe ring still gets its bytes
+    attributed, but must not be pointed at pl.cross_core_slot — that knob cannot
+    shrink a buffer the author sized themselves.
+    """
+    message = _overflow_message(_overflowing_mat_program("my_scratch_buffer"))
+    assert "The first 524288 bytes of that space are reserved by system.reserve_buffer" in message
+    assert "cross-core pipe ring" not in message
+    assert "cross_core_slot" not in message
+
+
+def test_overflow_diagnostic_omits_ring_knob_on_a_pipe_name_collision(ascend_backend):
+    """`pl.reserve_buffer` takes an ARBITRARY name, so the pipe-ring test cannot be a
+    suffix match: a hand-authored "scratch_v2c_slot_buffer" ends in the pipe suffix
+    yet is not the ring, and pl.cross_core_slot cannot resize it. The expected name
+    is reconstructed exactly (BuildPipeBufferName of this function's kernel name),
+    so the collision is rejected.
+    """
+    message = _overflow_message(_overflowing_mat_program("scratch_v2c_slot_buffer"))
+    assert "The first 524288 bytes of that space are reserved by system.reserve_buffer" in message
+    assert "cross-core pipe ring" not in message
+    assert "cross_core_slot" not in message
+
+
+def test_overflow_diagnostic_omits_ring_note_for_an_unrelated_space(ascend_backend):
+    """The attribution is scoped to the space that actually pays for the buffer.
+
+    An AIC reserve_buffer reserves Mat only, so a Vec overflow in the same
+    function must NOT be blamed on it — otherwise the hint would send an author
+    to a knob that cannot move the number they were shown.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.AIC)
+        def kernel_aic(
+            self,
+            input_a: pl.Tensor[[64, 752], pl.FP32],
+            out_0: pl.Out[pl.Tensor[[64, 752], pl.FP32]],
+        ) -> pl.Tensor[[64, 752], pl.FP32]:
+            # Small Mat ring; the overflow is in Vec (192512 > 188416).
+            _ = pl.reserve_buffer(name="kernel_v2c_slot_buffer", size=4096)
+            tile_a: pl.Tile[[64, 752], pl.FP32] = pl.load(input_a, [0, 0], [64, 752])
+            result: pl.Tensor[[64, 752], pl.FP32] = pl.store(tile_a, [0, 0], out_0)
+            return result
+
+    message = _overflow_message(Before)
+    assert re.search(r"Vec buffer usage .* exceeds platform limit", message)
+    assert "reserved by system.reserve_buffer" not in message
 
 
 def test_allocate_memory_addr_uses_default_policy_without_backend():

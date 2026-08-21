@@ -12,6 +12,7 @@
 #include "pypto/ir/type_inference.h"
 
 #include <algorithm>
+#include <any>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -21,7 +22,9 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
+#include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/arith/analyzer.h"
 #include "pypto/ir/expr.h"
@@ -389,6 +392,82 @@ std::vector<ValidShapeBoundsError> ValidateValidShapeBounds(const std::vector<Ex
   return errors;
 }
 
+void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs,
+                            const std::string& op_name) {
+  auto shapes = As<MakeTuple>(args[4]);
+  CHECK(shapes) << "The operator " << op_name << " requires shapes to be a literal tuple, but got "
+                << args[4]->TypeName();
+  for (size_t i = 0; i < shapes->elements_.size(); ++i) {
+    CHECK(As<ConstInt>(shapes->elements_[i]))
+        << "The operator " << op_name << " requires shapes[" << i
+        << "] to be a compile-time constant (it sizes pto.subview, whose sizes is a static attribute), "
+           "but got a runtime value. Pass a dynamic row count through valid_shape instead — it keeps "
+           "the window (and so the tile allocation and box alignment) static while varying only the "
+           "transfer length.";
+  }
+  if (args.size() < 6) return;
+
+  auto valid = As<MakeTuple>(args[5]);
+  CHECK(valid) << "The operator " << op_name << " requires valid_shape to be a literal tuple, but got "
+               << args[5]->TypeName();
+  // Rank must be checked here, not left to ValidateValidShapeBounds: that helper
+  // reads an *empty* valid shape as "implicitly fully valid" and accepts it, which
+  // is right for a type's valid_shape but wrong for an explicit operand — an empty
+  // one would sail past deduction and trip an INTERNAL_CHECK in the backend.
+  CHECK(valid->elements_.size() == shapes->elements_.size())
+      << "The operator " << op_name << " requires valid_shape to have the same rank as shapes ("
+      << shapes->elements_.size() << "), but got rank " << valid->elements_.size();
+  // The bounds proofs below return "unknown" for a non-integer scalar rather than
+  // rejecting it, so a literal like [1.5, 128] would otherwise reach lowering as a
+  // fractional transfer extent.
+  for (size_t i = 0; i < valid->elements_.size(); ++i) {
+    auto dtype = ExtractDataType(valid->elements_[i]->GetType());
+    CHECK(dtype.has_value() && !dtype->IsFloat())
+        << "The operator " << op_name << " requires valid_shape[" << i
+        << "] to be an integer extent, but got "
+        << (dtype.has_value() ? dtype->ToString() : valid->elements_[i]->GetType()->TypeName());
+  }
+
+  bool transpose = false;
+  for (const auto& [k, v] : kwargs) {
+    if (k == "transpose") transpose = AnyCast<bool>(v, "transpose");
+  }
+  if (transpose) {
+    for (const auto& elem : valid->elements_) {
+      CHECK(As<ConstInt>(elem))
+          << "The operator " << op_name
+          << " does not support a dynamic valid_shape together with transpose=True (the DN2NZ per-row "
+             "path would need a runtime column extent on a boxed NZ tile). Use a static valid_shape "
+             "with transpose=True, or gather without transpose and read the operand with "
+             "matmul(b_trans=True).";
+    }
+  }
+
+  // Report every violation at once rather than only the first — the messages
+  // already carry the op name and dimension index.
+  const auto errors = ValidateValidShapeBounds(valid->elements_, shapes->elements_, op_name);
+  if (errors.empty()) return;
+  std::ostringstream msg;
+  for (size_t i = 0; i < errors.size(); ++i) {
+    if (i > 0) msg << "; ";
+    msg << errors[i].message;
+  }
+  throw ValueError(msg.str());
+}
+
+void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const std::string& op_name) {
+  if (args.size() <= index) return;
+  const auto& cond = args[index];
+  auto scalar_type = As<ScalarType>(cond->GetType());
+  CHECK(scalar_type) << "The operator " << op_name << " requires init_cond to be a boolean scalar, but got "
+                     << cond->GetType()->TypeName();
+  CHECK(scalar_type->dtype_ == DataType::BOOL)
+      << "The operator " << op_name << " requires init_cond to have dtype BOOL, but got "
+      << scalar_type->dtype_.ToString()
+      << ". Write a comparison such as `k == 0` rather than passing the index itself.";
+}
+
 void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
                                  const Span& span) {
   for (size_t i = 0; i < valid.size(); ++i) {
@@ -456,19 +535,6 @@ ExprPtr MinExtent(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span) {
   return FoldExtent(MakeMin(lhs, rhs, span));
 }
 
-/// `max(extent, 0)`, elided whenever the sign of the extent is already settled: a
-/// non-negative extent is its own clamp, and a non-positive one clamps to a literal
-/// zero rather than a `max` node that only ever evaluates to zero.
-ExprPtr ClampNonNegative(const ExprPtr& extent, const Span& span) {
-  if (ProveValidExtentLessEqual(IndexZero(), extent) == ProofResult::kTrue) {
-    return extent;
-  }
-  if (ProveValidExtentLessEqual(extent, IndexZero()) == ProofResult::kTrue) {
-    return IndexZero();
-  }
-  return FoldExtent(MakeMax(extent, IndexZero(), span));
-}
-
 /// The extent of dimension `i` that a read must keep inside its source.
 ///
 /// Under kExactWindow nothing trims the window, so all of it has to fit,
@@ -532,7 +598,8 @@ void CheckWindowReadDimBounds(const WindowReadValidShapeParams& p, size_t i) {
   // is the standing bounds invariant of the type this read produces. The request
   // is returned as the result whenever the source cannot be proven narrower, so
   // an oversized one would otherwise walk straight into the result type. Reject
-  // what we can disprove and trust the rest, as everywhere else here.
+  // what we can disprove and trust the rest, as everywhere else here. Operators
+  // that require stricter scalar-kind validation enforce it in their deducers.
   if (!p.requested_valid.empty()) {
     const ExprPtr& requested = p.requested_valid[i];
     CHECK_SPAN(ProveValidExtentLessEqual(requested, p.window[i]) != ProofResult::kFalse, p.span)
@@ -573,20 +640,30 @@ std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams&
 
     // available = clamp(source_valid - offset, 0, window).
     //
-    // When the source is fully valid and the read is non-clamping, the
-    // precondition checked above already gives window <= source_valid - offset,
-    // so the clamp is the window itself and no guard expression is built.
+    // When the source is fully valid and the read is non-clamping, proof-only
+    // callers may trust the precondition checked above and avoid building a
+    // guard expression. Runtime-intersection callers must retain a symbolic
+    // source bound: an unknown `window <= source_valid - offset` relation is
+    // accepted by the verifier, but the emitted read still has to stay in-bounds.
+    // Static source bounds keep the historical proof-only path so bounded
+    // dynamic offsets produced by collective schedules remain codegen-friendly.
     ExprPtr available;
-    if (source_fully_valid && !params.clamp) {
+    const bool source_bound_is_static = As<ConstInt>(src_valid) != nullptr;
+    if (source_fully_valid && !params.clamp &&
+        (!params.materialize_symbolic_intersection || source_bound_is_static)) {
       available = window;
     } else {
       CHECK_SPAN(IsIntegerScalarExpr(offset), params.span)
           << params.op_name << " offset " << i << " must be an integer scalar to narrow dimension " << i
           << " against a partial source, but got " << offset->GetType()->TypeName();
-      const ExprPtr remaining = ProveValidExtentEqual(offset, IndexZero()) == ProofResult::kTrue
-                                    ? src_valid
-                                    : FoldExtent(MakeSub(src_valid, offset, params.span));
-      available = MinExtent(ClampNonNegative(remaining, params.span), window, params.span);
+      // max(src_valid, offset) - offset is equivalent to
+      // max(src_valid - offset, 0), but cannot underflow when src_valid is a
+      // UINT64 symbolic extent smaller than the offset.
+      const ExprPtr remaining =
+          ProveValidExtentEqual(offset, IndexZero()) == ProofResult::kTrue
+              ? src_valid
+              : FoldExtent(MakeSub(MakeMax(src_valid, offset, params.span), offset, params.span));
+      available = MinExtent(remaining, window, params.span);
     }
 
     // result = min(requested, available).
@@ -594,29 +671,58 @@ std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams&
     // With no explicit request, the source's extent under the window *is* the
     // answer, guard expression and all.
     //
-    // With one, the request is narrowed to the source's extent only when that is
-    // provably the smaller of the two. An undecidable relation between them is
-    // taken on trust, exactly as the bounds obligation above is: the request is
-    // the caller's declared statement of what this read touches, and it is the
-    // only one of the two that the operator is sure it can name. A source valid
-    // extent is a *type-level* expression, and may legitimately mention a symbol
-    // that has no value in the reading function at all — a `pl.dynamic()` dim used
-    // in a parameter's `valid_shape` is bound at the call site, so a standalone
-    // (precompiled) kernel never receives it. Folding such a symbol into a runtime
-    // `min` would emit an operand that does not exist. Narrowing only on a proof
-    // keeps every real intersection — a partial source is still cut down to what it
-    // actually has — without inventing a guard over a name we cannot materialize.
+    // With one, proof-only callers narrow to the source's extent only when that
+    // is provably the smaller of the two. An undecidable relation is otherwise
+    // taken on trust because a source-valid type expression can mention a symbol
+    // that is not bound in the reading function. Callers that know those symbols
+    // are available at runtime may opt into materializing the exact min instead.
     if (params.requested_valid.empty()) {
       result.push_back(available);
       continue;
     }
     const ExprPtr& requested = params.requested_valid[i];
+    // Most window readers preserve the historical proof-only narrowing below:
+    // when ordering is unknown, keep the caller's requested extent. Remote
+    // loads opt into an exact runtime min because their partition must never
+    // include invalid peer-buffer elements.
+    if (params.materialize_symbolic_intersection) {
+      result.push_back(MinExtent(requested, available, params.span));
+      continue;
+    }
     const bool source_is_narrower = !AreExprsEqual(available, window) &&
                                     ProveValidExtentLessEqual(available, requested) == ProofResult::kTrue;
     result.push_back(source_is_narrower ? available : requested);
   }
 
   return result;
+}
+
+std::vector<ExprPtr> InferTensorSliceFullValidShape(const TensorType& source_type,
+                                                    const std::vector<ExprPtr>& full_shape,
+                                                    const std::vector<ExprPtr>& offsets,
+                                                    const std::vector<ExprPtr>& requested_valid, bool clamp,
+                                                    const Span& span) {
+  if (full_shape.size() == source_type.shape_.size() && offsets.size() == full_shape.size()) {
+    return InferWindowReadValidShape({
+        /*source_physical=*/source_type.shape_,
+        /*source_valid=*/GetEffectiveTensorValidShape(source_type),
+        /*offsets=*/offsets,
+        /*window=*/full_shape,
+        /*requested_valid=*/requested_valid,
+        /*kind=*/WindowReadKind::kClampedWindow,
+        /*clamp=*/clamp,
+        /*op_name=*/"tensor.slice",
+        /*bounds_remedy=*/
+        "Pass clamp=True -- pl.slice(x, shape, offset, clamp=True) -- to narrow the valid region to "
+        "the source edge instead",
+        /*span=*/span,
+    });
+  }
+
+  CHECK_SPAN(requested_valid.empty() || requested_valid.size() == full_shape.size(), span)
+      << "tensor.slice requires valid_shape to have the same rank as shape, but got valid_shape rank "
+      << requested_valid.size() << " and shape rank " << full_shape.size();
+  return requested_valid.empty() ? full_shape : requested_valid;
 }
 
 void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
@@ -634,6 +740,487 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
         << ", which is not provably 1. Rank reduction erases an axis, so the axis must be fully valid; "
            "keep the dimension instead of dropping it";
   }
+}
+
+namespace {
+
+// Whether two extents are provably the same. Constants decide by value first:
+// ProveValidExtentEqual only compares extents of matching signedness, so a
+// UINT64 valid extent (what tile.set_validshape emits) against an INDEX
+// physical extent comes back kUnknown even when both are the same literal.
+// Reading a full axis as partial that way rejects reshapes that map exactly --
+// the same signedness caveat IsProvablyEmptyExtent documents above.
+bool ExtentsProvablyEqual(const ExprPtr& lhs, const ExprPtr& rhs) {
+  const auto lhs_const = GetConstantDimension(lhs);
+  const auto rhs_const = GetConstantDimension(rhs);
+  if (lhs_const.has_value() && rhs_const.has_value()) {
+    return *lhs_const == *rhs_const;
+  }
+  return ProveValidExtentEqual(lhs, rhs) == ProofResult::kTrue;
+}
+
+// Align the input and target axes of a reshape that only inserts or erases
+// provably-full physical unit axes, returning the mapped valid shape.
+//
+// Such a reshape is a coordinate-only rank change -- rows stay rows, columns
+// stay columns -- so it preserves an arbitrary origin-anchored rectangle
+// exactly, which the flat-prefix rule below could not. Ambiguous runs of unit
+// axes are resolved by a small sequence alignment: matching equal axes is tried
+// first so a partial or empty unit axis is preserved rather than erased and
+// recreated as fully valid. An input unit axis may be erased only when its sole
+// coordinate is provably valid; an output unit axis is inserted fully valid.
+//
+// `failed` memoizes the states already proven unmappable, indexed
+// `input_dim * (out_rank + 1) + output_dim`. Without it the three moves make
+// this a backtracking search over monotone lattice paths -- Delannoy-many,
+// ~5.83^rank -- and the miss path is not rare: it is the ordinary fall-through
+// to the flat-prefix rule. Since the answer at a state depends only on that
+// state, caching failures bounds the walk at one visit per state.
+std::optional<std::vector<ExprPtr>> MapUnitAxisRankChange(const std::vector<ExprPtr>& src_valid,
+                                                          const std::vector<ExprPtr>& in_shape,
+                                                          const std::vector<ExprPtr>& new_shape,
+                                                          size_t input_dim, size_t output_dim,
+                                                          std::vector<char>* failed) {
+  const size_t state = input_dim * (new_shape.size() + 1) + output_dim;
+  INTERNAL_CHECK(state < failed->size())
+      << "Internal error: reshape unit-axis memo table is sized " << failed->size() << ", need > " << state;
+  if ((*failed)[state]) return std::nullopt;
+
+  if (input_dim == in_shape.size() && output_dim == new_shape.size()) {
+    return std::vector<ExprPtr>{};
+  }
+
+  // Match two axes carrying the same extent. Tried first so an axis that is
+  // only partially valid keeps its own extent instead of being erased and
+  // recreated as fully valid.
+  if (input_dim < in_shape.size() && output_dim < new_shape.size() &&
+      ProveValidExtentEqual(in_shape[input_dim], new_shape[output_dim]) == ProofResult::kTrue) {
+    if (auto tail =
+            MapUnitAxisRankChange(src_valid, in_shape, new_shape, input_dim + 1, output_dim + 1, failed)) {
+      tail->insert(tail->begin(), src_valid[input_dim]);
+      return tail;
+    }
+  }
+  // Erase an input unit axis -- lossless only when its sole coordinate is valid.
+  if (input_dim < in_shape.size() && IsConstValue(in_shape[input_dim], 1) &&
+      ExtentsProvablyEqual(src_valid[input_dim], in_shape[input_dim])) {
+    if (auto tail =
+            MapUnitAxisRankChange(src_valid, in_shape, new_shape, input_dim + 1, output_dim, failed)) {
+      return tail;
+    }
+  }
+  // Insert a target unit axis -- one coordinate, and it holds real data.
+  if (output_dim < new_shape.size() && IsConstValue(new_shape[output_dim], 1)) {
+    if (auto tail =
+            MapUnitAxisRankChange(src_valid, in_shape, new_shape, input_dim, output_dim + 1, failed)) {
+      tail->insert(tail->begin(), new_shape[output_dim]);
+      return tail;
+    }
+  }
+  (*failed)[state] = 1;
+  return std::nullopt;
+}
+
+}  // namespace
+
+std::vector<ExprPtr> ComputeReshapeValidShape(const std::vector<ExprPtr>& src_valid,
+                                              const std::vector<ExprPtr>& in_shape,
+                                              const std::vector<ExprPtr>& new_shape,
+                                              bool row_major_contiguous, const Span& span,
+                                              const std::string& op_name) {
+  INTERNAL_CHECK_SPAN(src_valid.size() == in_shape.size(), span)
+      << "Internal error: " << op_name << " source valid_shape rank (" << src_valid.size()
+      << ") must match the source shape rank (" << in_shape.size()
+      << "); callers resolve the valid shape through GetValidShape";
+  CHECK_SPAN(!src_valid.empty() && !new_shape.empty(), span)
+      << op_name << ": reshape validity mapping requires non-empty input and output ranks";
+
+  // (1) A fully valid source stays fully valid. Returning the target shape
+  // verbatim keeps an unpadded program byte-identical to what it deduced before
+  // this rule existed -- the type constructor canonicalizes the redundant full
+  // valid_shape away, so no view survives.
+  bool fully_valid = true;
+  for (size_t i = 0; i < src_valid.size(); ++i) {
+    if (!ExtentsProvablyEqual(src_valid[i], in_shape[i])) {
+      fully_valid = false;
+      break;
+    }
+  }
+  if (fully_valid) {
+    return new_shape;
+  }
+
+  // (2) The empty set stays empty under every reshape. This is settled before
+  // the prefix proof below because a box such as [1, 0, N] is not a flat prefix
+  // by that syntactic form, yet it denotes no cells and so has an exact
+  // representation in every target shape.
+  if (std::any_of(src_valid.begin(), src_valid.end(), IsProvablyEmptyExtent)) {
+    return std::vector<ExprPtr>(new_shape.size(), IndexZero());
+  }
+
+  // (3) A pure rank change over provably-full unit axes preserves an arbitrary
+  // rectangle, which the flat-prefix rule cannot see.
+  std::vector<char> unit_axis_failed((in_shape.size() + 1) * (new_shape.size() + 1), 0);
+  if (auto unit_mapped = MapUnitAxisRankChange(src_valid, in_shape, new_shape, 0, 0, &unit_axis_failed)) {
+    return *unit_mapped;
+  }
+
+  // (4) Otherwise the region has to occupy a contiguous flat prefix of the
+  // buffer, so that some rectangle of the target shape spans exactly the same
+  // cells. Everything below walks flat positions in row-major order, so a
+  // source stored any other way would be measured against the wrong offsets:
+  // a col_major [2, 3] valid [1, 3] really occupies flat {0, 2, 4}, and the
+  // row-major reading would hand back a box covering {0, 1, 2} -- marking two
+  // padding elements as real. Reject instead of guessing.
+  CHECK_SPAN(row_major_contiguous, span)
+      << op_name << ": cannot reshape " << FormatShape(in_shape) << " to " << FormatShape(new_shape)
+      << " because only part of it holds real data (valid_shape " << FormatShape(src_valid)
+      << ") and its elements are not stored row-major, so the real data does not occupy a contiguous "
+         "run that the new shape can describe. Reshape the full extent and narrow afterwards, or copy "
+         "the real data out first (pl.slice / pl.store).";
+
+  // Leading axes pinned to a single valid coordinate contribute nothing to the
+  // extent; the first remaining axis carries the prefix's one free extent, and
+  // every axis below it must be full.
+  const size_t input_rank = src_valid.size();
+  size_t free_dim = 0;
+  while (free_dim + 1 < input_rank && IsConstValue(src_valid[free_dim], 1)) {
+    ++free_dim;
+  }
+
+  for (size_t i = free_dim + 1; i < input_rank; ++i) {
+    const bool full_axis = ExtentsProvablyEqual(src_valid[i], in_shape[i]);
+    const ProofResult full = ProveValidExtentEqual(src_valid[i], in_shape[i]);
+    CHECK_SPAN(full_axis, span)
+        << op_name << ": cannot reshape " << FormatShape(in_shape) << " to " << FormatShape(new_shape)
+        << " because only part of it holds real data (valid_shape " << FormatShape(src_valid)
+        << "). Dimension " << i << " is valid for " << PythonPrint(src_valid[i]) << " of "
+        << PythonPrint(in_shape[i])
+        << (full == ProofResult::kUnknown ? " (a runtime extent that cannot be proven equal)" : "")
+        << ", so the real data is scattered across the buffer rather than filling it from the start, and "
+           "no region of the new shape describes the same cells. Reshape the full extent and narrow "
+           "afterwards, or copy the real data out first (pl.slice / pl.store).";
+  }
+
+  // The prefix is measured in elements, so every extent it spans has to be a
+  // compile-time constant.
+  int64_t trailing_volume = 1;
+  for (size_t i = free_dim + 1; i < input_rank; ++i) {
+    const auto extent = GetConstantDimension(in_shape[i]);
+    CHECK_SPAN(extent.has_value(), span)
+        << op_name << ": cannot reshape a partially-valid " << FormatShape(in_shape) << " because dimension "
+        << i << " has the runtime extent " << PythonPrint(in_shape[i]) << ". Mapping the real data into "
+        << FormatShape(new_shape)
+        << " needs its size at compile time; use a static shape, or reshape before narrowing.";
+    trailing_volume *= *extent;
+  }
+  std::vector<int64_t> target(new_shape.size());
+  for (size_t i = 0; i < new_shape.size(); ++i) {
+    const auto extent = GetConstantDimension(new_shape[i]);
+    CHECK_SPAN(extent.has_value(), span)
+        << op_name << ": cannot reshape a partially-valid " << FormatShape(in_shape) << " into "
+        << FormatShape(new_shape) << " because target dimension " << i << " has the runtime extent "
+        << PythonPrint(new_shape[i])
+        << ". Mapping the real data needs the target size at compile time; use a static shape, or "
+           "reshape before narrowing.";
+    target[i] = *extent;
+  }
+
+  // Row-major volume below each target axis: the number of elements one step
+  // along that axis advances by.
+  std::vector<int64_t> suffix(target.size(), 1);
+  for (size_t i = target.size(); i-- > 0;) {
+    suffix[i] = i + 1 < target.size() ? suffix[i + 1] * target[i + 1] : 1;
+  }
+
+  // The result box is full below its own free axis and pinned to one coordinate
+  // above it -- the target-shape spelling of "a flat prefix".
+  const ExprPtr pinned = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  auto build_box = [&](size_t output_free_dim, const ExprPtr& free_extent) {
+    std::vector<ExprPtr> output(new_shape.size());
+    for (size_t i = 0; i < new_shape.size(); ++i) {
+      if (i < output_free_dim) {
+        output[i] = pinned;
+      } else if (i == output_free_dim) {
+        output[i] = free_extent;
+      } else {
+        output[i] = new_shape[i];
+      }
+    }
+    return output;
+  };
+
+  const ExprPtr& free_valid = src_valid[free_dim];
+  if (const auto extent = GetConstantDimension(free_valid)) {
+    // A static prefix maps onto the outermost target axis whose suffix volume
+    // divides it -- the prefix is then a whole number of that axis's steps.
+    const int64_t prefix_elements = *extent * trailing_volume;
+    for (size_t i = 0; i < new_shape.size(); ++i) {
+      if (suffix[i] == 0 || prefix_elements % suffix[i] != 0) continue;
+      const int64_t output_extent = prefix_elements / suffix[i];
+      if (output_extent <= target[i]) {
+        return build_box(i, std::make_shared<ConstInt>(output_extent, DataType::INDEX, span));
+      }
+    }
+    CHECK_SPAN(false, span)
+        << op_name << ": cannot reshape " << FormatShape(in_shape) << " to " << FormatShape(new_shape)
+        << " because only " << prefix_elements << " of its "
+        << (prefix_elements == 1 ? "element" : "elements") << " hold real data (valid_shape "
+        << FormatShape(src_valid) << "), and no region of " << FormatShape(new_shape)
+        << " covers exactly those " << prefix_elements
+        << " elements -- they do not fill a whole number of rows there. Pick a target shape whose "
+           "trailing dimensions divide it, or copy the real data out first (pl.slice / pl.store).";
+  }
+
+  // A dynamic prefix cannot be divided, so it survives only on a target axis
+  // whose step is exactly the input's trailing volume: the free extent then
+  // carries over unchanged. That axis has to have room for the whole free
+  // dimension, which is knowable only if the free dimension is itself static --
+  // a requirement of this branch alone, not of the static one above.
+  const auto free_physical = GetConstantDimension(in_shape[free_dim]);
+  if (free_physical.has_value()) {
+    for (size_t i = 0; i < new_shape.size(); ++i) {
+      if (suffix[i] == trailing_volume && *free_physical <= target[i]) {
+        return build_box(i, free_valid);
+      }
+    }
+  }
+  CHECK_SPAN(false, span)
+      << op_name << ": cannot reshape " << FormatShape(in_shape) << " to " << FormatShape(new_shape)
+      << " because its real data extends a runtime number of rows (" << PythonPrint(free_valid)
+      << ") and no dimension of " << FormatShape(new_shape) << " has the matching row size of "
+      << trailing_volume
+      << " elements. Keep that dimension intact in the target shape, or copy the real data out first "
+         "(pl.slice / pl.store).";
+  return {};
+}
+
+// ============================================================================
+// Write valid-region unions (assemble / store)
+// ============================================================================
+
+namespace {
+
+/// Dual of `MinExtent`: the provably larger operand when the ordering is settled,
+/// and a folded `max` only when it is not.
+ExprPtr MaxExtent(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span) {
+  if (ProveValidExtentLessEqual(lhs, rhs) == ProofResult::kTrue) {
+    return rhs;
+  }
+  if (ProveValidExtentLessEqual(rhs, lhs) == ProofResult::kTrue) {
+    return lhs;
+  }
+  return FoldExtent(MakeMax(lhs, rhs, span));
+}
+
+/// Whether `valid` names the whole of `physical`, dimension by dimension.
+///
+/// Canonicalization stores redundant full validity as an absent view, so this is
+/// usually the identity `GetValidShape` returned; an explicit spelling that the
+/// analyzer can still settle is accepted too.
+bool IsFullyValid(const std::vector<ExprPtr>& valid, const std::vector<ExprPtr>& physical) {
+  for (size_t i = 0; i < valid.size(); ++i) {
+    if (!AreExprsEqual(valid[i], physical[i]) &&
+        ProveValidExtentEqual(valid[i], physical[i]) != ProofResult::kTrue) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Whether every offset is provably zero, i.e. the written region is itself
+/// origin-anchored and can stand alone as a valid shape.
+bool IsOriginAnchored(const std::vector<ExprPtr>& offsets) {
+  for (const auto& offset : offsets) {
+    if (!IsProvablyEmptyExtent(offset)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string FormatDimensionList(const std::vector<size_t>& dims) {
+  std::string out;
+  for (size_t i = 0; i < dims.size(); ++i) {
+    if (i != 0) {
+      out += i + 1 == dims.size() ? " and " : ", ";
+    }
+    out += std::to_string(dims[i]);
+  }
+  return out;
+}
+
+void CheckWriteUnionRanks(const WriteValidShapeUnionParams& p) {
+  const size_t rank = p.target_physical.size();
+  CHECK_SPAN(p.source_physical.size() == rank, p.span)
+      << p.op_name << " requires the source and the target to have the same rank, but got source rank "
+      << p.source_physical.size() << " " << FormatShape(p.source_physical) << " and target rank " << rank
+      << " " << FormatShape(p.target_physical);
+  CHECK_SPAN(p.offsets.size() == rank, p.span)
+      << p.op_name << " requires one offset per target dimension, but got " << p.offsets.size()
+      << " offsets for target rank " << rank;
+  CHECK_SPAN(p.target_valid.size() == rank, p.span)
+      << p.op_name << " target valid_shape rank " << p.target_valid.size()
+      << " does not match its shape rank " << rank;
+  CHECK_SPAN(p.source_valid.size() == rank, p.span)
+      << p.op_name << " source valid_shape rank " << p.source_valid.size()
+      << " does not match its shape rank " << rank;
+}
+
+/// The extent of dimension `i` the write must keep inside the target.
+///
+/// Under `kExactSubview` the whole physical source lands, so all of it has to fit,
+/// however small its valid region. Under `kValidRegionTransfer` only the valid
+/// region moves, so a larger physical source allocation is free.
+const ExprPtr& WriteReach(const WriteValidShapeUnionParams& p, size_t i) {
+  return p.kind == WriteBoundsKind::kExactSubview ? p.source_physical[i] : p.source_valid[i];
+}
+
+/// Enforce what a write promises about dimension `i` before its union is derived:
+/// it starts inside the target, and the extent it touches also ends inside it.
+///
+/// Provable violations reject; relations that stay symbolic are taken on trust,
+/// exactly as for a non-clamping window read, because that inequality is the
+/// operator's precondition rather than a guess.
+void CheckWriteDimBounds(const WriteValidShapeUnionParams& p, size_t i) {
+  const ExprPtr& offset = p.offsets[i];
+  const ExprPtr& target = p.target_physical[i];
+
+  CHECK_SPAN(ProveValidExtentLessEqual(IndexZero(), offset) != ProofResult::kFalse, p.span)
+      << p.op_name << " offset " << i << " is provably negative (" << PythonPrint(offset)
+      << "); a write must start inside its target";
+
+  const ExprPtr& reach = WriteReach(p, i);
+  if (IsIntegerScalarExpr(offset) && IsIntegerScalarExpr(reach) && IsIntegerScalarExpr(target)) {
+    const ExprPtr end = FoldExtent(MakeAdd(offset, reach, p.span));
+    CHECK_SPAN(ProveValidExtentLessEqual(end, target) != ProofResult::kFalse, p.span)
+        << p.op_name << " writes past the end of dimension " << i << ": offset " << PythonPrint(offset)
+        << " + extent " << PythonPrint(reach) << " exceeds the target extent " << PythonPrint(target)
+        << (p.bounds_remedy.empty() ? "" : ". ") << p.bounds_remedy;
+  }
+}
+
+/// The far edge `offset[i] + source_valid[i]` of the written region.
+ExprPtr WriteFarEdge(const WriteValidShapeUnionParams& p, size_t i) {
+  const ExprPtr& offset = p.offsets[i];
+  const ExprPtr& extent = p.source_valid[i];
+  if (IsProvablyEmptyExtent(offset)) {
+    return extent;
+  }
+  CHECK_SPAN(IsIntegerScalarExpr(offset) && IsIntegerScalarExpr(extent), p.span)
+      << p.op_name << " needs an integer scalar offset and valid extent to place dimension " << i
+      << " against a partially valid target, but got offset " << offset->GetType()->TypeName()
+      << " and extent " << extent->GetType()->TypeName();
+  return FoldExtent(MakeAdd(offset, extent, p.span));
+}
+
+}  // namespace
+
+std::vector<ExprPtr> InferWriteValidShapeUnion(const WriteValidShapeUnionParams& params) {
+  CheckWriteUnionRanks(params);
+  const size_t rank = params.target_physical.size();
+  for (size_t i = 0; i < rank; ++i) {
+    CheckWriteDimBounds(params, i);
+  }
+
+  const std::vector<ExprPtr>& target_valid = params.target_valid;
+  const std::vector<ExprPtr>& source_valid = params.source_valid;
+
+  // An empty written region leaves the target exactly as it was.
+  for (size_t i = 0; i < rank; ++i) {
+    if (IsProvablyEmptyExtent(source_valid[i])) {
+      return target_valid;
+    }
+  }
+
+  // An empty target holds nothing to union with, so the result is the written
+  // region alone — which is a valid shape only if it starts at the origin.
+  for (size_t i = 0; i < rank; ++i) {
+    if (IsProvablyEmptyExtent(target_valid[i])) {
+      CHECK_SPAN(IsOriginAnchored(params.offsets), params.span)
+          << params.op_name << " writes at offset " << FormatShape(params.offsets)
+          << " into a target whose valid region is empty (dimension " << i
+          << " has extent 0), which would leave a region that does not start at the origin. A valid "
+             "shape names one origin-anchored rectangle, so initialize an empty target at offset 0";
+      return source_valid;
+    }
+  }
+
+  // A fully valid target stays fully valid: the physical bounds asserted above
+  // are exactly the containment proof, including for the symbolic offsets that
+  // dominate real code, so this must not be re-derived from the weaker
+  // per-dimension proofs below.
+  if (IsFullyValid(target_valid, params.target_physical)) {
+    return target_valid;
+  }
+
+  // Dimensions the write may push past the target's valid region. Everything it
+  // cannot reach is already covered, so an empty set means the write lands inside.
+  std::vector<ExprPtr> far_edge;
+  std::vector<size_t> growing;
+  far_edge.reserve(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    far_edge.push_back(WriteFarEdge(params, i));
+    if (ProveValidExtentLessEqual(far_edge[i], target_valid[i]) != ProofResult::kTrue) {
+      growing.push_back(i);
+    }
+  }
+  if (growing.empty()) {
+    return target_valid;
+  }
+
+  // The written region swallows the target whole, and starts at the origin, so it
+  // stands alone. This is the multi-dimensional overwrite the single-axis rule
+  // below cannot express.
+  if (IsOriginAnchored(params.offsets)) {
+    bool covers_target = true;
+    for (size_t i = 0; i < rank && covers_target; ++i) {
+      covers_target = ProveValidExtentLessEqual(target_valid[i], source_valid[i]) == ProofResult::kTrue;
+    }
+    if (covers_target) {
+      return source_valid;
+    }
+  }
+
+  // Otherwise the only representable growth is along a single axis: the new slab
+  // must abut what is already there, and must span every other axis exactly, or
+  // the union is an L-shape that no valid shape can name.
+  CHECK_SPAN(growing.size() == 1, params.span)
+      << params.op_name << " grows the valid region along dimensions " << FormatDimensionList(growing)
+      << " at once, whose union with the target is an L-shape rather than one origin-anchored "
+         "rectangle. Target valid "
+      << FormatShape(target_valid) << ", writing " << FormatShape(source_valid) << " at offset "
+      << FormatShape(params.offsets);
+
+  const size_t axis = growing.front();
+  CHECK_SPAN(ProveValidExtentLessEqual(params.offsets[axis], target_valid[axis]) == ProofResult::kTrue,
+             params.span)
+      << params.op_name << " leaves a gap in dimension " << axis << ": the write starts at "
+      << PythonPrint(params.offsets[axis]) << ", which is not provably at or before the target valid extent "
+      << PythonPrint(target_valid[axis])
+      << ". A valid shape names one contiguous origin-anchored rectangle, so a write that grows it must "
+         "abut the region already there";
+
+  for (size_t i = 0; i < rank; ++i) {
+    if (i == axis) {
+      continue;
+    }
+    CHECK_SPAN(IsProvablyEmptyExtent(params.offsets[i]), params.span)
+        << params.op_name << " grows dimension " << axis << ", so it must span dimension " << i
+        << " from the origin, but it starts at " << PythonPrint(params.offsets[i])
+        << ". The added region would be narrower than the region it extends, making the union an L-shape";
+    CHECK_SPAN(ProveValidExtentEqual(source_valid[i], target_valid[i]) == ProofResult::kTrue, params.span)
+        << params.op_name << " grows dimension " << axis << ", so its extent in dimension " << i << " ("
+        << PythonPrint(source_valid[i]) << ") must provably equal the target valid extent ("
+        << PythonPrint(target_valid[i])
+        << "). The added region would otherwise not line up with the region it extends, making the union "
+           "an L-shape";
+  }
+
+  std::vector<ExprPtr> result = target_valid;
+  result[axis] = MinExtent(MaxExtent(target_valid[axis], far_edge[axis], params.span),
+                           params.target_physical[axis], params.span);
+  return result;
 }
 
 // ============================================================================

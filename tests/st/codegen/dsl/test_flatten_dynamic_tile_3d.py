@@ -7,20 +7,20 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""End-to-end (compile-pipeline) test for the issue #1578 scenario.
+"""End-to-end lowering test for the issue #1578 scenario.
 
 A 3D+ tensor with a *dynamic* dimension that flows into a tile shape inside an
 ``pl.at`` (InCore) scope yields a >2D tile with a dynamic extent, which cannot be
 flattened directly. The user handles it by **writing the chunk loop themselves**:
 they iterate the dynamic dimension with ``pl.range`` in a static ``CHUNK`` step
 and load each chunk as a static physical ``[1, CHUNK, 512]`` tile whose
-``valid_shapes`` carries the runtime tail ``min(CHUNK, s - c)``. The chunk size
+``valid_shape`` carries the runtime tail ``min(CHUNK, s - c)``. The chunk size
 is the user's choice (it strongly affects performance).
 
 ``FlattenTileNdTo2D`` then only needs to lower the per-chunk ``[1, CHUNK, 512]``
 tile to ``[CHUNK, 512]`` while **preserving the dynamic ``valid_shape``**
 (``ComputeMergedValidShape``) so the runtime tail survives. This test pins that
-the full ``@pl.jit`` pipeline compiles such a kernel.
+the full ``@pl.jit`` lowering pipeline accepts such a kernel.
 """
 
 # DSL function bodies are parsed as AST, not executed — suppress pyright errors
@@ -49,7 +49,7 @@ def cast_3d_dynamic(
 
     The user iterates the dynamic S dim in CHUNK steps and loads each chunk as a
     static ``[1, CHUNK, 512]`` tile, clamping the tail with
-    ``valid_shapes=[1, min(CHUNK, s - c), 512]`` so the last (partial) chunk does
+    ``valid_shape=[1, min(CHUNK, s - c), 512]`` so the last (partial) chunk does
     not read out of bounds.
     """
     b_dim = pl.tensor.dim(x, 0)
@@ -62,7 +62,7 @@ def cast_3d_dynamic(
             # (the LHS supplies the post-loop binding); bare pl.yield_ is rejected.
             for c, (o,) in pl.range(0, s_dim, CHUNK, init_values=(out,)):
                 valid = pl.min(CHUNK, s_dim - c)
-                t = pl.load(x, [b, c, 0], [1, CHUNK, 512], valid_shapes=[1, valid, 512])
+                t = pl.load(x, [b, c, 0], [1, CHUNK, 512], valid_shape=[1, valid, 512])
                 t = pl.cast(t, target_type=pl.FP32)
                 o = pl.store(t, [b, c, 0], o)
                 chunk_out = pl.yield_(o)  # noqa: F841 — parser requires the yield-LHS binding
@@ -70,12 +70,14 @@ def cast_3d_dynamic(
 
 
 class TestFlattenDynamicTile3D:
-    """Compile-pipeline guard for issue #1578."""
+    """Lowering-pipeline guard for issue #1578."""
 
-    def test_3d_dynamic_tile_now_compiles(self):
-        """A user-chunked dynamic >2D tile compiles end-to-end: flatten lowers the
-        static per-chunk tile to 2D while preserving the dynamic valid tail."""
-        cast_3d_dynamic._cache.clear()
+    def test_3d_dynamic_tile_now_lowers(self):
+        """A user-chunked dynamic >2D tile survives end-to-end lowering.
+
+        Flatten lowers the static per-chunk tile to 2D while preserving the
+        dynamic valid tail.
+        """
         # Concrete arg shapes only seed specialization; B_DYN/S_DYN stay symbolic,
         # so the [1, CHUNK, 512] tile keeps a dynamic valid extent at pass time.
         # S=40 with CHUNK=16 exercises multiple chunks plus a partial tail (16 + 16 + 8).
@@ -84,8 +86,8 @@ class TestFlattenDynamicTile3D:
 
         # Runs the full pass pipeline (no raise). Before the fix, FlattenTileNdTo2D
         # dropped the dynamic valid_shape when flattening the >2D per-chunk tile.
-        program = cast_3d_dynamic.compile_for_test(x, out)
-        assert program is not None, "compile_for_test returned None"
+        program = cast_3d_dynamic.lower(x, out)
+        assert program is not None, "lower returned None"
         # The kernel's InCore function survives the pipeline.
         names = [fn.name for fn in program.functions.values()]
         assert any("cast_3d_dynamic" in n or "inner" in n for n in names), (

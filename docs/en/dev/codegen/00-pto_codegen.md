@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -107,16 +107,16 @@ class MyKernel:
         tile_c = pl.add(tile_a, tile_b)
         pl.store(tile_c, [0, 0], a)
 
-# Compile with PTO backend and DebugTileOptimization (debug only)
+# Compile with PTO backend
 output_dir = compile(
     MyKernel,
-    strategy=OptimizationStrategy.DebugTileOptimization,
+    strategy=OptimizationStrategy.Default,
     backend_type=BackendType.Ascend910B,
 )
 ```
 
 The `compile()` function automatically applies the selected optimization strategy and invokes the appropriate codegen based on `backend_type`.
-Use `Default` for normal PTO compilation; `DebugTileOptimization` is intended only for pass-pipeline debugging.
+`Default` is the only optimization strategy.
 
 ### Direct Codegen Access
 
@@ -139,6 +139,7 @@ print(pto_code)
 | `tile.store(tile, [row, col], tensor)` | `pto.partition_view` + `pto.tstore` |
 | `tile.slice(tile, [h, w], [row, col][, valid_shape=...])` | `pto.subview` (zero-copy view; `valid [...]` clause emitted only when `valid_shape` is supplied) |
 | `tile.assemble(target, source, [row, col])` | (optional) `pto.tmov target -> dst` + `pto.subview dst[row, col] sizes [src.rows, src.cols]` + `pto.tmov src -> dst_view` |
+| `tile.set_validshape(tile, vr, vc)` | `pto.set_validshape`; a view operand is rejected (see below) |
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.add(a, b, c)` | `pto.taddc` (3-operand add) |
 | `tile.adds(tile, scalar)` | `pto.tadds` (tile + scalar) |
@@ -148,13 +149,13 @@ print(pto_code)
 through `pto.subview`, which is a pure view alias of the source tile (no
 data movement, no extra `pto.alloc_tile`).  `pto.subview` requires the
 result `tile_buf` to share `dtype`, `memory_space`, `blayout`, `slayout`,
-`fractal`, and `pad` with the source — `DeduceTileSliceType` propagates
-those four `TileView` fields from the source so the produced `TileType`
+`fractal`, `pad`, and `compact` with the source — `DeduceTileSliceType` propagates
+those five `TileView` fields from the source so the produced `TileType`
 satisfies the constraints by construction.  Backend codegen also runs a
 `CheckSubviewTileCompat` guard at lowering time:
 
 - Source and result must both carry an explicit `TileView`.
-- `dtype`, `blayout`, `slayout`, `fractal`, and `pad` must match exactly.
+- `dtype`, `blayout`, `slayout`, `fractal`, `pad`, and `compact` must match exactly.
 - `pad` must be `PadValue::null` — `pto.subview` is a view, not a fillpad,
   so use `tile.fillpad` on the slice result if zero/min/max padding is
   required.
@@ -164,6 +165,18 @@ when buffer reuse did not collapse `target` and the destination buffer; in
 that case it preserves any data outside the insertion window.  The
 trailing `pto.tmov src → dst_view` is the actual data write into the
 sub-window carved out by `pto.subview`.
+
+**`tile.set_validshape` lowering details.**  `pto.set_validshape` mutates the
+operand's `valid_row` / `valid_col` operands, so the operand must be a handle
+that has them: an alloc, an `scf.if` result, a cross-core pop slot.  A **view** —
+the `pto.subview` a `tile.slice` lowers to, or a `pto.treshape` — carries its
+valid extent in its own type instead, so ptoas rejects the op against one; PyPTO
+therefore rejects it first, with a message pointing at the slice.  View-ness is
+tracked at those emission sites rather than inferred from the rendered dims: a
+slice given a runtime `valid_shape` renders `v_row=?, v_col=?` exactly as an
+alloc-backed handle does.  To narrow a view, pass `valid_shape=` to the slice
+(it lands in `pto.subview`'s `valid [...]` clause and accepts runtime extents),
+or call `set_validshape` on the source tile before taking the view.
 
 ### Cross-Core Operations → PTO Instructions
 
@@ -180,7 +193,7 @@ sub-window carved out by `pto.subview`.
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | Reserve buffer (`auto = true`, `base` omitted under `memory_planner=PTOAS`) |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | Cross-core all-participant barrier (hard/FFTS form) |
-| `system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview, %scratch, %used : !pto.partition_tensor_view<...xi32>, !pto.tile_buf<loc=vec, ...i32>, i32) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<aiv_only>` | Soft/GM-polling barrier (partial occupancy; `gm_workspace` lowers to a `pto.partition_view`, scratch tile is compiler-synthesized) |
+| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview[, %used] : !pto.partition_tensor_view<...xi32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Current PTO-ISA soft/GM-polling barrier (partial occupancy; at least 64-byte GM workspace; explicit `N=0` derives the count from device launch registers and omits `%used`) |
 
 **Notes:**
 
@@ -188,17 +201,46 @@ sub-window carved out by `pto.subview`.
 - `id` is optional. When omitted, PTOAS defaults to frontend pipe id `0`. Use explicit ids only when authoring multiple independent frontend pipes; automatic bidirectional mixed-kernel setup keeps a single `dir_mask = 3` pipe.
 - If the pushed tile was allocated with dynamic `valid_row` / `valid_col` operands or updated by
   `tile.set_validshape`, `tpush` emits the same tile handle after its runtime valid shape has been
-  updated. For split `tpush`, codegen temporarily uses a full non-split transport dimension (`cols`
-  for up/down, `rows` for left/right), then restores the producer tile's logical valid shape;
-  consumer-side dynamic tpop operands carry the logical extents used by compute and store.
-- When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store.
-- For split consumers, `SplitVectorKernel` localizes those dynamic tpop
+  updated. For split `tpush`, codegen temporarily uses the full physical transport box, then restores
+  the producer tile's logical valid shape.
+- `split` is pto-isa's `TileSplitAxis`, printed verbatim. `0` = no split, `1` / `2` = up-down /
+  left-right, and `3` / `4` = the same two axes over an **odd** extent:
+
+  | Code | pto-isa | Lane 0 | Lane 1 | Lane 1's band starts at |
+  | ---- | ------- | ------ | ------ | ----------------------- |
+  | 0 | `TILE_NO_SPLIT` | whole tile | (single reader) | — |
+  | 1 / 2 | `TILE_UP_DOWN` / `TILE_LEFT_RIGHT` | `e0` | `e1` | `e1 * pitch` |
+  | 3 / 4 | `TILE_UP_DOWN_ODD` / `TILE_LEFT_RIGHT_ODD` | `e0` | `e1` | `(e1 + 1) * pitch` |
+
+  `eL` is lane `L`'s **runtime** valid extent on the split axis — the ISA reads it off the popped
+  tile (`popVecTileFromGMFiFo`), so the even codes require `e0 == e1` and the odd ones
+  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/20-lower_auto_vector_split.md) materializes those
+  extents and [ExpandMixedKernel](../passes/21-expand_mixed_kernel.md) picks the matching code.
+- The Cube-to-Vector FIFO carries a compacted rectangle: the producer stores its `valid_row` x
+  `valid_col` block at a `valid_col` row pitch, and each consumer lane reads its band back with the
+  same pitch (`gmStrideR = valid_col`, doubled for the left-right codes). A partial valid shape on
+  one side of the transport and not the other therefore mis-strides the pop — silent corruption of
+  the *valid* region, since the ISA's matching assertion is compiled out in release builds. So a
+  partial Acc-to-Vec transfer uses the full physical box for both TPUSH and TPOP, whether the
+  transfer is no-split or split, and restores the logical valid shape immediately on each side of the
+  transport — on the consumer side through a metadata-only `pto.treshape` (a frontend tpop result is
+  not a locally bound PTOAS tile, so `pto.set_validshape` cannot restore it in place). The split-axis
+  extent is the exception: it stays per-lane on the TPOP operands, because that is what tells the ISA
+  where lane 1's band begins.
+- When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The full-box Cube-to-Vector transport above overrides this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
+- For split consumers, `LowerAutoVectorSplit` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes
-  `[8, 16]` then `[0, 16]` under up/down split of a `[16, 16]` tile).
+  `[8, 16]` then `[0, 16]` under up/down split of a `[16, 16]` tile). An odd
+  split axis reaches the operands the same way — a `[17, 128]` tile pops
+  `[9, 128]` on lane 0 and `[8, 128]` on lane 1 under `split = 3`.
 - `system.tfree_*` derives `split` from its tile argument, so the frontend must free the exact SSA value produced by `tile.tpop_*`, even though the PTO instruction itself does not take the tile as an explicit operand
 - `ExpandMixedKernel` now auto-generates consumer-side `system.tfree_*` after split-generated `tile.tpop_*`, preserving `tpop -> direct users -> tfree -> next tpop`
 - `reserve_buffer` and `import_reserved_buffer` return `i32` SSA values; `initialize_pipe` references them as operands
-- Under `memory_planner=PYPTO`, `AllocateMemoryAddr` resolves `reserve_buffer(base=AUTO)` before PTO emission, so PTO emits `auto = false, base = <value>`. Under `memory_planner=PTOAS` that pass is skipped, so PTO emits `auto = true` with `base` omitted (ptoas rejects both attributes together) and ptoas `PlanMemory` places the reserved region
+- Under `memory_planner=PYPTO` or `DSA_RP`, `AllocateMemoryAddr` resolves
+  `reserve_buffer(base=AUTO)` before PTO emission, so PTO emits
+  `auto = false, base = <value>`. Under `memory_planner=PTOAS` that pass is
+  skipped, so PTO emits `auto = true` with `base` omitted (ptoas rejects both
+  attributes together) and ptoas `PlanMemory` places the reserved region
 - `reserve_buffer` location is `mat` for AIC functions, `vec` for AIV/InCore functions
 - `import_reserved_buffer` uses MLIR symbol syntax (`@func_name`) for `peer_func`
 - Buffer name and peer_func strings are validated by `CheckSafeIdentifier` (alphanumeric + underscore only)
@@ -285,27 +327,80 @@ Based on TileType variables collected from the function body. Each tile variable
 #### Who plans memory: `compile(memory_planner=...)`
 
 Who assigns the physical `addr` is selected by the `memory_planner` option
-(`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | PTOAS)`, default
-`PYPTO`). It threads to both the pass pipeline (via `PassContext`) and codegen:
+(`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | DSA_RP | PTOAS)`,
+default `PYPTO`). It threads to both the pass pipeline (via `PassContext`) and
+codegen:
 
 | Mode | Pipeline | `pto.alloc_tile` | `pto.reserve_buffer` | ptoas |
 | ---- | -------- | ---------------- | -------------------- | ----- |
 | `PYPTO` (default) | runs `MaterializeSemanticAliases` + `MemoryReuse` + `AllocateMemoryAddr` | emits `addr = <const>` (from `MemRef.byte_offset_`) | `auto = false, base = <const>` | `--pto-level=level3` (trusts baked addresses) |
+| `DSA_RP` | runs `MaterializeSemanticAliases` + `AllocateMemoryAddr`; skips `MemoryReuse` | emits the in-process canonical-greedy DSA-RP `addr = <const>` | `auto = false, base = <const>` | `--pto-level=level3` (trusts baked addresses) |
 | `PTOAS` | runs `MaterializeSemanticAliases`; **skips** `MemoryReuse` + `AllocateMemoryAddr` | omits `addr` (`PTOCodegen.generate(emit_tile_addr=False)`) | `auto = true` (no `base`) | `--pto-level=level2` (ptoas `PlanMemory` does reuse + addresses) |
 
 Memory planning is split into two passes: **`MaterializeSemanticAliases`**
 forces *semantics-required* aliasing (loop-carried accumulators, in-place ops)
 to share one MemRef, while **`MemoryReuse`** does *opportunistic* lifetime-based
-coalescing of independent buffers. `InitMemRef` + `MaterializeSemanticAliases`
-run in both modes, so the must-alias buffers survive; in `PTOAS` mode codegen
-renders those shared MemRefs as a single `tile_buf` handle with an in-place
-`outs(%acc)`, and ptoas `PlanMemory` (which `level2` requires, rejecting any
-`addr` operand) does the lifetime reuse and address assignment.
+coalescing of independent buffers for `PYPTO`. `DSA_RP` skips that coalescing
+and places the independent identities under capacity and reuse penalties in
+`AllocateMemoryAddr`. `InitMemRef` + `MaterializeSemanticAliases` run in all
+three modes, so must-alias buffers survive. In `PTOAS` mode, ptoas `PlanMemory`
+(which `level2` requires, rejecting any `addr` operand) performs lifetime reuse
+and address assignment.
 
 > **Caveat:** `PTOAS` mode skips the Ascend910B `load + tpop_from_aic` in-place
 > hazard guard (part of `MemoryReuse`) and reserve-buffer base resolution
 > (`AllocateMemoryAddr`); those are deferred to ptoas. `compile()` emits a
 > warning — verify affected kernels on-device.
+
+#### Multi-slot declarations become one ptoas region (`PTOAS` mode)
+
+A declared multi-slot allocation (`pl.MemRef(slots=N)`, see
+[Python syntax](../language/00-python_syntax.md#slots)) is not lowered to N
+`alloc_tile`s. It maps onto ptoas's own multi-buffer pair, one region declared in
+the function head and one slot selection per use:
+
+```mlir
+%l0c_mb = pto.alloc_multi_tile valid_row = %c64_index valid_col = %c64_index
+        : !pto.multi_tile_buf<!pto.tile_buf<loc=vec, dtype=f32, rows=64, cols=64, ...>, count=2>
+scf.for %i = %c0_index to %c4_index step %c1_index {
+  %0 = arith.remsi %i, %c2_index : index
+  %t = pto.multi_tile_get %l0c_mb[%0]
+     : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<loc=vec, ...>
+  ...
+}
+```
+
+Two properties matter:
+
+- **No `addr`.** ptoas `PlanMemory` places the region and is forbidden to merge
+  its slots, which is what carries the author's separation into `level2`.
+- **The operand is the slot index, not the byte offset** `InitMemRef` derived from
+  it. ptoas matches the index's affine form (`i % 2`) to decide which accesses can
+  share a slot, and that is what earns the rotation per-slot (dynamic) event ids —
+  iteration *i*'s load overlapping iteration *i-1*'s compute.
+
+`PlanMultiBufferRegions` decides eligibility before the body walk; a shape ptoas
+cannot describe (slots holding differently shaped tiles, slots declaring
+different valid shapes, two slots live at once inside a loop, a space other than
+Vec / Mat / Acc, a runtime valid shape, a slot carried out of an `if` or loop as
+a phi, a count outside ptoas's `[2, 16]`) is a `ValueError` naming the shape,
+because falling back to per-slot `alloc_tile` would let ptoas plan the slots on
+top of each other.
+
+**One slot per iteration.** The co-live rejection is not a shape ptoas fails to
+*type* — it is one it fails to *synchronize*. ptoas 0.54 derives the per-slot WAR
+guard only for the first `multi_tile_get` of an iteration; given two, the second
+load is emitted with no `wait_flag`, so the next iteration overwrites that slot
+while the current one still reads it. Measured wrong on device, so codegen refuses
+the shape and points at the PyPTO planner, whose baked addresses and PyPTO-emitted
+sync handle it. Straight-line code is unaffected — with no loop there is no
+cross-iteration reuse to guard. Filed as
+[PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118); lifting the
+restriction is one condition in `PlanMultiBufferRegions`.
+
+Under `PYPTO` no region is emitted at all: at `--pto-level=level3` ptoas does not
+fold its per-slot address fan-out, so the region form would lose the slot analysis
+it exists for ([PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)).
 
 ### Load Operation Transformation
 
@@ -378,6 +473,41 @@ pto.tmul ins(%tile_a_buf : !pto.tile_buf<...>,
 - Result variable's MemRef determines output tile_buf
 - Input operands resolved through variable name lookup
 - All `ins`/`outs` clauses include type annotations
+
+### Source Locations (`loc`)
+
+Every emitted **operation** carries a trailing MLIR location built from the IR
+`Span`, e.g. `pto.tadd ins(...) outs(...) loc("kernels/attn.py":41:9)`. ptoas
+propagates `loc()` verbatim into its diagnostics, so a verifier rejection names
+the user's `.py` line instead of a line in the generated `.pto` — a file that,
+under `@pl.jit`, the user never sees (spans there are already remapped from the
+synthesized `<jit:name>` text back to the real source).
+
+**Which span is used** — bound at two levels, the second refining the first:
+
+| Level | Bound in | Source |
+| ----- | -------- | ------ |
+| Statement (primary) | `PTOCodegen::VisitStmt` | `Stmt::span_` |
+| Call (refinement) | `PTOCodegen::VisitExpr_(CallPtr)` | `Call::span_`, only when nested inside the statement span |
+
+The containment test is what makes this correct. `Call::span_` is
+column-accurate when preserved, but passes that synthesize tile ops
+(`ConvertTensorToTileOps`) rebuild the `Call` carrying the enclosing
+*function*'s span while leaving the `AssignStmt`'s own span intact. Such a span
+begins before the statement, fails containment, and is discarded in favour of
+the statement span — otherwise most operations would report the `def` line.
+
+**No location is emitted for**: region braces, separators and block labels
+(`loc(...)` is legal only at the end of a complete operation, so these use
+`EmitStructural()` rather than `Emit()`); `arith.constant` in the constants
+section (deduplicated across uses, so no single span fits); and nodes whose span
+is unknown or has no filename.
+
+**Disabling** — `Generate(program, emit_tile_addr, emit_source_loc)`,
+`compile(..., emit_source_loc=...)`, or `PYPTO_EMIT_PTO_LOC=0`. The output is
+then byte-identical to the location-free form; this is the escape hatch for a
+ptoas build whose parser rejects a trailing location, since ptoas ships
+independently of PyPTO.
 
 ## Complete Example
 
@@ -520,7 +650,8 @@ The codegen:
 
 ### Tile Buffer Attributes
 
-Generated `alloc_tile` operations derive dtype and dimensions from TileType metadata, and layout/fractal/pad from the associated TileView (when available):
+Generated `alloc_tile` operations derive dtype and dimensions from TileType metadata, and
+layout/fractal/pad/compact mode from the associated TileView (when available):
 
 ```mlir
 !pto.tile_buf<
@@ -532,8 +663,9 @@ Generated `alloc_tile` operations derive dtype and dimensions from TileType meta
   v_col=32,            // Virtual column size (= cols)
   blayout=row_major,   // Block layout (from TileView, default: row_major)
   slayout=none_box,    // Scatter layout (from TileView, default: none_box)
-  fractal=512,         // Fractal size (from TileView, default: 512)
-  pad=0                // Pad mode as int (from TileView, default: 0/null)
+  fractal=512,         // Fractal size in bytes, not elements (from TileView, default: 512)
+  pad=0,               // Pad mode as int (from TileView, default: 0/null)
+  compact=1            // Optional compact mode (normal=1; omitted for null=0)
 >
 ```
 
@@ -545,8 +677,31 @@ Generated `alloc_tile` operations derive dtype and dimensions from TileType meta
 | `slayout` | `TileView::slayout` | `none_box`, `row_major`, `col_major` | `none_box` |
 | `fractal` | `TileView::fractal` | uint64 | `512` |
 | `pad` | `TileView::pad` | `null(0)`, `zero(1)`, `max(2)`, `min(3)` | `null(0)` |
+| `compact` | `TileView::compact` | `null(0)`, `normal(1)` | `null(0)` |
 
 When no TileView is associated with the MemRef, the codegen falls back to the default values listed above.
+The `compact` attribute is omitted for its null default. Two paths set `normal(1)` automatically:
+
+- A partial `tile.extract` into L0A/L0B, so TEXTRACT transfers only the logical `valid_shape` instead
+  of treating box-alignment padding as data.
+- An **Acc (L0C) tile whose valid rows are not provably equal to its physical rows**, as produced by the
+  `tile.matmul`, `tile.matmul_bias`, and `tile.matmul_mx` deducers. `mad` always lays the product out
+  with an N-fractal stride of `ceil(validRow/16)*16` taken from the *lhs* valid rows, while every Acc
+  reader derives its stride from the compile-time physical `Rows` unless the tile is compact. Without
+  the flag a runtime-narrowed accumulator is read back at a different pitch than it was written at.
+  Only the **row** extent decides this — every Acc stride the ISA derives is a function of `validRow`
+  alone, so a narrowed column extent keeps the non-compact form.
+
+  Compact is stamped **only where the accumulator's layout is established**, never re-derived on an
+  alias of it. `tile.matmul_acc` (and `matmul_mx_acc`) *inherit* the accumulator operand's mode,
+  because the op reuses that operand's buffer in place and codegen aliases the two only when their
+  full tile config matches. `tile.set_validshape` likewise inherits: it is metadata-only and may run
+  *after* the buffer was written, so the pitch its readers must use is the one `mad` already wrote at
+  — deriving a new one from the narrowed rows would re-interpret bytes that were never repacked.
+
+Note that the Acc → L1 readers (`TExtractAccToMat`, `TMovCcToCb`) have no `CompactMode` branch in
+PTO-ISA on either a2a3 or a5, so a runtime-narrowed accumulator consumed by `tile.extract` /
+`tile.move` into L1 still reads at the physical `Rows` pitch. That gap needs a matching PTO-ISA change.
 
 ## Kernel Wrapper Generation (PTO Backend)
 
@@ -570,6 +725,8 @@ When the program contains an Orchestration function, the PTO backend generates t
 ```text
 output_dir/
 ├── passes_dump/                     # IR after each pass
+├── ptoas_passes/                    # Optional ptoas IR after each pass
+│   └── <kernel-or-group>/            # ptoas/MLIR-managed dump tree
 ├── ptoas/                           # Intermediates
 │   ├── <func_name>.pto              # MLIR from PTOCodegen
 │   └── <func_name>.cpp              # C++ from ptoas
@@ -580,6 +737,9 @@ output_dir/
 └── kernel_config.py                 # Runtime/orchestration/kernel config
 ```
 
+`ptoas_passes/` is emitted only when `ir.compile(...,
+dump_ptoas_passes=True)` or `RunConfig(dump_ptoas_passes=True)` is used.
+
 The orchestration codegen generates identical orchestration C++ code using the PTO2 runtime API (`rt_submit_task`, `make_tensor_external`, etc.).
 
 ### Runtime configuration (`kernel_config.py`)
@@ -588,9 +748,25 @@ The orchestration codegen generates identical orchestration C++ code using the P
 
 | Key | When emitted | Notes |
 | --- | ------------ | ----- |
-| `runtime` | Always | Currently `"tensormap_and_ringbuffer"` — the runtime requires 4 AICPU threads (3 schedulers + 1 orchestrator on thread 3). |
-| `aicpu_thread_num` | Always (`4`) | Dictated by the chosen runtime. |
-| `block_dim` | Only when `compile(..., block_dim=N)` is set | Number of logical SPMD blocks to dispatch. Omitted by default; the simpler runtime then applies its own default and validates it against device capacity — over-capacity values raise a clear error (`max_block_dim=...`) instead of hanging. Pass `compile(block_dim=...)` or `RunConfig(block_dim=...)` (per-invocation override) when targeting devices whose usable core count is below the runtime default. |
+| `runtime` | Always | `"tensormap_and_ringbuffer"` (default) or `"host_build_graph"` — the wire name of the `RuntimeKind` selected by `ir.compile(runtime=...)`, or by wrapping the call in `PassContext([], runtime=...)`. |
+| `aicpu_thread_num` | Always (`0`) | `0` selects the runtime's architecture default (a2a3: 4; a5: 5); callers may explicitly override it. |
+
+The runtime is carried by `PassContext` as an `ir::RuntimeKind`, not by a
+codegen-only argument, so passes that must legalize IR for a specific runtime
+switch on `PassContext::GetRuntime()` rather than comparing strings. It is an
+enum rather than a name because the set is closed — one enumerator per
+implementation under `runtime/src/<arch>/runtime/` — so a typo is a compile
+error instead of a value that surfaces much later as an opaque CCEC error about
+a nonexistent include directory.
+
+The wire name crosses the ABI boundary in exactly one place each way:
+`ir::RuntimeKindToName` when writing `kernel_config.py`, and
+`ir::RuntimeKindFromName` when reading one back. Both are re-exported to Python
+as `passes.runtime_kind_to_name` / `passes.runtime_kind_from_name`.
+
+The runtime is also part of the `@pl.jit` cache key, so a `host_build_graph`
+call cannot reuse an artifact compiled for `tensormap_and_ringbuffer`, whose
+`kernel_config.py` names a runtime no matching worker would bind.
 
 ### Argument Unpacking
 
@@ -598,7 +774,7 @@ The wrapper unpacks `int64_t* args` following the standard convention:
 
 | Parameter Type | Unpacking Pattern |
 | -------------- | ----------------- |
-| `TensorType` | `Tensor*` → `buffer.addr` → typed pointer |
+| `TensorType` | `ChipTensor*` → `buffer.addr` → typed pointer |
 | `ScalarType` | `uint64_t` → union decode → typed value |
 
 ### SPMD Identity Parameters

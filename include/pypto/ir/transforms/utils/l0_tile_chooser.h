@@ -70,12 +70,46 @@ struct L0TileConfig {
   int align_n = 16;
   int align_k = 16;
 
+  // Physical row alignment of one L0C accumulator allocation. This is
+  // deliberately separate from align_m: align_m constrains legal cube work
+  // shapes, while l0c_align_m accounts for rows that occupy SRAM outside the
+  // logical/valid M extent. Ascend910B's INT8 -> INT32 path, for example,
+  // charges M=16 as 32 physical accumulator rows.
+  int l0c_align_m = 16;
+
+  // Physical boxing applied to the logical output window before it enters
+  // L0A/L0B/L0C. Most callers leave these at 1 because their tile shape is
+  // already physical. A caller that materializes a boundary window in a
+  // boxed Mat layout must provide the layout's row/column granularity so the
+  // chooser charges the same padded operand/result shapes that lowering will
+  // allocate. L0C applies l0c_align_m after box_align_m.
+  int box_align_m = 1;
+  int box_align_n = 1;
+
+  // Optional caller-imposed upper bound on the logical N tile extent. Zero
+  // means unbounded. AutoTileMatmulL0 uses this for auxiliary L0 resources
+  // whose footprint depends only on N, notably the architectural bias table
+  // used by tile.matmul_bias. This is a capacity constraint, not a cost-model
+  // coefficient.
+  int max_n = 0;
+
+  // Optional tighter N bound for a full-K output-grid candidate whose N axis
+  // is the moving axis of the emitted pipeline. This models an N-dependent
+  // auxiliary resource that is stage-replicated in that schedule. Zero means
+  // no additional bound. A/B/output stationarity remain in one exhaustive
+  // search: candidates that hold N in the sequential outer loop keep max_n.
+  int max_n_pipelined = 0;
+
+  // Optional bound for the same N-dependent resource when its definition is
+  // nested under two pipeline levels. Zero means no additional bound. This is
+  // normally tighter than max_n_pipelined because stage replication composes.
+  int max_n_nested_pipelined = 0;
+
   // --- Realizable mask -----------------------------------------------------
   // The chooser scores the design space (stationarity x dbC), but only EMITS
-  // design points whose pass lowering exists. These gates select the realizable
-  // subset; they all default to today's mask -- output-stationary, single L0C --
-  // so a caller that sets nothing gets the algorithm the pass realizes now. Each
-  // new lowering flips one gate; the cost model is untouched. Operand
+  // design points whose caller can lower. These gates select the realizable
+  // subset; they default to the conservative output-stationary, single-L0C
+  // baseline. Callers open the gates for the schedules they implement. Operand
   // double-buffer depths (dbA, dbB) are NOT gates: they are derived from the
   // chosen stationarity (moving operand -> 2, stationary -> 1).
 
@@ -93,9 +127,11 @@ struct L0TileConfig {
   // true, C traffic doubles in the cost estimate.
   bool c_read = false;
 
-  // Closed-form cost-model parameters (filled from
+  // Cost-model parameters (filled from
   // BackendHandler::GetL0CostModel). Bandwidths are in BYTES PER CYCLE so the
-  // chooser scores wall-clock directly: wall ~= max(C_load, C_mad) + C_drain.
+  // chooser scores wall-clock directly: an exposed drain uses
+  // max(C_load, C_mad) + C_drain; dbC=2 overlaps the drain and includes one
+  // fill/drain bubble.
   // Defaults are Ascend a2a3 (910B) for the common BF16 x BF16 -> FP32 GEMM, so
   // standalone callers (tests) get a sane model without wiring a backend.
   double bw_a = 129.7;                // L1->L0A bytes/cycle (on-device MTE1 sweep, R^2 0.993).
@@ -179,7 +215,7 @@ struct L0TileResult {
   // outer). This is the SAME bandwidth-weighted decision the wall cost is scored
   // under (LoadCycles' min-hoist), recorded here so the emit obeys the scored
   // hoist by construction rather than re-deriving it from raw byte traffic (the
-  // ~200:132 L0A:L0B ratio makes "fewest bytes" and "fewest cycles" disagree).
+  // ~130:85 L0A:L0B ratio makes "fewest bytes" and "fewest cycles" disagree).
   // Only meaningful for output-stationary k == K; A/B-stationary force the loop
   // order from `stationarity`, and split-K (k < K) uses a different emitter.
   bool os_holds_a = true;
@@ -187,9 +223,9 @@ struct L0TileResult {
   // Whether the chooser chose to double-buffer L0C (two accumulators ping-ponged
   // to overlap the FIXPIPE drain). True only when allow_double_buffer_c was set,
   // the single-L0C optimum already tiles the output (a full [M, N, K] tile that
-  // fits one L0C is left untiled instead), the tile forms a >= 2x2 output grid,
-  // reduces K in one pass (k == K), and the double-buffered wall was strictly
-  // lower.
+  // fits one L0C is left untiled instead), the moving inner loop has at least two
+  // full interior tiles, K reduces in one pass (k == K), and the double-buffered
+  // wall was strictly lower. The stationary outer axis may have one tile.
   //
   // NOTE: the caller must REALIZE this with a genuine two-accumulator schedule
   // (two co-live L0C buffers). A full-K emitter that threads the output as a
@@ -209,18 +245,23 @@ struct L0TileResult {
  *
  * Scores the roofline cost model (see DESIGN_SPACE.md in the pto-isa cost-model
  * study) over the design space and returns the minimum-wall design point
- *   P = (m, n, k, stationarity, dbA, dbB, dbC),
+ *   P = (m, n, k, stationarity, dbC),
  * where dbA / dbB are derived from `stationarity` (moving operand -> depth 2,
  * stationary -> depth 1) and prefetch depth is fixed at <= 2 (no multistage).
  * A "realizable mask" (the allow_* gates) restricts which points may be emitted;
- * it defaults to today's realizable subset {output-stationary, dbC = 1}, so a
- * caller that opens no gate gets exactly the algorithm the pass realizes now.
+ * it defaults to the conservative subset {output-stationary, dbC = 1}.
  *
  *   1. Enumerate the allowed (stationarity, dbC) combinations. For each, derive
  *      the operand depths and L0 budgets:
  *        A0 = L0A/(bytes_a*dbA), B0 = L0B/(bytes_b*dbB), C0 = L0C/(bytes_c*dbC).
- *   2. Enumerate every legal aligned (m, n) with m*n <= C0, and for each (m, n)
- *      every legal aligned k (m*k <= A0, n*k <= B0, k >= min_k; k | K when neither
+ *   2. Enumerate every legal aligned (m, n) with
+ *      AlignUp(AlignUp(m, box_align_m), l0c_align_m) *
+ *      AlignUp(n, box_align_n) <= C0 and n <= max_n when max_n > 0. A full-K
+ *      output-grid candidate additionally obeys max_n_pipelined when its
+ *      N-dependent resource is under one pipeline level, and
+ *      max_n_nested_pipelined when under two. For each (m, n),
+ *      every legal aligned k (AlignUp(m, box_align_m)*k <= A0,
+ *      AlignUp(n, box_align_n)*k <= B0, k >= min_k; k | K when neither
  *      padding nor k_boundary; plus k == K when the full K fits one block). ALL k
  *      are scored -- ceil(K/k)*ceil(k/kt) is non-monotone in k when kt != align_k,
  *      so the largest legal k is not always wall-optimal.
@@ -242,16 +283,22 @@ struct L0TileResult {
  *          OS split-K: ba*M*K*ceil(N/n)/BW_A + bb*K*N*ceil(M/m)/BW_B  (both re-streamed)
  *          A-stat    : ba*M*K/BW_A           + bb*K*N*ceil(M/m)/BW_B   (k==K, held-A)
  *          B-stat    : ba*M*K*ceil(N/n)/BW_A + bb*K*N/BW_B             (k==K, held-B)
- *        wall   = max(C_load, C_mad) + C_drain        (dbC == 1, drain exposed)
- *               = max(C_load, C_mad, C_drain)         (dbC == 2, drain hidden)
+ *        compute = max(C_load, C_mad)
+ *        wall    = compute + C_drain                         (dbC == 1)
+ *                = max(compute, C_drain)
+ *                  + min(compute, C_drain)/T                 (dbC == 2)
+ *          where T = ceil(M/m)*ceil(N/n); the second term is the one-tile
+ *          pipeline fill/drain bubble.
  *      with kt = mad_k_fractal_bytes/bytes_a, cpr = bytes_a/2. Ties break by lex
  *      (padded_compute, ceil(K/k), C_load, -m*n, -k) -- the C_load key picks the
  *      lower-hidden-load aspect among MAD-bound (m,n)<->(n,m) ties.
  *   4. Pick the global minimum-wall point across all enumerated combinations.
  *      A-stationary / B-stationary require k == K (operand residency). dbC = 2
- *      additionally requires a >= 2x2 grid, k == K, and that the single-L0C
- *      optimum already tiles. The
- *      (m, n) grid is bounded by m*n <= C0 and the operand caps, k by K/align_k:
+ *      additionally requires at least two full tiles on the moving inner axis,
+ *      k == K, and that the single-L0C optimum already tiles. The (m, n) grid
+ *      is bounded by
+ *      AlignUp(AlignUp(m, box_align_m), l0c_align_m) *
+ *      AlignUp(n, box_align_n) <= C0 and the boxed operand caps, k by K/align_k:
  *      O((C0/align^2) * (K/align_k)) per matmul -- a hardware constant, independent
  *      of IR size; the chooser runs once per matmul op, so the pass stays linear
  *      in the IR.

@@ -18,10 +18,14 @@ This aligns MemRef objects consistently: if two tiles share a MemRef in
 
 import pypto.language as pl
 import pytest
-from pypto import DataType, backend, ir, passes
+from pypto import DataType, InternalError, backend, ir, passes, testing
 from pypto.backend import BackendType
 from pypto.ir.op import tile
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+
+# Tile-producing reads from GM. Built through the getter so a renamed operator fails at import
+# rather than silently dropping out of the membership test below.
+_LOAD_LIKE_OPS = frozenset({ir.get_op("tile.load").name, ir.get_op("tile.read").name})
 
 
 def _run_pipeline(program: ir.Program) -> ir.Program:
@@ -33,6 +37,24 @@ def _run_pipeline(program: ir.Program) -> ir.Program:
     tests exercise the same combined transformation.
     """
     return passes.memory_reuse()(passes.materialize_semantic_aliases()(passes.init_mem_ref()(program)))
+
+
+def _collect_allocated_tile_ranges(program: ir.Program) -> dict[str, tuple[int, int]]:
+    """Collect constant addressed Tile MemRefs from a transformed program."""
+    ranges: dict[str, tuple[int, int]] = {}
+    function = next(iter(program.functions.values()))
+
+    class _RangeCollector(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):  # type: ignore[override]
+            tile_type = stmt.var.type
+            if isinstance(tile_type, ir.TileType) and tile_type.memref is not None:
+                offset = tile_type.memref.byte_offset_
+                assert isinstance(offset, ir.ConstInt)
+                ranges[stmt.var.name_hint] = (offset.value, tile_type.memref.size_)
+            super().visit_assign_stmt(stmt)
+
+    _RangeCollector().visit_stmt(function.body)
+    return ranges
 
 
 class TestBasic:
@@ -480,7 +502,7 @@ class TestFillpad:
                 output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 padded: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.fillpad(
                     tile_a, pad_value=pl.PadValue.max
@@ -535,14 +557,14 @@ class TestFillpad:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 padded_max: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.fillpad(
                     tile_a, pad_value=pl.PadValue.max
                 )
                 _res_a: pl.Tensor[[64, 64], pl.FP32] = pl.store(padded_max, [0, 0], output_a)
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 padded_min: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.fillpad(
                     tile_b, pad_value=pl.PadValue.min
@@ -615,14 +637,14 @@ class TestFillpad:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 padded_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.fillpad(
                     tile_a, pad_value=pl.PadValue.max
                 )
                 _res_a: pl.Tensor[[64, 64], pl.FP32] = pl.store(padded_a, [0, 0], output_a)
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 padded_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.fillpad(
                     tile_b, pad_value=pl.PadValue.max
@@ -704,11 +726,11 @@ class TestValidShapeDivergence:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 _res_a: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_a, [0, 0], output_a)
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[32, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[32, 64]
                 )
                 result: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_b, [0, 0], output_b)
                 return result
@@ -761,11 +783,11 @@ class TestValidShapeDivergence:
                 output_b: pl.Out[pl.Tensor[[4, 64, 64], pl.FP32]],
             ) -> pl.Tensor[[4, 64, 64], pl.FP32]:
                 tile_a: pl.Tile[[4, 64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0, 0], [4, 64, 64], valid_shapes=[4, 48, 64]
+                    input_a, [0, 0, 0], [4, 64, 64], valid_shape=[4, 48, 64]
                 )
                 _res_a: pl.Tensor[[4, 64, 64], pl.FP32] = pl.store(tile_a, [0, 0, 0], output_a)
                 tile_b: pl.Tile[[4, 64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0, 0], [4, 64, 64], valid_shapes=[4, 32, 64]
+                    input_a, [0, 0, 0], [4, 64, 64], valid_shape=[4, 32, 64]
                 )
                 result: pl.Tensor[[4, 64, 64], pl.FP32] = pl.store(tile_b, [0, 0, 0], output_b)
                 return result
@@ -810,7 +832,7 @@ class TestValidShapeDivergence:
                 output_b: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    input_a, [0, 0], [64, 64], valid_shapes=[48, 64]
+                    input_a, [0, 0], [64, 64], valid_shape=[48, 64]
                 )
                 _res_a: pl.Tensor[[64, 64], pl.FP32] = pl.store(tile_a, [0, 0], output_a)
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_a, [0, 0], [64, 64])
@@ -868,6 +890,45 @@ def _collect_tile_memref_bases(program: ir.Program) -> dict[str, str]:
     visitor = _Collector()
     visitor.visit_stmt(main_func.body)
     return result
+
+
+def _divergent_acc_phi_program() -> ir.Program:
+    """A divergent Acc if-phi: ``then`` yields the pre-if seed ``pre``, ``else``
+    accumulates in place into ``prev``.
+
+    The accumulator coalescer must decline this shape (``pre`` runs
+    unconditionally, so retargeting it onto ``prev`` would clobber the
+    accumulator), leaving a divergent Acc carry that YieldFixup must reject.
+    Shared by the tests that assert each half of that contract.
+    """
+
+    @pl.program
+    class Before:
+        @pl.function
+        def main(
+            self,
+            lhs: pl.Tensor[[16, 64], pl.BF16],
+            rhs: pl.Tensor[[64, 64], pl.BF16],
+            cond: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+        ) -> pl.Tensor[[16, 64], pl.FP32]:
+            sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat
+            )
+            sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat
+            )
+            prev: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)  # the accumulator
+            pre: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)  # pre-if seed
+            if cond < 1:
+                phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(pre)
+            else:
+                acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(prev, sa, sb)
+                phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(acc)
+            result: pl.Tensor[[16, 64], pl.FP32] = pl.store(phi, [0, 0], out)
+            return result
+
+    return Before
 
 
 class TestViewOps:
@@ -1296,6 +1357,37 @@ class TestInplaceOps:
 
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_move_output_must_not_alias_input(self):
+        """tile.move's output must get a buffer distinct from its input.
+
+        The TMOV intrinsic cannot execute with src == dst. ``tile.move`` is
+        registered ``.not_inplace_safe()`` so MemoryReuse cannot colocate its
+        output with the input; baked-address codegen rejects any explicit alias
+        that bypasses memory planning.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.FP32],
+                output: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                tile_a: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_a, [0, 0], [32, 32])
+                tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemorySpace.Vec] = pl.move(
+                    tile_a, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tensor[[32, 32], pl.FP32] = pl.store(tile_b, [0, 0], output)
+                return result
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        assert bases["tile_b"] != bases["tile_a"], (
+            "move output must not reuse its input's buffer (tile.move is not in-place safe); "
+            f"both bound to {bases['tile_a']}"
+        )
 
     def test_inplace_unsafe_op_allows_non_producer_consumer_reuse(self):
         """tile.recip output must never share a buffer with its input.
@@ -1891,6 +1983,17 @@ class TestYieldFixup:
 
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_divergent_acc_phi_rejects_acc_to_acc_move(self):
+        """YieldFixup must not manufacture an unsupported Acc-to-Acc copy.
+
+        The divergent phi cannot be safely coalesced because one seed is
+        produced before the branch. Reject it before codegen rather than emit a
+        type-correct ``tile.move`` that PTOAS cannot lower for distinct L0C
+        buffers.
+        """
+        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+            _run_pipeline(_divergent_acc_phi_program())
 
 
 class TestControlFlow:
@@ -2651,6 +2754,71 @@ class TestTopDownRetargeter:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_padded_acc_initializer_preserves_valid_shape_and_coalesces(self):
+        """A ``set_validshape`` Acc initializer stays on the loop accumulator allocation.
+
+        AutoTile uses this form for box-padded M/N boundary tiles. MemoryReuse
+        must retarget the underlying physical initializer along with its view;
+        otherwise YieldFixup needs a second Acc buffer or an unsupported
+        Acc-to-Acc move. The logical 16x16 valid region must survive that
+        storage rewrite inside the physical 32x32 tile.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 32], pl.BF16],
+                rhs: pl.Tensor[[32, 16], pl.BF16],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [32, 32], [16, 32], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [32, 32], [32, 16], target_memory=pl.Mem.Mat)
+                lhs_left = pl.tile.move(lhs_mat, target_memory=pl.Mem.Left)
+                rhs_right = pl.tile.move(rhs_mat, target_memory=pl.Mem.Right)
+                init_storage = pl.tile.create([32, 32], dtype=pl.FP32, target_memory=pl.Mem.Acc)
+                init = pl.tile.set_validshape(init_storage, 16, 16)
+                for _k, (acc,) in pl.range(0, 2, init_values=(init,)):
+                    acc_next = pl.tile.matmul_acc(acc, lhs_left, rhs_right)
+                    loop_out = pl.yield_(acc_next)
+                return pl.tile.store(loop_out, [0, 0], output)
+
+        after = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(after)
+        acc_names = ("init_storage", "init", "acc_next")
+        assert all(name in bases for name in acc_names), f"missing accumulator definitions: {bases}"
+        assert len({bases[name] for name in acc_names}) == 1, (
+            f"padded initializer and accumulator must share one allocation: {bases}"
+        )
+
+        tile_types: dict[str, ir.TileType] = {}
+
+        class _TypeCollector(ir.IRVisitor):
+            def visit_assign_stmt(self, stmt):  # type: ignore[override]
+                if isinstance(stmt.var.type, ir.TileType):
+                    tile_types[stmt.var.name_hint] = stmt.var.type
+                super().visit_assign_stmt(stmt)
+
+            def visit_for_stmt(self, stmt):  # type: ignore[override]
+                for var in stmt.return_vars:
+                    if isinstance(var.type, ir.TileType):
+                        tile_types[var.name_hint] = var.type
+                super().visit_for_stmt(stmt)
+
+        collector = _TypeCollector()
+        main = after.get_function("main")
+        assert main is not None
+        collector.visit_stmt(main.body)
+        loop_out_type = tile_types["loop_out"]
+        assert loop_out_type.memref is not None
+        assert loop_out_type.memref.base_.name_hint == bases["init"]
+        for name in ("init", "acc_next", "loop_out"):
+            tile_type = tile_types[name]
+            assert tile_type.shape == [32, 32]
+            valid_shape = tile_type.get_effective_tile_view().valid_shape
+            assert [dim.value for dim in valid_shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+
     def test_pipelined_kloop_accumulator_coalesces_to_one_acc_buffer(self):
         """A stage-2 pipelined K-loop matmul (as AutoTileMatmulL0 emits) whose
         L0C accumulator is large (176x176x4 = 121KB, fp32). After
@@ -2710,26 +2878,43 @@ class TestTopDownRetargeter:
                 result: pl.Tensor[[176, 176], pl.FP32] = pl.store(c, [0, 0], out)
                 return result
 
+        def assert_coalesced(after: ir.Program, planner: str) -> None:
+            # The whole accumulator chain must coalesce onto ONE Acc allocation. A
+            # phantom acc->acc tile.move (failed coalescing) leaves a 2nd Acc base.
+            acc_bases = {b for b in _collect_tile_memref_bases(after).values() if "acc" in b}
+            assert len(acc_bases) == 1, (
+                f"{planner}: expected ONE Acc allocation (accumulator coalesced), "
+                f"got {len(acc_bases)}: {sorted(acc_bases)}\n{ir.python_print(after)}"
+            )
+            # Self-documenting: an in-place accumulator kernel needs no tile.move; a
+            # surviving one here would be the illegal Acc->Acc copy.
+            assert "tile.move" not in ir.python_print(after), (
+                f"{planner}: expected no tile.move in a coalesced accumulator chain:\n"
+                f"{ir.python_print(after)}"
+            )
+
         # BASIC verification: the coalescing fix makes the peeled IR round-trip
         # clean, so this exercises the legality check, not just the buffer count.
         with passes.PassContext([], passes.VerificationLevel.BASIC):
-            After = passes.memory_reuse()(
+            legacy_after = passes.memory_reuse()(
                 passes.materialize_semantic_aliases()(
                     passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
                 )
             )
-        # The whole accumulator chain must coalesce onto ONE Acc allocation. A
-        # phantom acc->acc tile.move (failed coalescing) leaves a 2nd Acc base.
-        acc_bases = {b for b in _collect_tile_memref_bases(After).values() if "acc" in b}
-        assert len(acc_bases) == 1, (
-            f"expected ONE Acc allocation (accumulator coalesced), got {len(acc_bases)}: "
-            f"{sorted(acc_bases)}\n{ir.python_print(After)}"
-        )
-        # Self-documenting: an in-place accumulator kernel needs no tile.move; a
-        # surviving one here would be the illegal Acc->Acc copy.
-        assert "tile.move" not in ir.python_print(After), (
-            f"expected no tile.move in a coalesced accumulator chain:\n{ir.python_print(After)}"
-        )
+        assert_coalesced(legacy_after, "PYPTO")
+
+        # DSA-RP skips MemoryReuse, so MaterializeSemanticAliases itself must run
+        # the same accumulator coalescing -> yield fixup -> identity-copy
+        # normalization sequence before lifetime analysis.
+        with passes.PassContext(
+            [],
+            passes.VerificationLevel.BASIC,
+            memory_planner=passes.MemoryPlanner.DSA_RP,
+        ):
+            dsa_after = passes.materialize_semantic_aliases()(
+                passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
+            )
+        assert_coalesced(dsa_after, "DSA_RP")
 
     def test_accumulator_if_phi_seed_retargets_to_accumulator_buffer(self):
         """Structural before/after for CoalesceAccumulatorIfPhis on a minimal
@@ -2878,43 +3063,11 @@ class TestTopDownRetargeter:
         the coalescer must skip this phi (leaving it to YieldFixup) and keep
         ``pre`` and ``prev`` on distinct buffers.
         """
-
-        @pl.program
-        class Before:
-            @pl.function
-            def main(
-                self,
-                lhs: pl.Tensor[[16, 64], pl.BF16],
-                rhs: pl.Tensor[[64, 64], pl.BF16],
-                cond: pl.Scalar[pl.INDEX],
-                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
-            ) -> pl.Tensor[[16, 64], pl.FP32]:
-                sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    lhs, [0, 0], [16, 64], target_memory=pl.Mem.Mat
-                )
-                sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
-                    rhs, [0, 0], [64, 64], target_memory=pl.Mem.Mat
-                )
-                prev: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)  # the accumulator
-                pre: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)  # pre-if seed
-                if cond < 1:
-                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(pre)
-                else:
-                    acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(prev, sa, sb)
-                    phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(acc)
-                result: pl.Tensor[[16, 64], pl.FP32] = pl.store(phi, [0, 0], out)
-                return result
-
-        # Verification off: the un-coalesced divergent Acc phi is the documented
-        # out-of-scope case (YieldFixup emits its usual move); we only assert the
-        # safety property — the pre-if seed was NOT retargeted onto the accumulator.
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            After = _run_pipeline(Before)
-        bases = _collect_tile_memref_bases(After)
-        assert bases["pre"] != bases["prev"], (
-            f"pre-if seed must not be coalesced onto the accumulator buffer (clobber): "
-            f"pre={bases.get('pre')} prev={bases.get('prev')}\n{ir.python_print(After)}"
-        )
+        # Branch-locality correctly prevents unsafe coalescing. Because Acc->Acc
+        # tile.move is unsupported, YieldFixup must then fail loudly instead of
+        # emitting invalid IR for this unlowerable control-flow shape.
+        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+            _run_pipeline(_divergent_acc_phi_program())
 
     def test_seed_branch_write_only_clobber_blocks_acc_coalesce(self):
         """Safety gate for the accumulator-if-phi coalescer's branch-tail
@@ -2935,9 +3088,8 @@ class TestTopDownRetargeter:
         ``memory_reuse`` alone: the clobbering alias is a specific buffer layout
         that only surfaces after allocation, so it cannot be expressed through the
         high-level ``init_mem_ref`` path (which hands every tile a distinct base).
-        Verification off: the declined phi is reconciled by YieldFixup's usual
-        (legal, distinct-buffer) move — we assert only the safety property, that
-        ``seed`` was NOT retargeted onto the accumulator buffer.
+        The required safety decline leaves divergent Acc buffers. Because no
+        legal Acc->Acc move exists, YieldFixup must reject this unlowerable shape.
         """
 
         @pl.program
@@ -2991,14 +3143,8 @@ class TestTopDownRetargeter:
                 )
                 return result
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            After = passes.memory_reuse()(Before)
-        bases = _collect_tile_memref_bases(After)
-        assert bases["seed"] != bases["prev"], (
-            f"seed must not be coalesced onto the accumulator buffer when a later write-only op "
-            f"clobbers it in the branch tail: seed={bases.get('seed')} prev={bases.get('prev')}\n"
-            f"{ir.python_print(After)}"
-        )
+        with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
+            passes.memory_reuse()(Before)
 
     def test_retargeter_declines_when_target_still_live(self):
         """Safety check: if target's base is read after the candidate
@@ -3574,19 +3720,16 @@ class TestL0CrossShapeReuse:
         )
 
 
-class TestStorageLayoutReuseGate:
-    """Vec ND↔NZ tiles must not share a MemRef; other layout diffs may.
+class TestStorageLayoutReuse:
+    """Disjoint tiles may reuse storage across TileView representations.
 
-    A5 V→C inserts an ND→NZ ``*_nz`` adapt before tpush (NZ: col_major blayout).
-    Colocating that NZ tile with the ND source at one Vec address makes even a
-    kept ``pto.tmov`` an in-place layout rewrite that silently mis-transfers.
-    Gate only Vec ND↔NZ — same-family fractal quirks and non-Vec spaces stay
-    eligible for reuse (#1788).
+    The tile.move ``not_inplace_safe`` constraint precisely separates a move
+    from its source. Unrelated ND and NZ values therefore need no global layout
+    gate and remain eligible for ordinary lifetime-based reuse.
     """
 
-    def test_nd_and_nz_vec_tiles_do_not_reuse(self):
-        """Disjoint-lifetime ND and NZ Vec tiles of equal size keep separate buffers."""
-
+    @staticmethod
+    def _build_nd_nz_program() -> ir.Program:
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
@@ -3613,12 +3756,31 @@ class TestStorageLayoutReuseGate:
                 result: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_nz, [0, 0], out_nz)
                 return result
 
+        return Before
+
+    def test_nd_and_nz_vec_tiles_can_reuse(self):
+        """Disjoint-lifetime ND and NZ Vec tiles of equal size share a buffer."""
+
+        Before = self._build_nd_nz_program()
         After = _run_pipeline(Before)
         bases = _collect_tile_memref_bases(After)
         assert "tile_nd" in bases and "tile_nz" in bases, f"missing tiles in {bases}"
-        assert bases["tile_nd"] != bases["tile_nz"], (
-            f"ND and NZ Vec tiles must not share a MemRef; both bound to {bases['tile_nd']}"
+        assert bases["tile_nd"] == bases["tile_nz"], (
+            "unrelated ND and NZ Vec tiles should share a lifetime-compatible MemRef; "
+            f"got {bases['tile_nd']} vs {bases['tile_nz']}"
         )
+
+    def test_dsa_rp_nd_and_nz_vec_tiles_have_no_layout_separation(self, ascend_backend):
+        """DSA-RP does not add a hard edge solely for ND/NZ representations."""
+
+        Before = self._build_nd_nz_program()
+        initialized = passes.init_mem_ref()(Before)
+        function = next(iter(initialized.functions.values()))
+        edges = {
+            (edge["first_name"], edge["second_name"], edge["cost"])
+            for edge in testing.recognize_dsa_reuse_penalties(function)
+        }
+        assert ("tile_nd", "tile_nz", 1) in edges
 
     def test_same_nz_family_different_fractal_vec_tiles_can_reuse(self):
         """Same NZ family (col_major) with fractal-only difference may coalesce."""
@@ -3748,6 +3910,27 @@ class TestAscend910BLoadTpopHazard:
             f"(load+tpop_from_aic hazard), but both bind to {bases['down_prev']}"
         )
 
+    def test_dsa_rp_ascend910b_split_aiv_physically_separates_load_buffer(self):
+        """DSA-RP exports the load+tpop target hazard as an unrelaxable edge."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+                after = passes.allocate_memory_addr()(
+                    passes.materialize_semantic_aliases()(passes.init_mem_ref()(self._build_program()))
+                )
+        finally:
+            backend.reset_for_testing()
+
+        ranges = _collect_allocated_tile_ranges(after)
+        previous_offset, previous_size = ranges["down_prev"]
+        next_offset, next_size = ranges["down_next"]
+        assert previous_offset + previous_size <= next_offset or next_offset + next_size <= previous_offset, (
+            "Ascend910B split-AIV: DSA-RP must physically separate tile.add output "
+            f"{ranges['down_next']} from load buffer {ranges['down_prev']}"
+        )
+
     def test_ascend950_allows_load_buffer_reuse(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend950)
@@ -3813,6 +3996,113 @@ class TestForbidOutputAlias:
         assert bases["dst"] != bases["tmp"], (
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_sels_output_may_reuse_dead_tmp(self, backend_type):
+        """TSELS consumes tmp before dst writes on A2/A3; A5 leaves tmp unread."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                keep_src_live: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(src, dst)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(keep_src_live, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["tmp"]
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["mask"]
+
+    def test_prelu_output_does_not_alias_any_input(self):
+        """A2/A3 TPRELU reads src, slope, and tmp while writing dst."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_in: pl.Tensor[[16, 16], pl.FP32],
+                slope_in: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(src_in, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(slope_in, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [17, 32])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.prelu(src, slope, tmp)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "slope", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["slope"]
+        assert bases["dst"] != bases["tmp"]
+
+    def test_a5_prelu_output_may_reuse_dead_tmp(self):
+        """A5 retains unread TPRELU tmp, so dst may reuse it while src/slope stay live."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_in: pl.Tensor[[16, 16], pl.FP32],
+                slope_in: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(src_in, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(slope_in, [0, 0], [16, 16])
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.prelu(src, slope, tmp)
+                live_inputs: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(src, slope)
+                result: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(dst, live_inputs)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "slope", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["tmp"]
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["slope"]
 
     def test_row_sum_output_does_not_alias_input_or_tmp(self):
         """A row reduction output must not share a buffer with its input or tmp.
@@ -4082,7 +4372,7 @@ class TestPipelineStageSeparation:
                 var_type = stmt.var.type
                 if isinstance(var_type, ir.TileType) and var_type.memref is not None:
                     val = stmt.value
-                    is_load = isinstance(val, ir.Call) and val.op.name in ("tile.load", "tile.read")
+                    is_load = isinstance(val, ir.Call) and val.op.name in _LOAD_LIKE_OPS
                     defs.append((is_load, var_type.memref.base_.name_hint))
                 super().visit_assign_stmt(stmt)
 
@@ -4206,6 +4496,35 @@ class TestCapacityGatedReuse:
         return bases
 
     @staticmethod
+    def _collect_offsets(program: ir.Program, names: tuple[str, ...]) -> dict[str, int]:
+        """Concrete byte offsets of named tiles after DSA-RP writeback."""
+        func = program.get_function("kernel")
+        assert func is not None
+        offsets: dict[str, int] = {}
+
+        def visit(stmt: ir.Stmt) -> None:
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint in names:
+                tile = stmt.var.type
+                assert isinstance(tile, ir.TileType) and tile.memref is not None
+                offset = tile.memref.byte_offset_
+                assert isinstance(offset, ir.ConstInt)
+                offsets[stmt.var.name_hint] = offset.value
+            if isinstance(stmt, ir.SeqStmts):
+                for child in stmt.stmts:
+                    visit(child)
+            elif isinstance(stmt, ir.IfStmt):
+                visit(stmt.then_body)
+                if stmt.else_body is not None:
+                    visit(stmt.else_body)
+            elif isinstance(stmt, (ir.ForStmt, ir.WhileStmt)):
+                visit(stmt.body)
+
+        visit(func.body)
+        missing = [name for name in names if name not in offsets]
+        assert not missing, f"operands {missing} not found in After IR: {list(offsets)}"
+        return offsets
+
+    @staticmethod
     def _two_stage_matmuls(
         a_shape: tuple[int, int] = (32, 32), b_shape: tuple[int, int] = (32, 32)
     ) -> ir.Program:
@@ -4310,6 +4629,42 @@ class TestCapacityGatedReuse:
         assert "shrink the per-stage tile" in text, (
             f"an operand-too-large shed must give the byte-threshold fix, got: {text!r}"
         )
+
+    def test_dsa_rp_keeps_affordable_pipeline_stages_separate(self, tmp_path):
+        """The strict DSA-RP solve preserves pipeline intent when it fits."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._two_stage_matmuls()
+
+        with passes.PassContext(
+            [passes.ReportInstrument(str(tmp_path))],
+            memory_planner=passes.MemoryPlanner.DSA_RP,
+        ):
+            After = passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
+
+        offsets = self._collect_offsets(After, ("r0", "r1"))
+        assert offsets["r0"] != offsets["r1"]
+        log = tmp_path / "perf_hints.log"
+        assert not log.exists() or "PH-DSA-001" not in log.read_text()
+
+    def test_dsa_rp_relaxes_pipeline_only_after_strict_no_fit(self, tmp_path):
+        """A capacity-forced pipeline reuse emits PH-DSA-001 after actual overlap."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._two_stage_matmuls(a_shape=(16, 128), b_shape=(128, 192))
+
+        with passes.PassContext(
+            [passes.ReportInstrument(str(tmp_path))],
+            memory_planner=passes.MemoryPlanner.DSA_RP,
+        ):
+            After = passes.allocate_memory_addr()(passes.init_mem_ref()(Before))
+
+        offsets = self._collect_offsets(After, ("r0", "r1"))
+        assert offsets["r0"] == offsets["r1"]
+        text = (tmp_path / "perf_hints.log").read_text()
+        assert "PH-DSA-001" in text
+        assert "1 of 1 relaxed pair(s) reuse physical storage" in text
+        assert "pipeline_membership" not in ir.python_print(After)
 
     def test_finds_max_affordable_double_buffer_depth(self):
         """Depth-aware: a 3-stage group whose full separation (3 x 32 = 96 KB)
@@ -5089,6 +5444,41 @@ class TestCapacityGatedReuse:
         assert "fell back to the legacy packing" in err, (
             f"force_legacy must warn through the diagnostic channel, got stderr: {err!r}"
         )
+
+    def test_intrinsically_oversized_buffer_defers_to_allocator_without_reuse_warning(self, capfd):
+        """One 128 KiB Right tile in a 64 KiB L0B is not a reuse failure.
+
+        MemoryReuse still applies its legacy fallback so placement behavior is
+        unchanged, but it must not suggest that packing or pipeline depth caused
+        the failure. AllocateMemoryAddr remains the hard generic capacity gate;
+        operation-specific passes may diagnose it earlier with more context.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 256], pl.FP16],
+                b: pl.Tensor[[256, 256], pl.FP16],
+                out: pl.Out[pl.Tensor[[128, 256], pl.FP32]],
+            ) -> pl.Tensor[[128, 256], pl.FP32]:
+                a_mat = pl.tile.load(a, [0, 0], [128, 256], target_memory=pl.Mem.Mat)
+                b_mat = pl.tile.load(b, [0, 0], [256, 256], target_memory=pl.Mem.Mat)
+                a_left = pl.tile.extract(a_mat, 0, 0, [128, 256], target_memory=pl.Mem.Left)
+                b_right = pl.tile.extract(b_mat, 0, 0, [256, 256], target_memory=pl.Mem.Right)
+                acc = pl.tile.matmul(a_left, b_right)
+                out = pl.tile.store(acc, [0, 0], out)
+                return out
+
+        after = passes.memory_reuse()(passes.init_mem_ref()(Before))
+        err = capfd.readouterr().err
+        assert "capacity-gated reuse could not fit memory space Right" not in err
+
+        with pytest.raises(ValueError, match=r"Right buffer usage \(131072 bytes\).*\(65536 bytes\)"):
+            passes.allocate_memory_addr()(after)
 
 
 if __name__ == "__main__":

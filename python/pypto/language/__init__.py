@@ -42,6 +42,7 @@ from pypto.jit import JITFunction, jit
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     AtomicType,
+    CompactMode,
     ForKind,
     FunctionType,
     Level,
@@ -62,6 +63,7 @@ from .dsl_api import (
     cluster,
     cond,
     const,
+    func_attr,
     parallel,
     pipeline,
     range,
@@ -74,6 +76,7 @@ from .dsl_api import (
     yield_,
 )
 from .op import array_ops as array
+from .op import prefetch_ops as prefetch
 from .op import system_ops as system
 from .op import tensor_ops as tensor
 from .op import tile_ops as tile
@@ -90,9 +93,14 @@ from .op.system_ops import (
     tpush_to_aic,
     tpush_to_aiv,
 )
+from .op.tensor_ops import ci as arange
+
+# Names that also exist at tile level are imported below from ``unified_ops``
+# instead so the Tensor/Tile dispatch wins. Keep this block to names the tile
+# layer does not define, or whose tile twin takes a signature no dispatcher can
+# reconcile (``gather`` / ``scatter``), or that carry no operand to dispatch on
+# at all (``full``, ``random``, and the block-identity queries).
 from .op.tensor_ops import (
-    assemble,
-    cos,
     create_l1,
     create_tensor,
     dim,
@@ -100,60 +108,48 @@ from .op.tensor_ops import (
     expand_clone,
     full,
     gather,
-    gather_row,
     get_block_idx,
     get_block_num,
     get_subblock_idx,
-    mrgsort,
     no_dep,
     paged_gather,
     random,
     scatter,
-    scatter_update,
-    sin,
-    sort32,
 )
-from .op.tensor_ops import ci as arange
 from .op.tile_ops import (
     MemRefType,
     addc,
     addsc,
     aic_gather,
     aiv_shard,
-    and_,
-    ands,
     cmps,
     create_tile,
+    gatherb,
     gemv,
     gemv_acc,
     gemv_bias,
     load,
-    log,
     lrelu,
     matmul_bias,
+    matmul_mx,
+    matmul_mx_acc,
+    matmul_mx_bias,
     max,
     maximums,
+    mgather,
     min,
     minimums,
     move,
-    not_,
-    or_,
-    ors,
     prelu,
     relu,
     rem,
     rems,
     sel,
     sels,
-    shl,
-    shls,
-    shr,
-    shrs,
     store,
     subc,
     subsc,
-    xor,
-    xors,
+    tri,
 )
 from .op.tile_ops import (
     mscatter as mscatter,
@@ -161,6 +157,9 @@ from .op.tile_ops import (
 from .op.unified_ops import (
     abs,
     add,
+    and_,
+    ands,
+    assemble,
     batch_matmul,
     cast,
     cmp,
@@ -179,6 +178,7 @@ from .op.unified_ops import (
     col_prod,
     col_sum,
     concat,
+    cos,
     div,
     exp,
     expands,
@@ -186,12 +186,18 @@ from .op.unified_ops import (
     fillpad_expand,
     fmod,
     fmods,
+    gather_row,
+    log,
     matmul,
     matmul_acc,
     maximum,
     minimum,
+    mrgsort,
     mul,
     neg,
+    not_,
+    or_,
+    ors,
     part_add,
     part_max,
     part_min,
@@ -215,18 +221,43 @@ from .op.unified_ops import (
     row_prod,
     row_sum,
     rsqrt,
+    scatter_update,
     set_validshape,
+    shl,
+    shls,
+    shr,
+    shrs,
+    sin,
     slice,
+    sort32,
     sqrt,
     sub,
     transpose,
     write,
+    xor,
+    xors,
 )
-from .optimizations import split
+from .optimizations import cross_core_slot, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
-from .typing import Array, DynVar, InOut, IntLike, MemRef, Out, Scalar, Tensor, Tile, Tuple, dynamic
+from .typing import (
+    RUNTIME,
+    Array,
+    AsyncEvent,
+    AsyncSession,
+    DynVar,
+    InOut,
+    IntLike,
+    MemRef,
+    Out,
+    PrefetchAsyncContext,
+    Scalar,
+    Tensor,
+    Tile,
+    Tuple,
+    dynamic,
+)
 
 # Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
 Mem = MemorySpace
@@ -238,11 +269,14 @@ Ptr = PtrType
 ND = TensorLayout.ND
 DN = TensorLayout.DN
 NZ = TensorLayout.NZ
+MX_A_ZZ = TensorLayout.MX_A_ZZ
+MX_B_NN = TensorLayout.MX_B_NN
 
 # Re-export DataType constants for convenience
 FP4 = DataType.FP4
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
+FP8E8M0 = DataType.FP8E8M0
 FP16 = DataType.FP16
 FP32 = DataType.FP32
 BF16 = DataType.BF16
@@ -287,6 +321,7 @@ __all__ = [
     "InOut",
     "IntLike",
     "Out",
+    "RUNTIME",
     "dynamic",
     "const",
     "range",
@@ -298,14 +333,17 @@ __all__ = [
     "cond",
     "static_print",
     "static_assert",
+    "func_attr",
     "at",
     "cluster",
     "spmd",
     "split_aiv",
     "optimizations",
     "split",
+    "cross_core_slot",
     "adir",
     "array",
+    "prefetch",
     "tile",
     "system",
     "tensor",
@@ -320,6 +358,7 @@ __all__ = [
     "part_min",
     "maximum",
     "exp",
+    "log",
     "cast",
     "concat",
     "reshape",
@@ -370,13 +409,17 @@ __all__ = [
     "load",
     "store",
     "move",
+    "gatherb",
+    "mgather",
     "mscatter",
     "sqrt",
     "rsqrt",
-    "log",
     "relu",
     "matmul_acc",
     "matmul_bias",
+    "matmul_mx",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
     "gemv",
     "gemv_acc",
     "gemv_bias",
@@ -411,6 +454,7 @@ __all__ = [
     "lrelu",
     "sel",
     "sels",
+    "tri",
     # Promoted system ops (cross-core)
     "AUTO",
     "tpush_to_aiv",
@@ -425,10 +469,16 @@ __all__ = [
     "import_peer_buffer",
     "tfree_to_aic",
     "tfree_to_aiv",
-    # Promoted tensor-only
-    "create_tensor",
+    # Unified dispatch (also defined at tile level)
     "assemble",
     "cos",
+    "gather_row",
+    "mrgsort",
+    "scatter_update",
+    "sin",
+    "sort32",
+    # Promoted tensor-only
+    "create_tensor",
     "dim",
     "full",
     "ScopeMode",
@@ -439,19 +489,14 @@ __all__ = [
     "no_dep",
     "dump_tag",
     "scatter",
-    "scatter_update",
-    "sin",
     "arange",
     "gather",
     "paged_gather",
     "random",
     "create_l1",
-    "gather_row",
     "get_block_idx",
     "get_block_num",
     "get_subblock_idx",
-    "mrgsort",
-    "sort32",
     "FunctionType",
     "ForKind",
     "AtomicType",
@@ -464,18 +509,25 @@ __all__ = [
     "MemorySpace",
     "PipeType",
     "Ptr",
+    "PrefetchAsyncContext",
+    "AsyncEvent",
+    "AsyncSession",
     "PtrType",
     "TensorLayout",
     "TensorView",
     "TileLayout",
     "PadValue",
+    "CompactMode",
     "TileView",
     "ND",
     "DN",
     "NZ",
+    "MX_A_ZZ",
+    "MX_B_NN",
     "FP4",
     "FP8E4M3FN",
     "FP8E5M2",
+    "FP8E8M0",
     "FP16",
     "FP32",
     "BF16",

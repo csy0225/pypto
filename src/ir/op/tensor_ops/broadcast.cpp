@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
@@ -37,6 +38,11 @@
 
 namespace pypto {
 namespace ir {
+
+static bool IsTRowExpandAddDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+         dtype == DataType::FP16 || dtype == DataType::FP32;
+}
 
 TypePtr DeduceTensorRowExpandType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -70,7 +76,7 @@ TypePtr DeduceTensorRowExpandType(const std::vector<ExprPtr>& args,
   auto row_col_const = As<ConstInt>(row_shape[row_shape.size() - 1]);
   CHECK(row_col_const && row_col_const->value_ == 1)
       << "The operator " << op_name << " requires second argument's last dimension to be 1, but got "
-      << row_shape[row_shape.size() - 1];
+      << FormatShape(row_shape);
 
   // Second-to-last dimension (rows) must match
   auto tensor_rows_const = As<ConstInt>(tensor_shape[tensor_shape.size() - 2]);
@@ -90,6 +96,21 @@ TypePtr DeduceTensorRowExpandType(const std::vector<ExprPtr>& args,
 
   // Output has the same shape as the main tensor
   return std::make_shared<TensorType>(tensor_shape, *result_dtype);
+}
+
+TypePtr DeduceTensorRowExpandAddType(const std::vector<ExprPtr>& args,
+                                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                     const std::string& op_name) {
+  auto result_type = DeduceTensorRowExpandType(args, kwargs, op_name);
+  auto tensor_type = As<TensorType>(args[0]->GetType());
+  auto row_type = As<TensorType>(args[1]->GetType());
+  CHECK(tensor_type->dtype_ == row_type->dtype_)
+      << "The operator " << op_name << " requires src0 and src1 to have the same dtype, but got "
+      << tensor_type->dtype_.ToString() << " and " << row_type->dtype_.ToString();
+  CHECK(IsTRowExpandAddDataType(tensor_type->dtype_))
+      << "The operator " << op_name << " requires dtype in {INT8, INT16, INT32, FP16, FP32}, but got "
+      << tensor_type->dtype_.ToString();
+  return result_type;
 }
 
 TypePtr DeduceTensorColExpandType(const std::vector<ExprPtr>& args,
@@ -276,7 +297,7 @@ REGISTER_OP("tensor.row_expand_add")
     .add_argument("row_vec", "Row vector (TensorType [M, 1])")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTensorRowExpandType(args, kwargs, "tensor.row_expand_add");
+      return DeduceTensorRowExpandAddType(args, kwargs, "tensor.row_expand_add");
     });
 
 REGISTER_OP("tensor.row_expand_sub")

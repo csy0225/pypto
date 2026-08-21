@@ -200,7 +200,17 @@ static std::vector<std::pair<std::string, std::any>> DeserializeKwargs(const msg
           }
         }
       }
-      if (type_name == "ArgDirectionVector") {
+      if (type_name == "ArgDirection") {
+        if (!has_value_obj || value_obj_inner.type != msgpack::type::POSITIVE_INTEGER) {
+          throw TypeError("ArgDirection kwarg '" + key + "' must have integer value");
+        }
+        uint8_t code = value_obj_inner.as<uint8_t>();
+        if (code > static_cast<uint8_t>(ArgDirection::Scalar)) {
+          throw TypeError("Invalid ArgDirection value " + std::to_string(static_cast<int>(code)) +
+                          " for kwarg: " + key);
+        }
+        kwargs.emplace_back(key, static_cast<ArgDirection>(code));
+      } else if (type_name == "ArgDirectionVector") {
         if (!has_value_obj || value_obj_inner.type != msgpack::type::ARRAY) {
           throw TypeError("ArgDirectionVector kwarg '" + key + "' must have ARRAY value");
         }
@@ -348,7 +358,22 @@ static IRNodePtr DeserializeMemRef(const msgpack::object& fields_obj, msgpack::z
   // base_ is a VarPtr, serialized as a full IRNode
   auto base = std::static_pointer_cast<const Var>(ctx.DeserializeNode(GET_FIELD_OBJ("base"), zone));
   INTERNAL_CHECK_SPAN(base, span) << "MemRef base deserialized to null";
-  return std::make_shared<MemRef>(name_hint, base, byte_offset, size, span);
+  // Absent in blobs written before declared allocations existed; those hold only
+  // compiler allocations, which is exactly what `false` means.
+  bool is_pinned = ctx.HasField(fields_obj, "is_pinned") && GET_FIELD(bool, "is_pinned");
+  uint64_t slot_count =
+      ctx.HasField(fields_obj, "slot_count") ? GET_FIELD(uint64_t, "slot_count") : uint64_t{1};
+  // slot_index_ is an Expr (a runtime slot index is legal), so it deserializes as
+  // a node; absent means an unsubscripted declaration.
+  std::optional<ExprPtr> slot_index = std::nullopt;
+  if (ctx.HasField(fields_obj, "slot_index")) {
+    const auto& slot_obj = GET_FIELD_OBJ("slot_index");
+    if (!slot_obj.is_nil()) {
+      slot_index = std::static_pointer_cast<const Expr>(ctx.DeserializeNode(slot_obj, zone));
+    }
+  }
+  return std::make_shared<MemRef>(name_hint, base, byte_offset, size, span, is_pinned, slot_count,
+                                  std::move(slot_index));
 }
 
 // Deserialize ConstInt
@@ -786,7 +811,9 @@ static std::vector<std::pair<std::string, std::any>> DeserializeScopeAttrs(const
 static IRNodePtr DeserializeInCoreScopeStmt(const msgpack::object& fields_obj, msgpack::zone& zone,
                                             DeserializerContext& ctx) {
   auto span = ctx.DeserializeSpan(GET_FIELD_OBJ("span"));
-  auto split = DeserializeScopeSplit(fields_obj, ctx);
+  // A ``.pto`` written before issue #2205 may carry ``split: nil`` for "no split";
+  // it maps onto the single surviving encoding, ``SplitMode::None``.
+  auto split = DeserializeScopeSplit(fields_obj, ctx).value_or(SplitMode::None);
   auto name_hint = DeserializeScopeNameHint(fields_obj, ctx);
   auto body = std::static_pointer_cast<const Stmt>(ctx.DeserializeNode(GET_FIELD_OBJ("body"), zone));
   return std::make_shared<InCoreScopeStmt>(split, std::move(name_hint), body, span,

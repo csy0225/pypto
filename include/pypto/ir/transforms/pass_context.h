@@ -12,16 +12,14 @@
 #ifndef PYPTO_IR_TRANSFORMS_PASS_CONTEXT_H_
 #define PYPTO_IR_TRANSFORMS_PASS_CONTEXT_H_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
-#include <set>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "pypto/core/error.h"
 #include "pypto/ir/program.h"
-#include "pypto/ir/reporter/report.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/verifier/diagnostic_check_registry.h"
 
@@ -146,16 +144,15 @@ class CallbackInstrument : public PassInstrument {
 };
 
 /**
- * @brief Instrument that generates reports to files after specified passes
- * (analogous to VerificationInstrument using PropertyVerifierRegistry)
+ * @brief Instrument that names the directory pipeline artifacts are written to.
  *
- * Uses ReportGeneratorRegistry to dispatch report generation. Enable specific
- * report types for specific passes via EnableReport().
+ * It observes no pass itself; its only job is to carry `output_dir` so that
+ * `DiagnosticInstrument` knows where to append `perf_hints.log`. Register it in
+ * the context whenever a compilation should produce on-disk diagnostics.
  *
  * Usage (Python):
  * @code
  *   instrument = passes.ReportInstrument("/path/to/output")
- *   instrument.enable_report(passes.ReportType.Memory, "AllocateMemoryAddr")
  *   with passes.PassContext([instrument]):
  *       pipeline.run(program)
  * @endcode
@@ -163,13 +160,6 @@ class CallbackInstrument : public PassInstrument {
 class ReportInstrument : public PassInstrument {
  public:
   explicit ReportInstrument(std::string output_dir);
-
-  /**
-   * @brief Enable a report type to be generated after a specific pass
-   * @param type Report type to enable
-   * @param trigger_pass Name of the pass that triggers this report
-   */
-  void EnableReport(ReportType type, std::string trigger_pass);
 
   void RunBeforePass(const Pass& pass, const ProgramPtr& program) override;
   void RunAfterPass(const Pass& pass, const ProgramPtr& program) override;
@@ -186,9 +176,6 @@ class ReportInstrument : public PassInstrument {
 
  private:
   std::string output_dir_;
-  std::unordered_map<std::string, std::set<ReportType>> triggers_;
-
-  void WriteReport(const Report& report, const std::string& filename);
 };
 
 /**
@@ -236,15 +223,59 @@ class DiagnosticInstrument : public PassInstrument {
 /**
  * @brief Selects who plans on-chip buffer memory.
  *
- * PyPTO runs its own allocator (AllocateMemoryAddr) and bakes physical
- * addresses into `pto.alloc_tile addr = ...`; PtoAS skips the pypto
- * allocation passes (MemoryReuse + AllocateMemoryAddr), emits no addresses,
- * and lets the ptoas PlanMemory pass allocate at `--pto-level=level2`.
+ * PyPTO runs its legacy coalescing allocator and bakes physical addresses into
+ * `pto.alloc_tile addr = ...`. DsaRP keeps semantic aliases but replaces
+ * opportunistic coalescing with capacity-constrained DSA with reuse penalties.
+ * PtoAS skips the PyPTO allocation passes, emits no addresses, and lets the
+ * ptoas PlanMemory pass allocate at `--pto-level=level2`.
  */
 enum class MemoryPlanner {
-  PyPTO,  ///< PyPTO allocates addresses (ptoas --pto-level=level3)
-  PtoAS,  ///< ptoas PlanMemory allocates (ptoas --pto-level=level2)
+  PyPTO = 0,  ///< Legacy PyPTO coalescing + address allocation (ptoas level 3).
+  PtoAS = 1,  ///< ptoas PlanMemory allocates (ptoas level 2).
+  DsaRP = 2,  ///< In-tree DSA with automatically recognized reuse penalties.
 };
+
+/**
+ * @brief Which Simpler runtime ABI a compilation targets.
+ *
+ * The two runtimes differ in where the task graph is built, which is what
+ * decides whether an orchestration fragment can be recorded and replayed at
+ * all. Closed set: each enumerator corresponds to one implementation under
+ * `runtime/src/<arch>/runtime/`, and a pass that must legalize IR for a
+ * particular runtime switches on this rather than comparing strings.
+ */
+enum class RuntimeKind : uint8_t {
+  /// Task graph built on the AICPU, dependencies auto-derived through the
+  /// TensorMap. The production runtime, and the default.
+  TensorMapAndRingBuffer = 0,
+  /// Host CPU builds the whole task graph up front, which is what makes Graph
+  /// Execution (record once, replay) possible.
+  HostBuildGraph = 1,
+};
+
+inline constexpr RuntimeKind kDefaultRuntimeKind = RuntimeKind::TensorMapAndRingBuffer;
+
+/**
+ * @brief Wire name for a runtime kind.
+ *
+ * This is the value written to `RUNTIME_CONFIG["runtime"]` in the generated
+ * `kernel_config.py`, the value `CompiledProgram.runtime_name` reports, and the
+ * name used verbatim as a filesystem path component when compiling kernels — so
+ * it is spelled out here rather than derived from the enumerator name.
+ *
+ * @param kind The runtime kind
+ * @return Wire name, e.g. "host_build_graph"
+ */
+[[nodiscard]] std::string RuntimeKindToName(RuntimeKind kind);
+
+/**
+ * @brief Parse a wire name back into a runtime kind.
+ *
+ * @param name Wire name as it appears in `RUNTIME_CONFIG["runtime"]`
+ * @return The matching kind
+ * @throws pypto::ValueError if the name is not one PyPTO can compile for
+ */
+[[nodiscard]] RuntimeKind RuntimeKindFromName(const std::string& name);
 
 class PassContext {
  public:
@@ -260,20 +291,25 @@ class PassContext {
    *        Performance hints are on by default; disable individual hints by
    *        adding their DiagnosticCheck values here.
    * @param memory_planner Who plans on-chip buffer memory (default: PyPTO).
-   *        PtoAS makes the pipeline skip the pypto allocation passes so the
-   *        ptoas PlanMemory pass owns allocation instead.
-   * @param enable_pypto_l0c_double_buffer Opt in to L0C double-buffering (dbC=2)
-   *        under the PyPTO memory planner (default: false; experimental, pending
-   *        device validation). No effect under PtoAS, which already emits dbC=2
-   *        unconditionally. When true, AutoTileMatmulL0 emits two co-live L0C
-   *        accumulators and MemoryReuse's capacity gate allocates the ping-pong.
+   *        DsaRP replaces MemoryReuse with in-tree capacity-constrained DSA-RP.
+   *        PtoAS skips PyPTO address allocation so ptoas PlanMemory owns it.
+   * @param enable_pypto_l0c_double_buffer Opt the legacy PyPTO planner in to
+   *        chooser-emitted L0C double-buffering (dbC=2; default: false,
+   *        experimental). No effect under DsaRP or PtoAS, which enable chooser
+   *        dbC=2 automatically. When true, AutoTileMatmulL0 may emit two co-live
+   *        L0C accumulators and the legacy PyPTO allocator preserves the
+   *        ping-pong where capacity permits.
+   * @param runtime Which Simpler runtime ABI to target (default:
+   *        TensorMapAndRingBuffer). Passes that must legalize IR for a specific
+   *        runtime switch on this rather than inspecting codegen options.
    */
   explicit PassContext(std::vector<PassInstrumentPtr> instruments,
                        VerificationLevel verification_level = VerificationLevel::Basic,
                        DiagnosticPhase diagnostic_phase = DiagnosticPhase::PrePipeline,
                        DiagnosticCheckSet disabled_diagnostics = {DiagnosticCheck::UnusedControlFlowResult},
                        MemoryPlanner memory_planner = MemoryPlanner::PyPTO,
-                       bool enable_pypto_l0c_double_buffer = false);
+                       bool enable_pypto_l0c_double_buffer = false,
+                       RuntimeKind runtime = kDefaultRuntimeKind);
 
   /**
    * @brief Push this context onto the thread-local stack
@@ -332,10 +368,18 @@ class PassContext {
   [[nodiscard]] MemoryPlanner GetMemoryPlanner() const;
 
   /**
-   * @brief Whether L0C double-buffering (dbC=2) is enabled under the PyPTO memory
-   *        planner. Off by default (experimental). No effect under PtoAS.
+   * @brief Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under
+   *        the legacy PyPTO planner. Off by default (experimental). No effect
+   *        under DsaRP or PtoAS.
    */
   [[nodiscard]] bool GetEnablePyptoL0cDoubleBuffer() const;
+
+  /**
+   * @brief Get the target Simpler runtime ABI for this context.
+   *
+   * Passes gate runtime-specific legalization on this value.
+   */
+  [[nodiscard]] RuntimeKind GetRuntime() const;
 
   /**
    * @brief Get the currently active context (top of thread-local stack)
@@ -363,6 +407,7 @@ class PassContext {
   DiagnosticCheckSet disabled_diagnostics_;
   MemoryPlanner memory_planner_;
   bool enable_pypto_l0c_double_buffer_;
+  RuntimeKind runtime_;
   PassContext* previous_;
 
   static thread_local PassContext* current_;

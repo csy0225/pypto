@@ -22,8 +22,15 @@ from pypto.language.typing.array import Array
 from pypto.language.typing.direction import InOut, Out
 from pypto.language.typing.dynamic import DynVar, dynamic
 from pypto.language.typing.memref import MemRef
+from pypto.language.typing.prefetch_handle import AsyncEvent, AsyncSession, PrefetchAsyncContext
 from pypto.language.typing.ptr import Ptr
-from pypto.language.typing.scalar import Scalar
+from pypto.language.typing.scalar import (
+    RUNTIME,
+    BoolLike,
+    RuntimeScalarMarker,
+    Scalar,
+    predicate_to_expr,
+)
 from pypto.language.typing.tensor import Tensor
 from pypto.language.typing.tile import Tile
 from pypto.language.typing.tuple import Tuple
@@ -33,16 +40,23 @@ IntLike: TypeAlias = int | Scalar | Expr
 """Type alias for shape/offset parameters that accept int literals, Scalar DSL values, or raw Expr."""
 
 __all__ = [
+    "RUNTIME",
     "Array",
+    "AsyncEvent",
+    "AsyncSession",
+    "BoolLike",
     "DynVar",
     "InOut",
     "IntLike",
     "MemRef",
     "Out",
+    "PrefetchAsyncContext",
     "Ptr",
+    "RuntimeScalarMarker",
     "Scalar",
     "Tensor",
     "Tile",
     "Tuple",
     "dynamic",
+    "predicate_to_expr",
 ]

@@ -9,10 +9,10 @@
 
 """Scalar wrapper type for PyPTO Language DSL."""
 
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 
 from pypto.pypto_core import DataType
-from pypto.pypto_core.ir import Expr
+from pypto.pypto_core.ir import ConstInt, Expr, Span
 
 
 def _validate_scalar_meta_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
@@ -262,4 +262,92 @@ class Scalar(metaclass=ScalarMeta):
         return cls.__getitem__(item)
 
 
-__all__ = ["Scalar"]
+class RuntimeScalarMarker(Scalar):
+    """Marker for a scalar parameter whose value is supplied at dispatch.
+
+    A ``pl.Scalar[dtype]`` annotation carries a type but no value, so
+    annotation-driven signature mode (``compile()`` / ``lower()`` with no
+    tensor arguments) needs one value per scalar parameter. Passing a literal
+    **specializes** that value into the compiled artifact; passing
+    [`RUNTIME`][pypto.language.RUNTIME] leaves the parameter **unspecialized** — it stays a real
+    ``pl.Scalar`` parameter in the generated program and its value is supplied
+    at dispatch, exactly like a ``pl.dynamic`` dimension extent. Unspecialized
+    scalars also drop out of the specialization cache key, so one artifact
+    serves every runtime value.
+
+    Subclasses [`Scalar`][pypto.language.Scalar] so that a type checker accepts it as the default
+    of a scalar parameter — ``n: pl.Scalar[dtype] = pl.RUNTIME`` — for the same
+    reason ``DynVar`` does: the marker
+    stands in wherever a ``Scalar`` is expected. It carries no dtype of its own;
+    the parameter's annotation supplies that.
+
+    Use the [`RUNTIME`][pypto.language.RUNTIME] singleton rather than instantiating this class.
+
+    Examples:
+        >>> import pypto.language as pl
+        >>>
+        >>> # num_tokens varies per step: keep it out of the artifact.
+        >>> compiled = prefill_fwd.compile(num_tokens=pl.RUNTIME)  # doctest: +SKIP
+    """
+
+    def __init__(self) -> None:
+        """Initialize the marker with no dtype and no wrapped expression.
+
+        Bypasses ``Scalar.__init__``, which requires one of the two — this
+        marker deliberately has neither, and its dtype comes from the annotated
+        parameter it defaults.
+        """
+        self.dtype = None
+        self.expr = None
+        self._annotation_only = False
+
+    def unwrap(self) -> Expr:
+        """Reject use in an expression.
+
+        Raises:
+            RuntimeError: Always — the marker has no value to unwrap.
+        """
+        raise RuntimeError(
+            "pl.RUNTIME is a compile-time marker with no value. Pass it to compile() or "
+            "lower() to leave a scalar parameter unspecialized; it cannot take part in an "
+            "expression."
+        )
+
+    def __repr__(self) -> str:
+        """Return the marker's canonical spelling."""
+        return "pl.RUNTIME"
+
+
+RUNTIME = RuntimeScalarMarker()
+"""Singleton ``RuntimeScalarMarker`` — see the class docstring."""
+
+
+BoolLike: TypeAlias = bool | Scalar | Expr
+"""Type alias for predicate parameters accepting a Python bool, a Scalar, or a raw Expr."""
+
+
+def predicate_to_expr(value: BoolLike | None, span: Span | None = None) -> Expr | None:
+    """Coerce an optional boolean predicate operand to an ``Expr``.
+
+    A Python ``bool`` becomes ``ConstInt(.., BOOL)`` — a compile-time constant an
+    operator's lowering can fold away. A [`Scalar`][pypto.language.Scalar] (typically a comparison
+    such as ``k == 0``) is unwrapped to the symbolic expression it carries, which
+    stays a runtime value.
+
+    Args:
+        value: Predicate to coerce, or ``None`` to pass through
+        span: Optional span for a materialized constant
+
+    Returns:
+        The corresponding ``Expr``, or ``None`` when @p value is ``None``
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return ConstInt(int(value), DataType.BOOL, span if span is not None else Span.unknown())
+    if isinstance(value, Scalar):
+        return value.unwrap()
+    return value
+
+
+__all__ = ["RUNTIME", "BoolLike", "RuntimeScalarMarker", "Scalar", "predicate_to_expr"]

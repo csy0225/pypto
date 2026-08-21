@@ -27,7 +27,14 @@ from pypto.pypto_core.ir import (
     TensorLayout,
 )
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_int32_scalar, _to_make_tuple, resolve_cast_mode
+from ..utils import (
+    _get_span_or_capture,
+    _normalize_expr,
+    _normalize_scalar_operand,
+    _to_int32_scalar,
+    _to_make_tuple,
+    resolve_cast_mode,
+)
 from ._pad_value import normalize_pad_value
 from .tile_ops import resolve_gather_compare_cmp_mode
 
@@ -420,12 +427,18 @@ def matmul(
 ) -> Call:
     """Matrix multiplication with optional transpose.
 
+    A transpose flag swaps its own operand's two trailing axes, so that operand
+    must be at least 2D: ``a_trans`` with a 1D ``lhs`` (or ``b_trans`` with a 1D
+    ``rhs``) raises rather than being ignored. On the mixed mat-vec / vec-mat
+    forms the flag applies to the matrix side, so a ``lhs`` stored ``[K, M]``
+    with ``a_trans=True`` against a ``[K]`` ``rhs`` deduces ``[M]``.
+
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
         out_dtype: Output data type (optional, inferred if not provided)
-        a_trans: Whether to transpose lhs
-        b_trans: Whether to transpose rhs
+        a_trans: Whether to transpose lhs (requires a 2D+ lhs)
+        b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
         span: Optional source span for debugging (auto-captured if not provided)
 
@@ -453,8 +466,15 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
 ) -> Call:
     """Matrix multiplication with accumulation: acc = acc + lhs @ rhs.
+
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into (the split-K ``k == 0`` idiom). Only 2D operands
+    support the predicate.
 
     Args:
         acc: Accumulator tensor
@@ -463,13 +483,15 @@ def matmul_acc(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"a_trans": a_trans, "b_trans": b_trans}
-    return _ir_core.create_op_call("tensor.matmul_acc", [acc, lhs, rhs], kwargs, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tensor.matmul_acc", args, kwargs, actual_span)
 
 
 def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -487,11 +509,7 @@ def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise multiplication
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -512,11 +530,7 @@ def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise multiplication with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.muls", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -535,11 +549,7 @@ def add(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise addition
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -560,11 +570,7 @@ def adds(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise addition with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.adds", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -583,11 +589,7 @@ def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise subtraction
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -608,15 +610,17 @@ def subs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise subtraction with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.subs", [lhs, rhs_expr], {}, actual_span)
 
 
-def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def div(
+    lhs: Expr,
+    rhs: int | float | Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -626,22 +630,24 @@ def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` has TensorType.
 
     Returns:
         Call expression for element-wise division
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
+        if high_precision:
+            # TypeError, matching the unified pl.* guards: a kwarg this operand
+            # combination cannot honour is a wrong-arguments error, not a bad value.
+            raise TypeError("tensor.div(high_precision=True) requires a Tensor rhs")
         return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
-    else:
-        return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], kwargs, actual_span)
 
 
 def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -656,11 +662,7 @@ def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise division with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -740,11 +742,7 @@ def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise floating-point remainder
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -765,12 +763,229 @@ def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise floating-point remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.fmods", [lhs, rhs_expr], {}, actual_span)
+
+
+def _bitwise_dispatch(
+    tensor_op: str,
+    scalar_op: str,
+    lhs: Expr,
+    rhs: int | Expr,
+    span: Span | None,
+) -> Call:
+    """Build a tensor bitwise/shift call, routing a scalar ``rhs`` to ``scalar_op``.
+
+    Bitwise ops are integer-only, so an untyped literal keeps
+    ``_normalize_scalar_operand``'s INT32 default instead of the FP32 fallback the
+    arithmetic wrappers use — a float shift or mask has no meaning here and is
+    rejected by type deduction rather than silently promoted.
+
+    Args:
+        tensor_op: Registered op name for the tensor-tensor form
+        scalar_op: Registered op name for the tensor-scalar form
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor or integer scalar
+        span: Optional source span (auto-captured if not provided)
+
+    Returns:
+        Call expression for the selected operator
+    """
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    chosen = scalar_op if isinstance(rhs_expr.type, ScalarType) else tensor_op
+    return _ir_core.create_op_call(chosen, [lhs, rhs_expr], {}, actual_span)
+
+
+def _bitwise_scalar(op_name: str, lhs: Expr, rhs: int | Expr, span: Span | None) -> Call:
+    """Build a tensor-scalar bitwise/shift call (the explicit ``*s`` entry points)."""
+    actual_span = _get_span_or_capture(span)
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    return _ir_core.create_op_call(op_name, [lhs, rhs_expr], {}, actual_span)
+
+
+def and_(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise AND of tensor and tensor or scalar.
+
+    Automatically selects between tensor.and (tensor & tensor) and
+    tensor.ands (tensor & scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise AND
+    """
+    return _bitwise_dispatch("tensor.and", "tensor.ands", lhs, rhs, span)
+
+
+def ands(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise AND of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise AND with scalar
+    """
+    return _bitwise_scalar("tensor.ands", lhs, rhs, span)
+
+
+def or_(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise OR of tensor and tensor or scalar.
+
+    Automatically selects between tensor.or (tensor | tensor) and
+    tensor.ors (tensor | scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise OR
+    """
+    return _bitwise_dispatch("tensor.or", "tensor.ors", lhs, rhs, span)
+
+
+def ors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise OR of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise OR with scalar
+    """
+    return _bitwise_scalar("tensor.ors", lhs, rhs, span)
+
+
+def xor(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise XOR of tensor and tensor or scalar.
+
+    Automatically selects between tensor.xor (tensor ^ tensor) and
+    tensor.xors (tensor ^ scalar) based on the rhs type.
+
+    Unlike ``tile.xor``, no ``tmp`` operand is required: ConvertTensorToTileOps
+    allocates the scratch tile that pto.txor needs.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise XOR
+    """
+    return _bitwise_dispatch("tensor.xor", "tensor.xors", lhs, rhs, span)
+
+
+def xors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise XOR of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise XOR with scalar
+    """
+    return _bitwise_scalar("tensor.xors", lhs, rhs, span)
+
+
+def not_(input: Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise NOT of a tensor.
+
+    Args:
+        input: Input tensor (int16 or uint16 dtype, matching the TNOT instruction)
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise NOT
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.not", [input], {}, actual_span)
+
+
+def shl(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise left shift of tensor by tensor or scalar.
+
+    Automatically selects between tensor.shl (tensor << tensor) and
+    tensor.shls (tensor << scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount as a tensor or integer scalar
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise left shift
+    """
+    return _bitwise_dispatch("tensor.shl", "tensor.shls", lhs, rhs, span)
+
+
+def shls(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise left shift of tensor by scalar.
+
+    Note:
+        The shift amount must be zero or positive. A negative constant is
+        rejected when the op is built; a negative value only known at runtime
+        is undefined behaviour on the hardware.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount; must be >= 0
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise left shift with scalar
+    """
+    return _bitwise_scalar("tensor.shls", lhs, rhs, span)
+
+
+def shr(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise right shift of tensor by tensor or scalar.
+
+    Automatically selects between tensor.shr (tensor >> tensor) and
+    tensor.shrs (tensor >> scalar) based on the rhs type. The shift is
+    arithmetic for signed dtypes and logical for unsigned ones, matching the
+    tile ops and the underlying ISA.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount as a tensor or integer scalar
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise right shift
+    """
+    return _bitwise_dispatch("tensor.shr", "tensor.shrs", lhs, rhs, span)
+
+
+def shrs(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
+    """Element-wise bitwise right shift of tensor by scalar.
+
+    Note:
+        The shift amount must be zero or positive. A negative constant is
+        rejected when the op is built; a negative value only known at runtime
+        is undefined behaviour on the hardware.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount; must be >= 0
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for element-wise bitwise right shift with scalar
+    """
+    return _bitwise_scalar("tensor.shrs", lhs, rhs, span)
 
 
 def maximum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -789,11 +1004,7 @@ def maximum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Cal
         Call expression for element-wise maximum
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.maximum", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -813,11 +1024,7 @@ def minimum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Cal
         Call expression for element-wise minimum
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.minimum", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -838,11 +1045,7 @@ def cmp(lhs: Expr, rhs: int | float | Expr, cmp_type: int = 0, span: Span | None
         Call expression for element-wise comparison (0/1 tensor)
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.cmp", [lhs, rhs_expr], {"cmp_type": cmp_type}, actual_span)
 
 
@@ -1320,11 +1523,7 @@ def expands(target: Expr, scalar: int | float | Expr, span: Span | None = None) 
         Call expression for scalar expansion
     """
     actual_span = _get_span_or_capture(span)
-    scalar_expr = (
-        _normalize_expr(scalar, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(scalar, Expr)
-        else scalar
-    )
+    scalar_expr = _normalize_scalar_operand(target, scalar, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.expands", [target, scalar_expr], {}, actual_span)
 
 
@@ -1361,18 +1560,20 @@ def exp(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.exp", [input], {}, actual_span)
 
 
-def log(input: Expr, span: Span | None = None) -> Call:
+def log(input: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Call expression for element-wise natural logarithm
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tensor.log", [input], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.log", [input], kwargs, actual_span)
 
 
 def sin(input: Expr, span: Span | None = None) -> Call:
@@ -1431,18 +1632,20 @@ def abs(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.abs", [input], {}, actual_span)
 
 
-def recip(input: Expr, span: Span | None = None) -> Call:
+def recip(input: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise reciprocal (1/x) operation.
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
 
     Returns:
         Call expression for element-wise reciprocal
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tensor.recip", [input], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.recip", [input], kwargs, actual_span)
 
 
 def sqrt(input: Expr, span: Span | None = None) -> Call:
@@ -1524,7 +1727,11 @@ def assemble(
         span: Optional source span for debugging (auto-captured if not provided)
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into the global-memory target). The kwarg is
-            omitted entirely when 0 so non-atomic assembles are unchanged.
+            omitted entirely when 0 so non-atomic assembles are unchanged. ``kAdd``
+            requires a tile source stored into a global-memory target, i.e. an
+            assemble inside an InCore (``pl.at(level=pl.Level.CORE_GROUP, ...)``)
+            function; it has no lowering at the orchestration level and is rejected
+            there.
 
     Returns:
         Call expression for tensor assembly
@@ -1672,11 +1879,12 @@ def view(
        product-preserving (new product == old product), except for symbolic
        dimensions where equality is unprovable and accepted optimistically.
        Static target dimensions must be positive. A source with a partial
-       ``valid_shape`` can only use the packed ND leading-dimension collapse
-       to 2D and requires an explicit target ``valid_shape``.
+       ``valid_shape`` can only use a packed ND leading-dimension collapse to
+       2D or a contiguous-prefix linear collapse to ``[1, product(shape)]``;
+       both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Orchestration lowering only supports shape
-    reinterpret for ND-layout tensors because the runtime ``Tensor::reshape``
+    reinterpret for ND-layout tensors because the runtime ``ChipTensor::reshape``
     cannot express an arbitrary-layout view.
 
     Args:
@@ -1686,9 +1894,10 @@ def view(
             dimensions (RFC #1300 P4). Must be a sequence of ints or
             Expr values, or a ``MakeTuple``. In an InCore function, the source
             must remain a GM Tensor through tensor-to-tile conversion.
-        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
-            collapse to 2D. Required when this supported collapse reinterprets
-            a source with partial validity.
+        valid_shape: Explicit valid dimensions for a packed ND
+            leading-dimension collapse to 2D or contiguous-prefix linear
+            collapse to ``[1, product(shape)]``. Required when either supported
+            collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
             When combined with ``shape``, layout changes are supported in-core
@@ -1729,8 +1938,9 @@ def set_validshape(
     """Update valid-shape metadata of a tensor without data movement.
 
     .. note::
-        Internal API — this op is intended for compiler-generated code only
-        and should not be exposed to end users in future releases.
+        Prefer expressing the extent at its source where possible —
+        ``pl.load(..., valid_shape=...)`` or a slice's ``valid_shape=`` — and use
+        this to pin an extent the type deducer cannot infer.
 
     Args:
         tensor: Input tensor expression (must be 2D TensorType)
@@ -2190,6 +2400,8 @@ def gather_row(  # noqa: PLR0913
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     transpose: bool = False,
     span: Span | None = None,
+    *,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
     """Gather one GM row into a sub-region of an on-chip accumulator (tensor-level, DPS).
 
@@ -2205,7 +2417,10 @@ def gather_row(  # noqa: PLR0913
         src: Source tensor in GM.
         dst_offset: ``[row, col]`` offset within ``acc``, or a MakeTuple.
         src_offset: ``[row, col]`` offset within the GM ``src``, or a MakeTuple.
-        shapes: GM row window shape ``[r, c]`` (typically ``[1, size]``), or a MakeTuple.
+        shapes: GM row window shape ``[r, c]``, or a MakeTuple. Must be
+            compile-time constant.
+        valid_shape: Runtime transfer extent within ``shapes``, or a MakeTuple.
+            May hold runtime ``Scalar[INDEX]`` values. Defaults to ``shapes``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]`` (for a
             matmul B-operand the consumer reads with ``b_trans``).
         span: Optional source span (auto-captured if not provided).
@@ -2217,9 +2432,10 @@ def gather_row(  # noqa: PLR0913
     dst_off = _to_make_tuple(dst_offset, actual_span)
     src_off = _to_make_tuple(src_offset, actual_span)
     shapes_tuple = _to_make_tuple(shapes, actual_span)
-    return _ir_core.create_op_call(
-        "tensor.gather_row", [acc, src, dst_off, src_off, shapes_tuple], {"transpose": transpose}, actual_span
-    )
+    args: list[Any] = [acc, src, dst_off, src_off, shapes_tuple]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call("tensor.gather_row", args, {"transpose": transpose}, actual_span)
 
 
 # ============================================================================

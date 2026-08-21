@@ -36,7 +36,7 @@ Python::
     replay(
         "build_output/_jit_xxx/",
         a, b, c,
-        config=RunConfig(platform="a2a3sim", enable_pmu=2, enable_l2_swimlane=True),
+        config=RunConfig(platform="a2a3sim", enable_pmu=2, enable_chip_swimlane=4),
     )
 """
 
@@ -51,35 +51,19 @@ from types import ModuleType
 
 import torch
 
+from pypto.runtime._binary_cache import binary_context_lock, invalidate_binary_context
 from pypto.runtime.debug.pto_rebuild import rebuild_kernel_cpp_from_pto
 from pypto.runtime.device_tensor import DeviceTensor
-from pypto.runtime.runner import RunConfig, _DfxOpts, execute_compiled
+from pypto.runtime.runner import (
+    _SWIMLANE_CLI_HELP,
+    _SWIMLANE_FULL_LEVEL,
+    _SWIMLANE_MAX_LEVEL,
+    RunConfig,
+    _DfxOpts,
+    execute_compiled,
+)
 
 __all__ = ["replay", "invalidate_binary_cache"]
-
-
-def _invalidate_one_dir(base: Path) -> int:
-    """Remove cached binaries directly under *base*; return the count removed.
-
-    Deletes ``<base>/cache/*.bin`` (the pre-build cache written by
-    ``prebuild_binaries``) and the sibling ``.so`` / ``.o`` files under
-    ``<base>/kernels`` and ``<base>/orchestration``. CPP sources are untouched.
-    """
-    removed = 0
-    cache_dir = base / "cache"
-    if cache_dir.is_dir():
-        for f in cache_dir.glob("*.bin"):
-            f.unlink()
-            removed += 1
-    for sub in ("kernels", "orchestration"):
-        root = base / sub
-        if not root.is_dir():
-            continue
-        for ext in ("*.so", "*.o"):
-            for f in root.rglob(ext):
-                f.unlink()
-                removed += 1
-    return removed
 
 
 def invalidate_binary_cache(work_dir: Path | str) -> None:
@@ -102,12 +86,14 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
     can see the ``cpp -> .o`` rebuild path was taken.
     """
     work_dir = Path(work_dir)
-    removed = _invalidate_one_dir(work_dir)
+    with binary_context_lock(work_dir):
+        removed = invalidate_binary_context(work_dir)
     next_levels = work_dir / "next_levels"
     if next_levels.is_dir():
         for rank_dir in sorted(next_levels.iterdir()):
             if rank_dir.is_dir():
-                removed += _invalidate_one_dir(rank_dir)
+                with binary_context_lock(rank_dir):
+                    removed += invalidate_binary_context(rank_dir)
     if removed:
         print(f"[cpp->.so] invalidated {removed} cached binary file(s); cpp will rebuild")
     else:
@@ -137,10 +123,11 @@ def replay(
             corresponding host tensors.
         config: Run configuration (platform, device_id, DFX flags, ...).
             Defaults to ``RunConfig()``.
-        recompile: When ``True`` (default), invalidate cached kernel /
+        recompile: When ``True`` (default), force-invalidate cached kernel /
             orchestration binaries via :func:`invalidate_binary_cache` so
-            hand-edited cpps are picked up. Set to ``False`` to reuse
-            cached binaries (faster re-runs when no cpp has been modified).
+            hand-edited cpps are picked up. Set to ``False`` to skip only
+            this forced invalidation. Runtime / PTO-ISA compatibility checks
+            still invalidate and rebuild incompatible cached binaries.
         rebuild_from_pto: When ``True`` (default), before cache
             invalidation, scan ``ptoas/*.pto`` and rerun ``ptoas`` for any
             file newer than its sibling ``ptoas/<unit>.cpp``; the new body
@@ -209,13 +196,13 @@ def replay(
     if recompile:
         invalidate_binary_cache(work_dir)
     else:
-        print("[cpp->.so] reusing cached binaries (recompile=False)")
+        print("[cpp->.so] skipped forced invalidation; compatibility checks still apply (recompile=False)")
 
     print("[execute] running on device...")
     if is_l3:
         # L3: reconstruct the distributed program from the build dir and dispatch
-        # via simpler Worker(level=3). DFX flags on ``config`` are not yet plumbed
-        # through the distributed dispatch path (tracked separately).
+        # via simpler Worker(level=3); per-dispatch ring and DFX settings are
+        # forwarded through its CallConfig.
         from pypto.runtime.distributed_runner import (  # noqa: PLC0415
             execute_distributed_compiled,
         )
@@ -333,7 +320,25 @@ def _main(
     parser.add_argument("--platform", default=default_platform, help="Target execution platform")
     parser.add_argument("--device-id", type=int, default=0, help="Hardware device index")
     parser.add_argument("--pmu", type=int, default=0, metavar="LEVEL", help="PMU level")
-    parser.add_argument("--swimlane", action="store_true", help="Enable L2 swimlane capture")
+    # Two options, not one optional-valued option: this parser has a positional
+    # ``work_dir``, and an ``nargs="?"`` flag would eat it in
+    # ``replay --swimlane build_output/x``.
+    parser.add_argument(
+        "--swimlane",
+        action="store_const",
+        const=_SWIMLANE_FULL_LEVEL,
+        default=0,
+        help=f"Enable chip swimlane capture at the full level ({_SWIMLANE_FULL_LEVEL}). "
+        "Use --swimlane-level N for a lower level.",
+    )
+    parser.add_argument(
+        "--swimlane-level",
+        default=None,
+        type=int,
+        choices=range(_SWIMLANE_MAX_LEVEL + 1),
+        metavar="LEVEL",
+        help=_SWIMLANE_CLI_HELP + " Takes precedence over --swimlane.",
+    )
     parser.add_argument(
         "--dump-args",
         nargs="?",
@@ -349,7 +354,10 @@ def _main(
     parser.add_argument(
         "--no-recompile",
         action="store_true",
-        help="Reuse cached binaries (faster, but ignores cpp edits)",
+        help=(
+            "Skip forced invalidation for cpp edits; runtime/PTO-ISA compatibility "
+            "checks may still rebuild cached binaries"
+        ),
     )
     parser.add_argument(
         "--no-rebuild-from-pto",
@@ -361,7 +369,7 @@ def _main(
         default=None,
         metavar="LEVEL",
         help=(
-            "PyPTO runtime log level (debug, v0..v9, info, warn, error, null). "
+            "PyPTO runtime log level (debug, info, timing, warn, error, null). "
             "Equivalent to setting PYPTO_RUNTIME_LOG=<level> in the environment. "
             "Pass --log-sync-pypto to also push the band to PyPTO's C++ logger."
         ),
@@ -401,7 +409,7 @@ def _main(
         platform=args.platform,
         device_id=args.device_id,
         enable_pmu=args.pmu,
-        enable_l2_swimlane=args.swimlane,
+        enable_chip_swimlane=(args.swimlane_level if args.swimlane_level is not None else args.swimlane),
         enable_dump_args=args.dump_args,
         enable_dep_gen=args.dep_gen,
         enable_scope_stats=args.scope_stats,

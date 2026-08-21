@@ -328,6 +328,9 @@ class StructuralHasher {
       } else if (value.type() == typeid(PadValue)) {
         h = hash_combine(
             h, std::hash<uint8_t>{}(static_cast<uint8_t>(AnyCast<PadValue>(value, "hashing kwarg: " + key))));
+      } else if (value.type() == typeid(ArgDirection)) {
+        h = hash_combine(h, std::hash<uint8_t>{}(
+                                static_cast<uint8_t>(AnyCast<ArgDirection>(value, "hashing kwarg: " + key))));
       } else if (value.type() == typeid(std::vector<ArgDirection>)) {
         h = hash_combine(h,
                          VisitLeafField(AnyCast<std::vector<ArgDirection>>(value, "hashing kwarg: " + key)));
@@ -383,8 +386,32 @@ class StructuralHasher {
   template <typename NodePtr>
   result_type HashNodeImpl(const NodePtr& node);
 
+  /// Hash a Var-like back-reference the way ``EqualVar`` compares it: identity
+  /// only, never fields.
+  ///
+  /// ``EqualType`` routes ``DistributedTensorType::window_buffer_`` through
+  /// ``EqualVar``, which under auto-mapping accepts any two buffers a
+  /// consistent bijection allows, regardless of their ``size_`` or staging
+  /// flags. Hashing the node itself (``HashNode``) would mix those fields in
+  /// and make two buffers ``structural_equal`` accepts hash apart, breaking the
+  /// equal-implies-equal-hash contract.
+  ///
+  /// Memoised separately from ``hash_value_map_`` (which caches full-node
+  /// hashes) so repeated references to one buffer agree, mirroring EqualVar's
+  /// stable variable mapping.
+  result_type HashVarIdentity(const VarPtr& var) {
+    INTERNAL_CHECK(var) << "structural_hash encountered null Var back-reference";
+    auto it = var_identity_map_.find(var);
+    if (it != var_identity_map_.end()) return it->second;
+    result_type h = enable_auto_mapping_ ? static_cast<result_type>(free_var_counter_++)
+                                         : static_cast<result_type>(var->UniqueId());
+    var_identity_map_.emplace(var, h);
+    return h;
+  }
+
   bool enable_auto_mapping_;
   std::unordered_map<IRNodePtr, result_type> hash_value_map_;
+  std::unordered_map<VarPtr, result_type> var_identity_map_;
   int64_t free_var_counter_ = 0;
   std::vector<std::string> field_name_stack_;
   std::vector<std::string> node_type_stack_;
@@ -437,7 +464,13 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       dtype = CanonicalizeForSyntaxScalarDtype(dtype);
     }
     h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(dtype.Code())));
-  } else if (auto tensor_type = As<TensorType>(type)) {
+  } else if (type->GetKind() == ObjectKind::TensorType ||
+             type->GetKind() == ObjectKind::DistributedTensorType) {
+    // DistributedTensorType is a TensorType subclass with its own ObjectKind, so
+    // As<TensorType>(dt) is nullptr by design (kind_traits.h). Match the explicit
+    // disjunction the sibling ladders use (structural_equal.cpp:1023) and share the
+    // field hashing via static_cast; TypeName() above already separates the kinds.
+    auto tensor_type = std::static_pointer_cast<const TensorType>(type);
     h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(tensor_type->dtype_.Code())));
     h = hash_combine(h, static_cast<result_type>(tensor_type->shape_.size()));
     for (const auto& dim : tensor_type->shape_) {
@@ -462,20 +495,26 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       }
       // Hash layout
       h = hash_combine(h, static_cast<result_type>(tv.layout));
+      // Hash pad — EqualType compares TensorView::pad, and the sibling TileView
+      // branch below hashes its own pad; omitting it here only made TensorType
+      // hashing needlessly coarse.
+      h = hash_combine(h, static_cast<result_type>(tv.pad));
     } else {
       h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
     }
     // DistributedTensorType-only back-reference to its source WindowBuffer.
-    // Mix in presence + Var identity (HashNode dispatches the WindowBuffer Var
-    // path) so two same-shape / same-dtype DistributedTensorTypes built from
-    // different WindowBuffers hash apart.
+    // Mix in presence + Var identity so two same-shape / same-dtype
+    // DistributedTensorTypes built from different WindowBuffers hash apart.
+    // Identity only, via HashVarIdentity: EqualType compares this field with
+    // EqualVar, so hashing the buffer's fields would break equal => equal-hash
+    // under auto-mapping (see HashVarIdentity).
     if (type->GetKind() == ObjectKind::DistributedTensorType) {
       auto dt = std::static_pointer_cast<const DistributedTensorType>(type);
       if (dt->window_buffer_.has_value()) {
         h = hash_combine(h, static_cast<result_type>(1));
         INTERNAL_CHECK(*dt->window_buffer_)
             << "structural_hash encountered null window_buffer in DistributedTensorType";
-        h = hash_combine(h, HashNode(*dt->window_buffer_));
+        h = hash_combine(h, HashVarIdentity(*dt->window_buffer_));
       } else {
         h = hash_combine(h, static_cast<result_type>(0));
       }
@@ -507,9 +546,21 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
         INTERNAL_CHECK(dim) << "structural_hash encountered null stride dimension in TileView";
         h = hash_combine(h, HashNode(dim));
       }
-      // Hash start_offset
-      INTERNAL_CHECK(tv.start_offset) << "structural_hash encountered null start_offset in TileView";
-      h = hash_combine(h, HashNode(tv.start_offset));
+      // Hash start_offset. Unlike valid_shape / stride elements, a null
+      // start_offset is a legal TileView state, not a construction bug: the
+      // default ctor leaves it unset (type.h), pl.TileView(...) defaults it to
+      // None, and IsImplicitPrintedTileView reads non-null as "explicit
+      // offset". EqualType compares it through the null-tolerant Equal(...)
+      // (structural_equal.cpp), so asserting here broke equal => equal-hash by
+      // aborting on a type structural_equal happily accepts. Hash the
+      // presence tag the way the optional fields around this branch do, and
+      // mirror ir::Hash(const TileView&)'s null tolerance (type.cpp).
+      if (tv.start_offset) {
+        h = hash_combine(h, static_cast<result_type>(1));  // indicate presence
+        h = hash_combine(h, HashNode(tv.start_offset));
+      } else {
+        h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
+      }
       // Hash blayout
       h = hash_combine(h, static_cast<result_type>(tv.blayout));
       // Hash slayout
@@ -518,6 +569,8 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       h = hash_combine(h, static_cast<result_type>(tv.fractal));
       // Hash pad
       h = hash_combine(h, static_cast<result_type>(tv.pad));
+      // Hash compact mode
+      h = hash_combine(h, static_cast<result_type>(tv.compact));
     } else {
       h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
     }
@@ -534,8 +587,15 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
       INTERNAL_CHECK(t) << "structural_hash encountered null type in TupleType";
       h = hash_combine(h, HashType(t));
     }
+  } else if (auto array_type = As<ArrayType>(type)) {
+    // Mirrors EqualType's ArrayType branch (structural_equal.cpp:1271): dtype +
+    // single-axis extent are the only semantic fields.
+    h = hash_combine(h, static_cast<result_type>(std::hash<uint8_t>{}(array_type->dtype_.Code())));
+    INTERNAL_CHECK(array_type->extent()) << "structural_hash encountered null extent in ArrayType";
+    h = hash_combine(h, HashNode(array_type->extent()));
   } else if (IsA<MemRefType>(type) || IsA<UnknownType>(type) || IsA<PtrType>(type) ||
-             IsA<WindowBufferType>(type) || IsA<CommCtxType>(type)) {
+             IsA<WindowBufferType>(type) || IsA<CommCtxType>(type) || IsA<PrefetchAsyncContextType>(type) ||
+             IsA<AsyncEventType>(type) || IsA<AsyncSessionType>(type)) {
     // Singleton marker types (no fields beyond the type name hashed above).
   } else {
     INTERNAL_CHECK(false) << "HashType encountered unhandled Type: " << type->TypeName();

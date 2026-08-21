@@ -955,7 +955,7 @@ class TestRobustness:
         """Test that deserializing invalid data raises an error."""
         invalid_data = b"invalid msgpack data"
 
-        with pytest.raises(ValueError):  # Should raise some kind of error
+        with pytest.raises(ValueError):  # deserializer CHECK -> pypto::ValueError
             ir.deserialize(invalid_data)
 
     def test_deserialize_nonexistent_file(self):
@@ -1153,6 +1153,7 @@ class TestTypeSerialization:
                 slayout=ir.TileLayout.row_major,
                 fractal=1024,
                 pad=ir.PadValue.max,
+                compact=ir.CompactMode.normal,
             ),
         )
         assert tile_type.tile_view is not None
@@ -1168,6 +1169,7 @@ class TestTypeSerialization:
         assert restored.tile_view.slayout == ir.TileLayout.row_major
         assert restored.tile_view.fractal == 1024
         assert restored.tile_view.pad == ir.PadValue.max
+        assert restored.tile_view.compact == ir.CompactMode.normal
 
     def test_tiletype_partial_symbolic_valid_shape_with_null_offset_round_trip(self):
         span = ir.Span.unknown()

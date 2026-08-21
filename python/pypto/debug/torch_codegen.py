@@ -20,6 +20,7 @@ import torch
 import pypto.language as pl
 from pypto import DataType
 from pypto import ir as _ir
+from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 
 # ---------------------------------------------------------------------------
 # DataType -> torch dtype string
@@ -105,6 +106,16 @@ def _copy_region_attrs(src, dst):
     return dst
 
 
+# pto-isa TileSplitAxis codes carried by the cross-core ``split`` attr:
+# 0 = no split, 1 = up/down, 2 = left/right, 3 / 4 = the same two axes over an
+# ODD extent (lane 0 takes the ceil half, lane 1 the floor one).
+_SPLIT_CODES = (1, 2, 3, 4)
+
+
+def _is_odd_split(split):
+    return split in (3, 4)
+
+
 class _CrossCoreRuntime:
     def __init__(self):
         self._lock = threading.Lock()
@@ -115,10 +126,10 @@ class _CrossCoreRuntime:
         with self._cv:
             self._no_split_dual_aiv_dispatch = bool(no_split_dual_aiv_dispatch)
             self._to_aiv = deque()
-            self._to_aiv_split = {1: {0: deque(), 1: deque()}, 2: {0: deque(), 1: deque()}}
+            self._to_aiv_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
             self._to_aiv_dual_nosplit = {0: deque(), 1: deque()}
             self._to_aic = deque()
-            self._to_aic_split = {1: {0: deque(), 1: deque()}, 2: {0: deque(), 1: deque()}}
+            self._to_aic_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
             self._to_aic_dual_nosplit = {0: deque(), 1: deque()}
             self._cv.notify_all()
 
@@ -139,8 +150,8 @@ class _CrossCoreRuntime:
                 1: len(self._to_aiv_dual_nosplit[1]),
             },
             "to_aiv_split": {
-                1: {0: len(self._to_aiv_split[1][0]), 1: len(self._to_aiv_split[1][1])},
-                2: {0: len(self._to_aiv_split[2][0]), 1: len(self._to_aiv_split[2][1])},
+                c: {0: len(self._to_aiv_split[c][0]), 1: len(self._to_aiv_split[c][1])}
+                for c in _SPLIT_CODES
             },
             "to_aic": len(self._to_aic),
             "to_aic_dual_nosplit": {
@@ -148,8 +159,8 @@ class _CrossCoreRuntime:
                 1: len(self._to_aic_dual_nosplit[1]),
             },
             "to_aic_split": {
-                1: {0: len(self._to_aic_split[1][0]), 1: len(self._to_aic_split[1][1])},
-                2: {0: len(self._to_aic_split[2][0]), 1: len(self._to_aic_split[2][1])},
+                c: {0: len(self._to_aic_split[c][0]), 1: len(self._to_aic_split[c][1])}
+                for c in _SPLIT_CODES
             },
         }
 
@@ -171,25 +182,57 @@ class _CrossCoreRuntime:
             self._cv.wait(timeout=min(0.05, remaining))
 
     @staticmethod
-    def _split_tile(tile, split):
-        dim = 0 if split == 1 else 1
+    def _split_tile(tile, split, lane_stride=None):
+        # Partition a pushed tile between the two AIV lanes exactly the way the
+        # compiler did: lane L owns [L * S, L * S + S) of the split axis, where S
+        # is the partition stride (`lane_stride` when a ragged boundary was
+        # rebalanced, else the ceil half of the physical box). The split CODE
+        # states how the two lanes' VALID extents relate — equal for 1/2, one
+        # apart for the _ODD codes 3/4 — so it is validated against those
+        # extents, not against the physical box, which stays even in the common
+        # "even box, odd valid extent" case.
+        dim = 0 if split in (1, 3) else 1
         size = int(tile.shape[dim])
-        if size % 2 != 0:
-            raise ValueError(f"Split mode {split} requires even dimension size, got {size}")
-        half = size // 2
+        # Two distinct quantities: every lane's PHYSICAL box is the ceil half of
+        # the pushed tile (that is the buffer the compiler typed), while the
+        # partition STRIDE only says where lane 1's data begins — they differ
+        # exactly when a ragged boundary was rebalanced (box 16, stride 7).
+        box_half = (size + 1) // 2
+        stride = int(lane_stride) if lane_stride else box_half
+        if stride <= 0 or stride > box_half:
+            raise ValueError(
+                f"Split mode {split} got an out-of-range lane stride {stride} for a {size}-wide "
+                f"axis (per-lane box {box_half})"
+            )
+        valid_shape = getattr(tile, "_pypto_valid_shape", None)
+        valid = int(valid_shape[dim]) if valid_shape is not None else size
+        lane0 = min(valid, stride)
+        lane1 = min(max(valid - stride, 0), stride)
+        # Only the _ODD codes carry a contract worth checking here: they exist to
+        # say "lane 1 is exactly one cell shorter". The even codes stay permissive
+        # — this runtime is a semantic simulator, and it is the compiler
+        # (split_axis::ShardSplitCode) that refuses lane extents pto-isa cannot
+        # place.
+        if _is_odd_split(split) and lane0 != lane1 + 1:
+            raise ValueError(
+                f"Split mode {split} requires lanes one cell apart, but a valid extent of {valid} "
+                f"over stride {stride} gives {lane0} and {lane1}"
+            )
+        # Lane L takes a box_half-wide slice starting at L * stride, so both
+        # payloads keep the physical shape the compiler gave the popped tile.
         if dim == 0:
-            part0 = tile[:half, ...].clone()
-            part1 = tile[half:, ...].clone()
+            part0 = tile[:box_half, ...].clone()
+            part1 = tile[stride : stride + box_half, ...].clone()
         else:
-            part0 = tile[:, :half, ...].clone()
-            part1 = tile[:, half:, ...].clone()
+            part0 = tile[:, :box_half, ...].clone()
+            part1 = tile[:, stride : stride + box_half, ...].clone()
 
         full_shape = getattr(tile, "_pypto_full_shape", None)
         if full_shape is not None:
             full0 = list(int(s) for s in full_shape)
             full1 = list(int(s) for s in full_shape)
-            full0[dim] = min(full0[dim], half)
-            full1[dim] = max(full1[dim] - half, 0)
+            full0[dim] = min(full0[dim], box_half)
+            full1[dim] = min(max(full1[dim] - stride, 0), box_half)
             part0._pypto_full_shape = tuple(full0)
             part1._pypto_full_shape = tuple(full1)
 
@@ -197,8 +240,8 @@ class _CrossCoreRuntime:
         if valid_shape is not None:
             valid0 = list(int(s) for s in valid_shape)
             valid1 = list(int(s) for s in valid_shape)
-            valid0[dim] = min(valid0[dim], half)
-            valid1[dim] = max(valid1[dim] - half, 0)
+            valid0[dim] = lane0
+            valid1[dim] = lane1
             part0._pypto_valid_shape = tuple(valid0)
             part1._pypto_valid_shape = tuple(valid1)
 
@@ -206,7 +249,7 @@ class _CrossCoreRuntime:
 
     @staticmethod
     def _merge_tile(part0, part1, split):
-        dim = 0 if split == 1 else 1
+        dim = 0 if split in (1, 3) else 1
         merged = torch.cat([part0, part1], dim=dim)
 
         full0 = getattr(part0, "_pypto_full_shape", tuple(part0.shape))
@@ -228,8 +271,9 @@ class _CrossCoreRuntime:
 
         return merged
 
-    def push_to_aiv(self, tile, split):
+    def push_to_aiv(self, tile, split, lane_stride=0):
         split = int(split)
+        lane_stride = int(lane_stride)
         with self._cv:
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
@@ -237,8 +281,8 @@ class _CrossCoreRuntime:
                     self._to_aiv_dual_nosplit[1].append(_copy_region_attrs(tile, tile.clone()))
                 else:
                     self._to_aiv.append(_copy_region_attrs(tile, tile.clone()))
-            elif split in (1, 2):
-                lane0, lane1 = self._split_tile(tile, split)
+            elif split in _SPLIT_CODES:
+                lane0, lane1 = self._split_tile(tile, split, lane_stride)
                 self._to_aiv_split[split][0].append(lane0)
                 self._to_aiv_split[split][1].append(lane1)
             else:
@@ -260,7 +304,7 @@ class _CrossCoreRuntime:
                     return queue.popleft()
                 self._wait_for_locked(lambda: len(self._to_aiv) > 0, "tpop_from_aic", split, lane)
                 return self._to_aiv.popleft()
-            if split in (1, 2):
+            if split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpop_from_aic requires lane in {{0,1}}, got {lane}")
                 queue = self._to_aiv_split[split][lane]
@@ -270,6 +314,11 @@ class _CrossCoreRuntime:
 
     def push_to_aic(self, tile, split):
         split = int(split)
+        if _is_odd_split(split):
+            # pto-isa places lane 1's Vector -> Cube band at lane 1's own extent,
+            # so the two only abut when the lanes are equal: there is no odd V2C
+            # transport, and PTO codegen rejects these codes too.
+            raise ValueError(f"Unsupported odd split mode for push_to_aic: {split}")
         lane = _get_subblock_idx()
         with self._cv:
             if split == 0:
@@ -281,7 +330,7 @@ class _CrossCoreRuntime:
                     self._to_aic_dual_nosplit[lane].append(_copy_region_attrs(tile, tile.clone()))
                 else:
                     self._to_aic.append(_copy_region_attrs(tile, tile.clone()))
-            elif split in (1, 2):
+            elif split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpush_to_aic requires lane in {{0,1}}, got {lane}")
                 self._to_aic_split[split][lane].append(_copy_region_attrs(tile, tile.clone()))
@@ -291,6 +340,8 @@ class _CrossCoreRuntime:
 
     def pop_from_aiv(self, split):
         split = int(split)
+        if _is_odd_split(split):
+            raise ValueError(f"Unsupported odd split mode for pop_from_aiv: {split}")
         lane = _get_subblock_idx()
         with self._cv:
             if split == 0:
@@ -308,7 +359,7 @@ class _CrossCoreRuntime:
                     return lane0_tile
                 self._wait_for_locked(lambda: len(self._to_aic) > 0, "tpop_from_aiv", split, lane)
                 return self._to_aic.popleft()
-            if split in (1, 2):
+            if split in _SPLIT_CODES:
                 lane0_q = self._to_aic_split[split][0]
                 lane1_q = self._to_aic_split[split][1]
                 self._wait_for_locked(
@@ -331,7 +382,7 @@ def _run_mixed_kernels(group_name, meta, *args):
     aiv_name = meta["aiv"]
     split = int(meta.get("split", 0))
     dual_aiv_dispatch = bool(meta.get("dual_aiv_dispatch", False))
-    num_aiv_lanes = 2 if split in (1, 2) or dual_aiv_dispatch else 1
+    num_aiv_lanes = 2 if split in _SPLIT_CODES or dual_aiv_dispatch else 1
 
     _cross_core_rt.reset(no_split_dual_aiv_dispatch=(split == 0 and dual_aiv_dispatch))
     aic_fn = globals().get(aic_name)
@@ -446,9 +497,9 @@ def _pad_scalar(tensor, pad_mode):
     iinfo = torch.iinfo(tensor.dtype)
     return iinfo.min if pad_mode == "min" else iinfo.max
 
-def _mask_valid_region(tensor, shapes, valid_shapes):
+def _mask_valid_region(tensor, shapes, valid_shape):
     shapes_t = _coerce_shape(shapes)
-    valid_t = _coerce_shape(valid_shapes) if valid_shapes is not None else None
+    valid_t = _coerce_shape(valid_shape) if valid_shape is not None else None
     if valid_t is not None:
         if valid_t != shapes_t:
             masked = tensor.new_zeros(shapes_t)
@@ -459,7 +510,7 @@ def _mask_valid_region(tensor, shapes, valid_shapes):
         tensor._pypto_full_shape = shapes_t
     return tensor
 
-def _tile_load(tensor, offsets, shapes, valid_shapes=None):
+def _tile_load(tensor, offsets, shapes, valid_shape=None):
     offsets_t = _coerce_shape(offsets)
     shapes_t = _coerce_shape(shapes)
     slices = tuple(slice(o, o + s) for o, s in zip(offsets_t, shapes_t))
@@ -471,8 +522,8 @@ def _tile_load(tensor, offsets, shapes, valid_shapes=None):
         pad_slices = tuple(slice(0, s) for s in actual_shape)
         padded[pad_slices] = tile
         tile = padded
-    # Use provided valid_shapes or fall back to the physical boundary; cap by actual data bounds.
-    v_shape = _coerce_shape(valid_shapes) if valid_shapes is not None else actual_shape
+    # Use provided valid_shape or fall back to the physical boundary; cap by actual data bounds.
+    v_shape = _coerce_shape(valid_shape) if valid_shape is not None else actual_shape
     v_shape = tuple(min(v, a) for v, a in zip(v_shape, actual_shape))
     return _mask_valid_region(tile, shapes_t, v_shape)
 
@@ -487,7 +538,7 @@ def _tile_store(tile, offsets, output_tensor, atomic=0):
         output_tensor[slices] = tile[valid_slices]
     return output_tensor
 
-def _tensor_slice(tensor, offsets, shapes, valid_shapes=None):
+def _tensor_slice(tensor, offsets, shapes, valid_shape=None):
     offsets_t = _coerce_shape(offsets)
     shapes_t = _coerce_shape(shapes)
     slices = tuple(slice(o, o + s) for o, s in zip(offsets_t, shapes_t))
@@ -499,8 +550,8 @@ def _tensor_slice(tensor, offsets, shapes, valid_shapes=None):
         pad_slices = tuple(slice(0, s) for s in sliced.shape)
         padded[pad_slices] = sliced
         sliced = padded
-    if valid_shapes is not None:
-        sliced._pypto_valid_shape = _coerce_shape(valid_shapes)
+    if valid_shape is not None:
+        sliced._pypto_valid_shape = _coerce_shape(valid_shape)
         sliced._pypto_full_shape = shapes_t
     return sliced
 
@@ -638,7 +689,7 @@ def _kw_dtype(kw: dict[str, Any]) -> str:
 
 
 def _handle_tile_load(a: list[str], kw: dict[str, Any]) -> str:
-    # args: [tensor, offsets_tuple, shapes_tuple, valid_shapes_tuple]
+    # args: [tensor, offsets_tuple, shapes_tuple, valid_shape_tuple]
     return f"_tile_load({a[0]}, {a[1]}, {a[2]}, {a[3]})"
 
 
@@ -662,7 +713,7 @@ def _handle_cmp(a: list[str], kw: dict[str, Any]) -> str:
 
 
 def _handle_slice(a: list[str], _kw: dict[str, Any]) -> str:
-    # args: [tensor, shapes, offsets] or [tensor, shapes, offsets, valid_shapes]
+    # args: [tensor, shapes, offsets] or [tensor, shapes, offsets, valid_shape]
     if len(a) >= 4:
         return f"_tensor_slice({a[0]}, {a[2]}, {a[1]}, {a[3]})"
     return f"_tensor_slice({a[0]}, {a[2]}, {a[1]})"
@@ -710,8 +761,17 @@ def _split_kwarg(kw: dict[str, Any]) -> int:
     return _split_mode_to_int(kw.get("split", 0))
 
 
+def _lane_stride_kwarg(kw: dict[str, Any]) -> int:
+    """The partition stride a rebalanced ragged boundary carries (0 = box partition)."""
+    return int(kw.get("lane_stride", 0) or 0)
+
+
 def _handle_tpush_to_aiv(a: list[str], kw: dict[str, Any]) -> str:
-    return f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)})"
+    # The stride is emitted only when a ragged boundary was rebalanced, so every
+    # other kernel keeps the two-argument form.
+    stride = _lane_stride_kwarg(kw)
+    stride_arg = f", {stride}" if stride else ""
+    return f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)}{stride_arg})"
 
 
 def _handle_tpush_to_aic(a: list[str], kw: dict[str, Any]) -> str:
@@ -726,11 +786,14 @@ def _handle_tpop_from_aiv(_a: list[str], kw: dict[str, Any]) -> str:
     return f"_cross_core_rt.pop_from_aiv({_split_kwarg(kw)})"
 
 
+# Built through the registry getter, which raises on an unregistered name, so a renamed operator
+# fails at import. A bare literal here would instead drop silently out of the membership test in
+# _collect_cross_core_split_from_expr and route the call down the wrong codegen path.
 _CROSS_CORE_SPLIT_OPS = {
-    "tile.tpush_to_aiv",
-    "tile.tpush_to_aic",
-    "tile.tpop_from_aic",
-    "tile.tpop_from_aiv",
+    _ir.get_op("tile.tpush_to_aiv").name,
+    _ir.get_op("tile.tpush_to_aic").name,
+    _ir.get_op("tile.tpop_from_aic").name,
+    _ir.get_op("tile.tpop_from_aiv").name,
 }
 
 
@@ -851,7 +914,7 @@ def _build_group_meta(program: _ir.Program) -> dict[str, dict[str, Any]]:
             split = _split_mode_to_int(func.split)
             if split == 0:
                 split = _split_mode_to_int(aiv_func.split)
-        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get("dual_aiv_dispatch", False))
+        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get(DUAL_AIV_DISPATCH_ATTR, False))
         group_meta[func.name] = {
             "aic": aic_name,
             "aiv": aiv_name,
@@ -907,6 +970,21 @@ def _register_ops() -> None:  # noqa: PLR0915
         m[f"{prefix}.part_mul"] = _torch_fn("mul", 2)
         m[f"{prefix}.part_max"] = _torch_fn("maximum", 2)
         m[f"{prefix}.part_min"] = _torch_fn("minimum", 2)
+
+        # bitwise / shift ops (integer-only). xor/xors carry a trailing scratch
+        # operand at the tile level only; _torch_fn slices to its first nargs, so
+        # the same entry serves the 2-arg tensor form and the 3-arg tile form.
+        m[f"{prefix}.and"] = _torch_fn("bitwise_and", 2)
+        m[f"{prefix}.or"] = _torch_fn("bitwise_or", 2)
+        m[f"{prefix}.not"] = _torch_fn("bitwise_not")
+        m[f"{prefix}.xor"] = _torch_fn("bitwise_xor", 2)
+        m[f"{prefix}.shl"] = _binop("<<")
+        m[f"{prefix}.shr"] = _binop(">>")
+        m[f"{prefix}.ands"] = _torch_fn("bitwise_and", 2)
+        m[f"{prefix}.ors"] = _torch_fn("bitwise_or", 2)
+        m[f"{prefix}.xors"] = _torch_fn("bitwise_xor", 2)
+        m[f"{prefix}.shls"] = _binop("<<")
+        m[f"{prefix}.shrs"] = _binop(">>")
 
         # scalar variants: same math, torch broadcasting handles it
         m[f"{prefix}.adds"] = _binop("+")
@@ -993,17 +1071,6 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.relu"] = _torch_fn("relu")
     m["tile.rem"] = _binop("%")
 
-    # tile bitwise
-    m["tile.and"] = _torch_fn("bitwise_and", 2)
-    m["tile.or"] = _torch_fn("bitwise_or", 2)
-    m["tile.not"] = _torch_fn("bitwise_not")
-    m["tile.shl"] = _binop("<<")
-    m["tile.shr"] = _binop(">>")
-    m["tile.ands"] = _torch_fn("bitwise_and", 2)
-    m["tile.ors"] = _torch_fn("bitwise_or", 2)
-    m["tile.shls"] = _binop("<<")
-    m["tile.shrs"] = _binop(">>")
-
     # tile cmp
     m["tile.cmp"] = _handle_cmp
     m["tile.cmps"] = _handle_cmp
@@ -1019,13 +1086,11 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.gemv_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
 
     # tile ternary ops (third arg is workspace/tmp, ignore it)
-    m["tile.xor"] = lambda a, _kw: f"torch.bitwise_xor({a[0]}, {a[1]})"
-    m["tile.xors"] = lambda a, _kw: f"torch.bitwise_xor({a[0]}, {a[1]})"
     m["tile.prelu"] = lambda a, _kw: f"torch.where({a[0]} > 0, {a[0]}, {a[0]} * {a[1]})"
 
     # tile selection
     m["tile.sel"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[2]})"
-    m["tile.sels"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[2]})"
+    m["tile.sels"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[3]})"
     m["tile.lrelu"] = lambda a, _kw: f"torch.where({a[0]} > 0, {a[0]}, {a[0]} * {a[1]})"
 
     # tile ternary add/sub with carry
@@ -1168,25 +1233,27 @@ class TorchCodegen(_ir.IRVisitor):
         """Build a stable key for nanobind-backed IR vars.
 
         IR callbacks may wrap the same underlying C++ Var with different Python
-        objects, so ``id(var)`` alone is not stable across visits. We key by
-        semantic fields that remain stable across wrappers.
-        """
-        span = getattr(var, "span", None)
-        span_key: tuple[Any, ...] | None = None
-        if span is not None and getattr(span, "is_valid", False):
-            span_key = (
-                getattr(span, "filename", ""),
-                int(getattr(span, "begin_line", 0)),
-                int(getattr(span, "begin_column", 0)),
-                int(getattr(span, "end_line", 0)),
-                int(getattr(span, "end_column", 0)),
-            )
+        objects, so ``id(var)`` alone is not stable across visits. ``Var`` carries
+        a ``unique_id`` for exactly this purpose -- a process-unique counter
+        assigned at construction, documented as the key to use when deduplicating
+        wrappers of the same underlying object. ``IterArg`` shares the counter.
 
+        Keying on it is both stricter and looser than the surrounding fields in
+        the ways we need: two wrappers of one Var always agree, and two distinct
+        Vars never collide, including when both carry ``Span.unknown()`` and the
+        same name and type -- a case name/type/span fields cannot separate.
+        """
+        unique_id = getattr(var, "unique_id", None)
+        if unique_id is not None:
+            return (type(var).__name__, int(unique_id))
+
+        # No identity available (a non-Var duck type): fall back to the
+        # descriptive fields rather than merging everything onto one key.
         var_type = getattr(var, "type", None)
         return (
             type(var).__name__,
             getattr(var, "name_hint", ""),
-            span_key,
+            id(var),
             str(var_type) if var_type is not None else "",
         )
 

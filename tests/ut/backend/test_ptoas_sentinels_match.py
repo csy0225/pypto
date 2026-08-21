@@ -18,9 +18,12 @@ These tests catch silent drift if either side evolves.
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pypto.backend import pto_backend
+from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime.debug import pto_rebuild
 
 
@@ -88,6 +91,54 @@ def test_base_ptoas_flags_subset_of_backend_flags() -> None:
     assert not missing, (
         f"pto_rebuild base flag tokens {missing!r} no longer found in pto_backend._get_ptoas_flags source."
     )
+
+
+@pytest.mark.parametrize(
+    ("planner", "expected_level"),
+    [
+        (MemoryPlanner.PYPTO, "--pto-level=level3"),
+        (MemoryPlanner.DSA_RP, "--pto-level=level3"),
+        (MemoryPlanner.PTOAS, "--pto-level=level2"),
+    ],
+)
+def test_memory_planner_selects_ptoas_level(monkeypatch, planner, expected_level) -> None:
+    handler = SimpleNamespace(get_extra_ptoas_flags=lambda: [])
+    monkeypatch.setattr(pto_backend._backend_core, "get_handler", lambda: handler)
+    assert expected_level in pto_backend._get_ptoas_flags(planner)
+
+
+def test_compile_pto_module_enables_per_unit_pass_dump(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_ptoas(pto_path, output_path, ptoas_flags=None):
+        captured["pto_path"] = pto_path
+        captured["output_path"] = output_path
+        captured["flags"] = ptoas_flags
+        Path(output_path).write_text("generated cpp")
+
+    monkeypatch.setattr(pto_backend, "_run_ptoas", fake_run_ptoas)
+    handler = SimpleNamespace(get_extra_ptoas_flags=lambda: ["--pto-arch", "a3"])
+    monkeypatch.setattr(pto_backend._backend_core, "get_handler", lambda: handler)
+
+    result = pto_backend._compile_pto_module(
+        "module {}",
+        "vector_kernel",
+        str(tmp_path),
+        dump_ptoas_passes=True,
+    )
+
+    dump_dir = tmp_path / "ptoas_passes" / "vector_kernel"
+    assert result == "generated cpp"
+    assert dump_dir.is_dir()
+    assert captured["flags"] == [
+        "--enable-insert-sync",
+        "--pto-level=level3",
+        "--mlir-print-ir-after-all",
+        "--mlir-print-ir-module-scope",
+        f"--mlir-print-ir-tree-dir={dump_dir}",
+        "--pto-arch",
+        "a3",
+    ]
 
 
 if __name__ == "__main__":

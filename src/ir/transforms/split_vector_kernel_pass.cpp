@@ -50,9 +50,6 @@ namespace ir {
 
 namespace {
 
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
-constexpr const char* kExternalSourceAttr = "external_source";
-
 using split_axis::InjectSubblockIdx;
 using split_axis::ProcessStmts;
 using split_axis::SplitDimension;
@@ -62,7 +59,7 @@ bool RequiresNoSplitDualAivSync(const FunctionPtr& func) {
   return func != nullptr && func->func_type_ == FunctionType::AIV &&
          pypto::backend::BackendConfig::IsConfigured() &&
          pypto::ir::PassContext::Current()->GetBackendHandler()->RequiresNoSplitDualAivDispatch() &&
-         func->HasAttr(kDualAivDispatchAttr) && func->GetAttr<bool>(kDualAivDispatchAttr, false);
+         func->HasAttr(kAttrDualAivDispatch) && func->GetAttr<bool>(kAttrDualAivDispatch, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +84,17 @@ bool IsCrossCoreSplitOp(const OpPtr& op) {
          IsOp(op, "tile.tpop_from_aic");
 }
 
+// The AUTHORED mode behind a cross-core op's split attribute. The odd codes
+// (3 / 4) normalize to their even sibling: parity is a property of one tile's
+// split-axis extent, not of the function's split mode, so two pipes of
+// different parity in one function still agree on the mode.
 std::optional<SplitMode> SplitModeFromInt(int split) {
-  if (split == 0) return std::nullopt;
-  if (split == 1) return SplitMode::UpDown;
-  if (split == 2) return SplitMode::LeftRight;
-  throw pypto::ValueError("SplitVectorKernel found invalid cross-core split attribute: " +
-                          std::to_string(split));
+  if (split == kSplitNone) return std::nullopt;
+  if (!IsValidSplitCode(split)) {
+    throw pypto::ValueError("SplitVectorKernel found invalid cross-core split attribute: " +
+                            std::to_string(split));
+  }
+  return SplitModeFromSplitCode(split);
 }
 
 // Infer the split mode from the function body's cross-core pipe ops. All
@@ -158,7 +160,7 @@ std::vector<std::pair<std::string, std::any>> WithSplitAttrs(const FunctionPtr& 
   auto attrs = func->attrs_;
   attrs.erase(
       std::remove_if(attrs.begin(), attrs.end(),
-                     [](const auto& kv) { return kv.first == "split" || kv.first == kDualAivDispatchAttr; }),
+                     [](const auto& kv) { return kv.first == "split" || kv.first == kAttrDualAivDispatch; }),
       attrs.end());
   if (mode != SplitMode::None) {
     attrs.emplace_back("split", static_cast<int>(mode));
@@ -166,7 +168,7 @@ std::vector<std::pair<std::string, std::any>> WithSplitAttrs(const FunctionPtr& 
     // codegen. Stamp the attribute here so codegen reads it directly instead
     // of re-deriving from SplitMode.
     if (is_aiv) {
-      attrs.emplace_back(kDualAivDispatchAttr, true);
+      attrs.emplace_back(kAttrDualAivDispatch, true);
     }
   }
   return attrs;
@@ -499,7 +501,6 @@ std::vector<StmtPtr> BuildNoSplitLane1ReplayStmts(const std::vector<StmtPtr>& st
 // explicit tpush/tpop boundaries (no tile.move -> aiv_shard rewrite needed).
 FunctionPtr ProcessStandaloneSplitFunction(const FunctionPtr& func, SplitMode mode) {
   if (mode == SplitMode::None) return func;
-  int split_int = static_cast<int>(mode);
   int split_dim = SplitDimension(mode);
   bool is_aiv = (func->func_type_ == FunctionType::AIV);
 
@@ -515,7 +516,7 @@ FunctionPtr ProcessStandaloneSplitFunction(const FunctionPtr& func, SplitMode mo
 
   auto injected = InjectSubblockIdx(func, is_aiv);
 
-  auto new_stmts = ProcessStmts(injected.body_stmts, mode, split_int, split_dim, tile_vars, is_aiv,
+  auto new_stmts = ProcessStmts(injected.body_stmts, mode, split_dim, tile_vars, is_aiv,
                                 injected.subblock_idx_expr, var_replacements);
   StmtPtr new_body =
       (new_stmts.size() == 1) ? new_stmts[0] : std::make_shared<SeqStmts>(new_stmts, func->span_);
@@ -596,23 +597,23 @@ Pass SplitVectorKernel() {
       // External kernels are signature-only declarations. Their hand-written
       // source owns sub-lane partitioning, so preserve launch attrs but never
       // synthesize a DSL body (which would violate the external-source contract).
-      if (func->HasAttr(kExternalSourceAttr)) {
+      if (func->HasAttr(kAttrExternalSource)) {
         if (func->func_type_ == FunctionType::AIV) {
           auto explicit_mode = func->GetSplitMode();
-          bool split_aiv = func->HasAttr("split_aiv") && func->GetAttr<bool>("split_aiv", false);
+          bool split_aiv = func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false);
           if (explicit_mode.has_value() && explicit_mode.value() != SplitMode::None) {
             auto external_func = MutableCopy(func);
             external_func->attrs_ = WithSplitAttrs(func, explicit_mode.value(), /*is_aiv=*/true);
             new_functions.push_back(external_func);
             changed = true;
             continue;
-          } else if (split_aiv && !func->GetAttr<bool>(kDualAivDispatchAttr, false)) {
+          } else if (split_aiv && !func->GetAttr<bool>(kAttrDualAivDispatch, false)) {
             auto external_func = MutableCopy(func);
             auto attrs = external_func->attrs_;
             attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
-                                       [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                                       [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
                         attrs.end());
-            attrs.emplace_back(kDualAivDispatchAttr, true);
+            attrs.emplace_back(kAttrDualAivDispatch, true);
             external_func->attrs_ = std::move(attrs);
             new_functions.push_back(external_func);
             changed = true;
@@ -634,7 +635,7 @@ Pass SplitVectorKernel() {
       // function reaches here split_aiv-marked, so re-halving here would
       // double-halve the (already-half) body.
       if ((func->func_type_ == FunctionType::AIV || func->func_type_ == FunctionType::AIC) &&
-          func->HasAttr("split_aiv") && func->GetAttr<bool>("split_aiv", false)) {
+          func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false)) {
         auto explicit_mode = func->GetSplitMode();
         auto new_func = MutableCopy(func);
         if (explicit_mode.has_value() && explicit_mode.value() != SplitMode::None) {
@@ -645,16 +646,16 @@ Pass SplitVectorKernel() {
               WithSplitAttrs(func, explicit_mode.value(), func->func_type_ == FunctionType::AIV);
         } else {
           // Multi-mode explicit split_aiv: the per-region modes were lowered and
-          // erased by LowerAutoVectorSplit (pass 21); no single function-level mode
+          // erased by LowerAutoVectorSplit (pass 20); no single function-level mode
           // survives. The authoritative per-op "split" ints already sit on the
           // tpop/tpush pairs, so only the mode-agnostic dual_aiv_dispatch bool needs
           // stamping here (all RequiresDualAivDispatch consults).
           auto attrs = func->attrs_;
           attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
-                                     [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                                     [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
                       attrs.end());
           if (func->func_type_ == FunctionType::AIV) {
-            attrs.emplace_back(kDualAivDispatchAttr, true);
+            attrs.emplace_back(kAttrDualAivDispatch, true);
           }
           new_func->attrs_ = std::move(attrs);
         }

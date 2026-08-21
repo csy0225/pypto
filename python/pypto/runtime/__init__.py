@@ -26,10 +26,11 @@ Example::
 
 from .bench import BenchmarkStats, TraceInvocation, TraceSpan, benchmark
 from .device_tensor import DeviceTensor, StackedDeviceTensor
-from .distributed_runner import DistributedWorker, execute_distributed_compiled
+from .distributed_runner import DistributedRunHandle, DistributedWorker, execute_distributed_compiled
 from .log_config import _ensure_configured as _ensure_log_configured
 from .log_config import configure_log
 from .log_config import current_level as log_level
+from .pto_isa import ensure_pto_isa_root, pto_isa_include_dir
 from .runner import RunConfig, RunResult, compile_program, execute_compiled, run
 from .runtime_base import Worker
 from .tensor_spec import ScalarSpec, TensorSpec
@@ -37,7 +38,6 @@ from .worker import ChipWorker, RegistrationHandle
 
 # Honour ``PYPTO_RUNTIME_LOG`` before any runtime entry point runs.
 _ensure_log_configured()
-
 
 __all__ = [
     "run",
@@ -47,6 +47,8 @@ __all__ = [
     "execute_distributed_compiled",
     "configure_log",
     "log_level",
+    "ensure_pto_isa_root",
+    "pto_isa_include_dir",
     "BenchmarkStats",
     "TraceInvocation",
     "TraceSpan",
@@ -54,6 +56,7 @@ __all__ = [
     "DeviceTensor",
     "StackedDeviceTensor",
     "DistributedWorker",
+    "DistributedRunHandle",
     "RegistrationHandle",
     "RunConfig",
     "RunResult",

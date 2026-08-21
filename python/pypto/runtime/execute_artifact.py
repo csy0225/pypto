@@ -43,10 +43,17 @@ Exit contract (the harness relies on it; ``task-submit`` propagates it verbatim)
 import argparse
 import json
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any
 
-from pypto.runtime.runner import _DfxOpts, _execute_on_device
+from pypto.runtime.runner import (
+    _SWIMLANE_CLI_HELP,
+    _SWIMLANE_FULL_LEVEL,
+    _SWIMLANE_MAX_LEVEL,
+    _DfxOpts,
+    _execute_on_device,
+)
 
 __all__ = ["ArtifactSetupError", "execute_artifact_dir", "execute_batch_manifest", "main"]
 
@@ -102,11 +109,20 @@ def execute_artifact_dir(
         Exception: Any device / validation error is propagated to the caller
             (``main`` turns it into ``PYPTO_EXEC_RESULT=FAIL`` + exit ``1``).
     """
-    chip_callable, runtime_name = _reconstruct_artifact(work_dir, platform)
-    _run_on_device(work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate)
+    chip_callable, runtime_name, enable_sdma = _reconstruct_artifact(work_dir, platform)
+    _run_on_device(
+        work_dir,
+        platform,
+        device_id,
+        chip_callable,
+        runtime_name,
+        enable_sdma,
+        dfx=dfx,
+        validate=validate,
+    )
 
 
-def _reconstruct_artifact(work_dir: Path, platform: str) -> tuple[Any, str]:
+def _reconstruct_artifact(work_dir: Path, platform: str) -> tuple[Any, str, bool]:
     """Rebuild the cached artifact, reclassifying any failure as infra.
 
     ``compile_and_assemble`` reuses the cached ``.o``/``.so`` next to each kernel
@@ -117,10 +133,11 @@ def _reconstruct_artifact(work_dir: Path, platform: str) -> tuple[Any, str]:
     from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
     try:
-        chip_callable, runtime_name, _ = compile_and_assemble(work_dir, platform)
+        chip_callable, runtime_name, runtime_config = compile_and_assemble(work_dir, platform)
     except Exception as exc:  # noqa: BLE001 — reclassified as infra, re-raised below
         raise ArtifactSetupError(f"artifact reconstruction failed for {work_dir}: {exc}") from exc
-    return chip_callable, runtime_name
+    enable_sdma = bool(runtime_config.get("enable_sdma", False))
+    return chip_callable, runtime_name, enable_sdma
 
 
 def _run_on_device(
@@ -129,6 +146,7 @@ def _run_on_device(
     device_id: int,
     chip_callable: Any,
     runtime_name: str,
+    enable_sdma: bool,
     *,
     dfx: _DfxOpts,
     validate: bool,
@@ -147,6 +165,7 @@ def _run_on_device(
         runtime_name,
         platform,
         device_id,
+        enable_sdma=enable_sdma,
         dfx=dfx,
         validate=validate,
         actual_out_dir=work_dir / "data" / "actual",
@@ -168,6 +187,10 @@ def execute_batch_manifest(
     per artifact) — the fix for the per-artifact cold-start cost.  Artifacts
     that share the batch's ``(platform, runtime)`` reuse the worker; a differing
     one falls back to a fresh one-shot worker inside ``_execute_on_device``.
+    Before opening the shared worker, the batch reconstructs every artifact so
+    it can provision SDMA when any usable artifact on the shared worker's
+    binding requires it.  Ordinary artifacts can run on that SDMA-enabled
+    worker, while an all-ordinary batch keeps SDMA disabled.
 
     Each artifact runs under its own ``try`` so one failure doesn't abort the
     rest, and emits a per-artifact marker the harness parses::
@@ -197,15 +220,24 @@ def execute_batch_manifest(
     # the batch lifetime to keep ids distinct.
     live_callables: list[Any] = []
 
-    def _rebind(work_dir: Path, platform: str) -> tuple[Any, str]:
+    def _rebind(work_dir: Path, platform: str) -> tuple[Any, str, bool]:
         # _reconstruct_artifact already wraps a compile failure as ArtifactSetupError.
-        chip_callable, runtime_name = _reconstruct_artifact(work_dir, platform)
+        chip_callable, runtime_name, enable_sdma = _reconstruct_artifact(work_dir, platform)
         live_callables.append(chip_callable)
-        return chip_callable, runtime_name
+        return chip_callable, runtime_name, enable_sdma
 
     def _run_one(work_dir: Path, platform: str) -> None:
-        chip_callable, runtime_name = _rebind(work_dir, platform)
-        _run_on_device(work_dir, platform, device_id, chip_callable, runtime_name, dfx=dfx, validate=validate)
+        chip_callable, runtime_name, enable_sdma = _rebind(work_dir, platform)
+        _run_on_device(
+            work_dir,
+            platform,
+            device_id,
+            chip_callable,
+            runtime_name,
+            enable_sdma,
+            dfx=dfx,
+            validate=validate,
+        )
 
     def _run_and_mark(entry: dict) -> None:
         nonlocal all_ok
@@ -232,37 +264,82 @@ def execute_batch_manifest(
     # execution (each _execute_on_device opens + closes its own worker) so the
     # dep-gen child owns the device first, preserving the two-pass design.
     first_platform = str(entries[0]["platform"])
-    if dfx.enable_l2_swimlane and not first_platform.endswith("sim"):
+    if dfx.enable_chip_swimlane and not first_platform.endswith("sim"):
         for entry in entries:
             _run_and_mark(entry)
         return all_ok
 
-    # Reuse one ChipWorker for the batch, bound to the runtime of the first
-    # artifact that rebinds. Probe entries in order so a leading un-rebindable
-    # artifact gets its own INFRA marker instead of aborting the batch before the
-    # worker opens. compile_and_assemble is a cache hit, so the probe is cheap.
-    first_runtime: str | None = None
-    start_idx = 0
-    for i, entry in enumerate(entries):
+    # Reconstruct the whole batch before opening the shared worker so its SDMA
+    # capability does not depend on manifest order. Keep setup failures in the
+    # prepared list and emit their INFRA markers in manifest order below.
+    prepared: list[tuple[dict, tuple[Any, str, bool] | None, str | None]] = []
+    for entry in entries:
         try:
-            _, first_runtime = _rebind(Path(entry["work_dir"]), entry["platform"])
-            start_idx = i
-            break
+            rebound = _rebind(Path(entry["work_dir"]), entry["platform"])
         except Exception:
-            work_dir = Path(entry["work_dir"])
-            print(traceback.format_exc(), flush=True)
-            print(f"{_RESULT_PREFIX}=INFRA work_dir={work_dir}", flush=True)
-            all_ok = False
-    else:
-        # No artifact could be rebound — every entry already got an INFRA marker.
+            prepared.append((entry, None, traceback.format_exc()))
+        else:
+            prepared.append((entry, rebound, None))
+
+    def _mark_setup_failure(entry: dict, setup_traceback: str | None) -> None:
+        nonlocal all_ok
+        assert setup_traceback is not None
+        print(setup_traceback, flush=True)
+        print(f"{_RESULT_PREFIX}=INFRA work_dir={Path(entry['work_dir'])}", flush=True)
+        all_ok = False
+
+    first_usable_idx = next(
+        (i for i, (_, rebound, _) in enumerate(prepared) if rebound is not None),
+        None,
+    )
+    if first_usable_idx is None:
+        for entry, _, setup_traceback in prepared:
+            _mark_setup_failure(entry, setup_traceback)
         return False
 
+    # Preserve the historical leading-failure behavior: publish each leading
+    # INFRA marker before attempting to open the worker for the remaining batch.
+    for entry, _, setup_traceback in prepared[:first_usable_idx]:
+        _mark_setup_failure(entry, setup_traceback)
+
+    first_entry, first_rebound, _ = prepared[first_usable_idx]
+    assert first_rebound is not None
+    _, first_runtime, _ = first_rebound
+    shared_platform = str(first_entry["platform"])
+    shared_enable_sdma = any(
+        rebound[2]
+        for entry, rebound, _ in prepared
+        if rebound is not None and str(entry["platform"]) == shared_platform and rebound[1] == first_runtime
+    )
+
     with ChipWorker(
-        config=RunConfig(platform=str(entries[start_idx]["platform"]), device_id=device_id),
+        config=RunConfig(platform=shared_platform, device_id=device_id),
         runtime=first_runtime,
+        enable_sdma=shared_enable_sdma,
     ):
-        for entry in entries[start_idx:]:
-            _run_and_mark(entry)
+        for entry, rebound, setup_traceback in prepared[first_usable_idx:]:
+            work_dir = Path(entry["work_dir"])
+            if rebound is None:
+                _mark_setup_failure(entry, setup_traceback)
+                continue
+
+            chip_callable, runtime_name, enable_sdma = rebound
+            try:
+                _run_on_device(
+                    work_dir,
+                    entry["platform"],
+                    device_id,
+                    chip_callable,
+                    runtime_name,
+                    enable_sdma,
+                    dfx=dfx,
+                    validate=validate,
+                )
+                print(f"{_RESULT_PREFIX}=PASS work_dir={work_dir} device={device_id}", flush=True)
+            except Exception:
+                print(traceback.format_exc(), flush=True)
+                print(f"{_RESULT_PREFIX}=FAIL work_dir={work_dir}", flush=True)
+                all_ok = False
     return all_ok
 
 
@@ -288,7 +365,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-id", type=int, required=True, help="Hardware device index")
     # DFX toggles — names mirror tests/st/conftest.py so the harness round-trip
     # (_dfx_to_cli) is symmetric.
-    parser.add_argument("--enable-l2-swimlane", action="store_true", help="Capture L2 swimlane records")
+    parser.add_argument(
+        "--enable-chip-swimlane",
+        nargs="?",
+        const=_SWIMLANE_FULL_LEVEL,
+        default=0,
+        type=int,
+        choices=range(_SWIMLANE_MAX_LEVEL + 1),
+        metavar="LEVEL",
+        help=_SWIMLANE_CLI_HELP,
+    )
+    # Deprecated spelling. Separate dest so ``main`` can tell it was used and
+    # warn; ``default=None`` distinguishes "absent" from an explicit ``0``.
+    parser.add_argument(
+        "--enable-l2-swimlane",
+        dest="enable_l2_swimlane_deprecated",
+        nargs="?",
+        const=_SWIMLANE_FULL_LEVEL,
+        default=None,
+        type=int,
+        choices=range(_SWIMLANE_MAX_LEVEL + 1),
+        metavar="LEVEL",
+        help="Deprecated alias for --enable-chip-swimlane.",
+    )
     parser.add_argument(
         "--dump-args",
         type=int,
@@ -311,6 +410,28 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_swimlane_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """Fold the deprecated ``--enable-l2-swimlane`` into the canonical level.
+
+    Returns the requested collection level, warning when the old flag supplied
+    it and erroring when both flags disagree.
+    """
+    deprecated = args.enable_l2_swimlane_deprecated
+    if deprecated is None:
+        return args.enable_chip_swimlane
+    warnings.warn(
+        "--enable-l2-swimlane is deprecated; use --enable-chip-swimlane.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if args.enable_chip_swimlane and args.enable_chip_swimlane != deprecated:
+        parser.error(
+            f"--enable-chip-swimlane {args.enable_chip_swimlane} conflicts with the "
+            f"deprecated --enable-l2-swimlane {deprecated}; pass only the former."
+        )
+    return deprecated
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry: run one artifact, print the result marker, return exit code.
 
@@ -321,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     dfx = _DfxOpts(
-        enable_l2_swimlane=args.enable_l2_swimlane,
+        enable_chip_swimlane=_resolve_swimlane_args(parser, args),
         enable_dump_args=args.dump_args,
         enable_pmu=args.enable_pmu,
         enable_dep_gen=args.enable_dep_gen,

@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
+Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
 
 ## Overview
 
@@ -8,9 +8,9 @@ Decomposes composite tile / distributed ops into compositions of primitive tile 
 
 Host-orchestrator `pld.tensor.allreduce` calls are skipped by this pass: `SynthesizeAllReduceSignals` first normalizes optional-signal host calls to the explicit-signal form, `MaterializeCommDomainScopes` places the data and signal windows into comm domains, and then `LowerHostTensorCollectives` lowers them to internal builtin dispatches.
 
-The pass is **FP32-only**. Non-FP32 inputs are rejected at op-construction time by the shared `DeduceTileFP32OnlyType` deducer (see `src/ir/op/tile_ops/unary.cpp:94`), so the lowering pass itself only sees well-typed FP32 operands and never has to fail on dtype.
+The `tile.sin` / `tile.cos` rules are **FP32-only**. Non-FP32 trig inputs are rejected at op-construction time by the shared `DeduceTileFP32OnlyType` deducer (see `src/ir/op/tile_ops/unary.cpp:94`), so those rules only see well-typed FP32 operands. Distributed rules have their own dtype contracts; allreduce supports FP16 and FP32 as documented below.
 
-The pass is **structural no-op** on programs that contain no registered composite call such as `tile.sin`, `tile.cos`, or `pld.tensor.*` distributed collectives: every other statement passes through `IRMutator::VisitStmt_`. The decomposition emits only primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, none of which the mutator rewrites — so the pass is also **idempotent**.
+The pass is **structural no-op** on programs that contain no registered composite call such as `tile.sin`, `tile.cos`, or `pld.tensor.*` distributed collectives: every other statement passes through `IRMutator::VisitStmt_`. The decomposition emits only primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, `tile.cast`) and distributed primitives, none of which the mutator rewrites — so the pass is also **idempotent**.
 
 **Requires**: nothing.
 
@@ -18,7 +18,7 @@ The pass is **structural no-op** on programs that contain no registered composit
 
 **Invalidates**: nothing.
 
-The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus shape-only tensor views (`tensor.view`) used to expose canonical flattened windows; it neither establishes nor breaks any `IRProperty`.
+The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus metadata-only tensor views (`tensor.view`) used to expose canonical flattened windows; a partial-prefix ring view also carries a flattened `valid_shape`. The pass neither establishes nor breaks any `IRProperty`.
 
 ## When It Runs
 
@@ -31,7 +31,8 @@ The pass is a single translation unit, `src/ir/transforms/lower_composite_ops_pa
 ```text
 src/ir/transforms/lower_composite_ops_pass.cpp
   LoweringBuilder           — per-call scratchpad (Bind + primitive tile-op builders:
-                              tile.muls, tile.adds, tile.add, tile.sub, tile.mul, tile.cast
+                              tile.muls, tile.adds, tile.add, tile.sub, tile.mul,
+                              tile.maximum, tile.minimum, tile.cast
                               + structured control-flow: EmitFor / EmitForReduce
                               / EmitIf / EmitIfExpr + NotEq scalar guard)
   CompositeLoweringFn       — (call, visited_args, builder) -> result expr
@@ -43,7 +44,7 @@ src/ir/transforms/lower_composite_ops_pass.cpp
 
 Adding a new composite op (all edits stay in `lower_composite_ops_pass.cpp`):
 
-1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (4-phase notify / wait / remote_load+accumulate / store for mesh; `LowerTensorRingAllReduceRule` adds a chunked RS+AG ring schedule dispatched via a `mode` kwarg).
+1. Write a `Lower<Op>Rule(call, args, builder)` function. It receives the original `CallPtr` (use `call->span_`, `call->kwargs_`, `call->op_->name_` as needed), the visited arg expressions (var-remap already applied), and a `LoweringBuilder` whose `Bind` helper appends an `AssignStmt` per intermediate temp. For rules that need control flow, use `builder.EmitFor` / `builder.EmitForReduce` / `builder.EmitIf` / `builder.EmitIfExpr` — each takes a body callback that receives a nested builder sharing the same temp counter, so emitted temps stay uniquely named regardless of nesting depth. `LowerTensorAllReduceRule` is the canonical example of a control-flow-bearing rule (ready barrier plus chunked remote_load+accumulate / barrier / store for mesh; `LowerTensorRingAllReduceRule` adds a chunked RS+AG ring schedule dispatched via a `mode` kwarg).
 2. Add a `{"<op>", &Lower<Op>Rule}` row to `kRules` inside `LookupCompositeRule`.
 
 No edits to the mutator are needed. When the table grows past a handful of entries — or a rule wants its own translation unit — promote it back to a standalone registry under `src/ir/transforms/composite_ops/`.
@@ -183,23 +184,36 @@ All constants are FP32 literals (the `k*` literals near the top of `src/ir/trans
 
 ## Idempotency
 
-Running `LowerCompositeOps` twice produces identical IR after the first run: the tile recipes emit only `tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, and `tile.cast`, while the distributed recipes emit only the distributed primitives listed below. The mutator only rewrites registered composite calls (`tile.sin`, `tile.cos`, `pld.tensor.*` distributed collectives, ...), so the second invocation visits the body and changes nothing. This is verified by the sin/cos and distributed-collective idempotency tests in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
+Running `LowerCompositeOps` twice produces identical IR after the first run: the recipes emit only primitives such as `tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, and `tile.cast`, plus the distributed primitives listed below. The mutator only rewrites registered composite calls (`tile.sin`, `tile.cos`, `pld.tensor.*` distributed collectives, ...), so the second invocation visits the body and changes nothing. This is verified by the sin/cos and distributed-collective idempotency tests in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
 
 ## `pld.tensor.*` distributed collectives
 
-The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe. The data-movement primitive differs by op: `allgather` uses `pld.tile.put` (TPUT-based, auto-chunks through a VEC staging tile), `broadcast` relocates window data with `pld.tile.get` (GM→GM copy), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load` and accumulate with `tile.add`. The rules share the same signal-buffer discipline: a window-bound INT32 `signal` matrix is used as a cross-rank barrier, and the buffer is **single-shot per call**.
+The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe, plus a self-clearing epilogue. The data-movement primitive differs by op: `allgather` uses `pld.tile.put` (TPUT-based, auto-chunks through a VEC staging tile), `broadcast` relocates window data with `pld.tile.get` (GM→GM copy), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load`. Allreduce selects `tile.add`, `tile.maximum`, `tile.minimum`, or `tile.mul`; reduce-scatter currently accumulates with `tile.add`. All seven rules share the same **self-clearing credit-barrier protocol** (`LoweringBuilder::EmitBarrier` + `EmitEpilogueReset`) — see [Barrier-signal protocol](#barrier-signal-protocol) below — so a `signal` buffer is reusable across back-to-back calls, and even inside `for` / `while` / `if`.
+
+### Barrier-signal protocol
+
+Every call issues `N` barriers — `AtomicAdd(1)` into each peer's cell, then `Wait(>= g)` where `g` counts up **within that call only** (every fresh call restarts at 1, via `LoweringBuilder::EmitBarrier`'s call-local `barrier_count_`). After the body, an epilogue (`LoweringBuilder::EmitEpilogueReset`) subtracts the call's total credit `N` back out of every non-self cell with a single `AtomicAdd(-N)`. Because atomic adds and subtracts commute, the signal is provably all-zero again once every rank has finished its epilogue — there is no cross-call state to get wrong, so the *next* call on the same signal also starts at generation 1.
+
+`N` may be a **runtime scalar** (`pld.system.notify`'s `value` only requires `ScalarType`), so a mesh allreduce's per-chunk credit count does not need to be a compile-time constant — unlike the barrier count itself, which is always a small compile-time sequence (`1`, `2`, ...) because each `Wait`'s `expected` must be resolvable without knowing how many times the surrounding (possibly dynamic) loop will execute at runtime.
+
+`kGe` (not `kEq`) is the load-bearing choice for every wait predicate: a fast peer can advance a cell past the value a slow rank is looking for before that rank ever polls it, so equality would deadlock. For the same reason `kSet` must never be mixed with `kAtomicAdd` on the same cells — a set could clobber an already-advanced counter.
+
+Mesh (`[NR, 1]`, one cell per rank) and ring (`[2*(NR-1), NR]`, one row per round) signals use incompatible cell addressing, so sharing one buffer between the two is rejected as a shape mismatch (`ValidateMeshSignalShape`) — the only restriction the protocol still imposes.
 
 ### `pld.tensor.allreduce`
 
-The allreduce rule decomposes one composite call into two cross-rank barriers reusing the same `signal` cells: Phase 2a `Set 1` + Phase 2b `wait ≥1`, then Phase 3.5a `AtomicAdd 1` + Phase 3.5b `wait ≥2`. By the time the call returns, every cell sits at `2` rather than its initial `0`.
+The allreduce rule starts with a cross-rank ready barrier on shared `signal` cells (generation 1). It then processes a fully-valid target in UB-sized chunks. Every chunk performs a peer reduction, then barriers on its own call-local generation (`2`, `3`, ...) before storing its result — preventing a fast rank from overwriting bytes a slow rank has not remote-loaded yet. The epilogue then subtracts the call's total credit (`1 + chunk_count`, built as an IR expression since `chunk_count` may depend on a runtime extent) back out of every non-self row. The partial-valid single-rectangle path issues exactly two barriers (ready + post-reduce) and its epilogue subtracts `2`.
 
-Mesh lowering collapses a packed target to `[product(leading dimensions), last dimension]`. If an ND target carries a partial `TensorView.valid_shape`, the pass preserves it and reduces only the corresponding 2D rectangle. Strided targets, DN partial views, and partial boxes that cannot be represented by this leading-dimension collapse are rejected explicitly.
+For a fully-valid packed target, mesh lowering creates a logical `[1, product(all dimensions)]` view and traverses it with physical tiles of at most 16 KiB. A statically known extent smaller than the budget shrinks the chunk to the smallest 32-byte-aligned physical width that covers it, so small allreduces do not reserve a full 16-KiB tile while remaining legal PTO tiles. The tail carries `valid_shape=[1, min(chunk, remaining)]` through both `tile.load` and `pld.tile.remote_load`, so the allocation stays static while the read/store extent is exact. If an ND target carries a partial `TensorView.valid_shape`, the pass preserves and reduces the representable `[rows, cols]` rectangle through the established single-rectangle path. Constant valid rectangles use their compact shape; symbolic valid extents fall back to the source's physical rectangle when that statically bounded rectangle fits within one 16-KiB chunk. Oversized partial rectangles, strided targets, DN partial views, and partial boxes that cannot be represented by the leading-dimension collapse are rejected explicitly.
 
-**Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale `2` in any cell would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's Phase 4 writes. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
+Ring lowering uses one packed 2D view for its reduce-scatter and allgather phases. A fully valid target becomes `[1, SIZE]`; a contiguous partial prefix keeps physical shape `[1, product(target.shape)]` and carries logical `TensorView.valid_shape=[1, product(target.valid_shape)]`. FP32 retains balanced `floor(i * SIZE / NR)` segment boundaries. FP16 rounds each interior boundary up to 16 elements and caps it at `SIZE`; consequently every non-empty segment and every UB subchunk starts at a 32-byte-aligned address. A ragged FP16 remote load may read the aligned physical tail reserved by the communication domain, then `tile.set_validshape` restores the logical extent before reduction and store. This supports non-divisible inputs and `SIZE < NR` without inserting holes into the public tensor layout. Every subchunk of every round barriers on a call-local ready + read-complete generation pair; the epilogue then subtracts `2 * chunk_count` (uniform across rounds, since every round's subchunk loop shares the same bound) from every row of the `[2*(NR-1), NR]` signal.
 
-`kGe` (not `kEq`) is the load-bearing choice for both wait predicates. The cell is monotonically increasing within a single call, but a slow rank's first poll may already see the cell past `1` if a faster peer has completed Phase 3 (microseconds-long remote loads) and started Phase 3.5a. `kEq(==1)` would then deadlock; `kGe(≥1)` does not. The hand-written reference at `tests/st/distributed/test_l3_allreduce.py` uses `Ge(1)` for the same reason.
+Any symbolic target or partial-valid extent that survives lowering must be runtime-bound by a kernel scalar, loop variable, or physical tensor-shape parameter; a type-metadata-only symbol is rejected during PTO codegen. A fully dynamic physical target dimension is bound from that tensor parameter.
 
-Only `ReduceOp::kSum` is supported in the first version; the C++ deducer rejects `Max` / `Min` / `Prod`.
+Signal buffers are reusable across back-to-back allreduce calls — including a mesh allreduce over a symbolic extent, whose credit total is simply a runtime-computed expression rather than a value the compiler must know. See [Barrier-signal protocol](#barrier-signal-protocol) above.
+
+Mesh and ring lowering support FP16 and FP32 with `ReduceOp::kSum`, `kMax`,
+`kMin`, and `kProd` for arbitrary positive element counts.
 
 ### `pld.tensor.allgather`
 
@@ -207,22 +221,20 @@ Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's 
 
 - ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking.  ``pld.tile.put`` reads directly from the ``local_data`` Tensor (or Tile) source — no explicit ``tile.load`` is emitted.
 - Phase 1: for `peer` in `0..NR-1`, `pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — push this rank's chunk into every peer's window at row `my_rank`. Self-store (`peer == my_rank`) uses HCCL identity mapping. `pld.tile.put` auto-chunks when SIZE exceeds the staging-tile capacity
-- Phase 2a: notify-all (`Set 1`)
-- Phase 2b: wait-all (`Ge 1`)
+- Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
 - Return `target` — the window IS the gathered `[NR, SIZE]` result (window-as-result, `DistributedTensor`)
 
 Compared to the original pull-based allgather (4-arg with a separate `out` tensor), this push-based variant drops the `out` parameter and the per-peer `pld.tile.get` gather loop. Total HBM drops from `(NR+1)×SIZE` to `NR×SIZE`, at the cost of the window remaining occupied until the caller consumes the result.
 
 ### `pld.tensor.reduce_scatter`
 
-Decomposes into the same 5-phase shape as `allreduce`:
+Decomposes into the same phase shape as `allreduce`'s rectangle path:
 
-- Phase 2a: notify-all (`Set 1`)
-- Phase 2b: wait-all (`Ge 1`)
+- Phase 2a/2b: ready barrier (generation 1)
 - Phase 3: for each peer, `remote_load` chunk `r` from peer `p` and accumulate into a local scratch with `tile.add`
-- Phase 3.5a: re-notify (`AtomicAdd 1`)
-- Phase 3.5b: re-wait (`Ge 2`)
+- Phase 3.5a/3.5b: post-reduce barrier (generation 2)
 - Phase 4: `tile.store` the reduced chunk `r` back into `target[r, 0:SIZE]`
+- Epilogue: subtract 2 from every non-self cell
 
 `target` has shape `[NR, SIZE]`; each rank stages all `NR` chunks before the call. After the call, rank `r`'s row `[r, 0:SIZE]` holds the element-wise sum of chunk `r` across all ranks. The post-reduce barrier is required for the same WAR reason as `allreduce`.
 
@@ -232,24 +244,16 @@ Only `ReduceOp::kSum` is supported in the first version; the C++ deducer rejects
 
 Decomposes into a 3-phase recipe:
 
-- Phase 2a: notify-all (`Set 1`)
-- Phase 2b: wait-all (`Ge 1`)
+- Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
 - Phase 3: `tile.create` (VEC staging tile) + `pld.tile.get(target, peer=root, target, stage)` on every rank — each rank reads root's slice into its own `target`. For `peer == root` the HCCL identity mapping makes the get a local no-op, so root keeps its own data while non-root ranks receive root's.
 
 `root` is a static `int` kwarg known at compile time.
 
 ### `pld.tensor.barrier`
 
-Pure synchronization — no data movement. Decomposes into a 2-phase recipe:
+Pure synchronization — no data movement. Decomposes into a barrier (generation 1) plus its epilogue (subtract 1 from every non-self cell).
 
-- Phase 2a: notify-all (`Set 1`)
-- Phase 2b: wait-all (`Ge 1`)
-
-The returned expression is the same `signal` tensor, enabling the rebind idiom `signal = pld.tensor.barrier(signal)`.
-
-### Signal-buffer discipline
-
-All distributed rules use `kGe` (not `kEq`) for wait predicates. The cell is monotonically increasing within a single call, but a slow rank's first poll may already see the cell past the threshold if a faster peer has finished its Phase-3 data movement and started the next notify. `kEq` would deadlock in that case; `kGe` does not. A self-resetting variant (Set 0 / Eq 0 at the end of a call) is blocked on PTOAS issue #797.
+The returned expression is the same `signal` tensor, enabling the rebind idiom `signal = pld.tensor.barrier(signal)`. Under the self-clearing protocol every call restarts at generation 1 regardless of how many times the signal has already been used, so the rebind no longer needs to chain onto any prior state.
 
 ## Implementation Notes
 

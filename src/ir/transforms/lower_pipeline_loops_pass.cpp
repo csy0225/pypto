@@ -33,6 +33,7 @@
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -69,12 +70,7 @@ std::optional<int64_t> TryGetConstInt(const ExprPtr& expr) {
   return std::nullopt;
 }
 
-/// Trip count for a static for-loop range.
-int64_t ComputeStaticTripCount(int64_t start, int64_t stop, int64_t step) {
-  if (step > 0 && start < stop) return (stop - start + step - 1) / step;
-  if (step < 0 && start > stop) return (start - stop + (-step) - 1) / (-step);
-  return 0;
-}
+using transform_utils::ComputeStaticTripCount;
 
 ExprPtr MakeConstIndex(int64_t value, const Span& span) {
   return std::make_shared<ConstInt>(value, DataType::INDEX, span);
@@ -143,7 +139,11 @@ VarPtr MakeFreshVar(const VarPtr& original, const std::string& suffix) {
 ///
 /// One loop *does* tag its cube accumulator: the moving loop of a dbC=2
 /// double-buffered-L0C emit (kPipelineDoubleBufferCAttr), which genuinely co-lives
-/// two accumulators. See `loop_double_buffers_c_` in the tagger.
+/// two accumulators. The tag initially records the full source stage so
+/// CanonicalizeIOOrder can schedule a deeper operand pipeline in depth-two
+/// compute/drain chunks; that pass then rotates each replicated group's Acc
+/// membership modulo two before MemoryReuse consumes it. See
+/// `loop_double_buffers_c_` in the tagger.
 class PipelineMembershipTagger : public IRMutator {
  public:
   PipelineMembershipTagger(int32_t group, int32_t stage, bool loop_double_buffers_c)
@@ -172,7 +172,9 @@ class PipelineMembershipTagger : public IRMutator {
     // The dbC=2 exception (loop_double_buffers_c_): the moving loop that carries
     // kPipelineDoubleBufferCAttr *does* co-live two accumulators — tile i's FIXPIPE
     // drain overlaps tile i+1's MAD — so its accumulator DOES need this loop's
-    // (group, stage) to double-buffer. Only that loop tags it; every enclosing
+    // (group, stage) while scheduling. CanonicalizeIOOrder later rotates that
+    // stage modulo two within each replicated group before allocation. Only this
+    // loop tags it; every enclosing
     // pipeline loop still skips it (the outer loop double-buffers operands, but the
     // MADs writing successive outer-stage accumulators still serialize on the one
     // cube). The result is a flat depth-2 membership from the dbC loop alone, so the

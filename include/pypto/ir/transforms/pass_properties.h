@@ -66,9 +66,19 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+// Resolves a returned DistributedTensor to the parameter it writes back via
+// return_lineage::ExplicitReturnedParamIndices, which is a pointer-identity read
+// of the ReturnStmt and only meaningful once NormalizeReturnOrder has
+// canonicalized it — hence the ReturnParamsExplicit requirement.
 inline const PassProperties kMaterializeDistTensorCtxProperties{
-    .required = {IRProperty::CommDomainScopesMaterialized},
-    .produced = {IRProperty::CommDomainScopesMaterialized}};
+    .required = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit},
+    .produced = {IRProperty::CommDomainScopesMaterialized, IRProperty::DistTensorCtxMaterialized}};
+
+// -- MaterializeValidShapeSymbols pass (runs last) ---------------------------
+//    Prepends a Scalar[INDEX] parameter per device-kernel valid_shape symbol that
+//    the kernel cannot bind, and passes the actual extent at every call site.
+//    Signature-and-call rewrite only; touches no structural property.
+inline const PassProperties kMaterializeValidShapeSymbolsProperties{};
 
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
@@ -130,7 +140,7 @@ inline const PassProperties kLowerCompositeOpsProperties{};
 // OutlineIncoreScopes opens the AivSplitValid verification window: it preserves
 // the first-class SplitAivScopeStmt regions inside each outlined InCore function,
 // so the structural region verifier can run from here until LowerAutoVectorSplit
-// erases the node (pass 21).
+// erases the node (pass 20).
 inline const PassProperties kOutlineIncoreScopesProperties{
     .required = {IRProperty::SSAForm},
     .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::AivSplitValid}};
@@ -174,6 +184,15 @@ inline const PassProperties kFlattenTileNdTo2DProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
 
+// -- Legalize unsupported tile.cast pairs into native cast chains -------------
+//
+// Property-preserving: expands one tile.cast AssignStmt into a SeqStmts of
+// native tile.cast hops. Empty props (same rationale as LowerCompositeOps):
+// the rewrite stays inside the existing tile.cast vocabulary and does not
+// establish or destroy IRProperties. Pipeline position is FlattenTileNdTo2D
+// → LegalizeTileCast → AutoTileMatmulL0.
+inline const PassProperties kLegalizeTileCastProperties{};
+
 // -- Auto L0 matmul tiling pass -----------------------------------------------
 //
 // Property-preserving rewrite: replaces ``tile.matmul[_acc]`` over Mat-resident
@@ -211,8 +230,20 @@ inline const PassProperties kInferTileMemorySpaceProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
-                 IRProperty::AivSplitValid},
+                 IRProperty::AivSplitValid, IRProperty::AccToGmStoreValid},
     .invalidated = {IRProperty::AivSplitValid}};
+
+// -- Insert MX scale-address binding pass ------------------------------------
+//
+// Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale
+// and Right/RightScale spaces so tile.tget_scale_addr can be inserted before
+// each MX matmul consumer. Property-preserving (no new IRProperty).
+
+inline const PassProperties kInsertMxScaleAddrProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred}};
 
 // -- Materialize tensor strides pass (RFC #1300 §2.4) ------------------------
 
@@ -323,6 +354,14 @@ inline const PassProperties kSkewCrossCorePipelineProperties{
     .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
 
+// Rebinds tiles onto slots of a declared allocation and demotes the loop; no
+// property is added or removed (same set as the replication pass it precedes).
+inline const PassProperties kLowerPipelineToSlotsProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+
 inline const PassProperties kLowerPipelineLoopsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
@@ -360,11 +399,13 @@ inline const PassProperties kExpandManualPhaseFenceProperties{
 // -- Automatic runtime-scope task dependency pass -----------------------------
 //
 // Reads ``Call.attrs_["arg_directions"]`` and writes
-// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. MANUAL
-// scopes are analyzed in the default pipeline. AUTO-scope analysis is
-// controlled by the pass option and remains off by default at high-level
-// pipeline entry points. The pass preserves CallDirectionsResolved because it
-// does not rewrite call args or direction attrs.
+// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. User-written
+// MANUAL scopes are never analyzed: their explicit ``deps=[...]`` edges remain
+// the only task dependencies. AUTO-scope analysis is controlled by the pass
+// option and remains off by default at high-level pipeline entry points. The
+// pass preserves CallDirectionsResolved because it does not rewrite call args:
+// in an analyzed AUTO region it only refines already-resolved directions
+// (``Input -> NoDep``, ``InOut -> OutputExisting``), leaving every arg resolved.
 inline const PassProperties kAutoDeriveTaskDependenciesProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
     .produced = {IRProperty::CallDirectionsResolved}};
@@ -378,6 +419,16 @@ inline const PassProperties kFoldNoOpReshapeProperties{
 // -- Stamp tpop split/id onto tfree ops --------------------------------------
 
 inline const PassProperties kStampTfreeSplitProperties{.required = {IRProperty::SplitIncoreOrch}};
+
+// -- Insert data-before-signal comm markers (runs last, before codegen) -------
+//    After each local publishing write, a region system.cacheinvalid + GM
+//    system.fence; after each opaque write (Submit / unregistered call), a
+//    whole-GM system.cacheinvalid + fence; after each wait, a whole-GM
+//    system.cacheinvalid (the notify needs nothing; remote writes are handled by
+//    their codegen). Additive
+//    statement insertion over already-lowered InCore IR; requires SplitIncoreOrch
+//    (held throughout) and touches no other property.
+inline const PassProperties kInsertCommFenceProperties{.required = {IRProperty::SplitIncoreOrch}};
 
 }  // namespace pass
 }  // namespace ir

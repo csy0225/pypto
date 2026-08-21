@@ -17,17 +17,17 @@
  * :class:`DistributedTensorType` into a local tile. Mirrors ``tile.load``
  * at the IR level (positional ``offsets`` / ``shape`` tuples + TileType
  * result), but the source is a *remote* slice — the address translation
- * is realised at codegen time by ``CommRemoteOffset(ctx, peer) + addptr + make_tensor_view``.
+ * is realised at codegen time by inline peer-offset arithmetic + ``addptr`` + ``make_tensor_view``.
  *
  * IR signature::
  *
- *     pld.tile.remote_load(target, peer, offsets, shape) -> TileType(shape, target.dtype)
+ *     pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])
+ *         -> TileType(shape, target.dtype)
  *
  * The DSL surface (``pld.tile.remote_load`` in
- * ``python/pypto/language/distributed/op/tile_ops.py``) exposes ``peer`` /
- * ``offsets`` / ``shape`` as keyword-only arguments for readability; the
- * underlying IR op keeps them positional, matching the convention used by
- * ``tile.load`` (see ``src/ir/op/tile_ops/memory.cpp``).
+ * ``python/pypto/language/distributed/op/tile_ops.py``) accepts positional or
+ * keyword arguments so printer output round-trips; the underlying IR op keeps
+ * them positional, matching ``tile.load``.
  *
  * Verifier (strict per kind-trait rules — ``As<DistributedTensorType>``
  * does NOT match a plain :class:`TensorType`):
@@ -36,33 +36,66 @@
  *   :class:`TensorType` so users cannot accidentally feed a non-window-bound
  *   tensor into a cross-rank load.
  * * ``peer`` must be a :class:`ScalarType` expression (integer rank index).
- * * ``offsets`` / ``shape`` must each be a :class:`MakeTuple`, with rank
- *   equal to ``target.shape.size()``.
+ * * ``offsets`` / ``shape`` / optional ``valid_shape`` must each be a
+ *   :class:`MakeTuple`, with rank equal to ``target.shape.size()``.
  */
 
 #include <any>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
 
 namespace {
 
+std::vector<ExprPtr> NormalizeRemoteValidShape(const MakeTuple& valid_shape, const Span& span) {
+  std::vector<ExprPtr> normalized;
+  normalized.reserve(valid_shape.elements_.size());
+  const auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  for (size_t i = 0; i < valid_shape.elements_.size(); ++i) {
+    const auto& extent = valid_shape.elements_[i];
+    auto scalar_type = extent ? As<ScalarType>(extent->GetType()) : nullptr;
+    CHECK_SPAN(scalar_type && scalar_type->dtype_.IsInt(), span)
+        << "pld.tile.remote_load valid_shape " << i << " must be an integer scalar, but got "
+        << (extent ? extent->GetType()->TypeName() : "null");
+
+    ExprPtr index_extent;
+    if (auto constant = As<ConstInt>(extent)) {
+      index_extent = std::make_shared<ConstInt>(constant->value_, DataType::INDEX, extent->span_);
+    } else if (scalar_type->dtype_ == DataType::INDEX) {
+      index_extent = extent;
+    } else {
+      index_extent = std::make_shared<Cast>(extent, DataType::INDEX, extent->span_);
+    }
+    CHECK_SPAN(ProveValidExtentLessEqual(zero, index_extent) != ProofResult::kFalse, span)
+        << "pld.tile.remote_load valid_shape " << i << " is provably negative; "
+        << "a valid region cannot have a negative extent";
+    normalized.push_back(index_extent);
+  }
+  return normalized;
+}
+
 TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
-                             const std::vector<std::pair<std::string, std::any>>& /*kwargs*/) {
-  CHECK(args.size() == 4) << "pld.tile.remote_load requires exactly 4 positional arguments "
-                             "(target, peer, offsets, shape), but got "
-                          << args.size();
+                             const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 4 || args.size() == 5) << "pld.tile.remote_load requires 4 or 5 positional arguments "
+                                                 "(target, peer, offsets, shape[, valid_shape]), but got "
+                                              << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tile.remote_load positional argument #" << i << " must not be null";
   }
@@ -73,10 +106,12 @@ TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
   auto dist_type = As<DistributedTensorType>(args[0]->GetType());
   CHECK(dist_type) << "pld.tile.remote_load target must be a DistributedTensor (window-bound), got "
                    << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!dist_type->tensor_view_ || !IsMxTensorLayout(dist_type->tensor_view_->layout), args[0]->span_)
+      << "pld.tile.remote_load does not support MX-layout tensors";
 
   // peer must be a scalar (integer rank index). Allow any ScalarType — dtype
   // narrowing to integer is handled at codegen time when emitting the
-  // CommRemoteOffset scalar arithmetic.
+  // peer-offset scalar arithmetic.
   CHECK(IsA<ScalarType>(args[1]->GetType()))
       << "pld.tile.remote_load peer must be a scalar (rank index), got " << args[1]->GetType()->TypeName();
 
@@ -87,6 +122,15 @@ TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
   auto shape_tuple = As<MakeTuple>(args[3]);
   CHECK(shape_tuple) << "pld.tile.remote_load shape must be a tuple (MakeTuple of scalars), got "
                      << args[3]->TypeName();
+  const bool has_requested_valid = args.size() == 5;
+  std::vector<ExprPtr> requested_valid;
+  if (has_requested_valid) {
+    auto valid_shape_tuple = As<MakeTuple>(args[4]);
+    CHECK(valid_shape_tuple)
+        << "pld.tile.remote_load valid_shape must be a tuple (MakeTuple of scalars), got "
+        << args[4]->TypeName();
+    requested_valid = NormalizeRemoteValidShape(*valid_shape_tuple, args[4]->span_);
+  }
 
   const auto target_rank = dist_type->shape_.size();
   CHECK(offsets_tuple->elements_.size() == target_rank)
@@ -95,13 +139,73 @@ TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
   CHECK(shape_tuple->elements_.size() == target_rank)
       << "pld.tile.remote_load shape rank (" << shape_tuple->elements_.size()
       << ") must match target tensor rank (" << target_rank << ")";
+  CHECK(!has_requested_valid || requested_valid.size() == target_rank)
+      << "pld.tile.remote_load valid_shape rank (" << requested_valid.size()
+      << ") must match target tensor rank (" << target_rank << ")";
   CHECK(target_rank > 0) << "pld.tile.remote_load requires at least one dimension on target";
 
-  // Result: a local TileType with the requested shape and the target's dtype.
+  // FP16 peer MTE transfers require a 32-byte-aligned final span on A2/A3.
+  // LowerCompositeOps may therefore request an aligned physical tail while
+  // separately retaining the real logical tail for set_validshape. The comm
+  // domain reserves one extra 32-byte block, so exposing at most 15 additional
+  // FP16 elements to this internal load remains within mapped window memory.
+  // The public DSL never sets this attribute.
+  const bool allow_physical_tail_padding = GetKwargOr<bool>(kwargs, "allow_physical_tail_padding", false);
+  std::vector<ExprPtr> source_physical = dist_type->shape_;
+  std::vector<ExprPtr> source_valid = GetEffectiveTensorValidShape(*dist_type);
+  if (allow_physical_tail_padding) {
+    CHECK(dist_type->dtype_ == DataType::FP16)
+        << "pld.tile.remote_load allow_physical_tail_padding requires an FP16 target";
+    CHECK(target_rank == 2)
+        << "pld.tile.remote_load allow_physical_tail_padding requires a flattened rank-2 target";
+    CHECK(has_requested_valid)
+        << "pld.tile.remote_load allow_physical_tail_padding requires an explicit valid_shape";
+    auto padding_elements = std::make_shared<ConstInt>(15, DataType::INDEX, args[0]->span_);
+    source_physical[1] = MakeAdd(source_physical[1], padding_elements, args[0]->span_);
+    source_valid = source_physical;
+  }
+
+  // Result: a local TileType with the requested physical shape and the target's
+  // dtype. Its effective valid_shape always intersects the request (when
+  // present) with the source's valid region, so both the four- and five-argument
+  // forms enforce physical bounds. The internal FP16 tail mode extends only
+  // the final physical dimension by one alignment block as described above.
   // Layout / memory-space stay unresolved at this point; downstream passes
   // (InferTileMemorySpace etc.) pick them from consumer demand, mirroring
   // tile.load with no target_memory kwarg.
-  return std::make_shared<TileType>(shape_tuple->elements_, dist_type->dtype_);
+  TileView tile_view;
+  tile_view.valid_shape = InferWindowReadValidShape({
+      /*source_physical=*/source_physical,
+      /*source_valid=*/source_valid,
+      /*offsets=*/offsets_tuple->elements_,
+      /*window=*/shape_tuple->elements_,
+      /*requested_valid=*/requested_valid,
+      /*kind=*/WindowReadKind::kClampedWindow,
+      /*clamp=*/false,
+      /*op_name=*/"pld.tile.remote_load",
+      /*bounds_remedy=*/
+      "Pass a smaller valid_shape to describe a ragged remote-load tail",
+      /*span=*/args[0]->span_,
+      /*materialize_symbolic_intersection=*/true,
+  });
+  tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(shape_tuple->elements_);
+  if (dist_type->tensor_view_.has_value()) {
+    switch (dist_type->tensor_view_->layout) {
+      case TensorLayout::ND:
+        tile_view.blayout = TileLayout::row_major;
+        break;
+      case TensorLayout::DN:
+        tile_view.blayout = TileLayout::col_major;
+        break;
+      case TensorLayout::NZ:
+        break;
+      case TensorLayout::MX_A_ZZ:
+      case TensorLayout::MX_B_NN:
+        INTERNAL_CHECK(false) << "MX layouts were rejected before remote-load layout deduction";
+    }
+  }
+
+  return std::make_shared<TileType>(shape_tuple->elements_, dist_type->dtype_, std::nullopt, tile_view);
 }
 
 }  // namespace
@@ -109,19 +213,47 @@ TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
 // ============================================================================
 // pld.tile.remote_load — cross-rank slice of a DistributedTensor into a tile
 // ============================================================================
+//
+// Core placement: deliberately undeclared, and therefore SHARED today.
+//
+// Unlike TPUT/TGET, a remote load is not pinned to the vector core by the ISA —
+// it lands wherever its destination tile lives, and codegen emits the transfer
+// into that buffer. Declaring VECTOR here would be right only by accident of
+// InferTileMemorySpace currently pinning non-`tile.` producers to Vec, so it is
+// not declared.
+//
+// The consequence is a KNOWN GAP: this op has no memory spec and no TileType
+// *argument* (its tile is the result), so ClassifyCallAffinity's memory rules
+// both miss it and it reaches the SHARED fallback — which ExpandMixedKernel
+// replicates onto both lanes of a mixed kernel. The replication is benign
+// today: the cube copy produces a Vec tile that no cube-lane statement consumes
+// (a cube consumer reaches it through a C/V boundary tpush/tpop instead), so it
+// is dead and FinalizeSplitCoreBody's DCE removes it.
+//
+// Deriving the affinity from the resolved result-tile memory space looks like
+// the clean fix, but it is NOT safe as a general ClassifyCallAffinity rule:
+// LowerAutoVectorSplit (pass 20) treats a VECTOR-affine leaf as "route into the
+// halving machinery", and that machinery has no rewrite for this op's `offsets`
+// / `shape` tuples — it would shrink the result type while leaving the request
+// at full width. Fixing this properly means teaching the halving path about the
+// op, not reclassifying it.
 
 REGISTER_OP("pld.tile.remote_load")
     .set_description(
         "Load a region of the peer rank's slice of a window-bound DistributedTensor "
         "into a local tile. Mirrors tile.load at the IR level but the source is a "
         "remote slice — address translation is realised at codegen via "
-        "CommRemoteOffset(ctx, peer) + addptr + make_tensor_view.")
+        "inline peer-offset arithmetic + addptr + make_tensor_view.")
     .set_op_category("DistributedOp")
     .add_argument("target", "Window-bound DistributedTensor (DistributedTensorType)")
     .add_argument("peer", "Peer rank index (ScalarType, integer)")
     .add_argument("offsets", "Offsets in target tensor coordinates (MakeTuple of scalars)")
     .add_argument("shape", "Tile shape per dimension (MakeTuple of scalars)")
+    .add_argument("valid_shape", "Optional valid tile extent for ragged tails (MakeTuple of scalars)")
+    .set_attr<bool>("allow_physical_tail_padding")
     .no_memory_spec()
+    // Pulls a peer's window into a fresh SSA tile: every operand is a read.
+    .no_arg_writes()
     .f_deduce_type(DeduceRemoteLoadType);
 
 }  // namespace ir

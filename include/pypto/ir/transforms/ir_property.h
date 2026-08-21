@@ -64,6 +64,9 @@ enum class IRProperty : uint64_t {
   CommDomainScopesMaterialized,     ///< Host_orch bodies are wrapped in CommDomainScopeStmts (one per
                                     ///< inferred comm domain) and pld.tensor.window result types carry
                                     ///< DistributedTensorType.window_buffer_ back-references
+  DistTensorCtxMaterialized,        ///< No pld.system.get_comm_ctx survives outside host orchestration;
+                                    ///< every chip-orchestration / device communication context is an
+                                    ///< explicit CommCtxType SSA value traceable to a parameter
   RuntimeScopesMaterialized,        ///< Orchestration functions carry explicit RuntimeScopeStmt nodes for the
                                     ///< function body and for/if bodies; codegen no longer emits implicit
                                     ///< PTO2_SCOPE() wrappers
@@ -90,6 +93,17 @@ enum class IRProperty : uint64_t {
                                     ///< ``iter_arg_array_size_<i>`` for TaskId array carries), so
                                     ///< orchestration codegen reads the carry lowering instead of
                                     ///< re-deriving it
+  AccToGmStoreValid,                ///< Every tile.store whose source tile is Acc-resident targets a GM
+                                    ///< tensor whose dtype the backend's fix-pipe can narrow into
+                                    ///< (BackendHandler::SupportsAccToGmDtype). Verifiable only once
+                                    ///< InferTileMemorySpace has resolved memory spaces -- the same DSL
+                                    ///< program is legal when its result routes through Vec instead
+  AtomicAddDtypeValid,              ///< Every atomic-add write into GM (tile.store / tensor.assemble /
+                                    ///< pld.tensor.put / pld.tile.put / pld.tensor.remote_store /
+                                    ///< pld.tile.remote_store) targets a destination dtype the backend's
+                                    ///< store pipe can combine (BackendHandler::SupportsBf16AtomicAdd).
+                                    ///< Decidable on the user's own IR, so it is a structural property
+                                    ///< verified at pipeline input
   kCount                            ///< Sentinel (must be last)
 };
 
@@ -222,7 +236,10 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid} — lightweight checks that catch the most common IR errors.
+ * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * IterArgCarryClassified, RuntimeScopesMaterialized, AccToGmStoreValid,
+ * AtomicAddDtypeValid} — lightweight checks that catch the most common IR
+ * errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 

@@ -12,6 +12,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <ios>
 #include <map>
 #include <memory>
 #include <optional>
@@ -619,6 +620,9 @@ class StructuralEqualImpl {
       } else if (lhs_val.type() == typeid(PadValue)) {
         values_equal = (AnyCast<PadValue>(lhs_val, "comparing kwarg: " + lhs_key) ==
                         AnyCast<PadValue>(rhs_val, "comparing kwarg: " + lhs_key));
+      } else if (lhs_val.type() == typeid(ArgDirection)) {
+        values_equal = (AnyCast<ArgDirection>(lhs_val, "comparing kwarg: " + lhs_key) ==
+                        AnyCast<ArgDirection>(rhs_val, "comparing kwarg: " + lhs_key));
       } else if (lhs_val.type() == typeid(float)) {
         values_equal = (AnyCast<float>(lhs_val, "comparing kwarg: " + lhs_key) ==
                         AnyCast<float>(rhs_val, "comparing kwarg: " + lhs_key));
@@ -781,6 +785,7 @@ class StructuralEqualImpl {
   bool EqualVar(const VarPtr& lhs, const VarPtr& rhs);
   bool EqualMemRef(const MemRefPtr& lhs, const MemRefPtr& rhs);
   bool EqualIterArg(const IterArgPtr& lhs, const IterArgPtr& rhs);
+  bool EqualWindowBuffer(const WindowBufferPtr& lhs, const WindowBufferPtr& rhs);
   bool EqualType(const TypePtr& lhs, const TypePtr& rhs);
   bool IsLoopVarFieldContext() const {
     return !field_name_stack_.empty() && field_name_stack_.back() == "loop_var";
@@ -937,6 +942,12 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
     return result;
   }
 
+  // Check WindowBuffer before Var (WindowBuffer inherits from Var)
+  if (auto lhs_wb = As<WindowBuffer>(lhs)) {
+    bool result = EqualWindowBuffer(lhs_wb, std::static_pointer_cast<const WindowBuffer>(rhs));
+    return result;
+  }
+
   if (auto lhs_var = As<Var>(lhs)) {
     bool result = EqualVar(lhs_var, std::static_pointer_cast<const Var>(rhs));
     return result;
@@ -975,7 +986,6 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(InlineStmt)
   EQUAL_DISPATCH(Function)
   EQUAL_DISPATCH_TRANSPARENT(Program)
-  EQUAL_DISPATCH(WindowBuffer)
 
   throw pypto::TypeError("Unknown IR node type in StructuralEqualImpl::Equal: " + lhs->TypeName());
 }
@@ -1220,6 +1230,13 @@ bool StructuralEqualImpl<AssertMode>::EqualType(const TypePtr& lhs, const TypePt
         }
         return false;
       }
+      // Compare compact mode
+      if (lhs_tv.compact != rhs_tv.compact) {
+        if constexpr (AssertMode) {
+          ThrowMismatch("TileView compact mismatch", IRNodePtr(), IRNodePtr(), "", "");
+        }
+        return false;
+      }
     }
     // Compare memory_space
     if (lhs_tile->memory_space_.has_value() != rhs_tile->memory_space_.has_value()) {
@@ -1282,7 +1299,8 @@ bool StructuralEqualImpl<AssertMode>::EqualType(const TypePtr& lhs, const TypePt
     }
     return true;
   } else if (IsA<MemRefType>(lhs) || IsA<UnknownType>(lhs) || IsA<PtrType>(lhs) ||
-             IsA<WindowBufferType>(lhs) || IsA<CommCtxType>(lhs)) {
+             IsA<WindowBufferType>(lhs) || IsA<CommCtxType>(lhs) || IsA<PrefetchAsyncContextType>(lhs) ||
+             IsA<AsyncEventType>(lhs) || IsA<AsyncSessionType>(lhs)) {
     return true;  // Singleton type, both being same type kind is sufficient
   }
 
@@ -1368,7 +1386,6 @@ bool StructuralEqualImpl<AssertMode>::EqualMemRef(const MemRefPtr& lhs, const Me
   if (!EqualVar(lhs, rhs)) {
     return false;
   }
-
   // 2. Then, compare MemRef-specific fields: base_, byte_offset_, size_
   if (!EqualVar(lhs->base_, rhs->base_)) {
     if constexpr (AssertMode) {
@@ -1396,6 +1413,49 @@ bool StructuralEqualImpl<AssertMode>::EqualMemRef(const MemRefPtr& lhs, const Me
     return false;
   }
 
+  // 3. Declaration fields. These decide whether InitMemRef treats the MemRef as
+  // an author's allocation and which slot of it the tile lands on, so two MemRefs
+  // differing here describe different memory. Leaving them out also made every
+  // round-trip test that "passed" on assert_structural_equal alone vacuous.
+  if (lhs->is_pinned_ != rhs->is_pinned_) {
+    if constexpr (AssertMode) {
+      std::ostringstream msg;
+      msg << "MemRef is_pinned mismatch (" << std::boolalpha << lhs->is_pinned_ << " != " << rhs->is_pinned_
+          << ")";
+      ThrowMismatch(msg.str(), std::static_pointer_cast<const IRNode>(lhs),
+                    std::static_pointer_cast<const IRNode>(rhs));
+    }
+    return false;
+  }
+
+  if (lhs->slot_count_ != rhs->slot_count_) {
+    if constexpr (AssertMode) {
+      std::ostringstream msg;
+      msg << "MemRef slot_count mismatch (" << lhs->slot_count_ << " != " << rhs->slot_count_ << ")";
+      ThrowMismatch(msg.str(), std::static_pointer_cast<const IRNode>(lhs),
+                    std::static_pointer_cast<const IRNode>(rhs));
+    }
+    return false;
+  }
+
+  // The index is an Expr (a runtime slot index is legal), so compare it as one;
+  // "one side has an index" is itself a mismatch.
+  const bool lhs_has_slot = lhs->slot_index_.has_value() && *lhs->slot_index_;
+  const bool rhs_has_slot = rhs->slot_index_.has_value() && *rhs->slot_index_;
+  if (lhs_has_slot != rhs_has_slot) {
+    if constexpr (AssertMode) {
+      std::ostringstream msg;
+      msg << "MemRef slot_index presence mismatch (" << std::boolalpha << lhs_has_slot
+          << " != " << rhs_has_slot << ")";
+      ThrowMismatch(msg.str(), std::static_pointer_cast<const IRNode>(lhs),
+                    std::static_pointer_cast<const IRNode>(rhs));
+    }
+    return false;
+  }
+  if (lhs_has_slot && !Equal(*lhs->slot_index_, *rhs->slot_index_)) {
+    return false;
+  }
+
   return true;
 }
 
@@ -1416,6 +1476,34 @@ bool StructuralEqualImpl<AssertMode>::EqualIterArg(const IterArgPtr& lhs, const 
   }
 
   return true;
+}
+
+template <bool AssertMode>
+bool StructuralEqualImpl<AssertMode>::EqualWindowBuffer(const WindowBufferPtr& lhs,
+                                                        const WindowBufferPtr& rhs) {
+  // 1. Compare as Var (variable mapping / identity), mirroring EqualMemRef and
+  //    EqualIterArg. Without this the hash side's WindowBuffer identity fold
+  //    (structural_hash.cpp) has no equality counterpart, so two field-identical
+  //    buffers compare equal yet hash apart.
+  if (!EqualVar(lhs, rhs)) {
+    return false;
+  }
+
+  // 2. Remaining fields (base_, size_, the staging flags) through the reflection
+  //    visitor, exactly as the generic EQUAL_DISPATCH(WindowBuffer) path did
+  //    before this arm existed. Comparing them by hand here would drop the field
+  //    name from the mismatch path -- assert_structural_equal would report a bare
+  //    `value` instead of `size.value` -- and would silently skip any field added
+  //    to WindowBuffer later. The transparent_depth_ save/reset and the
+  //    node_type_stack_ push mirror EQUAL_DISPATCH so field names are recorded
+  //    even when this node is reached from inside a SeqStmts / Program.
+  node_type_stack_.emplace_back("WindowBuffer");
+  int saved_depth = transparent_depth_;
+  transparent_depth_ = 0;
+  bool result = EqualWithFields(lhs, rhs);
+  transparent_depth_ = saved_depth;
+  node_type_stack_.pop_back();
+  return result;
 }
 
 // Explicit template instantiations

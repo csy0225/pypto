@@ -35,6 +35,7 @@ ill-formed IR, so they assert on the raised error rather than on an ``Expected``
 program.
 """
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import DataType, ir, passes
@@ -344,6 +345,192 @@ class TestDeriveDirectionMatrix:
                         x, local, attrs={"arg_directions": [pl.adir.input, pl.adir.output_existing]}
                     )
                 return local
+
+        After = passes.derive_call_directions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_fresh_rebind_for_carry_tracks_yielded_buffer(self):
+        """A loop return follows the buffer yielded by a rebind carry.
+
+        The loop starts from ``initial`` but yields the distinct ``fresh``
+        allocation. The post-loop writer therefore follows the loop's prior
+        write to ``fresh`` and must be promoted to ``InOut``. Rooting the return
+        at ``initial`` incorrectly classifies it as a first writer.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                initial: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                for _i, (carried,) in pl.range(0, 4, 1, init_values=(initial,)):
+                    fresh: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                    fresh_result: pl.Tensor[[64], pl.FP32] = self.kernel(x, fresh)
+                    (carried_rv,) = pl.yield_(fresh_result)
+                result: pl.Tensor[[64], pl.FP32] = self.kernel(x, carried_rv)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t = pl.tile.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                ret = pl.tile.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                initial = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                for _i, (carried,) in pl.range(0, 4, 1, init_values=(initial,)):
+                    fresh = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                    fresh_result = self.kernel(
+                        x, fresh, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]}
+                    )
+                    (carried_rv,) = pl.yield_(fresh_result)
+                result = self.kernel(x, carried_rv, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]})
+                return result
+
+        After = passes.derive_call_directions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_fresh_rebind_while_carry_tracks_yielded_buffer(self):
+        """``WhileStmt`` return roots follow fresh yielded allocations too."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                keep_going: pl.Scalar[pl.BOOL],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                initial: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                for (carried,) in pl.while_(init_values=(initial,)):
+                    pl.cond(keep_going)
+                    fresh: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                    fresh_result: pl.Tensor[[64], pl.FP32] = self.kernel(x, fresh)
+                    (carried_rv,) = pl.yield_(fresh_result)
+                result: pl.Tensor[[64], pl.FP32] = self.kernel(x, carried_rv)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t = pl.tile.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                ret = pl.tile.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                keep_going: pl.Scalar[pl.BOOL],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                initial = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                for (carried,) in pl.while_(init_values=(initial,)):
+                    pl.cond(keep_going)
+                    fresh = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                    fresh_result = self.kernel(
+                        x, fresh, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]}
+                    )
+                    (carried_rv,) = pl.yield_(fresh_result)
+                result = self.kernel(x, carried_rv, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]})
+                return result
+
+        After = passes.derive_call_directions()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_if_result_rebind_in_loop_is_conservative(self):
+        """A loop yield may carry an IfStmt result rooted in either branch.
+
+        The post-loop write cannot be classified as a first writer of one
+        arbitrarily selected branch root, so it must remain ``InOut``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                initial: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                for i, (carried,) in pl.range(0, 4, 1, init_values=(initial,)):
+                    lhs: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                    rhs: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                    lhs_result: pl.Tensor[[64], pl.FP32] = self.kernel(x, lhs)
+                    rhs_result: pl.Tensor[[64], pl.FP32] = self.kernel(x, rhs)
+                    if i == 0:
+                        selected: pl.Tensor[[64], pl.FP32] = pl.yield_(lhs_result)
+                    else:
+                        selected: pl.Tensor[[64], pl.FP32] = pl.yield_(rhs_result)
+                    (carried_rv,) = pl.yield_(selected)
+                result: pl.Tensor[[64], pl.FP32] = self.kernel(x, carried_rv)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def kernel(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t = pl.tile.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                ret = pl.tile.store(t, [0], out)
+                return ret
+
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                initial = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                for i, (carried,) in pl.range(0, 4, 1, init_values=(initial,)):
+                    lhs = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                    rhs = pl.tensor.create([64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                    lhs_result = self.kernel(x, lhs, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]})
+                    rhs_result = self.kernel(x, rhs, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]})
+                    if i == 0:
+                        selected = pl.yield_(lhs_result)
+                    else:
+                        selected = pl.yield_(rhs_result)
+                    (carried_rv,) = pl.yield_(selected)
+                result = self.kernel(x, carried_rv, attrs={"arg_directions": [pl.adir.input, pl.adir.inout]})
+                return result
 
         After = passes.derive_call_directions()(Before)
         ir.assert_structural_equal(After, Expected)
@@ -1640,13 +1827,13 @@ class TestVerifyNegative:
     def test_input_with_output_rejected(self):
         # Position 0 is callee In; using Output there must fail.
         prog = self._build_program([ir.ArgDirection.Output, ir.ArgDirection.OutputExisting])
-        with pytest.raises(Exception, match=r"(?i)arg_direction|CallDirectionsResolved"):  # noqa: PT011
+        with pytest.raises(pypto.Error, match=r"(?i)arg_direction|CallDirectionsResolved"):
             _verify_call_directions(prog)
 
     def test_out_with_input_rejected(self):
         # Position 1 is callee Out; using Input there must fail.
         prog = self._build_program([ir.ArgDirection.Input, ir.ArgDirection.Input])
-        with pytest.raises(Exception, match=r"(?i)arg_direction|CallDirectionsResolved"):  # noqa: PT011
+        with pytest.raises(pypto.Error, match=r"(?i)arg_direction|CallDirectionsResolved"):
             _verify_call_directions(prog)
 
 
@@ -2433,7 +2620,7 @@ class TestVerifyWrapperDirections:
                 r = self.group(x, dst, attrs={"arg_directions": [pl.adir.input, pl.adir.input]})
                 return r
 
-        with pytest.raises(Exception, match="stale param_directions_"):
+        with pytest.raises(pypto.Error, match="stale param_directions_"):
             _verify_call_directions(Stale)
 
     def test_materialized_group_directions_accepted(self):

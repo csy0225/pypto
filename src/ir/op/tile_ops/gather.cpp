@@ -36,6 +36,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -112,6 +113,113 @@ REGISTER_OP("tile.gather")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileGatherType(args, kwargs, "tile.gather");
+    });
+
+// ============================================================================
+// GatherB: byte-offset form of gather (pto.tgatherb)
+// ============================================================================
+
+static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
+                                     const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                     const std::string& op_name) {
+  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (src, offset), but got "
+                          << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  CHECK(src_type) << "The operator " << op_name << " requires src to be a TileType, but got "
+                  << args[0]->GetType()->TypeName();
+  auto is_gatherb_dtype = [](const DataType& dtype) {
+    return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+           dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+           dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+  };
+  CHECK(is_gatherb_dtype(src_type->dtype_))
+      << "The operator " << op_name
+      << " requires src dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
+      << src_type->dtype_.ToString();
+  DataType output_dtype = src_type->dtype_;
+  for (const auto& [key, value] : kwargs) {
+    if (key != "output_dtype") continue;
+    if (value.type() == typeid(DataType)) {
+      output_dtype = AnyCast<DataType>(value, "kwarg key: output_dtype");
+    } else if (value.type() == typeid(int)) {
+      output_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: output_dtype"));
+    }
+    break;
+  }
+  CHECK(is_gatherb_dtype(output_dtype))
+      << "The operator " << op_name
+      << " requires output_dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
+      << output_dtype.ToString();
+
+  auto offset_type = As<TileType>(args[1]->GetType());
+  CHECK(offset_type) << "The operator " << op_name << " requires offset to be a TileType, but got "
+                     << args[1]->GetType()->TypeName();
+  CHECK(offset_type->dtype_ == DataType::UINT32)
+      << "The operator " << op_name << " requires offset dtype to be UINT32, but got "
+      << offset_type->dtype_.ToString();
+  CHECK(src_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D src tile, but got rank " << src_type->shape_.size();
+  CHECK(offset_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D offset tile, but got rank "
+      << offset_type->shape_.size();
+
+  // TGATHERB is a 32-byte block gather. Each UINT32 offset selects the first
+  // byte of one source block, and one offset row expands to a destination row
+  // whose element count is offset_cols * (32 / sizeof(src_dtype)). The offset
+  // row itself must occupy a whole number of 32-byte blocks: eight UINT32
+  // entries. This also supplies all eight offsets consumed by one vgatherb
+  // repeat on A2/A3, including a partial valid-column tail.
+  auto offset_cols = As<ConstInt>(offset_type->shape_[1]);
+  CHECK(offset_cols) << "The operator " << op_name << " requires static offset columns";
+  CHECK(offset_cols->value_ > 0 && offset_cols->value_ % 8 == 0)
+      << "The operator " << op_name
+      << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
+      << offset_cols->value_;
+
+  const auto element_bytes = output_dtype.GetByte();
+  CHECK(element_bytes != 0 && 32 % element_bytes == 0)
+      << "The operator " << op_name
+      << " requires a byte-addressable output dtype that divides 32 bytes, but got "
+      << output_dtype.ToString();
+  const int64_t elements_per_block = static_cast<int64_t>(32 / element_bytes);
+  auto make_scaled_dim = [elements_per_block](const ExprPtr& dim) -> ExprPtr {
+    if (auto constant = As<ConstInt>(dim)) {
+      return std::make_shared<ConstInt>(constant->value_ * elements_per_block, DataType::INDEX,
+                                        constant->span_);
+    }
+    return MakeMul(dim, std::make_shared<ConstInt>(elements_per_block, DataType::INDEX, Span::unknown()));
+  };
+
+  const auto& offset_view = tile_view_semantics::GetEffectiveTileView(*offset_type);
+  std::vector<ExprPtr> output_shape = {
+      offset_type->shape_[0],
+      make_scaled_dim(offset_type->shape_[1]),
+  };
+  std::vector<ExprPtr> output_valid_shape = {
+      offset_view.valid_shape[0],
+      make_scaled_dim(offset_view.valid_shape[1]),
+  };
+
+  TileView tile_view;
+  tile_view.valid_shape = std::move(output_valid_shape);
+  tile_view.blayout = TileLayout::row_major;
+  return std::make_shared<TileType>(std::move(output_shape), output_dtype, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.gatherb")
+    .set_op_category("TileOp")
+    .set_description("Gather 32-byte source blocks by UINT32 byte offset (maps to pto.tgatherb)")
+    .add_argument("src", "Source tile (8/16/32-bit int/uint or FP16/BF16/FP32)")
+    .add_argument("offset", "One UINT32 byte offset per 32-byte destination block")
+    .set_attr<DataType>("output_dtype")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileGatherbType(args, kwargs, "tile.gatherb");
     });
 
 // ============================================================================

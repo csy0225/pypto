@@ -51,6 +51,17 @@ __all__ = [
     "maximum",
     "minimum",
     "cmp",
+    "and_",
+    "ands",
+    "or_",
+    "ors",
+    "xor",
+    "xors",
+    "not_",
+    "shl",
+    "shls",
+    "shr",
+    "shrs",
     "row_max",
     "row_sum",
     "row_min",
@@ -113,12 +124,12 @@ __all__ = [
 ]
 
 from pypto.ir.op import tensor_ops as _ir_ops
-from pypto.ir.utils import _normalize_expr, has_partial_valid_region
+from pypto.ir.utils import _normalize_expr, caller_warning_stacklevel, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TensorLayout
 
-from ..typing import IntLike, Scalar, Tensor
+from ..typing import BoolLike, IntLike, Scalar, Tensor, predicate_to_expr
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -126,9 +137,20 @@ from ..typing import IntLike, Scalar, Tensor
 # DistributedTensor import is needed here.
 _TensorT = TypeVar("_TensorT", bound=Tensor)
 
+# The scalar half of an rhs operand. Bound (not constrained) so ``_unwrap_rhs`` hands
+# an integer-only caller back ``int | Expr`` rather than widening it to include float.
+_RhsT = TypeVar("_RhsT", bound=int | float | Expr)
 
-def _unwrap_rhs(rhs: int | float | Expr | Tensor | Scalar) -> int | float | Expr:
-    """Unwrap rhs operands into the IR-layer representation."""
+
+def _unwrap_rhs(rhs: "_RhsT | Tensor | Scalar") -> "_RhsT | Expr":
+    """Unwrap rhs operands into the IR-layer representation.
+
+    Generic in the scalar half so integer-only callers keep their narrower type:
+    the bitwise / shift wrappers pass ``int | Tensor | Scalar`` and get back
+    ``int | Expr``, which is what ``pypto.ir.op.tensor_ops`` declares for them, so
+    a float mask or shift count is a type error at the call site rather than a
+    runtime rejection from type deduction.
+    """
     if isinstance(rhs, (Tensor, Scalar)):
         return rhs.unwrap()
     return rhs
@@ -419,7 +441,7 @@ def slice(
             ``None`` means the source's padding mode carries through.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
-            spelling as :func:`tensor.fillpad`). Only meaningful when the
+            spelling as [`tensor.fillpad`][pypto.language.tensor.fillpad]). Only meaningful when the
             *effective* valid region is smaller than ``shape`` — which an explicit
             ``valid_shape``, a partially-valid source, or ``clamp=True`` can each
             bring about.
@@ -451,7 +473,9 @@ def slice(
             f"If you intend to narrow the valid region later via "
             f"tensor.set_validshape, you can ignore this warning; otherwise "
             f"pass valid_shape=... to tensor.slice.",
-            stacklevel=2,
+            # Not a literal 2: pl.slice forwards here, and a fixed level would
+            # name the dispatcher and collapse every call site's warning.
+            stacklevel=caller_warning_stacklevel(),
         )
 
     tensor_expr = tensor.unwrap()
@@ -490,7 +514,7 @@ def fillpad_expand(
 ) -> Tensor:
     """Copy a smaller source tensor into a larger destination tensor, padding the rest.
 
-    Unlike :func:`fillpad` (which keeps the same shape and only fills the invalid
+    Unlike [`fillpad`][pypto.language.tensor.fillpad] (which keeps the same shape and only fills the invalid
     view region), the destination ``shape`` may be larger than the source in
     either dimension. The source's valid region is copied into the top-left of
     the destination and every other element is filled with ``pad_value``.
@@ -514,8 +538,9 @@ def set_validshape(tensor: Tensor, valid_rows: IntLike, valid_cols: IntLike) -> 
     """Update valid-shape metadata of a tensor without data movement.
 
     .. note::
-        Internal API — this op is intended for compiler-generated code only
-        and should not be exposed to end users in future releases.
+        Prefer expressing the extent at its source where possible —
+        ``pl.load(..., valid_shape=...)`` or a slice's ``valid_shape=`` — and use
+        this to pin an extent the type deducer cannot infer.
 
     Args:
         tensor: Input tensor (must be 2D)
@@ -557,6 +582,10 @@ def ci(
 
     Equivalent to ``numpy.arange`` / ``torch.arange``. Lowers to ``tile.ci`` → ``pto.tci``.
 
+    Note:
+        ``pto.tci`` only populates the first row. Leading dimensions must be 1 —
+        prefer shapes of the form ``[1, N]``.
+
     Args:
         start: Starting integer (plain int or Scalar). Must match ``dtype``.
         shape: Destination tensor shape (innermost dim != 1).
@@ -593,8 +622,12 @@ def random(
     reproduce the same tensor. Lowers to ``tile.random`` → ``pto.trandom``.
 
     Args:
-        key0, key1: The two INT32 key words (plain ints or Scalars).
-        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        key0: Low INT32 key word (plain int or Scalar).
+        key1: High INT32 key word (plain int or Scalar).
+        counter0: First INT32 counter word.
+        counter1: Second INT32 counter word.
+        counter2: Third INT32 counter word.
+        counter3: Fourth INT32 counter word.
         shape: Destination tensor shape (static).
         dtype: Destination dtype. One of {INT32, UINT32}. Defaults to UINT32.
         rounds: Cipher round count, 7 or 10. Defaults to 10.
@@ -618,12 +651,18 @@ def matmul(
 ) -> Tensor:
     """Matrix multiplication with optional transpose.
 
+    A transpose flag swaps its own operand's two trailing axes, so that operand must
+    be at least 2D: ``a_trans`` with a 1D ``lhs`` (or ``b_trans`` with a 1D ``rhs``)
+    raises rather than being ignored. On the mixed mat-vec / vec-mat forms the flag
+    applies to the matrix side, so a ``lhs`` stored ``[K, M]`` with ``a_trans=True``
+    against a ``[K]`` ``rhs`` deduces ``[M]``.
+
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
         out_dtype: Output data type (optional, inferred if not provided)
-        a_trans: Whether to transpose lhs
-        b_trans: Whether to transpose rhs
+        a_trans: Whether to transpose lhs (requires a 2D+ lhs)
+        b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
 
     Returns:
@@ -641,8 +680,22 @@ def matmul_acc(
     rhs: Tensor,
     a_trans: bool = False,
     b_trans: bool = False,
+    init_cond: BoolLike | None = None,
 ) -> Tensor:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
+
+    ``init_cond`` makes the accumulator's initial value conditional: on the steps
+    where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into. This is the split-K idiom, and it removes the need to zero
+    the accumulator or to peel the first K step::
+
+        for k0 in pl.pipeline(0, K, K_TILE):
+            acc[t0 : t0 + R, :] = pl.matmul_acc(
+                acc[t0 : t0 + R, :], x_k, w_k, b_trans=True, init_cond=(k0 == 0)
+            )
+
+    Only 2D operands support the predicate; loop over the batch dimension
+    instead of passing higher-rank operands alongside ``init_cond``.
 
     Args:
         acc: Accumulator tensor
@@ -650,11 +703,19 @@ def matmul_acc(
         rhs: Right-hand side tensor
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tensor wrapping the matmul_acc operation
     """
-    call_expr = _ir_ops.matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap(), a_trans, b_trans)
+    call_expr = _ir_ops.matmul_acc(
+        acc.unwrap(),
+        lhs.unwrap(),
+        rhs.unwrap(),
+        a_trans,
+        b_trans,
+        init_cond=predicate_to_expr(init_cond),
+    )
     return Tensor(expr=call_expr)
 
 
@@ -757,7 +818,11 @@ def subs(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
+def div(
+    lhs: Tensor,
+    rhs: int | float | Tensor | Scalar | Expr,
+    high_precision: bool = False,
+) -> Tensor:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -766,12 +831,14 @@ def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` is a Tensor.
 
     Returns:
         Tensor wrapping the div operation
     """
     lhs_expr = lhs.unwrap()
-    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs))
+    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs), high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -932,6 +999,189 @@ def cmp(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr, cmp_type: int = 
     """
     lhs_expr = lhs.unwrap()
     call_expr = _ir_ops.cmp(lhs_expr, _unwrap_rhs(rhs), cmp_type=cmp_type)
+    return Tensor(expr=call_expr)
+
+
+def and_(lhs: Tensor, rhs: int | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise bitwise AND of tensor and tensor or scalar.
+
+    Automatically selects between tensor.and (tensor & tensor) and
+    tensor.ands (tensor & scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+
+    Returns:
+        Tensor wrapping the and operation
+    """
+    call_expr = _ir_ops.and_(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def ands(lhs: Tensor, rhs: int | Expr | Scalar) -> Tensor:
+    """Element-wise bitwise AND of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar
+
+    Returns:
+        Tensor wrapping the ands operation
+    """
+    call_expr = _ir_ops.ands(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def or_(lhs: Tensor, rhs: int | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise bitwise OR of tensor and tensor or scalar.
+
+    Automatically selects between tensor.or (tensor | tensor) and
+    tensor.ors (tensor | scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+
+    Returns:
+        Tensor wrapping the or operation
+    """
+    call_expr = _ir_ops.or_(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def ors(lhs: Tensor, rhs: int | Expr | Scalar) -> Tensor:
+    """Element-wise bitwise OR of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar
+
+    Returns:
+        Tensor wrapping the ors operation
+    """
+    call_expr = _ir_ops.ors(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def xor(lhs: Tensor, rhs: int | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise bitwise XOR of tensor and tensor or scalar.
+
+    Automatically selects between tensor.xor (tensor ^ tensor) and
+    tensor.xors (tensor ^ scalar) based on the rhs type.
+
+    Unlike ``pl.tile.xor``, there is no ``tmp`` parameter: the scratch buffer
+    that pto.txor needs is allocated during Tensor-to-Tile lowering.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side tensor or integer scalar
+
+    Returns:
+        Tensor wrapping the xor operation
+    """
+    call_expr = _ir_ops.xor(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def xors(lhs: Tensor, rhs: int | Expr | Scalar) -> Tensor:
+    """Element-wise bitwise XOR of tensor and scalar.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Right-hand side integer scalar
+
+    Returns:
+        Tensor wrapping the xors operation
+    """
+    call_expr = _ir_ops.xors(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def not_(input: Tensor) -> Tensor:
+    """Element-wise bitwise NOT of a tensor.
+
+    Args:
+        input: Input tensor; int16 or uint16, matching the TNOT instruction
+
+    Returns:
+        Tensor wrapping the not operation
+    """
+    call_expr = _ir_ops.not_(input.unwrap())
+    return Tensor(expr=call_expr)
+
+
+def shl(lhs: Tensor, rhs: int | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise bitwise left shift of tensor by tensor or scalar.
+
+    Automatically selects between tensor.shl (tensor << tensor) and
+    tensor.shls (tensor << scalar) based on the rhs type.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount as a tensor or integer scalar
+
+    Returns:
+        Tensor wrapping the shl operation
+    """
+    call_expr = _ir_ops.shl(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def shls(lhs: Tensor, rhs: int | Expr | Scalar) -> Tensor:
+    """Element-wise bitwise left shift of tensor by scalar.
+
+    Note:
+        The shift amount must be zero or positive. A negative constant is
+        rejected when the op is built; a negative value only known at runtime
+        is undefined behaviour on the hardware.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount; must be >= 0
+
+    Returns:
+        Tensor wrapping the shls operation
+    """
+    call_expr = _ir_ops.shls(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def shr(lhs: Tensor, rhs: int | Tensor | Scalar | Expr) -> Tensor:
+    """Element-wise bitwise right shift of tensor by tensor or scalar.
+
+    Automatically selects between tensor.shr (tensor >> tensor) and
+    tensor.shrs (tensor >> scalar) based on the rhs type. The shift is
+    arithmetic for signed dtypes and logical for unsigned ones, matching the
+    tile ops and the underlying ISA.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount as a tensor or integer scalar
+
+    Returns:
+        Tensor wrapping the shr operation
+    """
+    call_expr = _ir_ops.shr(lhs.unwrap(), _unwrap_rhs(rhs))
+    return Tensor(expr=call_expr)
+
+
+def shrs(lhs: Tensor, rhs: int | Expr | Scalar) -> Tensor:
+    """Element-wise bitwise right shift of tensor by scalar.
+
+    Note:
+        The shift amount must be zero or positive. A negative constant is
+        rejected when the op is built; a negative value only known at runtime
+        is undefined behaviour on the hardware.
+
+    Args:
+        lhs: Left-hand side tensor (integer dtype)
+        rhs: Shift amount; must be >= 0
+
+    Returns:
+        Tensor wrapping the shrs operation
+    """
+    call_expr = _ir_ops.shrs(lhs.unwrap(), _unwrap_rhs(rhs))
     return Tensor(expr=call_expr)
 
 
@@ -1138,6 +1388,9 @@ def row_expand(target: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_mul(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast multiplication: tensor[i,:] * row_vec[i,0].
 
+    Multiplies each row of the tensor by the corresponding row vector value,
+    for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1153,6 +1406,9 @@ def row_expand_mul(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_div(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast division: tensor[i,:] / row_vec[i,0].
+
+    Divides each row of the tensor by the corresponding row vector value,
+    for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1170,6 +1426,8 @@ def row_expand_div(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_add(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast addition: tensor[i,:] + row_vec[i,0].
 
+    Adds a row vector to each row of the tensor, for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1185,6 +1443,8 @@ def row_expand_add(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast subtraction: tensor[i,:] - row_vec[i,0].
+
+    Subtracts a row vector from each row of the tensor, for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1202,6 +1462,9 @@ def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast maximum: max(tensor[i,:], row_vec[i,0]).
 
+    Takes the element-wise maximum of each row and the row vector value,
+    for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1217,6 +1480,9 @@ def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast minimum: min(tensor[i,:], row_vec[i,0]).
+
+    Takes the element-wise minimum of each row and the row vector value,
+    for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1234,6 +1500,8 @@ def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise exp-diff: exp(tensor[i,:] - row_vec[i,0]).
 
+    Computes the exponential of the per-row difference, for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector providing per-row scalar (TensorType [M, 1])
@@ -1249,6 +1517,9 @@ def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def col_expand_mul(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast multiplication: tensor[:,j] * col_vec[0,j].
+
+    Multiplies each column of the tensor by the corresponding column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1282,6 +1553,8 @@ def col_expand(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_sub(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast subtraction: tensor[:,j] - col_vec[0,j].
 
+    Subtracts a column vector from each column of the tensor, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1297,6 +1570,9 @@ def col_expand_sub(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_div(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast division: tensor[:,j] / col_vec[0,j].
+
+    Divides each column of the tensor by the corresponding column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1314,6 +1590,8 @@ def col_expand_div(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast addition: tensor[:,j] + col_vec[0,j].
 
+    Adds a column vector to each column of the tensor, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1329,6 +1607,9 @@ def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast maximum: max(tensor[:,j], col_vec[0,j]).
+
+    Takes the element-wise maximum of each column and the column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1346,6 +1627,9 @@ def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast minimum: min(tensor[:,j], col_vec[0,j]).
 
+    Takes the element-wise minimum of each column and the column vector
+    value, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1361,6 +1645,8 @@ def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_expdif(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise exp-diff: exp(tensor[:,j] - col_vec[0,j]).
+
+    Computes the exponential of the per-column difference, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1421,17 +1707,18 @@ def exp(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def log(input: Tensor) -> Tensor:
+def log(input: Tensor, high_precision: bool = False) -> Tensor:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Tensor wrapping the log operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.log(input_expr)
+    call_expr = _ir_ops.log(input_expr, high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -1491,17 +1778,18 @@ def abs(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def recip(input: Tensor) -> Tensor:
+def recip(input: Tensor, high_precision: bool = False) -> Tensor:
     """Element-wise reciprocal (1/x) operation.
 
     Args:
         input: Input tensor
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
 
     Returns:
         Tensor wrapping the recip operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.recip(input_expr)
+    call_expr = _ir_ops.recip(input_expr, high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -1572,9 +1860,15 @@ def assemble(
         atomic: Combine mode for the write. ``AtomicType.None_`` (default)
             overwrites; ``AtomicType.Add`` atomically adds ``source`` into the
             target at ``offset`` — used for split-K, where several cores
-            accumulate partial products into one output. Only valid when the
-            target lowers to a global-memory store (a function output tensor);
-            an atomic assemble into an on-chip tile is rejected.
+            accumulate partial products into one output. Only valid inside an
+            InCore function — typically a ``pl.at(level=pl.Level.CORE_GROUP, ...)``
+            scope — where ``source`` lowers to an on-chip tile (a compute result)
+            and the write lowers to an atomic-add store into a global-memory
+            target (a function output tensor). Every other form is rejected at
+            compile time: a tensor-to-tensor assemble has no store to carry the
+            combine, an assemble into an on-chip tile has no global-memory
+            destination, and at the orchestration level no atomic-combine
+            instruction exists at all.
 
             NOTE: atomic-add accumulation order across cores is not fixed, so
             floating-point results are non-deterministic. The target must be
@@ -1611,12 +1905,21 @@ def concat(src0: Tensor, src1: Tensor) -> Tensor:
 def reshape(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor:
     """Reshape tensor to new shape.
 
+    The valid region is carried through, never widened: the result holds real
+    data in exactly the cells the input did. See ``pl.reshape`` for the cases
+    that always map.
+
     Args:
         tensor: Input tensor
         shape: New shape dimensions
 
     Returns:
         Tensor wrapping the reshape operation
+
+    Raises:
+        ValueError: If the element count changes, or if the input holds real
+            data in only part of its buffer and no origin-anchored region of
+            ``shape`` describes those same cells.
     """
     tensor_expr = tensor.unwrap()
     call_expr = _ir_ops.reshape(tensor_expr, _normalize_intlike(shape))
@@ -1671,19 +1974,19 @@ def view(
 ) -> _TensorT:
     """Reinterpret a tensor over the same physical memory.
 
-    At least one of ``shape`` or ``layout`` must be provided. The result is a
-    zero-copy tensor view with canonical strides derived by the IR type deducer.
-
-    See :func:`pypto.ir.op.tensor.view` for full details on validity
-    constraints, error conditions, and the product-preserving shape rule.
+    At least one of ``shape`` or ``layout`` must be provided: ``shape`` derives
+    canonical strides for the requested shape, ``layout`` derives the canonical
+    ND/DN layout view. The result is a zero-copy view over the same physical
+    memory, and its target shape must have rank at least 1.
 
     Args:
         tensor: Source tensor.
         shape: New shape for the view. Must be product-preserving unless
             symbolic dimensions are present. Rank-zero views are not supported.
-        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
-            collapse to 2D. Required when this supported collapse reinterprets
-            a source with partial validity.
+        valid_shape: Explicit valid dimensions for a packed ND
+            leading-dimension collapse to 2D or contiguous-prefix linear
+            collapse to ``[1, product(shape)]``. Required when either supported
+            collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN); DN requires rank at least 2.
             Layout changes combined with ``shape`` are supported in-core but not by orchestration
             lowering. Orchestration shape reinterpret is limited to ND-layout
@@ -1707,6 +2010,14 @@ def view(
 
 def scatter_update(input: Tensor, *args: Any, **kwargs: Any) -> Tensor:
     """Update input tensor rows at positions specified by 2D index with values from src.
+
+    Supports two rank variants:
+
+    - 2D: ``input [rows, d]``, ``src [b*s, d]``, ``index [b, s]``
+    - 4D: ``input [blockNum, blockSize, 1, d]``, ``src [b, s, 1, d]``, ``index [b, s]``
+
+    For each ``(i, j)``, row ``input[index[i*s + j]]`` receives row ``src[i*s + j]``
+    (linear layout).
 
     Accepts the same flexible call shapes as the IR builder
     ``pypto.ir.op.tensor.scatter_update``:
@@ -1862,7 +2173,7 @@ def gather(
     The tensor layer exposes a single unified ``gather``. Based on the arguments
     you pass, it lowers to one of three tile-level ops:
 
-    Index form (``dim`` + ``index``) → :func:`pl.tile.gather`::
+    Index form (``dim`` + ``index``) → [`pl.tile.gather`][pypto.language.tile.gather]::
 
         output[b, k] = input[b, index[b, k]]
 
@@ -1870,14 +2181,15 @@ def gather(
         ``index`` must be an INT32 tensor, or INT16 when ``input`` is a 16-bit
         dtype (FP16/INT16); its shape matches ``input`` on every axis except ``dim``.
 
-    Mask form (``mask_pattern=<int>``) → :func:`pl.tile.gather_mask`:
+    Mask form (``mask_pattern=<int>``) → [`pl.tile.gather_mask`][pypto.language.tile.gather_mask]:
         Selects columns of each row by a fixed hardware mask pattern. Last-dim
         shrinks by 2 (P0101/P1010) or 4 (P0001..P1000), or stays the same for P1111.
 
-    Compare form (``kvalue`` + ``cmp_mode`` + ``out_cols``) → :func:`pl.tile.gather_compare`:
+    Compare form (``kvalue`` + ``cmp_mode`` + ``out_cols``) →
+    [`pl.tile.gather_compare`][pypto.language.tile.gather_compare]:
         Scalar threshold compare (applied to every row). Returns ``(dst, cdst)`` —
         gathered indices ``[rows, out_cols] INT32`` and per-row match counts
-        ``[rows, 1] count_dtype``.
+        ``[1, rows] count_dtype``.
 
     Args:
         input: Source tensor (FP16/FP32/INT16/INT32).
@@ -2013,7 +2325,7 @@ def paged_gather(  # noqa: PLR0913
 def create_l1(shape: Sequence[IntLike], dtype: DataType, transpose: bool = False) -> Tensor:
     """Create an on-chip (L1/Mat) accumulator for a kernel-driven paged gather.
 
-    Companion of :func:`gather_row`. Returns a tensor-typed value that composes
+    Companion of [`gather_row`][pypto.language.tensor.gather_row]. Returns a tensor-typed value that composes
     with ``pl.matmul`` / softmax but lowers to an L1 (``MemorySpace.Mat``) tile,
     so a kernel can build a matmul operand directly on-chip — no GM round-trip.
 
@@ -2039,34 +2351,42 @@ def create_l1(shape: Sequence[IntLike], dtype: DataType, transpose: bool = False
     return Tensor(expr=call_expr)
 
 
-def gather_row(
+def gather_row(  # noqa: PLR0913
     acc: Tensor,
     src: Tensor,
     dst_offset: Sequence[IntLike],
     src_offset: Sequence[IntLike],
     shapes: Sequence[IntLike],
     transpose: bool = False,
+    *,
+    valid_shape: Sequence[IntLike] | None = None,
 ) -> Tensor:
     """Gather one GM row into a sub-region of an on-chip accumulator (DPS).
 
     Per-row primitive for a kernel-driven paged gather into L1 — the flexible
-    counterpart to :func:`paged_gather`: the caller computes the physical
+    counterpart to [`paged_gather`][pypto.language.tensor.paged_gather]: the caller computes the physical
     ``src_offset`` (block-table lookup, multi-source selection, invalid clamping)
     and the ``dst_offset`` slot itself, so arbitrary gather logic stays in the
     kernel. DMAs ``src`` straight into ``acc`` (``GM -> L1``, no ``tmov``); the
-    returned tile feeds ``pl.matmul`` directly.
+    returned tensor feeds ``pl.matmul`` directly.
 
     Args:
-        acc: On-chip accumulator from :func:`create_l1` (loop-carried).
+        acc: On-chip accumulator from [`create_l1`][pypto.language.tensor.create_l1] (loop-carried).
         src: Source pool in GM.
         dst_offset: ``[row, col]`` slot within ``acc`` to write.
         src_offset: ``[row, col]`` physical offset within the GM ``src``.
         shapes: GM row window ``[r, c]`` (typically ``[1, size]``).
+            Must be compile-time constant.
+        valid_shape: How much of that window to actually transfer, defaulting to
+            all of it. May hold runtime ``Scalar`` values, so a dynamic row count
+            leaves the accumulator's allocation and layout untouched. Not
+            supported together with ``transpose=True``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]`` — use
             for a matmul B-operand whose consumer would otherwise need ``b_trans``.
 
     Returns:
         Tensor aliasing ``acc`` (written in place).
+
     """
     call_expr = _ir_ops.gather_row(
         acc.unwrap(),
@@ -2075,6 +2395,7 @@ def gather_row(
         _normalize_intlike(src_offset),
         _normalize_intlike(shapes),
         transpose,
+        valid_shape=_normalize_intlike(valid_shape) if valid_shape is not None else None,
     )
     return Tensor(expr=call_expr)
 
@@ -2101,8 +2422,8 @@ def scatter(
     The tensor layer exposes a single unified ``scatter``. Based on the arguments
     you pass, it lowers to one of two tile-level ops:
 
-    Index form (``dim`` + ``index`` + ``src``) → :func:`pl.tile.scatter` — the
-    column-wise inverse of :func:`gather`, so ``index`` has the same shape as
+    Index form (``dim`` + ``index`` + ``src``) → [`pl.tile.scatter`][pypto.language.tile.scatter] — the
+    column-wise inverse of [`gather`][pypto.language.tensor.gather], so ``index`` has the same shape as
     ``src`` (just like gather's index matches its output)::
 
         output = input
@@ -2113,7 +2434,7 @@ def scatter(
         width must match ``input``: 4-byte input → INT32, 2-byte → INT16,
         1-byte → INT16.
 
-    Mask form (``mask_pattern=<int>`` + ``dst``) → :func:`pl.tile.scatter_mask`:
+    Mask form (``mask_pattern=<int>`` + ``dst``) → [`pl.tile.scatter_mask`][pypto.language.tile.scatter_mask]:
         Writes each row of ``input`` into the columns of ``dst`` selected by the
         hardware mask pattern. ``dst.cols`` equals ``input.cols * stride``
         (stride = 2 for P0101/P1010, 4 for P0001..P1000, 1 for P1111).
@@ -2176,6 +2497,13 @@ def alloc(
     The result is a base ``Ptr`` (allocation identity token): the printer
     annotates the assignment target as ``pl.Ptr``, matching the IR design
     where ``tensor.alloc`` Calls carry ``PtrType``.
+
+    Args:
+        memory_space: Space the allocation lives in, as resolved by InferTileMemorySpace.
+        size: Allocation size in bytes.
+
+    Returns:
+        A ``Ptr`` standing for the allocation, carrying no address of its own.
     """
     return PtrType()
 

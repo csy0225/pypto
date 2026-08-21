@@ -166,6 +166,7 @@ for the dispatch rule.
 | Semantics | Synchronous function call | Asynchronous task launch |
 | Where it appears | Anywhere | Inside `manual_scope` bodies (parser-produced) and as the outlined dispatch of a `pl.at(..., deps=[...])` scope (a missing `as tid` binding gets a synthetic unused TaskId Var); preserved through the whole pipeline |
 | Return type | Callee's declared return | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
+| `args_` vs callee `params_` | Identity mapping, full coverage: `args_.size() == params_.size()` | **Bounded** coverage: `args_.size() <= params_.size()`. Identity holds over the leading caller-supplied args (any direction — In, InOut, **and** caller-allocated Out); uncovered callee params in between must be declared `Out` and are runtime-allocated (orchestration codegen synths an `add_output` for each); the trailing `CommCtxType` params appended by `MaterializeDistTensorCtx` are carried in `args_`, but at `args_[i - gap]` where `gap = params_.size() - args_.size()` — so `args_[i] ↔ params_[i]` does *not* hold once a gap and a CommCtx suffix coexist. Canonical statement: `Submit::args_` in `include/pypto/ir/expr.h` |
 | Has `deps` | No — a plain `Call` never carries dep edges (`attrs["manual_dep_edges"]` appears only on `ScopeStmt` from `pl.at`, consumed at scope outlining; ManualDepsOnSubmitOnly verifies this) | First-class `deps_` field — `Scalar[TASK_ID]` Vars / `Array[N, TASK_ID]` Vars |
 | SPMD launch spec | none | `core_num_` (`optional<ExprPtr>` block count) + `sync_start_` (bool), set only by `pl.spmd_submit`; `sync_start_` is meaningful only when `core_num_` is present (the constructor enforces `sync_start ⇒ core_num`); `nullopt` ⇒ plain single-block submit |
 | Use-def chain | `args_` only | `args_`, `deps_`, **and** `core_num_` |
@@ -203,11 +204,11 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **IfStmt** | `condition_`, `then_stmts_`, `else_stmts_`, `return_vars_` | Conditional branching |
 | **ForStmt** | `loop_var_` (DefField), `start_`, `stop_`, `step_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField), `kind_` | For loop with optional iteration args |
 | **WhileStmt** | `condition_`, `iter_args_` (DefField), `body_`, `return_vars_` (DefField) | While loop with condition and iteration args |
-| **InCoreScopeStmt** | `name_hint_`, `body_`, `split_` (optional) | InCore region; outlined to `Function(InCore)` |
+| **InCoreScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, `None` = no split) | InCore region; outlined to `Function(InCore)` |
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster region; outlined to `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_` (optional) | Pipeline-stage region for a given Level/Role |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_` (integer-typed `Expr`), `sync_start_` | SPMD launch region; outlined to `Function(Spmd)` |
-| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 21) |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 20) |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`PTO2_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
 | **EvalStmt** | `expr_` | Evaluate expression for side effects |
@@ -369,15 +370,19 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   - `OutlineHierarchyScopes` extracts `HierarchyScopeStmt`
   - `SplitAivScopeStmt` is **non-outlined**: it is transparent to SSA and to the
     outliners (it survives inside an outlined `Function(InCore)` body), then is
-    consumed and **erased** by `LowerAutoVectorSplit` (pass 21). It never reaches
-    `ExpandMixedKernel` (pass 22) or codegen — those see only the per-op
+    consumed and **erased** by `LowerAutoVectorSplit` (pass 20). It never reaches
+    `ExpandMixedKernel` (pass 21) or codegen — those see only the per-op
     `aiv_shard` / `aic_gather` / `tpush` / `tpop` markers. A PTO codegen guard
     fails loudly if a `SplitAivScopeStmt` ever survives that far.
   - `SplitAivScopeStmt` is **nestable**: built via the generic
     `BeginScope`/`EndScope`, it emits into any parent context (a `pl.range` /
     `pl.pipeline` loop or an `if`). Sibling regions may carry **different**
     `split_` modes (multi-mode); pass-21 halving is region-scoped, so each region
-    halves independently and out-of-region vector compute stays full-width. A
+    halves independently. A function holding at least one region is in **manual
+    mode**: the regions are authoritative for vector placement, and the
+    `AivSplitValid` verifier rejects vector compute outside every region (write
+    a `mode=None` region per full-width phase — see
+    [LowerAutoVectorSplit](../passes/20-lower_auto_vector_split.md)). A
     top-level `for aiv_id in pl.split_aiv(...)` is wrapped by the parser in an
     enclosing `InCoreScopeStmt` (so `OutlineIncoreScopes` can outline it), i.e.
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`.
@@ -439,18 +444,23 @@ The `kind_` field (`ForKind` enum) distinguishes sequential (`ForKind.Sequential
 Describes memory allocation metadata shared by tensors/tiles. The memory space is
 stored on `TileType.memory_space_` for tiles; `TensorType` is canonically DDR.
 
+`MemRef` is a `Var` subclass, so it is a first-class expression. A MemRef names
+an allocation (`base_`) and a byte range within it (`byte_offset_`, `size_`);
+aliasing is answered by `MemRef.same_allocation(a, b)` and `MemRef.may_alias(a, b)`.
+
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `addr_` | ExprPtr | Base address |
-| `size_` | size_t | Size in bytes |
-| `id_` | uint64_t | Stable MemRef identifier |
+| `base_` | VarPtr | Allocation identity — the Ptr `Var` from `tile.alloc` / `tensor.alloc`. Two MemRefs alias only if they share it. |
+| `byte_offset_` | ExprPtr | Byte offset from `base_` (0 for a full alloc, a view offset otherwise) |
+| `size_` | uint64_t | Size in bytes of this region |
+| `is_pinned_` | bool | Author-declared allocation (`pl.MemRef("name")`), until `InitMemRef` resolves it |
+| `slot_count_` | uint64_t | Equally-sized slots the declaration holds (`pl.MemRef("name", slots=N)`); 1 when `slots` is omitted |
+| `slot_index_` | ExprPtr \| None | Which slot this MemRef denotes (`l0c[k]`); None until a slot is selected, and may be a runtime value |
 
 ```python
-memref = ir.MemRef(
-    ir.ConstInt(0x1000, DataType.INT64, span),
-    1024,  # bytes
-    0     # id
-)
+# base allocation name, byte offset within it, size in bytes
+memref = ir.MemRef("mem_left_0", 0, 1024)
+assert ir.MemRef.same_allocation(memref, memref)
 ```
 
 > **Note:** `ir.Mem` is a short alias for `ir.MemorySpace`.
@@ -461,15 +471,23 @@ Describes tile layout and access pattern:
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `valid_shape` | list[ExprPtr] | Valid dimensions |
+| `valid_shape` | list[ExprPtr] | Valid dimensions (empty ⇒ full shape) |
 | `stride` | list[ExprPtr] | Stride per dimension |
 | `start_offset` | ExprPtr | Starting offset |
+| `blayout` | TileLayout | Block layout (default `row_major`) |
+| `slayout` | TileLayout | Scatter layout (default `none_box`) |
+| `fractal` | uint64_t | Fractal size in **bytes**, not elements (default 512) |
+| `pad` | PadValue | Pad mode for out-of-`valid_shape` access (default `null`) |
+| `compact` | CompactMode | Partial-tile compact mode (default `null`) |
 
 ```python
-tile_view = ir.TileView()
-tile_view.valid_shape = [ir.ConstInt(16, DataType.INT64, span)] * 2
-tile_view.stride = [ir.ConstInt(1, DataType.INT64, span), ir.ConstInt(16, DataType.INT64, span)]
-tile_view.start_offset = ir.ConstInt(0, DataType.INT64, span)
+# TileView is immutable: pass every field to the constructor.
+# valid_shape / stride / start_offset accept int or Expr.
+tile_view = ir.TileView(valid_shape=[8, 16], stride=[1, 16], start_offset=0)
+
+# Expr form, for symbolic dimensions
+rows = ir.Var("rows", ir.ScalarType(DataType.INT64), span)
+symbolic_view = ir.TileView(valid_shape=[rows, ir.ConstInt(16, DataType.INT64, span)])
 ```
 
 ## Function Node
@@ -492,7 +510,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | Field | Type | Description |
 | ----- | ---- | ----------- |
 | `name_` | string | Function name |
-| `func_type_` | FunctionType | Function type (Opaque, Orchestration, InCore, AIC, AIV, Group, or Spmd) |
+| `func_type_` | FunctionType | Function type (see the FunctionType table below) |
 | `params_` | list[VarPtr] | Parameter variables (DefField) |
 | `param_directions_` | list[ParamDirection] | Parameter directions, same length as params_ |
 | `return_types_` | list[TypePtr] | Return types |
@@ -500,6 +518,29 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `level_` | optional[Level] | Hierarchy level (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration; see below) |
 | `role_` | optional[Role] | Hierarchy role (auto-derived from `func_type_` for InCore/AIC/AIV/Group/Orchestration; see below) |
 | `attrs_` | list[(str, Any)] | Ordered free-form metadata, exposed as `UsualField` (participates in structural traversal) |
+
+### Reserved `attrs_` keys
+
+A key that one pass writes and another reads is a contract, and spelling it as a
+bare string literal at each site leaves that contract with no single point of
+rename. Reserved `Function` attr keys are therefore declared once per layer:
+
+| Layer | Declaration site |
+| ----- | ---------------- |
+| C++ | `include/pypto/ir/function.h` — `inline constexpr const char* kAttr...`, each with a lifecycle comment naming the writer pass, the readers, and whether the key is ever stripped |
+| Python | `python/pypto/_function_attrs.py` — `..._ATTR = "..."` for the subset the DSL, backend and JIT layers touch |
+
+`tests/lint/check_function_attr_key_parity.py` (a pre-commit hook) enforces
+three things: the two declaration sites agree on every key Python declares, the
+identifiers correspond (`kAttrDualAivDispatch` ↔ `DUAL_AIV_DISPATCH_ATTR`), and
+no other source spells one of the keys as a bare literal at a site that reads or
+writes `attrs`.
+
+Keys on other node kinds have their own owners and are not covered by this
+check: `Call` / `Submit` attrs are declared in `include/pypto/ir/expr.h`
+(`kAttrCoreNum`, `kAttrDevice`, `kAttrPredicate`, `kAttrManualDepEdges`, …), and
+`ForStmt` / pass-internal attrs in
+`include/pypto/ir/transforms/utils/attrs.h`.
 
 ### Auto-derivation of `level_` / `role_`
 
@@ -570,8 +611,20 @@ Consequences:
 | `AIV` | Vector core kernel (specialized InCore) |
 | `Group` | Co-scheduled group of AIC + AIV kernels |
 | `Spmd` | SPMD data-parallel dispatch wrapper |
+| `Inline` | Whole-body substitution at every call site; eliminated by `InlineFunctions` before any other pass |
+| `Graph` | Callable orchestration fragment, recorded once and replayed by the `host_build_graph` runtime |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` returns `True` for `InCore`, `AIC`, and `AIV`.
+
+`IsOrchestrationLike(type)` returns `True` for `Orchestration` and `Graph`. Both
+have orchestration bodies, so a pass that processes a function *because it
+orchestrates tasks* must use this rather than `== FunctionType::Orchestration`,
+which silently skips Graph bodies. The exception is code that means "the single
+compilation entry point" — that stays a strict comparison, since a Graph is
+called by the entry and is never the entry itself.
+
+A Graph function derives `{Level::CHIP, Role::Orchestrator}` like any other
+orchestration body, so level and role alone no longer identify the entry either.
 
 ## Program Node
 

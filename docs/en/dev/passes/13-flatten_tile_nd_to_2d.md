@@ -42,18 +42,19 @@ program_2d = flatten_pass(program)
 
 For each InCore function (InCore, AIC, AIV):
 
-1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D
+1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D, and no >2D `tile.assemble` whose written region fails to collapse contiguously
 2. **Transform statements**: Walk function body and convert >2D tile ops to 2D, preserving any dynamic `valid_shape` (see [Dynamic valid_shape](#dynamic-tile-dimensions-issue-1578))
-3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks and codegen-ready transpose forms
+3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks, 2D `tile.assemble` offsets, and codegen-ready transpose forms
 
 Per-statement handling:
 
 | Tile op | Transformation |
 | ------- | -------------- |
-| `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shapes to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
+| `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shape to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
 | `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2 (e.g. a user-written `tile.reshape` to 3D feeding `pl.assemble` into an N-D tensor view), insert a `tile.reshape` to flatten the tile operand to 2D first — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
 | `tile.store` (2D tensor) | Pass through unchanged |
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
+| `tile.assemble` (>2D target) | Fold the ND offset into the flattened `(row, col)` space with the same row-major collapse `tile.load` applies to its tensor-rank offsets (`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`, `col = o[k-1]`); the tile operands themselves are flattened by their defining ops. Requires source, target and offset to share one rank, and the written region to collapse to a contiguous row band (`IsRowMajorCollapseContiguous`) — both rejected in the precondition phase otherwise. Without the fold the offset would keep its ND rank on a 2D tile, and codegen (which reads `elements[0]`/`elements[1]` positionally and ignores the rest) would silently place the write at the wrong address |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
 | `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below) |
 | `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, slicing the (already-flattened) accumulator per batch index. Memory-space decisions on the accumulator (Vec/Acc round-trips, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 17) — flatten emits no inline `tile.move` |
@@ -147,14 +148,14 @@ Hardware tiles map to fixed-size on-chip buffers, so every **physical** tile dim
 compile-time constant; the runtime extent lives in `TileView.valid_shape`. To process a dynamic
 dimension the user **writes the chunk loop themselves**: iterate the dynamic dim with `pl.range` in a
 static `CHUNK` step, and load each chunk as a static physical `[1, CHUNK, 512]` tile whose
-`valid_shapes` carries the runtime tail `min(CHUNK, s - c)`. The chunk size is the user's choice — it
+`valid_shape` carries the runtime tail `min(CHUNK, s - c)`. The chunk size is the user's choice — it
 strongly affects performance, so it is not auto-selected by the pass.
 
 ```python
-# User-written: chunk the dynamic S dim, clamp the tail in valid_shapes.
+# User-written: chunk the dynamic S dim, clamp the tail in valid_shape.
 for c, (o,) in pl.range(0, s_dim, CHUNK, init_values=(out,)):
     valid = pl.min(CHUNK, s_dim - c)
-    t = pl.load(x, [b, c, 0], [1, CHUNK, 512], valid_shapes=[1, valid, 512])
+    t = pl.load(x, [b, c, 0], [1, CHUNK, 512], valid_shape=[1, valid, 512])
     t = pl.cast(t, target_type=pl.FP32)
     o = pl.store(t, [b, c, 0], o)        # static physical [1, CHUNK, 512], dynamic valid
     pl.yield_(o)
@@ -201,8 +202,8 @@ The phase entry points and rewrite component interface are private to the transf
 
 | Property | Value |
 | -------- | ----- |
-| Required | SSAForm, IncoreTileOps |
-| Produced | SSAForm, TileOps2D |
+| Required | SSAForm, IncoreTileOps, NormalizedStmtStructure |
+| Produced | SSAForm, TileOps2D, NormalizedStmtStructure |
 | Invalidated | — |
 
 ## Scope

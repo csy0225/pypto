@@ -49,11 +49,16 @@ import ast
 import textwrap
 from typing import cast
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.pypto_core import DataType, ir, passes
+
+_OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER = ir.get_op("pld.tensor.alloc_window_buffer").name
+_OP_PLD_TENSOR_ALLREDUCE = ir.get_op("pld.tensor.allreduce").name
+_OP_PLD_TENSOR_WINDOW = ir.get_op("pld.tensor.window").name
 
 
 @pytest.fixture(autouse=True)
@@ -94,7 +99,7 @@ def _find_window_calls(func: ir.Function) -> list[ir.AssignStmt]:
 
     def walk(stmt: ir.Stmt) -> None:
         if isinstance(stmt, ir.AssignStmt):
-            if isinstance(stmt.value, ir.Call) and stmt.value.op.name == "pld.tensor.window":
+            if isinstance(stmt.value, ir.Call) and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW:
                 found.append(stmt)
         if isinstance(stmt, ir.SeqStmts):
             for s in stmt.stmts:
@@ -331,7 +336,7 @@ def test_explicit_allreduce_assignment_keeps_user_signal():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     assert synthetic_assigns == []
@@ -370,7 +375,7 @@ def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
         and stmt.var.name_hint.startswith("__allreduce_signal_")
     ]
     allreduces = [
@@ -378,7 +383,7 @@ def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     assert len(signal_windows) == 1
@@ -420,7 +425,7 @@ def test_optional_signal_allreduce_round_trips_before_materialization():
         for stmt in _flatten_stmts(host.body)
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     assert "pld.tensor.allreduce(" in printed
@@ -456,14 +461,14 @@ def test_synthesize_allreduce_signals_normalizes_host_allreduce():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
     signal_windows = [
         stmt
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
         and stmt.var.name_hint.startswith("__allreduce_signal_")
     ]
 
@@ -471,6 +476,67 @@ def test_synthesize_allreduce_signals_normalizes_host_allreduce():
     assert len(allreduces[0].args) == 2
     assert len(signal_windows) == 1
     assert _as_var(allreduces[0].args[1]).name_hint == signal_windows[0].var.name_hint
+
+
+def test_synthesize_multicore_allreduce_signal_uses_core_lanes_and_bytes():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, core_num=4)
+            return data
+
+    synthesized = _synthesize(P)
+    host = _get_func(synthesized, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    window_stmt = next(
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    )
+    alloc_stmt = next(
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
+        and stmt.var.name_hint.startswith("__allreduce_signal_buf_")
+    )
+    allreduce = next(
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    )
+
+    signal_type = window_stmt.var.type
+    assert isinstance(signal_type, ir.DistributedTensorType)
+    assert isinstance(signal_type.shape[1], ir.ConstInt)
+    assert signal_type.shape[1].value == 4
+    assert allreduce.kwargs["core_num"] == 4
+
+    assert isinstance(alloc_stmt.value, ir.Call)
+    alloc_size = alloc_stmt.value.args[0]
+    assert isinstance(alloc_size, ir.Mul)
+    assert isinstance(alloc_size.right, ir.ConstInt)
+    assert alloc_size.right.value == pl.INT32.get_byte()
+    assert isinstance(alloc_size.left, ir.Mul)
+    assert isinstance(alloc_size.left.left, ir.Var)
+    assert alloc_size.left.left.name_hint.startswith("__allreduce_signal_world_size_")
+    assert isinstance(alloc_size.left.right, ir.ConstInt)
+    assert alloc_size.left.right.value == 4
 
 
 def test_synthesized_allreduce_signal_round_trips_after_materialization():
@@ -499,7 +565,7 @@ def test_synthesized_allreduce_signal_round_trips_after_materialization():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
         and stmt.var.name_hint.startswith("__allreduce_signal_buf_")
     ]
     windows = [
@@ -507,7 +573,7 @@ def test_synthesized_allreduce_signal_round_trips_after_materialization():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
         and stmt.var.name_hint.startswith("__allreduce_signal_")
     ]
     allreduces = [
@@ -515,7 +581,7 @@ def test_synthesized_allreduce_signal_round_trips_after_materialization():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     printed_ast = ast.parse(printed)
@@ -598,7 +664,7 @@ def test_implicit_allreduce_signal_names_are_program_unique():
         for stmt in _flatten_stmts(host.body)
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
     world_size_vars = [
         stmt.var.name_hint
@@ -691,7 +757,7 @@ def test_synthesize_allreduce_signals_reserves_existing_alloc_names():
         for stmt in _flatten_stmts(_get_func(synthesized, "host_orch").body)
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     ]
 
     assert alloc_names == ["__allreduce_signal_buf_0", "__allreduce_signal_buf_1"]
@@ -762,7 +828,7 @@ def test_return_implicit_allreduce_is_lifted_for_host_lowering():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
     returns = [stmt for stmt in stmts if isinstance(stmt, ir.ReturnStmt)]
 
@@ -814,7 +880,7 @@ def test_return_explicit_allreduce_is_lifted_for_host_lowering():
         for stmt in stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.allreduce"
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
     returns = [stmt for stmt in stmts if isinstance(stmt, ir.ReturnStmt)]
 
@@ -851,7 +917,7 @@ def test_implicit_allreduce_eval_stmt_gets_signal():
         for stmt in stmts
         if isinstance(stmt, ir.EvalStmt)
         and isinstance(stmt.expr, ir.Call)
-        and stmt.expr.op.name == "pld.tensor.allreduce"
+        and stmt.expr.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     assert len(allreduces) == 1
@@ -898,7 +964,7 @@ def test_explicit_allreduce_eval_stmt_keeps_user_signal():
         for stmt in stmts
         if isinstance(stmt, ir.EvalStmt)
         and isinstance(stmt.expr, ir.Call)
-        and stmt.expr.op.name == "pld.tensor.allreduce"
+        and stmt.expr.op.name == _OP_PLD_TENSOR_ALLREDUCE
     ]
 
     assert synthetic_assigns == []
@@ -907,6 +973,11 @@ def test_explicit_allreduce_eval_stmt_keeps_user_signal():
 
 
 def test_implicit_allreduce_in_loop_is_rejected():
+    """The HOST-rail signal synthesis cannot allocate a fresh signal per dynamic
+    iteration, so an allreduce that omits its signal is rejected inside a loop.
+    Passing one explicitly is accepted - see the ``_is_accepted`` cases below.
+    """
+
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -923,7 +994,7 @@ def test_implicit_allreduce_in_loop_is_rejected():
                 data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+    with pytest.raises(ValueError, match="without an explicit signal is not supported inside a for/while"):
         _apply(P)
 
 
@@ -944,11 +1015,13 @@ def test_implicit_allreduce_in_while_loop_is_rejected():
                 data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+    with pytest.raises(ValueError, match="without an explicit signal is not supported inside a for/while"):
         _apply(P)
 
 
-def test_explicit_allreduce_in_loop_is_rejected():
+def test_explicit_allreduce_in_loop_is_accepted():
+    """An explicit signal is reusable across iterations, so a `for` loop is allowed."""
+
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -967,11 +1040,14 @@ def test_explicit_allreduce_in_loop_is_rejected():
                 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
-        _apply(P)
+    # An explicit signal needs no synthesis, and the lowered kernel restores its
+    # cells to zero before returning, so carrying it across iterations is safe.
+    _apply(P)
 
 
-def test_explicit_allreduce_in_while_loop_is_rejected():
+def test_explicit_allreduce_in_while_loop_is_accepted():
+    """Same as the `for` case: only a synthesized signal is loop-bound."""
+
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -990,7 +1066,140 @@ def test_explicit_allreduce_in_while_loop_is_rejected():
                 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+    # An explicit signal needs no synthesis, and the lowered kernel restores its
+    # cells to zero before returning, so carrying it across iterations is safe.
+    _apply(P)
+
+
+def test_all_to_all_v_signal_and_recv_counts_inherit_data_comm_domain():
+    """signal and recv_counts (both device-descriptor-less) each register their
+    own CollectiveConsumer entry sharing all_to_all_v's target alloc, so both
+    inherit target's device coverage — send_counts does not (its coverage comes
+    from its own dispatch site, like symmetric all_to_all's `input`).
+
+    chip_orch deliberately does NOT take `signal`/`recv` as params (unlike the
+    lowering-rule tests) — if it did, the per-rank dispatch loop would give
+    them their own device descriptors directly, and this test would pass even
+    with the two new CollectiveConsumer entries removed. Matches
+    test_allreduce_signal_inherits_data_comm_domain's discipline of leaving
+    the signal-like arg out of the dispatch site so only the collective's own
+    inheritance mechanism can supply its coverage.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            data: pld.DistributedTensor[[8, 64], pl.FP32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 64], dtype=pl.FP32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, counts, device=r)
+            signal = pld.window(signal_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            pld.tensor.all_to_all_v(inp, data, signal, counts, recv)
+            return 0
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    _assert_scope_fields(
+        scopes[0],
+        [],
+        [
+            _expected_slot("input_buf", _mul(8 * 64, 4)),
+            _expected_slot("data_buf", _mul(8 * 64, 4)),
+            _expected_slot("signal_buf", _mul(4, 4)),
+            _expected_slot("counts_buf", _mul(4, 4)),
+            _expected_slot("recv_buf", _mul(4, 4)),
+        ],
+    )
+
+
+def test_all_to_all_v_in_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            data: pld.DistributedTensor[[8, 64], pl.FP32],
+            sig: pld.DistributedTensor[[4, 1], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 64], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 1], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            for _ in pl.range(2):
+                data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv)
+            return 0
+
+    with pytest.raises(ValueError, match="all_to_all_v is not supported inside a for/while loop"):
+        _apply(P)
+
+
+def test_all_to_all_v_in_while_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self,
+            inp: pld.DistributedTensor[[8, 64], pl.FP32],
+            data: pld.DistributedTensor[[8, 64], pl.FP32],
+            sig: pld.DistributedTensor[[4, 1], pl.INT32],
+            counts: pld.DistributedTensor[[4, 1], pl.INT32],
+            recv: pld.DistributedTensor[[4, 1], pl.INT32],
+        ):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            input_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            data_buf = pld.alloc_window_buffer(8 * 64 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            counts_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            recv_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            inp = pld.window(input_buf, [8, 64], dtype=pl.FP32)
+            data = pld.window(data_buf, [8, 64], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4, 1], dtype=pl.INT32)
+            counts = pld.window(counts_buf, [4, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [4, 1], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(inp, data, signal, counts, recv, device=r)
+            while True:
+                data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv)
+            return 0
+
+    with pytest.raises(ValueError, match="all_to_all_v is not supported inside a for/while loop"):
         _apply(P)
 
 
@@ -1012,7 +1221,7 @@ def test_nested_explicit_allreduce_expression_is_rejected():
             wrapped = (pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum),)
             return wrapped
 
-    with pytest.raises(Exception, match="must be a direct assignment"):
+    with pytest.raises(ValueError, match="must be a direct assignment"):
         _apply(P)
 
 
@@ -1032,7 +1241,7 @@ def test_nested_implicit_allreduce_expression_is_rejected():
             wrapped = (pld.tensor.allreduce(data, op=pld.ReduceOp.Sum),)
             return wrapped
 
-    with pytest.raises(Exception, match="must be a direct assignment"):
+    with pytest.raises(ValueError, match="must be a direct assignment"):
         _apply(P)
 
 
@@ -1177,6 +1386,63 @@ def test_two_allocs_different_descriptors_two_groups():
     _assert_scope_fields(scopes[1], [2, 3], [_expected_slot("buf_b", _mul(256, 4))])
 
 
+def test_four_allocs_three_descriptors_three_groups():
+    """Regression for the Phase-6 clustering fix: a linear scan of `pending`
+    per alloc would still pass with two groups, but a third distinct
+    descriptor exercises the third `pending` slot the map-based lookup must
+    also resolve correctly (not just append-and-never-find). `buf_d` reuses
+    `buf_c`'s descriptor ({4, 5}) so `desc_to_index.find` must also succeed on
+    a *nonzero* index (index 2, not just index 0 as the two-group test above
+    already covers) and route `buf_d` into `pending[2]` instead of appending a
+    fourth, spurious domain."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_a(self, a: pld.DistributedTensor[[256], pl.FP32]):
+            return a
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_b(self, b: pld.DistributedTensor[[256], pl.FP32]):
+            return b
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch_c(
+            self, c: pld.DistributedTensor[[256], pl.FP32], d: pld.DistributedTensor[[256], pl.FP32]
+        ):
+            return c
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            buf_a = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            buf_b = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            buf_c = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            buf_d = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            a = pld.window(buf_a, [256], dtype=pl.FP32)
+            b = pld.window(buf_b, [256], dtype=pl.FP32)
+            c = pld.window(buf_c, [256], dtype=pl.FP32)
+            d = pld.window(buf_d, [256], dtype=pl.FP32)
+            self.chip_orch_a(a, device=0)
+            self.chip_orch_a(a, device=1)
+            self.chip_orch_b(b, device=2)
+            self.chip_orch_b(b, device=3)
+            self.chip_orch_c(c, d, device=4)
+            self.chip_orch_c(c, d, device=5)
+            return 0
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 3
+    _assert_scope_fields(scopes[0], [0, 1], [_expected_slot("buf_a", _mul(256, 4))])
+    _assert_scope_fields(scopes[1], [2, 3], [_expected_slot("buf_b", _mul(256, 4))])
+    _assert_scope_fields(
+        scopes[2],
+        [4, 5],
+        [_expected_slot("buf_c", _mul(256, 4)), _expected_slot("buf_d", _mul(256, 4))],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Single alloc / multiple views share the same WindowBuffer instance
 # ---------------------------------------------------------------------------
@@ -1270,7 +1536,7 @@ def test_dead_alloc_no_window_materialisation_raises():
             buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())  # noqa: F841  # never windowed
             return 0
 
-    with pytest.raises(Exception, match=r"no pld\.tensor\.window materialisation"):
+    with pytest.raises(pypto.InternalError, match=r"no pld\.tensor\.window materialisation"):
         _apply(P)
 
 
@@ -1288,7 +1554,7 @@ def test_dead_alloc_no_dispatch_raises():
             _ = pld.window(buf, [256], dtype=pl.FP32)
             return 0
 
-    with pytest.raises(Exception, match="not consumed by any chip_orch dispatch"):
+    with pytest.raises(pypto.InternalError, match="not consumed by any chip_orch dispatch"):
         _apply(P)
 
 
@@ -1320,7 +1586,7 @@ def test_non_unit_step_device_loop_raises():
                 self.chip_orch(data, device=r)
             return 0
 
-    with pytest.raises(Exception, match="non-unit-step loop is not supported"):
+    with pytest.raises(pypto.InternalError, match="non-unit-step loop is not supported"):
         _apply(P)
 
 

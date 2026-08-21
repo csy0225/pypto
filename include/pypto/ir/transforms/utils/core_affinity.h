@@ -38,6 +38,38 @@ std::optional<MemorySpace> GetFirstTileArgMemory(const CallPtr& call);
 
 CVDirection ClassifyMoveDirection(const CallPtr& call);
 
+/// True when the call's execution lane is STATED rather than inferred. Two ways
+/// to state one:
+///
+///   * the registry declares it (`set_core_affinity`) — `pld.tile.put` / `get`,
+///     the cross-core transfer ops, the SPMD index ops, `tile.create`;
+///   * the author writes it as a `core_type` kwarg on a barrier or cross-core
+///     event, which `ClassifyCallAffinity` dispatches on (rules 2a / 2b).
+///
+/// A stated lane outranks an inferred one, so both the `pl.split_aiv` region
+/// placement override below and the AivSplitValid verifier's check (e) leave
+/// such calls alone. A GlobalVar callee (cross-function Call / Submit) is not an
+/// operator and states nothing.
+bool HasStatedLane(const CallPtr& call);
+
+/// True when this call was spliced out of a `pl.split_aiv` region by
+/// LowerAutoVectorSplit, i.e. the author placed it on the vector lane. See
+/// `kCorePlacementAttr` (transforms/utils/attrs.h) for the carrier and its
+/// pass 20 -> pass 21 lifetime.
+bool IsAivRegionPlaced(const CallPtr& call);
+
+/// The lane this call runs on, BEFORE the `pl.split_aiv` region placement
+/// override — i.e. what the op itself, its kwargs and its operand/result memory
+/// spaces imply. `ClassifyCallAffinity` is this plus the override, and is what
+/// passes should use; this form exists for the override to consult, and for
+/// diagnostics that need to explain what changed.
+CoreAffinity ClassifyIntrinsicCallAffinity(const CallPtr& call);
+
+/// True when this call's operator declares `set_no_duplicate()`, i.e. running
+/// it on a second core would change what the program means. False for a
+/// GlobalVar callee (not an operator) and for unregistered names.
+bool IsNoDuplicateCall(const CallPtr& call);
+
 CoreAffinity ClassifyCallAffinity(const CallPtr& call);
 
 struct CVBoundaryMove {
@@ -50,10 +82,16 @@ struct CVBoundaryMove {
   // op already encodes the half/full shape in result_type and the cross-core
   // fractal/post-move behaviour differs (see ExpandMixedKernel's boundary arm).
   bool op_driven = false;
-  // Split axis carried by the originating op (1 = UP_DOWN/axis0,
-  // 2 = LEFT_RIGHT/axis1). Stamped onto the generated tpush/tpop. 0 for
-  // tile.move boundaries (split assigned later by SplitVectorKernel).
+  // Split MODE carried by the originating op (1 = UP_DOWN/axis0,
+  // 2 = LEFT_RIGHT/axis1); 0 for tile.move boundaries (split assigned later by
+  // SplitVectorKernel). The pto-isa split CODE stamped onto the generated
+  // tpush/tpop is derived from this mode plus the boundary tile's extents —
+  // see split_axis::ShardSplitCode / GatherSplitCode.
   int split = 0;
+  // Partition stride the halving used, from the originating op's optional
+  // `lane_stride` attr (see split_axis::ResolveLaneStride). 0 = the default box
+  // partition, where the stride is the tile's own physical half.
+  int lane_stride = 0;
 };
 
 }  // namespace core_affinity

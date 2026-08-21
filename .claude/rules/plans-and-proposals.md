@@ -120,13 +120,14 @@ New files:
 
 # ✅ Detailed
 "Implementation order:
+0. Load machine limits: `source .claude/skills/testing/load-env.sh`
 1. C++ header (`include/pypto/ir/stmt.h`): Declare `IsChunked()` — must come first
 2. C++ impl (`src/ir/stmt.cpp`): Implement `IsChunked()` — depends on step 1
-3. Build C++: `cmake --build build --parallel` — verify compilation before binding work
+3. Build C++: `cmake --build build --parallel "$PYPTO_BUILD_JOBS"` — verify compilation before binding work
 4. Python binding (`python/bindings/modules/ir.cpp`): Add `.def("is_chunked", ...)`
 5. Type stub (`python/pypto/pypto_core/ir.pyi`): Add `is_chunked()` signature
 6. Test (`tests/ut/ir/statements/test_for_stmt.py`): Add `test_is_chunked()`
-7. Build and test: `cmake --build build --parallel && cd build && ctest` — full verification
+7. Build and test: `cmake --build build --parallel "$PYPTO_BUILD_JOBS" && cd build && ctest --parallel "$PYPTO_TEST_JOBS"` — full verification
 "
 ````
 
@@ -175,17 +176,13 @@ and IfStmt/WhileStmt constructors (stmt.h:288,544) do no validation.
 
 # ✅ Detailed
 "Test strategy:
-1. Unit test (`tests/ut/ir/statements/test_for_stmt.py`):
-   - Add `test_is_chunked_true` to verify `is_chunked()` returns True
-     when `chunk_size` is provided.
-   - Add `test_is_chunked_false` to verify it returns False when
-     `chunk_size` is None.
-2. Printer test (`tests/ut/ir/printing/`):
-   - Update ForStmt printing test to verify the new step expression
-     appears in printed output.
-3. Round-trip test (`tests/ut/ir/parser/`):
-   - Add a ForStmt with explicit step to ensure it survives
-     parse → print → reparse correctly.
+1. Unit test (`tests/ut/ir/statements/test_for_stmt.py`): add
+   `test_is_chunked_true` / `test_is_chunked_false`, covering `chunk_size`
+   provided vs None.
+2. Printer test (`tests/ut/ir/printing/`): update the ForStmt printing test to
+   verify the new step expression appears in printed output.
+3. Round-trip test (`tests/ut/ir/parser/`): add a ForStmt with explicit step to
+   ensure it survives parse → print → reparse correctly.
 "
 ````
 

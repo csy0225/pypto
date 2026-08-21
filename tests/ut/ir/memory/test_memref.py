@@ -182,15 +182,16 @@ class TestTileView:
         assert tile_view.stride[0].value == 2
 
     def test_tileview_default_new_fields(self):
-        """Test TileView default values for blayout, slayout, fractal, and pad."""
+        """Test TileView default values for PTO-visible config fields."""
         tile_view = ir.TileView()
         assert tile_view.blayout == ir.TileLayout.row_major
         assert tile_view.slayout == ir.TileLayout.none_box
         assert tile_view.fractal == 512
         assert tile_view.pad == ir.PadValue.null
+        assert tile_view.compact == ir.CompactMode.null
 
     def test_tileview_constructor_with_new_fields(self):
-        """Test passing blayout, slayout, fractal, and pad through the constructor."""
+        """Test passing PTO-visible config fields through the constructor."""
         span = ir.Span.unknown()
         tile_view = ir.TileView(
             valid_shape=[ir.ConstInt(16, DataType.INT64, span)],
@@ -200,12 +201,14 @@ class TestTileView:
             slayout=ir.TileLayout.row_major,
             fractal=1024,
             pad=ir.PadValue.zero,
+            compact=ir.CompactMode.normal,
         )
 
         assert tile_view.blayout == ir.TileLayout.col_major
         assert tile_view.slayout == ir.TileLayout.row_major
         assert tile_view.fractal == 1024
         assert tile_view.pad == ir.PadValue.zero
+        assert tile_view.compact == ir.CompactMode.normal
 
 
 class TestTensorTypeWithMemRef:
@@ -995,7 +998,7 @@ class TestTileViewConstructor:
         assert tv.valid_shape[1].same_as(m)
 
     def test_tileview_constructor_with_new_fields(self):
-        """Test TileView constructor with blayout, slayout, fractal, and pad."""
+        """Test TileView positional constructor with PTO-visible config fields."""
         span = ir.Span.unknown()
         valid_shape = [
             ir.ConstInt(32, DataType.INT64, span),
@@ -1015,6 +1018,7 @@ class TestTileViewConstructor:
             ir.TileLayout.row_major,
             256,
             ir.PadValue.max,
+            ir.CompactMode.normal,
         )
 
         assert len(tv.valid_shape) == 2
@@ -1023,6 +1027,7 @@ class TestTileViewConstructor:
         assert tv.slayout == ir.TileLayout.row_major
         assert tv.fractal == 256
         assert tv.pad == ir.PadValue.max
+        assert tv.compact == ir.CompactMode.normal
 
     def test_tileview_constructor_default_new_fields(self):
         """Test TileView constructor uses correct defaults for new fields."""
@@ -1152,6 +1157,10 @@ class TestPadValue:
         assert ir.PadValue.max is not None
         assert ir.PadValue.min is not None
 
+    def test_module_null_alias_remains_pad_value(self):
+        """Adding CompactMode must not overwrite the existing public ir.null alias."""
+        assert getattr(ir, "null") is ir.PadValue.null
+
     def test_pad_equality(self):
         """Test PadValue enum equality and inequality."""
         assert ir.PadValue.null == ir.PadValue.null
@@ -1263,6 +1272,7 @@ class TestPythonSyntaxPrinting:
             ir.TileLayout.row_major,
             1024,
             ir.PadValue.zero,
+            ir.CompactMode.normal,
         )
 
         tile_type = ir.TileType(shape, DataType.FP16, memref, tv, ir.MemorySpace.Left)
@@ -1276,6 +1286,7 @@ class TestPythonSyntaxPrinting:
         assert "fractal=1024" in printed
         assert "pad=" in printed
         assert "pl.PadValue.zero" in printed
+        assert "compact=pl.CompactMode.normal" in printed
 
     def test_tile_type_with_tileview_default_fields_print(self):
         """Test printing TileView omits default field values."""
@@ -1429,6 +1440,30 @@ class TestIRBuilderHelpers:
         assert isinstance(tv, ir.TileView)
         assert len(tv.valid_shape) == 2
         assert len(tv.stride) == 2
+
+    def test_builder_tile_view_preserves_positional_span(self):
+        """The pre-compact positional ``span`` argument remains source-compatible."""
+        ib = IRBuilder()
+        span = ir.Span("legacy.py", 3, 4, 3, 12)
+
+        tv = ib.tile_view(
+            [16, 16],
+            [1, 16],
+            0,
+            ir.TileLayout.row_major,
+            ir.TileLayout.none_box,
+            512,
+            ir.PadValue.null,
+            span,
+            compact=ir.CompactMode.normal,
+        )
+
+        assert tv.compact == ir.CompactMode.normal
+        start_offset = tv.start_offset
+        assert start_offset is not None
+        assert start_offset.span.filename == span.filename
+        assert start_offset.span.begin_line == span.begin_line
+        assert start_offset.span.begin_column == span.begin_column
 
     def test_builder_tensor_type(self):
         """Test IRBuilder.tensor_type() helper."""

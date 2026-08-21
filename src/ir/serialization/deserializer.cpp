@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 // clang-format off
@@ -30,6 +31,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
@@ -153,8 +155,16 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
     CHECK(obj.type == msgpack::type::MAP) << "Expected map for MemRef";
 
     std::string base_name;
+    VarPtr base_node;
     ExprPtr byte_offset = nullptr;
     uint64_t size = 0;
+    // Absent in blobs written before declared allocations existed; those hold only
+    // compiler allocations, which is exactly what `false` means.
+    bool is_pinned = false;
+    // Slot fields default to "one slot, index 0" — what an unsubscripted
+    // declaration and every compiler allocation mean.
+    uint64_t slot_count = 1;
+    std::optional<ExprPtr> slot_index = std::nullopt;
     bool has_base = false;
     bool has_byte_offset = false;
     bool has_size = false;
@@ -167,21 +177,50 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
       if (key == "base") {
         p->val.convert(base_name);
         has_base = true;
+      } else if (key == "base_node") {
+        if (!p->val.is_nil()) {
+          base_node = As<Var>(DeserializeNode(p->val, zone));
+        }
       } else if (key == "byte_offset") {
         byte_offset = std::static_pointer_cast<const Expr>(DeserializeNode(p->val, zone));
         has_byte_offset = true;
       } else if (key == "size") {
         p->val.convert(size);
         has_size = true;
+      } else if (key == "is_pinned") {
+        p->val.convert(is_pinned);
+      } else if (key == "slot_count") {
+        p->val.convert(slot_count);
+      } else if (key == "slot_index") {
+        if (!p->val.is_nil()) {
+          slot_index = std::static_pointer_cast<const Expr>(DeserializeNode(p->val, zone));
+        }
       }
     }
 
     CHECK(has_base && has_byte_offset && has_size)
         << "MemRef missing required fields (base, byte_offset, or size)";
 
-    // Create a base Ptr variable from the name
-    auto base = std::make_shared<Var>(base_name, GetPtrType(), Span::unknown());
-    return std::make_shared<MemRef>(base, byte_offset, size);
+    // Prefer the serialized base node: it comes from the shared node graph, so it
+    // is the very same Var object every other reference resolves to — including
+    // the alloc statement that defines the Ptr. Allocation identity in the IR is
+    // base_ *pointer* identity (MemRef::SameAllocation, InitMemRef's
+    // DeclaredAllocMap key, the address allocator's base groups and its
+    // declared-size lookup), so a base rebuilt from a name would not match its own
+    // allocation and the group would be sized as if it held one MemRef.
+    //
+    // Blobs written before `base_node` existed carry only the name. Interning one
+    // Var per name recovers the sharing *among the MemRefs* — the best that is
+    // available without the node — so those blobs at least keep their slots on one
+    // allocation.
+    VarPtr base = base_node;
+    if (!base) {
+      auto& interned = memref_bases_[base_name];
+      if (!interned) interned = std::make_shared<Var>(base_name, GetPtrType(), Span::unknown());
+      base = interned;
+    }
+    return std::make_shared<MemRef>(base, byte_offset, size, Span::unknown(), is_pinned, slot_count,
+                                    std::move(slot_index));
   }
 
   std::optional<TileView> DeserializeTileView(const msgpack::object& obj, msgpack::zone& zone) {
@@ -256,6 +295,10 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
         } else {
           CHECK(false) << "Unknown PadValue: " << pad_str;
         }
+      } else if (key == "compact") {
+        std::string compact_str;
+        p->val.convert(compact_str);
+        tile_view.compact = StringToCompactMode(compact_str);
       }
     }
 
@@ -299,6 +342,10 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
           tensor_view.layout = TensorLayout::DN;
         } else if (layout_str == "NZ") {
           tensor_view.layout = TensorLayout::NZ;
+        } else if (layout_str == "MX_A_ZZ") {
+          tensor_view.layout = TensorLayout::MX_A_ZZ;
+        } else if (layout_str == "MX_B_NN") {
+          tensor_view.layout = TensorLayout::MX_B_NN;
         } else {
           CHECK(false) << "Unknown TensorLayout: " << layout_str;
         }
@@ -437,6 +484,12 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
       return GetWindowBufferType();
     } else if (type_kind == "CommCtxType") {
       return GetCommCtxType();
+    } else if (type_kind == "PrefetchAsyncContextType") {
+      return GetPrefetchAsyncContextType();
+    } else if (type_kind == "AsyncEventType") {
+      return GetAsyncEventType();
+    } else if (type_kind == "AsyncSessionType") {
+      return GetAsyncSessionType();
     } else if (type_kind == "MemRefType") {
       return GetMemRefType();
     } else if (type_kind == "Ptr") {
@@ -505,6 +558,12 @@ class IRDeserializer::Impl : public detail::DeserializerContext {
 
  private:
   std::unordered_map<uint64_t, IRNodePtr> id_to_ptr_;
+
+  /// Base Ptr per allocation name, so every MemRef naming one allocation shares
+  /// one Var. An embedded MemRef serializes its base by name, so without this the
+  /// reader mints a fresh Var per MemRef and the allocation identity — which the
+  /// IR carries as base_ *pointer* identity — is lost on the way back in.
+  std::unordered_map<std::string, VarPtr> memref_bases_;
 };
 
 // IRDeserializer implementation

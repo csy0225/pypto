@@ -44,6 +44,11 @@ def _default_config(M: int, N: int, K: int) -> passes.l0_tile_chooser.L0TileConf
     cfg.bytes_c = 4  # FP32 accumulator
     cfg.min_m = cfg.min_n = cfg.min_k = 16
     cfg.align_m = cfg.align_n = cfg.align_k = 16
+    cfg.l0c_align_m = 16
+    cfg.box_align_m = cfg.box_align_n = 1
+    cfg.max_n = 0
+    cfg.max_n_pipelined = 0
+    cfg.max_n_nested_pipelined = 0
     # Realizable-mask gates default OFF (output-stationary, dbC=1) — the
     # algorithm the pass realizes today. Tests open a gate to exercise an axis.
     cfg.allow_a_stationary = False
@@ -64,7 +69,10 @@ def _capacities_ok(
     a0 = cfg.l0a_bytes // (cfg.bytes_a * (2 if dba else 1))
     b0 = cfg.l0b_bytes // (cfg.bytes_b * (2 if dbb else 1))
     c0 = cfg.l0c_bytes // (cfg.bytes_c * (2 if dbc else 1))
-    return m * k <= a0 and k * n <= b0 and m * n <= c0
+    boxed_m = _cdiv(m, cfg.box_align_m) * cfg.box_align_m
+    boxed_n = _cdiv(n, cfg.box_align_n) * cfg.box_align_n
+    physical_m = _cdiv(boxed_m, cfg.l0c_align_m) * cfg.l0c_align_m
+    return boxed_m * k <= a0 and k * boxed_n <= b0 and physical_m * boxed_n <= c0
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +217,41 @@ class TestL0TilingEdgeCases:
         # but traffic estimate must include the extra C read.
         assert result_read.estimated_traffic_bytes > result_no_read.estimated_traffic_bytes
 
+    @pytest.mark.parametrize(
+        ("M", "N", "expected_tile", "rows_outer"),
+        [
+            (16, 256, (16, 128, 128), True),
+            (256, 16, (128, 16, 128), False),
+        ],
+    )
+    def test_dbc_supports_one_dimensional_output_grid(self, M, N, expected_tile, rows_outer):
+        """One stationary tile and two moving inner tiles can ping-pong L0C."""
+        cfg = _default_config(M=M, N=N, K=128)
+        cfg.allow_double_buffer_c = True
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert (result.m, result.n, result.k) == expected_tile
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert result.os_holds_a is rows_outer
+        assert result.double_buffer_c is True
+
+    @pytest.mark.parametrize(("M", "N", "restricted_axis"), [(16, 192, "n"), (192, 16, "m")])
+    def test_dbc_does_not_count_peeled_tail_as_inner_stage(self, M, N, restricted_axis):
+        """A partial boundary emitted outside the loop cannot be a dbC stage."""
+        cfg = _default_config(M=M, N=N, K=128)
+        if restricted_axis == "n":
+            cfg.min_n = cfg.align_n = 128
+        else:
+            cfg.min_m = cfg.align_m = 128
+        cfg.allow_double_buffer_c = True
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        expected_tile = (16, 128, 128) if restricted_axis == "n" else (128, 16, 128)
+        assert (result.m, result.n, result.k) == expected_tile
+        assert result.double_buffer_c is False
+
     def test_k_must_divide_K_when_no_padding(self):
         """Regression: qwen3_decode gate_proj/up_proj inner-K shape.
 
@@ -234,6 +277,71 @@ class TestL0TilingEdgeCases:
         # should match K (no K-iter needed).
         assert result.k >= 64
         assert result.m >= 64 and result.n >= 64
+
+    def test_int32_physical_accumulator_rows_force_n_tiling(self):
+        """Issue #2232: an INT32 [16, 1152] accumulator occupies 32 physical
+        rows on Ascend910B, so it is 144 KiB and cannot remain one L0C tile.
+
+        The logical 16-row calculation is only 72 KiB and therefore used to
+        let the chooser return the full N while splitting K alone.
+        """
+        boundary = _default_config(M=16, N=1024, K=128)
+        boundary.bytes_a = boundary.bytes_b = 1
+        boundary.bytes_c = 4
+        boundary.l0c_align_m = 32
+        exact_fit = passes.l0_tile_chooser.choose_l0_tile(boundary)
+        assert (exact_fit.m, exact_fit.n) == (16, 1024)
+
+        cfg = _default_config(M=16, N=1152, K=128)
+        cfg.bytes_a = cfg.bytes_b = 1
+        cfg.bytes_c = 4
+
+        cfg.l0c_align_m = 16
+        logical = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert (logical.m, logical.n) == (16, 1152)
+
+        cfg.l0c_align_m = 32
+        physical = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert physical.n < 1152
+        assert _capacities_ok(physical.m, physical.n, physical.k, cfg)
+
+    def test_boxed_output_footprint_is_charged_before_candidate_selection(self):
+        """The canonical split-K rewrite boxes an INT8 Right panel's logical
+        N=80 window to 96 columns. The formerly selected (336,80,96) tile is
+        135168 bytes after that padding and must not pass a 128 KiB L0C gate."""
+        cfg = _default_config(M=656, N=80, K=768)
+        cfg.bytes_a = cfg.bytes_b = 1
+        cfg.bytes_c = 4
+        cfg.l0c_align_m = 32
+        cfg.box_align_m = 16
+        cfg.box_align_n = 32
+        cfg.allow_k_boundary = True
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert (result.m, result.n, result.k) != (336, 80, 96)
+        assert _capacities_ok(result.m, result.n, result.k, cfg)
+
+    @pytest.mark.parametrize(
+        ("limited_buffer", "box_field"), [("l0a_bytes", "box_align_m"), ("l0b_bytes", "box_align_n")]
+    )
+    def test_boxed_operand_footprint_limits_k(self, limited_buffer, box_field):
+        """Mat boxing participates in operand legality as well as L0C.
+
+        A logical 16x64 INT8 panel exactly fits a 1024-element double-buffered
+        operand budget. Boxing its output axis to 32 makes full K illegal and
+        forces k=32, for either L0A or L0B.
+        """
+        cfg = _default_config(M=16, N=16, K=64)
+        cfg.bytes_a = cfg.bytes_b = 1
+        cfg.allow_k_boundary = True
+        setattr(cfg, limited_buffer, 2048)
+        setattr(cfg, box_field, 32)
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert (result.m, result.n, result.k) == (16, 16, 32)
+        assert _capacities_ok(result.m, result.n, result.k, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +392,86 @@ class TestL0TilingInvariants:
         with pytest.raises(ValueError, match="M, N, K must all be positive"):
             passes.l0_tile_chooser.choose_l0_tile(cfg)
 
+    def test_optional_max_n_caps_the_legal_tile_grid(self):
+        """Auxiliary N-only SRAM constraints restrict candidates without changing the cost model."""
+        cfg = _default_config(M=256, N=1024, K=128)
+        cfg.max_n = 64
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+        assert result.n <= 64
+
+    def test_max_n_must_fit_the_minimum_tile(self):
+        cfg = _default_config(M=128, N=128, K=128)
+        cfg.max_n = 8
+        with pytest.raises(ValueError, match=r"max_n must be zero .* or at least min_n"):
+            passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+    def test_pipelined_n_cap_keeps_full_width_b_stationary_candidate(self):
+        """A one-slot B-stationary candidate remains in the global legal search."""
+        cfg = _default_config(M=256, N=256, K=64)
+        cfg.allow_b_stationary = True
+        cfg.max_n = 256
+        cfg.max_n_pipelined = 128
+        cfg.max_n_nested_pipelined = 64
+        # Make holding the full B panel decisively preferable to re-streaming it.
+        cfg.bw_a = 1000.0
+        cfg.bw_b = 1.0
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.BStationary
+        assert result.n == 256
+
+    def test_pipelined_n_cap_restricts_a_stationary(self):
+        """An A-stationary schedule obeys the one-level N-resource cap."""
+        cfg = _default_config(M=512, N=1024, K=128)
+        # The wider synthetic L0B makes A-stationary's natural N tile 64; the
+        # explicit cap below must narrow it to 32 without changing regimes.
+        cfg.l0b_bytes = 128 * 1024
+        cfg.allow_a_stationary = True
+        cfg.allow_double_buffer_c = True
+        cfg.max_n = 256
+        cfg.max_n_pipelined = 32
+        cfg.max_n_nested_pipelined = 16
+        cfg.bw_a = 1.0
+        cfg.bw_b = 1000.0
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.AStationary
+        assert result.n <= 32
+
+    def test_pipelined_n_cap_restricts_output_stationary_hold_b(self):
+        """Output-stationary with B held obeys the one-level N-resource cap."""
+        cfg = _default_config(M=128, N=512, K=16)
+        cfg.max_n = 512
+        cfg.max_n_pipelined = 128
+        cfg.max_n_nested_pipelined = 64
+        cfg.bw_a = 1000.0
+        cfg.bw_b = 1.0
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert not result.os_holds_a
+        assert result.n <= 128
+
+    def test_nested_pipelined_n_cap_restricts_output_stationary_hold_a(self):
+        """A nested output-stationary schedule obeys the four-slot N-resource cap."""
+        cfg = _default_config(M=256, N=256, K=16)
+        cfg.max_n = 256
+        cfg.max_n_pipelined = 128
+        cfg.max_n_nested_pipelined = 64
+        # Slow A loads make the output-stationary schedule hold A and pipeline
+        # the N axis under both grid loops.
+        cfg.bw_a = 1.0
+        cfg.bw_b = 1000.0
+
+        result = passes.l0_tile_chooser.choose_l0_tile(cfg)
+
+        assert result.stationarity == passes.l0_tile_chooser.Stationarity.OutputStationary
+        assert result.os_holds_a
+        assert result.n <= 64
+
 
 # ---------------------------------------------------------------------------
 # Brute-force optimality: the chooser's pick must be the global wall-minimum
@@ -319,14 +507,32 @@ def _derive_db(stat: str) -> tuple[bool, bool]:
     return (True, True)
 
 
+def _held_load_cycles(m: int, n: int, cfg) -> tuple[float, float]:
+    """Return the held-A and held-B full-K load costs."""
+    M, N, K = cfg.M, cfg.N, cfg.K
+    cn, cm = _cdiv(N, n), _cdiv(M, m)
+    held_a = (cfg.bytes_a * M * K) / cfg.bw_a + (cfg.bytes_b * K * N * cm) / cfg.bw_b
+    held_b = (cfg.bytes_a * M * K * cn) / cfg.bw_a + (cfg.bytes_b * K * N) / cfg.bw_b
+    return held_a, held_b
+
+
+def _row_outer(m: int, n: int, cfg, stat: str) -> bool:
+    """Mirror BuildFullKPipelined's stationary-outer loop choice."""
+    if stat == _AS:
+        return True
+    if stat == _BS:
+        return False
+    held_a, held_b = _held_load_cycles(m, n, cfg)
+    return held_a <= held_b
+
+
 def _load_cycles(m: int, n: int, k: int, cfg, stat: str) -> float:
     # The full-K emitter hoists one operand (loaded once, reused across the inner
     # sweep); OS at k == K picks the cheaper hoist -- NOT "both re-streamed". Only
     # split-K (k < K) re-streams both. Mirrors C++ LoadCycles.
     M, N, K = cfg.M, cfg.N, cfg.K
     cn, cm = _cdiv(N, n), _cdiv(M, m)
-    held_a = (cfg.bytes_a * M * K) / cfg.bw_a + (cfg.bytes_b * K * N * cm) / cfg.bw_b  # hold A
-    held_b = (cfg.bytes_a * M * K * cn) / cfg.bw_a + (cfg.bytes_b * K * N) / cfg.bw_b  # hold B
+    held_a, held_b = _held_load_cycles(m, n, cfg)
     if stat == _AS:
         return held_a
     if stat == _BS:
@@ -391,7 +597,9 @@ def _legal_ks(m: int, n: int, cfg, a0: int, b0: int) -> list[int]:
     A non-divisor k (the K-peel) is admitted only when K is itself align_k-aligned
     (peel_ok); a non-16-aligned K has no legal k here and is rejected upstream.
     """
-    cap = min(a0 // m, b0 // n)  # max k fitting L0a and L0b
+    boxed_m = _cdiv(m, cfg.box_align_m) * cfg.box_align_m
+    boxed_n = _cdiv(n, cfg.box_align_n) * cfg.box_align_n
+    cap = min(a0 // boxed_m, b0 // boxed_n)  # max k fitting boxed L0a and L0b
     k_problem = max(_cdiv(cfg.K, cfg.align_k) * cfg.align_k, cfg.min_k) if cfg.allow_padding else cfg.K
     k_hi = (min(cap, k_problem) // cfg.align_k) * cfg.align_k
     peel_ok = cfg.allow_k_boundary and cfg.K % cfg.align_k == 0
@@ -404,7 +612,7 @@ def _legal_ks(m: int, n: int, cfg, a0: int, b0: int) -> list[int]:
     return ks
 
 
-def _enumerate_best(cfg, stat: str, dbc: bool, require_2d: bool, require_full_k: bool):
+def _enumerate_best(cfg, stat: str, dbc: bool, require_inner_pair: bool, require_full_k: bool):
     """Exhaustively score the legal aligned (m, n, k) grid for one regime; best
     (key, tile). Every legal k per (m, n) is scored (not a largest-k shortcut)."""
     dba, dbb = _derive_db(stat)
@@ -413,18 +621,24 @@ def _enumerate_best(cfg, stat: str, dbc: bool, require_2d: bool, require_full_k:
     c0 = cfg.l0c_bytes // (cfg.bytes_c * (2 if dbc else 1))
     best = None
     m = cfg.min_m
-    while m <= cfg.M and m * cfg.min_n <= c0:
-        if not (require_2d and _cdiv(cfg.M, m) < 2):
-            n = cfg.min_n
-            while n <= min(cfg.N, c0 // m):
-                if not (require_2d and _cdiv(cfg.N, n) < 2):
-                    for k in _legal_ks(m, n, cfg, a0, b0):
-                        if require_full_k and k != cfg.K:
-                            continue
-                        key = _wall_key(m, n, k, cfg, stat, dbc)
-                        if best is None or key < best[0]:
-                            best = (key, (m, n, k))
-                n += cfg.align_n
+    min_boxed_n = _cdiv(cfg.min_n, cfg.box_align_n) * cfg.box_align_n
+    while m <= cfg.M:
+        boxed_m = _cdiv(m, cfg.box_align_m) * cfg.box_align_m
+        physical_m = _cdiv(boxed_m, cfg.l0c_align_m) * cfg.l0c_align_m
+        if physical_m * min_boxed_n > c0:
+            break
+        n = cfg.min_n
+        while n <= min(cfg.N, c0 // physical_m):
+            boxed_n = _cdiv(n, cfg.box_align_n) * cfg.box_align_n
+            inner_full_tiles = cfg.N // n if _row_outer(m, n, cfg, stat) else cfg.M // m
+            if physical_m * boxed_n <= c0 and (not require_inner_pair or inner_full_tiles >= 2):
+                for k in _legal_ks(m, n, cfg, a0, b0):
+                    if require_full_k and k != cfg.K:
+                        continue
+                    key = _wall_key(m, n, k, cfg, stat, dbc)
+                    if best is None or key < best[0]:
+                        best = (key, (m, n, k))
+            n += cfg.align_n
         m += cfg.align_m
     return best
 
@@ -434,7 +648,7 @@ def _brute_optimum(cfg) -> tuple:
 
     Returns (tile, stationarity, double_buffer_c, wall).
     """
-    base = _enumerate_best(cfg, _OS, False, require_2d=False, require_full_k=False)
+    base = _enumerate_best(cfg, _OS, False, require_inner_pair=False, require_full_k=False)
     assert base is not None
     best_key, best = base[0], (base[1], _OS, False)
     # Explore the rest of the space only when the baseline already tiles.
@@ -452,9 +666,14 @@ def _brute_optimum(cfg) -> tuple:
             if stat == _OS and not dbc:
                 continue  # baseline, already scored
             c0 = cfg.l0c_bytes // (cfg.bytes_c * (2 if dbc else 1))
-            if c0 < cfg.min_m * cfg.min_n:
+            min_boxed_m = _cdiv(cfg.min_m, cfg.box_align_m) * cfg.box_align_m
+            min_boxed_n = _cdiv(cfg.min_n, cfg.box_align_n) * cfg.box_align_n
+            min_physical_m = _cdiv(min_boxed_m, cfg.l0c_align_m) * cfg.l0c_align_m
+            if c0 < min_physical_m * min_boxed_n:
                 continue
-            cand = _enumerate_best(cfg, stat, dbc, require_2d=dbc, require_full_k=(stat != _OS or dbc))
+            cand = _enumerate_best(
+                cfg, stat, dbc, require_inner_pair=dbc, require_full_k=(stat != _OS or dbc)
+            )
             if cand is not None and cand[0][0] < best_key[0]:  # strictly lower wall
                 best_key, best = cand[0], (cand[1], stat, dbc)
     tile, stat, dbc = best
@@ -529,14 +748,16 @@ class TestL0TilingRooflineOptimum:
 
         512x512x64: the L0C drain (~M*N) dominates the shallow-K compute, so
         hiding it behind the next tile beats a single big accumulator. The chosen
-        tile must fit the halved L0C budget and form a >= 2x2 grid.
+        tile must fit the halved L0C budget and provide at least two full tiles
+        on the moving inner axis.
         """
         cfg = _default_config(M=512, N=512, K=64)
         cfg.allow_double_buffer_c = True
         result = passes.l0_tile_chooser.choose_l0_tile(cfg)
         assert result.double_buffer_c is True
         assert result.k == 64, f"dbC=2 requires a full-K tile; got k={result.k}"
-        assert _cdiv(512, result.m) >= 2 and _cdiv(512, result.n) >= 2, "dbC=2 needs a >= 2x2 grid"
+        inner_full_tiles = 512 // result.n if _row_outer(result.m, result.n, cfg, _OS) else 512 // result.m
+        assert inner_full_tiles >= 2, "dbC=2 needs at least two full moving-inner tiles"
         assert _capacities_ok(result.m, result.n, result.k, cfg, dbc=True)
         # The single-L0C path must NOT pick dbC=2 (gate respected).
         cfg.allow_double_buffer_c = False

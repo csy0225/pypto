@@ -36,8 +36,9 @@ namespace ir {
 // ReduceOp selects the reduction operator of pld.tensor.allreduce (and
 // future collective reductions):
 // - kSum  : element-wise sum across ranks.
-// - kMax / kMin / kProd : reserved placeholders; lowering is currently
-//   kSum-only and rejects other variants at the deducer.
+// - kMax  : element-wise maximum across ranks.
+// - kMin  : element-wise minimum across ranks.
+// - kProd : element-wise product across ranks.
 //
 // Underlying integer values are part of the IR ABI: they are stored as the
 // `int` kwarg payload of the corresponding ops (`op` for notify, `cmp` for
@@ -57,6 +58,12 @@ enum class WaitCmp : int {
 enum class AtomicType : int {
   kNone = 0,
   kAdd = 1,
+};
+
+// Underlying values are stored in tile.mgather's integer `coalesce` kwarg.
+enum class MgatherCoalesceMode : int {
+  kRow = 0,
+  kElem = 1,
 };
 
 enum class ReduceOp : int {

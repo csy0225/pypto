@@ -15,11 +15,14 @@ each operation type, compiles them through the PassManager and PTOCodegen,
 and verifies the generated orchestration code.
 """
 
+import re
 import warnings
 
+import pypto
 import pypto.language as pl
 import pytest
-from pypto import DataType, backend, codegen, ir
+from _pto_loc_common import strip_loc
+from pypto import DataType, backend, codegen, ir, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
@@ -622,6 +625,551 @@ class TestRsqrtHighPrecisionCodegen:
         )
 
 
+class TestB01PrecisionAndRowExpandAddCodegen:
+    """Exact PTOAS forms added for the first op batch."""
+
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_operand_count(line: str) -> int:
+        ins_start = line.find("ins(")
+        ins_end = line.find(")", ins_start)
+        assert ins_start != -1 and ins_end != -1, f"ins(...) clause not found in: {line}"
+        operands = line[ins_start + len("ins(") : ins_end].split(":", 1)[0]
+        return operands.count(",") + 1
+
+    def test_tdiv_default_omits_and_high_precision_appends_exact_attr(self):
+        @pl.program
+        class DefaultProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class HighPrecisionProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile, high_precision=True)
+                return pl.store(result, [0, 0], out)
+
+        default_line = self._op_line(self._generate_mlir(DefaultProg), "pto.tdiv")
+        high_precision_line = self._op_line(self._generate_mlir(HighPrecisionProg), "pto.tdiv")
+        assert "precisionType" not in default_line
+        assert strip_loc(high_precision_line).endswith("{precisionType = #pto<div_precision high_precision>}")
+        assert ") outs(" in high_precision_line
+        assert high_precision_line.index("outs(") < high_precision_line.index("precisionType")
+
+    def test_tlog_emits_exact_high_precision_attr(self):
+        @pl.program
+        class LogProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result: pl.Tensor[[16, 16], pl.FP32] = pl.log(src, high_precision=True)
+                return result
+
+        log_line = self._op_line(self._generate_mlir(LogProg), "pto.tlog")
+        assert strip_loc(log_line).endswith("{precisionType = #pto<log_precision high_precision>}")
+
+    def test_trecip_default_omits_and_high_precision_appends_exact_attr_on_a5(self):
+        @pl.program
+        class DefaultProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result: pl.Tensor[[16, 16], pl.FP32] = pl.recip(src)
+                return result
+
+        @pl.program
+        class HighPrecisionProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result: pl.Tensor[[16, 16], pl.FP32] = pl.recip(src, high_precision=True)
+                return result
+
+        backend_type = BackendType.Ascend950
+        default_line = self._op_line(self._generate_mlir(DefaultProg, backend_type), "pto.trecip")
+        high_precision_line = self._op_line(
+            self._generate_mlir(HighPrecisionProg, backend_type), "pto.trecip"
+        )
+        assert "precisionType" not in default_line
+        assert strip_loc(high_precision_line).endswith(
+            "{precisionType = #pto<recip_precision high_precision>}"
+        )
+
+    def test_trowexpandadd_emits_two_and_three_operand_forms(self):
+        @pl.program
+        class WithoutTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class WithTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                tmp: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        two_operand_line = self._op_line(self._generate_mlir(WithoutTmpProg), "pto.trowexpandadd")
+        three_operand_line = self._op_line(self._generate_mlir(WithTmpProg), "pto.trowexpandadd")
+        assert self._ins_operand_count(two_operand_line) == 2
+        assert self._ins_operand_count(three_operand_line) == 3
+
+
+class TestB02SelectionAndPreluCodegen:
+    """Exact PTOAS forms for TSELS and TPRELU."""
+
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_outs_ssas(line: str) -> tuple[list[str], list[str]]:
+        match = re.fullmatch(r"\s*pto\.\w+\s+ins\((.*?)\)\s+outs\((.*?)\)\s*", line)
+        assert match, f"expected exact PTO ins(...)/outs(...) form, got: {line}"
+        ins = re.findall(r"%[\w.$-]+", match.group(1).split(":", 1)[0])
+        outs = re.findall(r"%[\w.$-]+", match.group(2).split(":", 1)[0])
+        return ins, outs
+
+    @staticmethod
+    def _assert_named_ssas(ssas: list[str], expected_names: list[str]) -> None:
+        assert len(ssas) == len(expected_names)
+        for ssa, expected_name in zip(ssas, expected_names, strict=True):
+            assert expected_name in ssa, f"expected {expected_name!r} SSA at this position, got {ssa!r}"
+
+    @staticmethod
+    def _alloc_addr_for_named_ssa(mlir: str, expected_name: str) -> str:
+        lines = [
+            line
+            for line in mlir.splitlines()
+            if "= pto.alloc_tile" in line and expected_name in line.split("=", 1)[0]
+        ]
+        assert len(lines) == 1, f"expected one alloc_tile for {expected_name!r}, got {lines}:\n{mlir}"
+        match = re.search(r"addr = (%[\w.$-]+)", lines[0])
+        assert match, f"expected a baked PyPTO address in: {lines[0]}"
+        return match.group(1)
+
+    def test_tsels_emits_mask_src_tmp_and_typed_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.INT32]:
+                src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        for backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
+            mlir = self._generate_mlir(Prog, backend_type)
+            line = self._op_line(mlir, "pto.tsels")
+            ins, outs = self._ins_outs_ssas(line)
+            scalar = re.search(r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -3 : i32\s*$", mlir, re.MULTILINE)
+            assert scalar
+            self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+            assert ins[3:] == [scalar.group(1)]
+            self._assert_named_ssas(outs, ["result"])
+            assert "i32" in line
+
+    def test_tsels_unsigned_src_emits_signed_bit_compatible_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.UINT32],
+                out: pl.Tensor[[16, 16], pl.UINT32],
+            ) -> pl.Tensor[[16, 16], pl.UINT32]:
+                src_tile: pl.Tile[[16, 16], pl.UINT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.UINT32] = pl.tile.sels(mask, src_tile, tmp, 0x8000000B)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = self._op_line(mlir, "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        scalar = re.search(
+            r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -2147483637 : i32\s*$",
+            mlir,
+            re.MULTILINE,
+        )
+        assert scalar
+        self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+        assert ins[3:] == [scalar.group(1)]
+        self._assert_named_ssas(outs, ["result"])
+        assert "ui32" in line
+        assert "i32" in line
+
+    def test_tsels_rejects_int8_on_a2a3(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT8],
+                out: pl.Tensor[[16, 16], pl.INT8],
+            ) -> pl.Tensor[[16, 16], pl.INT8]:
+                src_tile: pl.Tile[[16, 16], pl.INT8] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT8] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
+            self._generate_mlir(Prog)
+
+    def test_tsels_tmp_may_alias_src_only_on_a5(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src_tile: pl.Tile[[2, 16], pl.INT32] = pl.load(src, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_tile, src_tile, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps src"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        assert ins[1] == ins[2]
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tsels_tmp_may_alias_mask_only_on_a5(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src_tile: pl.Tile[[2, 16], pl.INT32] = pl.load(src, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_tile, mask, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps mask"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        assert ins[0] == ins[2]
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tsels_a2a3_rejects_overlapping_tmp_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 24], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                base: pl.Tile[[2, 24], pl.INT32] = pl.load(src, [0, 0], [2, 24])
+                src_view: pl.Tile[[2, 16], pl.INT32] = pl.tile.slice(base, [2, 16], [0, 0])
+                tmp_view: pl.Tile[[2, 16], pl.INT32] = pl.tile.slice(base, [2, 16], [0, 8])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_view, tmp_view, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps src"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        assert "pto.tsels" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_tsels_tmp_may_alias_result_on_a2a3(self):
+        """A2/A3 consumes tmp through set_cmpmask before the first dst write."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src_in: pl.Tensor[[2, 16], pl.INT32],
+                tmp_in: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src: pl.Tile[[2, 16], pl.INT32] = pl.load(src_in, [0, 0], [2, 16])
+                tmp: pl.Tile[[2, 16], pl.INT32] = pl.load(tmp_in, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src, tmp, -3)
+                keep_src_live: pl.Tile[[2, 16], pl.INT32] = pl.tile.add(src, result)
+                return pl.store(keep_src_live, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend910B)
+        line = self._op_line(mlir, "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins[:3], ["mask", "src", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+        tmp_addr = self._alloc_addr_for_named_ssa(mlir, "tmp")
+        result_addr = self._alloc_addr_for_named_ssa(mlir, "result")
+        assert tmp_addr == result_addr
+
+    def test_tprelu_emits_target_specific_exact_operands(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        a3_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend910B), "pto.tprelu")
+        a3_ins, a3_outs = self._ins_outs_ssas(a3_line)
+        self._assert_named_ssas(a3_ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(a3_outs, ["result"])
+
+        a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
+        self._assert_named_ssas(a5_ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(a5_outs, ["result"])
+
+    def test_tprelu_signed_scratch_is_a5_only(self):
+        """A2/A3 requires UINT8 scratch even though the pinned verifier accepts signed i8."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.INT8] = pl.tile.create([17, 32], dtype=pl.INT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="A2/A3 requires UINT8 tmp scratch"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a3_rejects_overlapping_views_but_a5_accepts_them(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 24], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                base: pl.Tile[[16, 24], pl.FP32] = pl.load(src, [0, 0], [16, 24])
+                src_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 0])
+                slope_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 8])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_view, slope_view, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="src overlaps slope"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        line = self._op_line(mlir, "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        subview_results = [
+            subview_line.split("=", 1)[0].strip()
+            for subview_line in mlir.splitlines()
+            if "= pto.subview " in subview_line
+        ]
+        assert ins[:2] == subview_results[:2]
+        self._assert_named_ssas(ins[2:], ["tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_undersized_tmp_is_a3_only_validation(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="physical rows"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a3_rejects_tmp_with_insufficient_valid_columns(self):
+        """Exercise the packed-column bound independently of the row bound."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32], valid_shape=[17, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="valid columns"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a2a3_rejects_unproven_dynamic_tmp_rows(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+                rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16], valid_shape=[rows, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    slope, [0, 0], [16, 16], valid_shape=[rows, 16]
+                )
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="physical rows"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+    def test_tprelu_a2a3_rejects_unproven_dynamic_tmp_columns(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+                cols: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16], valid_shape=[16, cols])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    slope, [0, 0], [16, 16], valid_shape=[16, cols]
+                )
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32], valid_shape=[17, 2])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="valid columns"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+
 class TestTileReadWriteOffsetCodegen:
     """Tests verifying tile.read/write multi-dimensional indices generate correct flat offsets."""
 
@@ -819,6 +1367,31 @@ class TestTileReadWriteOffsetCodegen:
         # emits arith.muli/arith.addi (offset = 0 * stride + col).
         assert "arith.muli" in mlir, f"Expected arith.muli for 2D partial-constant index, got:\n{mlir}"
         assert "arith.addi" in mlir, f"Expected arith.addi for 2D partial-constant index, got:\n{mlir}"
+
+    def test_store_dynamic_offset_clamped_to_non_negative(self):
+        """pl.store with a dynamic offset emits arith.maxsi clamp against zero.
+
+        A runtime INT32 scalar used as a store offset (e.g. a rank-derived ring
+        index) could evaluate to a negative value.  The offset must be clamped
+        to non-negative before it reaches pto.partition_view, which does not
+        handle negative indices.  Regression for issue #2201.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 8], pl.FP32],
+                config: pl.Tensor[[1], pl.INT32],
+                out: pl.Tensor[[1, 32], pl.FP32],
+            ) -> pl.Tensor[[1, 32], pl.FP32]:
+                offset: pl.Scalar[pl.INT32] = pl.read(config, [0])
+                ones: pl.Tile[[1, 8], pl.FP32] = pl.load(src, [0, 0], [1, 8])
+                return pl.store(ones, [0, offset], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "arith.maxsi" in mlir, f"Expected arith.maxsi clamp for dynamic store offset, got:\n{mlir}"
 
 
 class TestBroadcastOpsCodegen:
@@ -1023,6 +1596,57 @@ class TestTileSliceCodegen:
         line = subview_lines[0]
         assert "sizes [16, 16]" in line, f"sizes attribute must be [16, 16], got:\n{line}"
         assert "rows=16, cols=16" in line, f"result tile_buf must carry rows=16, cols=16, got:\n{line}"
+
+    def test_unaligned_vec_column_slice_into_muls_uses_aligned_extract(self):
+        """Regression for #1789: an FP32 column subview at offset 1 starts four
+        bytes past its source allocation and must not feed ``pto.tmuls``
+        directly. The pass materializes it into a fresh aligned tile first."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 8], pl.FP32],
+                dst: pl.Tensor[[16, 1], pl.FP32],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                local: pl.Tile[[16, 8], pl.FP32] = pl.load(src, [0, 0], [16, 8])
+                head: pl.Tile[[16, 1], pl.FP32] = pl.tile.slice(local, [16, 1], [0, 1])
+                scaled: pl.Tile[[16, 1], pl.FP32] = pl.tile.muls(head, 0.5)
+                return pl.store(scaled, [0, 0], dst)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.subview" not in mlir, (
+            f"unaligned Vec slice must be canonicalized to tile.extract, got:\n{mlir}"
+        )
+        textract_lines = [line.strip() for line in mlir.splitlines() if "pto.textract" in line]
+        tmuls_lines = [line.strip() for line in mlir.splitlines() if "pto.tmuls" in line]
+        assert len(textract_lines) == 1 and len(tmuls_lines) == 1, (
+            f"expected one aligned extract followed by one tmuls, got:\n{mlir}"
+        )
+
+        textract_out = textract_lines[0].split("outs(", 1)[1].split(":", 1)[0].strip()
+        tmuls_in = tmuls_lines[0].split("ins(", 1)[1].split(":", 1)[0].split(",", 1)[0].strip()
+        assert mlir.index("pto.textract") < mlir.index("pto.tmuls"), (
+            f"the aligned extract must precede pto.tmuls, got:\n{mlir}"
+        )
+
+        # Layout resolution may insert a row-major conversion between textract
+        # and tmuls. Both the materialized tile and the final tmuls operand must
+        # therefore have independent, aligned allocations; direct SSA identity
+        # is not required.
+        for value in (textract_out, tmuls_in):
+            alloc_line = next(
+                (line for line in mlir.splitlines() if line.strip().startswith(f"{value} = pto.alloc_tile")),
+                None,
+            )
+            assert alloc_line is not None, f"{value} must have its own allocation, got:\n{mlir}"
+            address = alloc_line.split("addr = ", 1)[1].split()[0]
+            constant = re.fullmatch(r"%c(-?\d+)_i64", address)
+            assert constant is not None, f"expected a static allocation address, got: {alloc_line}"
+            assert int(constant.group(1)) % 32 == 0, (
+                f"Vec operand address must be 32-byte aligned: {alloc_line}"
+            )
 
     @pytest.mark.parametrize(
         "op_name, pto_op",
@@ -1435,15 +2059,19 @@ class TestTileSliceCodegen:
                 return pl.store(sliced, [0, 0], dst)
 
         mlir = self._generate_mlir(Prog)
-        subview_lines = [line for line in mlir.splitlines() if "pto.subview" in line]
-        assert subview_lines, "no pto.subview line emitted"
-        result_type = subview_lines[0].split("->", 1)[-1]
-        assert "v_row=16" in result_type and "v_col=16" in result_type, (
-            f"Source valid [32,32] >= slice size [16,16] with dynamic offset must yield "
-            f"static v_row=16, v_col=16 in result tile_buf type, got:\n{subview_lines[0]}"
+        # A dynamic column cannot be proved aligned, so #1789 canonicalization
+        # materializes this slice. Its inferred static valid shape must survive
+        # on the fresh allocation.
+        assert "pto.subview" not in mlir, f"dynamic unaligned slice must be materialized, got:\n{mlir}"
+        textract_lines = [line.strip() for line in mlir.splitlines() if "pto.textract" in line]
+        assert len(textract_lines) == 1, f"expected one pto.textract, got:\n{mlir}"
+        textract_out = textract_lines[0].split("outs(", 1)[1].split(":", 1)[0].strip()
+        alloc_line = next(
+            line for line in mlir.splitlines() if line.strip().startswith(f"{textract_out} = pto.alloc_tile")
         )
-        assert "v_row=?" not in result_type and "v_col=?" not in result_type, (
-            f"v_row/v_col must not be dynamic ('?') when source valid >= slice size, got:\n{subview_lines[0]}"
+        assert "valid_row = %c16_index" in alloc_line and "valid_col = %c16_index" in alloc_line, (
+            f"Source valid [32,32] >= slice size [16,16] must preserve static valid [16,16], got:\n"
+            f"{alloc_line}"
         )
 
     def test_tile_slice_preserves_non_sentinel_parent_valid_shape(self):
@@ -1470,12 +2098,19 @@ class TestTileSliceCodegen:
                 return pl.store(sliced, [0, 0], dst)
 
         mlir = self._generate_mlir(Prog)
-        subview_lines = [line for line in mlir.splitlines() if "pto.subview" in line]
-        assert subview_lines, f"no pto.subview line emitted; got:\n{mlir}"
-        result_type = subview_lines[0].split("->", 1)[-1]
-        assert "v_row=6" in result_type and "v_col=6" in result_type, (
-            "Parent narrow valid [12, 12] with offset [6, 6] and sizes [8, 8] must yield "
-            f"v_row=6, v_col=6 (min(size, valid - offset)) on the subview result; got:\n{subview_lines[0]}"
+        # Offset [6,6] is not 32-byte aligned, so #1789 canonicalization
+        # materializes the slice. The narrow valid extent must be preserved on
+        # that fresh allocation.
+        assert "pto.subview" not in mlir, f"unaligned slice must be materialized, got:\n{mlir}"
+        textract_lines = [line.strip() for line in mlir.splitlines() if "pto.textract" in line]
+        assert len(textract_lines) == 1, f"expected one pto.textract, got:\n{mlir}"
+        textract_out = textract_lines[0].split("outs(", 1)[1].split(":", 1)[0].strip()
+        alloc_line = next(
+            line for line in mlir.splitlines() if line.strip().startswith(f"{textract_out} = pto.alloc_tile")
+        )
+        assert "valid_row = %c6_index" in alloc_line and "valid_col = %c6_index" in alloc_line, (
+            "Parent narrow valid [12, 12] with offset [6, 6] and sizes [8, 8] must preserve "
+            f"valid [6,6] (min(size, valid - offset)) on the materialized result; got:\n{alloc_line}"
         )
 
     def test_tile_slice_with_zero_valid_sentinel_parent_does_not_emit_zero_result_valid(self):
@@ -1918,7 +2553,9 @@ class TestSetValidShapeCodegen:
                 return pl.store(narrowed, [0, 0], dst)
 
         mlir = self._generate_mlir(Prog)
-        set_validshape_line = next(line.strip() for line in mlir.splitlines() if "pto.set_validshape" in line)
+        set_validshape_line = next(
+            strip_loc(line) for line in mlir.splitlines() if "pto.set_validshape" in line
+        )
         narrowed_alloc_lines = [
             line.strip() for line in mlir.splitlines() if "%narrowed" in line and "pto.alloc_tile" in line
         ]
@@ -1939,6 +2576,252 @@ class TestSetValidShapeCodegen:
         assert "%src_tile" in store_line, (
             f"Expected subsequent narrowed uses to resolve to the source tile SSA, got:\n{store_line}"
         )
+
+    def test_set_validshape_on_a_slice_is_rejected(self):
+        """A view operand has no valid_row / valid_col operands to update.
+
+        `tile.slice` lowers to a `pto.subview`, which carries its valid extent in
+        its own type. ptoas rejects a runtime `pto.set_validshape` against it
+        ("expects source tile_buf to have dynamic validShape (?, ?)"), so PyPTO
+        must reject it first with a message that names the alternative instead of
+        letting the failure surface in the assembler.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 8], pl.FP32],
+                dst: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+            ) -> pl.Tensor[[8, 8], pl.FP32]:
+                packed: pl.Tile[[32, 8], pl.FP32] = pl.load(
+                    src, [0, 0], [32, 8], target_memory=pl.MemorySpace.Vec
+                )
+                blk: pl.Tile[[8, 8], pl.FP32] = packed[8:16, 0:8]
+                narrowed: pl.Tile[[8, 8], pl.FP32] = pl.tile.set_validshape(blk, 8, 4)
+                padded: pl.Tile[[8, 8], pl.FP32] = pl.tile.fillpad(narrowed, pad_value=pl.PadValue.zero)
+                return pl.store(padded, [0, 0], dst)
+
+        with pytest.raises(ValueError, match="cannot narrow a tile view"):
+            self._generate_mlir(Prog)
+
+    def test_set_validshape_rejects_a_dynamic_valid_slice_by_view_provenance(self):
+        """A view is recognised by provenance, not by its rendered valid dims.
+
+        `tile.slice` given a runtime `valid_shape` emits a `pto.subview` typed
+        `v_row=?, v_col=?` — the same rendering an alloc-backed handle uses. It is
+        still a view with no operands to update, so it must be rejected too;
+        reading the type tokens instead would emit a `pto.set_validshape` that
+        ptoas refuses with "requires a locally bound tile source".
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 8], pl.FP32],
+                slice_rows: pl.Scalar[pl.INDEX],
+                slice_cols: pl.Scalar[pl.INDEX],
+                dst: pl.Out[pl.Tensor[[8, 8], pl.FP32]],
+            ) -> pl.Tensor[[8, 8], pl.FP32]:
+                packed: pl.Tile[[32, 8], pl.FP32] = pl.load(
+                    src, [0, 0], [32, 8], target_memory=pl.MemorySpace.Vec
+                )
+                blk: pl.Tile[[8, 8], pl.FP32] = pl.tile.slice(
+                    packed, [8, 8], [8, 0], valid_shape=[slice_rows, slice_cols]
+                )
+                narrowed: pl.Tile[[8, 8], pl.FP32] = pl.tile.set_validshape(blk, 8, 4)
+                padded: pl.Tile[[8, 8], pl.FP32] = pl.tile.fillpad(narrowed, pad_value=pl.PadValue.zero)
+                return pl.store(padded, [0, 0], dst)
+
+        with pytest.raises(ValueError, match="cannot narrow a tile view"):
+            self._generate_mlir(Prog)
+
+
+_ACC_M = 64
+_ACC_K = 128
+_ACC_N = 256
+
+# tile.assemble cases keep the accumulator small enough for the 128 KiB L0C arena.
+_ASM_M = 32
+_ASM_K = 128
+_ASM_N = 64
+
+
+@pl.program
+class AssembleNarrowedAccIntoFullWindow:
+    """A compact matmul result assembled into a *non*-narrowed Acc buffer.
+
+    The two windows address L0C at different fractal strides, so the copy is not
+    expressible as a `pto.subview`. Before #2470 both sides read as non-compact
+    and the mismatch was a silent miscompile.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[_ASM_M, _ASM_K], pl.INT8],
+        rhs: pl.Tensor[[_ASM_K, _ASM_N], pl.INT8],
+        valid_rows: pl.Scalar[pl.INDEX],
+        output: pl.Out[pl.Tensor[[_ASM_M, 2 * _ASM_N], pl.INT32]],
+    ) -> pl.Tensor[[_ASM_M, 2 * _ASM_N], pl.INT32]:
+        lhs_tile: pl.Tile[[_ASM_M, _ASM_K], pl.INT8] = pl.load(
+            lhs,
+            [0, 0],
+            [_ASM_M, _ASM_K],
+            valid_shape=[valid_rows, _ASM_K],
+            target_memory=pl.MemorySpace.Mat,
+        )
+        rhs_tile: pl.Tile[[_ASM_K, _ASM_N], pl.INT8] = pl.load(
+            rhs, [0, 0], [_ASM_K, _ASM_N], target_memory=pl.MemorySpace.Mat
+        )
+        part: pl.Tile[[_ASM_M, _ASM_N], pl.INT32] = pl.tile.matmul(lhs_tile, rhs_tile)
+        big: pl.Tile[[_ASM_M, 2 * _ASM_N], pl.INT32] = pl.tile.create(
+            [_ASM_M, 2 * _ASM_N], pl.INT32, target_memory=pl.MemorySpace.Acc
+        )
+        joined: pl.Tile[[_ASM_M, 2 * _ASM_N], pl.INT32] = pl.tile.assemble(big, part, [0, 0])
+        return pl.store(joined, [0, 0], output)
+
+
+@pl.program
+class AssembleFullAccIntoFullWindow:
+    """The remedy the diagnostic names: compute the full tile, no narrowing."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[_ASM_M, _ASM_K], pl.INT8],
+        rhs: pl.Tensor[[_ASM_K, _ASM_N], pl.INT8],
+        output: pl.Out[pl.Tensor[[_ASM_M, 2 * _ASM_N], pl.INT32]],
+    ) -> pl.Tensor[[_ASM_M, 2 * _ASM_N], pl.INT32]:
+        lhs_tile: pl.Tile[[_ASM_M, _ASM_K], pl.INT8] = pl.load(
+            lhs, [0, 0], [_ASM_M, _ASM_K], target_memory=pl.MemorySpace.Mat
+        )
+        rhs_tile: pl.Tile[[_ASM_K, _ASM_N], pl.INT8] = pl.load(
+            rhs, [0, 0], [_ASM_K, _ASM_N], target_memory=pl.MemorySpace.Mat
+        )
+        part: pl.Tile[[_ASM_M, _ASM_N], pl.INT32] = pl.tile.matmul(lhs_tile, rhs_tile)
+        big: pl.Tile[[_ASM_M, 2 * _ASM_N], pl.INT32] = pl.tile.create(
+            [_ASM_M, 2 * _ASM_N], pl.INT32, target_memory=pl.MemorySpace.Acc
+        )
+        joined: pl.Tile[[_ASM_M, 2 * _ASM_N], pl.INT32] = pl.tile.assemble(big, part, [0, 0])
+        return pl.store(joined, [0, 0], output)
+
+
+@pl.program
+class MatmulAccRuntimeNarrowedRows:
+    """Issue #2470: the matmul's lhs carries a runtime valid row count."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[_ACC_M, _ACC_K], pl.INT8],
+        rhs: pl.Tensor[[_ACC_K, _ACC_N], pl.INT8],
+        valid_rows: pl.Scalar[pl.INDEX],
+        output: pl.Out[pl.Tensor[[_ACC_M, _ACC_N], pl.INT32]],
+    ) -> pl.Tensor[[_ACC_M, _ACC_N], pl.INT32]:
+        lhs_tile: pl.Tile[[_ACC_M, _ACC_K], pl.INT8] = pl.load(
+            lhs,
+            [0, 0],
+            [_ACC_M, _ACC_K],
+            valid_shape=[valid_rows, _ACC_K],
+            target_memory=pl.MemorySpace.Mat,
+        )
+        rhs_tile: pl.Tile[[_ACC_K, _ACC_N], pl.INT8] = pl.load(
+            rhs, [0, 0], [_ACC_K, _ACC_N], target_memory=pl.MemorySpace.Mat
+        )
+        acc_tile: pl.Tile[[_ACC_M, _ACC_N], pl.INT32] = pl.tile.matmul(lhs_tile, rhs_tile)
+        return pl.store(acc_tile, [0, 0], output)
+
+
+@pl.program
+class MatmulAccFullRows:
+    """The same reduction with no narrowing anywhere -- the control case."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def kernel(
+        self,
+        lhs: pl.Tensor[[_ACC_M, _ACC_K], pl.INT8],
+        rhs: pl.Tensor[[_ACC_K, _ACC_N], pl.INT8],
+        output: pl.Out[pl.Tensor[[_ACC_M, _ACC_N], pl.INT32]],
+    ) -> pl.Tensor[[_ACC_M, _ACC_N], pl.INT32]:
+        lhs_tile: pl.Tile[[_ACC_M, _ACC_K], pl.INT8] = pl.load(
+            lhs, [0, 0], [_ACC_M, _ACC_K], target_memory=pl.MemorySpace.Mat
+        )
+        rhs_tile: pl.Tile[[_ACC_K, _ACC_N], pl.INT8] = pl.load(
+            rhs, [0, 0], [_ACC_K, _ACC_N], target_memory=pl.MemorySpace.Mat
+        )
+        acc_tile: pl.Tile[[_ACC_M, _ACC_N], pl.INT32] = pl.tile.matmul(lhs_tile, rhs_tile)
+        return pl.store(acc_tile, [0, 0], output)
+
+
+class TestMatmulAccCompactCodegen:
+    """Issue #2470: a runtime-narrowed accumulator must reach PTOAS as compact."""
+
+    def _generate_mlir(self, program_cls) -> str:
+        """Run PassManager and PTOCodegen on the given program, return MLIR string."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    def test_runtime_narrowed_matmul_stores_from_a_compact_accumulator(self):
+        """The store that reads L0C must use the stride ``mad`` wrote it at.
+
+        ``mad`` takes M from the L0A operand's *valid* rows and lays the result
+        out with an N-fractal stride of ceil(M/16)*16.  ``TSTORE`` recovers that
+        stride only for a compact tile; otherwise it walks L0C at the physical
+        ``Rows``, so every N-fractal above the first came back scrambled.
+        """
+        mlir = self._generate_mlir(MatmulAccRuntimeNarrowedRows)
+
+        store_lines = [line for line in mlir.splitlines() if "pto.tstore" in line]
+        assert store_lines, f"expected a pto.tstore for the accumulator, got:\n{mlir}"
+        for line in store_lines:
+            assert re.search(r"!pto\.tile_buf<loc=acc,[^>]*compact=1>", line), (
+                "a runtime-narrowed accumulator must be stored as compact, or TSTORE reads "
+                f"L0C at the physical Rows pitch instead of ceil(validRow/16)*16;\ngot:\n{line}"
+            )
+
+        # The accumulator's own allocation must agree with the store's view, or
+        # one L0C buffer would be declared at two different strides.
+        alloc_lines = [line for line in mlir.splitlines() if "pto.alloc_tile" in line and "loc=acc" in line]
+        assert alloc_lines, f"expected an Acc pto.alloc_tile, got:\n{mlir}"
+        for line in alloc_lines:
+            assert re.search(r"!pto\.tile_buf<loc=acc,[^>]*compact=1>", line), line
+
+    def test_full_width_matmul_accumulator_stays_noncompact(self):
+        """Without narrowing, the emitted accumulator keeps its historical form."""
+        mlir = self._generate_mlir(MatmulAccFullRows)
+
+        assert not re.search(r"!pto\.tile_buf<loc=acc,[^>]*compact=1>", mlir), (
+            f"a fully valid accumulator must not be stamped compact:\n{mlir}"
+        )
+
+    def test_assembling_a_narrowed_accumulator_into_a_full_window_is_rejected(self):
+        """Two Acc windows at different L0C strides cannot share a ``pto.subview``.
+
+        Before the accumulator carried compact this compiled and silently copied
+        at the wrong pitch. Rejecting it is the fix; the message has to name the
+        user's construct and a remedy rather than ``pto.subview``'s invariant.
+        """
+        with pytest.raises(ValueError, match="L0C fractal stride") as excinfo:
+            self._generate_mlir(AssembleNarrowedAccIntoFullWindow)
+
+        assert "Drop the narrowing from the matmul operand" in str(excinfo.value), str(excinfo.value)
+
+    def test_assembling_a_full_accumulator_still_compiles(self):
+        """The remedy the diagnostic names works, and the ordinary case is untouched."""
+        mlir = self._generate_mlir(AssembleFullAccIntoFullWindow)
+
+        assert "pto.subview" in mlir, mlir
+        assert not re.search(r"!pto\.tile_buf<loc=acc,[^>]*compact=1>", mlir), mlir
 
 
 class TestMrgSortCodegen:
@@ -1983,6 +2866,10 @@ class TestMrgSortCodegen:
         tmrgsort_lines = [line for line in mlir.splitlines() if "pto.tmrgsort" in line]
         assert tmrgsort_lines, "No pto.tmrgsort line found"
         assert "i32" in tmrgsort_lines[0], f"block_len type annotation should be i32: {tmrgsort_lines[0]}"
+        tgather_line = next(line for line in mlir.splitlines() if "pto.tgather" in line)
+        assert '"row"' in tgather_line and tgather_line.index('"row"') < tgather_line.index("outs("), (
+            f"mask-form pto.tgather must emit the PTOAS row axis before outs(...), got:\n{tgather_line}"
+        )
 
     def test_mrgsort_format1_variable_block_len(self):
         """mrgsort with variable block_len (function parameter) should generate pto.tmrgsort."""
@@ -2216,15 +3103,14 @@ class TestTileExtractCodegen:
         )
 
 
-class TestTileMoveAccNoopElision:
-    """Regression test for #1310: pto.tmov acc→acc must be elided.
+class TestTileMoveAccAddressInvariant:
+    """Regressions for #1310/#1352: lowering must not leave Acc→Acc moves.
 
     When AutoTileMatmulL0 rewrites matmul_acc into an inner K-loop, the fresh
     IterArg Vars carry different MemRef bases than the outer loop's accumulator.
-    MemoryReuse's YieldFixupMutator inserts tile.move(target_memory=Acc) for
-    these, but after AllocateMemoryAddr both sides share the same physical Acc
-    address. Codegen must elide the no-op pto.tmov to avoid the unsupported
-    acc→acc address-space pair on Ascend 910B.
+    The semantic-alias and MemoryReuse pipeline must keep the accumulator chain
+    on one buffer without leaving a redundant tile.move. Baked-address codegen
+    rejects any same-address move instead of masking an upstream mismatch.
     """
 
     def _generate_mlir(self, program_cls) -> str:
@@ -2271,9 +3157,8 @@ class TestTileMoveAccNoopElision:
 
         K=512 exceeds L0 capacity (256 for BF16), so AutoTileMatmulL0 rewrites
         each matmul into an inner K-loop with fresh IterArg Vars. MemoryReuse's
-        YieldFixupMutator may insert tile.move acc→acc when the inner loop's
-        yield MemRef has a different base_ pointer than the outer iter-arg init.
-        The codegen must elide this no-op move.
+        semantic-alias handling must align the inner yield with the outer
+        iter-arg so no redundant same-address tile.move reaches codegen.
         """
 
         @pl.program
@@ -2403,29 +3288,36 @@ class TestTileMoveAccNoopElision:
         )
 
 
-class TestTileMoveLayoutNoopElision:
-    """Same-addr tile.move must keep pto.tmov when layouts differ.
-
-    Complements #1310 (acc→acc same-layout elision): A5 V→C may co-locate an ND
-    cast result and an NZ ``*_nz`` adapt at one Vec address. Eliding that tmov
-    drops the fractal adapt and leaves TPUSH RowMajor vs AIC ColMajor.
-    Build IR with a shared MemRef so codegen sees same space+addr without relying
-    on MemoryReuse (which now gates layout coalescing).
-    """
+class TestTileMoveAddressValidation:
+    """Baked-address tile.move rejects in-place source/destination addresses."""
 
     @staticmethod
-    def _vec_tile_move_program(*, dst_view: ir.TileView | None, name: str) -> ir.Program:
+    def _vec_tile_move_program(
+        *,
+        dst_view: ir.TileView | None,
+        name: str,
+        dst_byte_offset: int = 0,
+        dst_space: ir.MemorySpace = ir.MemorySpace.Vec,
+        shared_base: bool = False,
+    ) -> ir.Program:
         span = ir.Span.unknown()
         size = 64
         nbytes = size * size * 2  # BF16
-        byte_offset_zero = ir.ConstInt(0, DataType.INT64, span)
-        shared = ir.MemRef(ir.MemorySpace.Vec, byte_offset_zero, nbytes, 0)
+        src_base = ir.Var(f"{name}_src_base", ir.PtrType(), span)
+        dst_base = src_base if shared_base else ir.Var(f"{name}_dst_base", ir.PtrType(), span)
+        src_memref = ir.MemRef(src_base, ir.ConstInt(0, DataType.INT64, span), nbytes, span)
+        dst_memref = ir.MemRef(
+            dst_base,
+            ir.ConstInt(dst_byte_offset, DataType.INT64, span),
+            nbytes,
+            span,
+        )
 
         inp = ir.Var("inp", ir.TensorType([size, size], DataType.BF16), span)
         out = ir.Var("out", ir.TensorType([size, size], DataType.BF16), span)
 
-        src_ty = ir.TileType([size, size], DataType.BF16, shared, None, ir.MemorySpace.Vec)
-        dst_ty = ir.TileType([size, size], DataType.BF16, shared, dst_view, ir.MemorySpace.Vec)
+        src_ty = ir.TileType([size, size], DataType.BF16, src_memref, None, ir.MemorySpace.Vec)
+        dst_ty = ir.TileType([size, size], DataType.BF16, dst_memref, dst_view, dst_space)
         src = ir.Var("src_nd", src_ty, span)
         dst = ir.Var("dst_layout", dst_ty, span)
         result = ir.Var("result", ir.TensorType([size, size], DataType.BF16), span)
@@ -2439,7 +3331,7 @@ class TestTileMoveLayoutNoopElision:
         move = ir.Call(
             ir.Op("tile.move"),
             [src],
-            {"target_memory": ir.MemorySpace.Vec},
+            {"target_memory": dst_space},
             dst_ty,
             span,
         )
@@ -2475,23 +3367,90 @@ class TestTileMoveLayoutNoopElision:
         backend.set_backend_type(BackendType.Ascend910B)
         return codegen.PTOCodegen().generate(program)
 
-    def test_same_addr_different_layout_emits_tmov(self):
-        """ND→NZ at one Vec address must still emit pto.tmov (not elide)."""
-        nz = ir.TileView(
-            blayout=ir.TileLayout.col_major,
-            slayout=ir.TileLayout.row_major,
-            fractal=1024,
-        )
-        mlir = self._generate_mlir(self._vec_tile_move_program(dst_view=nz, name="move_nd_to_nz_same_addr"))
-        tmovs = [ln for ln in mlir.splitlines() if "pto.tmov" in ln]
-        assert tmovs, f"same-addr ND→NZ tile.move must emit pto.tmov (layout adapt); got none in:\n{mlir}"
-        assert any("loc=vec" in ln for ln in tmovs), f"expected vec→vec tmov, got:\n{tmovs}"
+    @pytest.mark.parametrize(
+        ("dst_view", "name"),
+        [
+            pytest.param(None, "move_same_layout_same_addr", id="same-layout"),
+            pytest.param(
+                ir.TileView(
+                    blayout=ir.TileLayout.col_major,
+                    slayout=ir.TileLayout.row_major,
+                    fractal=1024,
+                ),
+                "move_nd_to_nz_same_addr",
+                id="different-layout",
+            ),
+            pytest.param(
+                ir.TileView(compact=ir.CompactMode.normal),
+                "move_noncompact_to_compact_same_addr",
+                id="different-compact",
+            ),
+            pytest.param(
+                ir.TileView(pad=ir.PadValue.max),
+                "move_unpadded_to_padded_same_addr",
+                id="different-pad",
+            ),
+        ],
+    )
+    def test_same_address_rejected(self, dst_view: ir.TileView | None, name: str):
+        """TMOV cannot use equal source and destination addresses."""
+        program = self._vec_tile_move_program(dst_view=dst_view, name=name)
+        with pytest.raises(ValueError, match="tile.move requires distinct source and destination addresses"):
+            self._generate_mlir(program)
 
-    def test_same_addr_same_layout_elides_tmov(self):
-        """Same space+addr+layout tile.move remains a no-op (elide pto.tmov)."""
-        mlir = self._generate_mlir(self._vec_tile_move_program(dst_view=None, name="move_nd_to_nd_same_addr"))
-        tmovs = [ln for ln in mlir.splitlines() if "pto.tmov" in ln]
-        assert not tmovs, f"same-addr same-layout tile.move must elide pto.tmov; got:\n{tmovs}\nfull:\n{mlir}"
+    def test_same_base_distinct_addresses_emit_tmov(self):
+        """Different offsets in one allocation remain a functional move."""
+        program = self._vec_tile_move_program(
+            dst_view=None,
+            name="move_same_base_distinct_addresses",
+            dst_byte_offset=64 * 64 * 2,
+            shared_base=True,
+        )
+        mlir = self._generate_mlir(program)
+        tmovs = [line for line in mlir.splitlines() if "pto.tmov" in line]
+        assert len(tmovs) == 1
+        assert "loc=vec" in tmovs[0]
+
+    def test_equal_numeric_addresses_in_different_spaces_emit_tmov(self):
+        """Equal offsets in independent memory spaces are not an in-place move."""
+        program = self._vec_tile_move_program(
+            dst_view=None,
+            name="move_vec_to_mat_at_zero",
+            dst_space=ir.MemorySpace.Mat,
+        )
+        mlir = self._generate_mlir(program)
+        tmovs = [line for line in mlir.splitlines() if "pto.tmov" in line]
+        assert len(tmovs) == 1
+        assert "loc=vec" in tmovs[0]
+        assert "loc=mat" in tmovs[0]
+
+    @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.DSA_RP])
+    def test_declared_same_address_rejected_after_planning(self, planner, ascend_backend):
+        """A pinned allocation cannot bypass the baked-address invariant."""
+
+        @pl.program
+        class SameAddressMove:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[32, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[32, 128], pl.FP32]],
+            ) -> pl.Tensor[[32, 128], pl.FP32]:
+                src: pl.Tile[[32, 128], pl.FP32, pl.MemRef("shared"), pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [32, 128]
+                )
+                dst: pl.Tile[[32, 128], pl.FP32, pl.MemRef("shared"), pl.Mem.Vec] = pl.tile.move(
+                    src, target_memory=pl.Mem.Vec
+                )
+                return pl.tile.store(dst, [0, 0], out)
+
+        with passes.PassContext([], memory_planner=planner):
+            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(SameAddressMove)
+        function = next(func for func in optimized.functions.values() if ir.is_incore_type(func.func_type))
+        program = ir.Program([function], function.name, optimized.span)
+
+        with pytest.raises(ValueError, match="tile.move requires distinct source and destination addresses"):
+            self._generate_mlir(program)
 
 
 class TestTileStoreAtomicCodegen:
@@ -2578,12 +3537,15 @@ class TestTileStoreAtomicCodegen:
         )
 
     def test_atomic_add_bf16_rejected_on_ascend950(self):
-        """bf16 atomic-add is A2/A3-only; on Ascend950 (A5) codegen rejects it cleanly.
+        """bf16 atomic-add is A2/A3-only; on Ascend950 (A5) the program is rejected.
 
         The IR-level dtype gate is backend-agnostic (a program may target A2/A3),
-        so bf16 atomic passes op validation. The backend-aware guard lives in
-        codegen: on Ascend950 the ``pto.tstore`` emit raises a clean PyPTO error
-        rather than deferring to a downstream pto-isa ``static_assert``.
+        so bf16 atomic passes op validation. The backend-aware guard is the
+        ``AtomicAddDtypeValid`` property verifier, which ``PassPipeline`` runs at
+        pipeline input — the error carries the user's own span instead of
+        deferring to a downstream pto-isa ``static_assert``. Per-verifier
+        coverage of all four atomic sites lives in
+        ``tests/ut/ir/verifier/test_atomic_add_dtype.py``.
         """
         # Capture the prior backend so the A5 override does not leak; it may be
         # unset (get_backend_type raises when no backend is configured yet).
@@ -2602,12 +3564,8 @@ class TestTileStoreAtomicCodegen:
                     t = pl.load(x, [0, 0], [16, 16])
                     pl.store(t, [0, 0], out, atomic=pl.AtomicType.Add)
 
-            optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
-            funcs = list(optimized.functions.values())
-            target = next((f for f in funcs if ir.is_incore_type(f.func_type)), funcs[0])
-            single = ir.Program([target], target.name, optimized.span)
-            with pytest.raises(Exception, match="bf16 atomic-add requires the Ascend910B"):
-                codegen.PTOCodegen().generate(single)
+            with pytest.raises(pypto.Error, match="AtomicAddDtypeValid"):
+                PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Prog)
         finally:
             backend.reset_for_testing()
             if prev_backend is not None:
@@ -2702,7 +3660,7 @@ class TestTensorAssembleAtomicCodegen:
                 out = pl.assemble(out, target, [0, 0])
                 return out
 
-        with pytest.raises(Exception, match="global-memory destination"):
+        with pytest.raises(ValueError, match="global-memory destination"):
             self._generate_mlir(Prog)
 
 
@@ -2761,7 +3719,7 @@ class TestScatterCodegen:
         )
 
     def test_tile_scatter_mask_form_codegen(self):
-        """tile.scatter_mask emits pto.tscatter with a maskPattern attribute (DPS)."""
+        """tile.scatter_mask emits row-axis pto.tscatter with a maskPattern attribute (DPS)."""
 
         @pl.program
         class Prog:
@@ -2794,6 +3752,9 @@ class TestScatterCodegen:
         # "expected ',' after src operand".
         assert line.index("maskPattern") < line.index("outs("), (
             f"maskPattern must appear inside ins(...) before outs(...), got:\n{line}"
+        )
+        assert '"row"' in line and line.index('"row"') < line.index("outs("), (
+            f"mask-form pto.tscatter must emit the PTOAS row axis before outs(...), got:\n{line}"
         )
 
 
@@ -2828,7 +3789,7 @@ class TestCrossCoreSyncCodegen:
         assert "pto.sync.wait <PIPE_MTE2>, 3" in mlir
 
     def test_a3_ffts_workspace_setup(self):
-        """An FFTS tensor stays a memref and lowers to the required PTO setup op."""
+        """An FFTS tensor stays a raw pointer and lowers to the required PTO setup op."""
 
         @pl.program
         class Prog:
@@ -2843,8 +3804,8 @@ class TestCrossCoreSyncCodegen:
                 return x
 
         mlir = self._generate_mlir(Prog)
-        assert "%arg0: memref<256xi64>" in mlir
-        assert "pto.set_ffts %arg0 : memref<256xi64>" in mlir
+        assert "%arg0: !pto.ptr<i64>" in mlir
+        assert "pto.set_ffts %arg0 : !pto.ptr<i64>" in mlir
         assert "ffts_workspace_view" not in mlir
 
     def test_dynamic_event_id(self):
@@ -2903,7 +3864,7 @@ class TestSyncAllCodegen:
         assert "core_type = #pto.sync_core_type<aiv_only>" in line, f"core_type missing:\n{line}"
 
     def test_syncall_soft_emits_gm_polling_barrier(self):
-        """soft syncall emits pto.syncall(%gm_pview, %scratch, %used : ...) mode=<soft>."""
+        """soft syncall emits pto.syncall(%gm_pview, %used : ...) mode=<soft>."""
 
         @pl.program
         class Prog:
@@ -2912,7 +3873,7 @@ class TestSyncAllCodegen:
                 self,
                 x: pl.Tensor[[16, 16], pl.FP32],
                 out: pl.Tensor[[16, 16], pl.FP32],
-                ws: pl.Tensor[[32], pl.INT32],
+                ws: pl.Tensor[[16], pl.INT32],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
                 pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=4)
@@ -2924,13 +3885,64 @@ class TestSyncAllCodegen:
         assert line, f"soft pto.syncall not found in MLIR:\n{mlir}"
         assert "mode = #pto.sync_all_mode<soft>" in line, f"soft mode missing:\n{line}"
         assert "core_type = #pto.sync_core_type<aiv_only>" in line, f"core_type missing:\n{line}"
-        # 3 operands: gm partition_view, scratch tile_buf, used_cores i32.
-        assert "partition_tensor_view<32xi32>" in line, f"gm partition_view missing:\n{line}"
-        assert "tile_buf<loc=vec" in line and "i32" in line, f"scratch tile_buf missing:\n{line}"
-        # The GM workspace is lowered to a partition_view over all 32 slots.
+        # The current PTO-ISA takes only gm partition_view + optional used_cores.
+        assert "partition_tensor_view<16xi32>" in line, f"gm partition_view missing:\n{line}"
+        assert "tile_buf" not in line, f"legacy scratch operand still emitted:\n{line}"
+        assert line.split(" : ", 1)[0].count(",") == 1, f"unexpected soft operand count:\n{line}"
+        # The GM workspace is lowered to a partition_view over all 16 slots.
         assert any("partition_view" in ln and "syncgm" in ln for ln in mlir.splitlines()), (
             f"gm workspace partition_view not emitted:\n{mlir}"
         )
+
+    def test_syncall_soft_omits_launch_derived_participant_count(self):
+        """used_cores=0 emits the canonical single-operand soft form."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_syncall_soft(self, ws: pl.Tensor[[4, 4], pl.INT32]) -> pl.Tensor[[4, 4], pl.INT32]:
+                pl.system.syncall(mode="soft", core_type="mix", gm_workspace=ws, used_cores=0)
+                return ws
+
+        mlir = self._generate_mlir(Prog)
+        line = next((ln for ln in mlir.splitlines() if "pto.syncall(" in ln), "")
+        assert line, f"soft pto.syncall not found in MLIR:\n{mlir}"
+        assert "partition_tensor_view<4x4xi32>" in line, f"gm partition_view missing:\n{line}"
+        assert line.split(" : ", 1)[0].count(",") == 0, f"unexpected used_cores operand:\n{line}"
+        assert "mode = #pto.sync_all_mode<soft>" in line, f"soft mode missing:\n{line}"
+
+    def test_syncall_soft_accepts_dynamic_participant_count(self):
+        """An INT32 scalar lowers as the optional soft used_cores operand."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_syncall_soft(
+                self,
+                ws: pl.Tensor[[16], pl.INT32],
+                participants: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[16], pl.INT32]:
+                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=participants)
+                return ws
+
+        mlir = self._generate_mlir(Prog)
+        line = next((ln for ln in mlir.splitlines() if "pto.syncall(" in ln), "")
+        assert line, f"soft pto.syncall not found in MLIR:\n{mlir}"
+        assert "partition_tensor_view<16xi32>, i32" in line, f"dynamic used_cores missing:\n{line}"
+        assert line.split(" : ", 1)[0].count(",") == 1, f"unexpected soft operand count:\n{line}"
+
+    def test_syncall_soft_rejects_workspace_smaller_than_cache_line(self):
+        """A static GM workspace must contain at least 16 INT32 elements."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_syncall_soft(self, ws: pl.Tensor[[15], pl.INT32]) -> pl.Tensor[[15], pl.INT32]:
+                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=0)
+                return ws
+
+        with pytest.raises(ValueError, match="at least 16 INT32 elements"):
+            self._generate_mlir(Prog)
 
 
 class TestFenceCodegen:
@@ -2970,17 +3982,8 @@ class TestFenceCodegen:
         )
 
 
-def _cmo_cacheinvalid_line(mlir: str) -> str:
-    """Return the single `pto.cmo.cacheinvalid` line (the whole module contains a
-    partition_tensor_view from the surrounding tile.store, so cmo-form assertions
-    must inspect this line, not the module)."""
-    lines = [line.strip() for line in mlir.splitlines() if "pto.cmo.cacheinvalid" in line]
-    assert len(lines) == 1, f"expected exactly one pto.cmo.cacheinvalid line, got {lines}"
-    return lines[0]
-
-
-class TestCacheInvalidCodegen:
-    """Tests that pl.system.cacheinvalid lowers to a ptr or partition-view cmo."""
+class TestPipeBarrierCodegen:
+    """Tests that pl.system.bar_* lower to pto.barrier on the expected pipe."""
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
@@ -2994,31 +3997,104 @@ class TestCacheInvalidCodegen:
         single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
         return codegen_instance.generate(single)
 
-    def test_cacheinvalid_scalar_write_emits_ptr(self):
-        """All-ones shapes (scalar write) lower to pto.addptr + a ptr-form cmo."""
+    def test_bar_all_emits_pipe_all_barrier(self):
+        """pl.system.bar_all() emits pto.barrier <PIPE_ALL>."""
 
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
-            def kernel_cacheinvalid(
+            def kernel_bar_all(
                 self,
                 x: pl.Tensor[[16, 16], pl.FP32],
                 out: pl.Tensor[[16, 16], pl.FP32],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                pl.system.bar_all()
                 updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
-                pl.system.cacheinvalid(updated, [1, 1], [0, 8])
                 return updated
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.addptr" in mlir, f"pto.addptr not found in MLIR:\n{mlir}"
-        cmo_line = _cmo_cacheinvalid_line(mlir)
-        # The ptr form emits a bare pointer operand, no partition_tensor_view annotation.
-        assert "single_cache_line" in cmo_line
-        assert "partition_tensor_view" not in cmo_line, f"unexpected partition view in ptr form: {cmo_line}"
+        assert "pto.barrier <PIPE_ALL>" in mlir, f"pto.barrier <PIPE_ALL> not found in MLIR:\n{mlir}"
 
-    def test_cacheinvalid_region_emits_partition_view(self):
-        """A multi-element region (tile store) lowers to a partition_tensor_view cmo."""
+    def test_bar_v_emits_pipe_v_barrier(self):
+        """pl.system.bar_v() emits pto.barrier <PIPE_V>."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_bar_v(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                pl.system.bar_v()
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
+                return updated
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.barrier <PIPE_V>" in mlir, f"pto.barrier <PIPE_V> not found in MLIR:\n{mlir}"
+
+    def test_bar_m_emits_pipe_m_barrier(self):
+        """pl.system.bar_m() emits pto.barrier <PIPE_M>."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_bar_m(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                pl.system.bar_m()
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
+                return updated
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.barrier <PIPE_M>" in mlir, f"pto.barrier <PIPE_M> not found in MLIR:\n{mlir}"
+
+
+def _cmo_cacheinvalid_line(mlir: str) -> str:
+    """Return the single `pto.cmo.cacheinvalid` line (the whole module contains a
+    partition_tensor_view from the surrounding tile.store, so cmo-form assertions
+    must inspect this line, not the module)."""
+    lines = [line.strip() for line in mlir.splitlines() if "pto.cmo.cacheinvalid" in line]
+    assert len(lines) == 1, f"expected exactly one pto.cmo.cacheinvalid line, got {lines}"
+    return lines[0]
+
+
+class TestCacheInvalidCodegen:
+    """Tests that pl.system.cacheinvalid lowers to a partition-view or whole-GM cmo."""
+
+    def _generate_mlir(self, program_cls) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        optimized = pm.run_passes(program_cls)
+        codegen_instance = codegen.PTOCodegen()
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen_instance.generate(single)
+
+    @pytest.mark.parametrize(
+        "shapes, offsets, expected_dims",
+        [
+            # A single element is not special-cased: it is a 1x1 region.
+            ([1, 1], [0, 8], "1x1"),
+            ([16, 16], [0, 0], "16x16"),
+        ],
+        ids=["single_element", "full_region"],
+    )
+    def test_cacheinvalid_region_emits_partition_view(self, shapes, offsets, expected_dims):
+        """Every region size lowers through the same partition_tensor_view cmo.
+
+        A raw `!pto.ptr` operand is rejected by ptoas — at parse without a type
+        annotation, and by the lowering pass with one — so the all-ones case must
+        take the partition-view path too, not a scalar `pto.addptr` shortcut.
+        """
 
         @pl.program
         class Prog:
@@ -3030,18 +4106,19 @@ class TestCacheInvalidCodegen:
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
                 updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
-                pl.system.cacheinvalid(updated, [16, 16], [0, 0])
+                pl.system.cacheinvalid(updated, shapes, offsets)
                 return updated
 
         mlir = self._generate_mlir(Prog)
         assert "pto.partition_view" in mlir, f"pto.partition_view not found in MLIR:\n{mlir}"
         cmo_line = _cmo_cacheinvalid_line(mlir)
-        # The region form addresses a partition_tensor_view, not a raw pointer.
         assert "single_cache_line" in cmo_line
-        assert "partition_tensor_view" in cmo_line, f"partition view not in cmo line: {cmo_line}"
+        assert f"!pto.partition_tensor_view<{expected_dims}xf32>" in cmo_line, (
+            f"expected a {expected_dims} partition view operand, got: {cmo_line}"
+        )
 
     def test_cacheinvalid_dynamic_offset(self):
-        """A runtime offset expression (loop-var arithmetic) reaches the flattened ptr offset."""
+        """A runtime offset expression (loop-var arithmetic) reaches the partition view."""
 
         @pl.program
         class Prog:
@@ -3059,10 +4136,768 @@ class TestCacheInvalidCodegen:
                 return updated
 
         mlir = self._generate_mlir(Prog)
-        # The dynamic row index feeds the flattened offset, then pto.addptr.
-        assert "pto.addptr" in mlir, f"pto.addptr not found in MLIR:\n{mlir}"
-        assert "pto.cmo.cacheinvalid" in mlir, f"pto.cmo.cacheinvalid not found in MLIR:\n{mlir}"
-        assert "single_cache_line" in mlir, f"single_cache_line not found in MLIR:\n{mlir}"
+        # The dynamic row index feeds the partition view's offsets operand.
+        assert "pto.partition_view" in mlir, f"pto.partition_view not found in MLIR:\n{mlir}"
+        cmo_line = _cmo_cacheinvalid_line(mlir)
+        assert "single_cache_line" in cmo_line
+        assert "!pto.partition_tensor_view<1x1xf32>" in cmo_line, f"unexpected cmo operand: {cmo_line}"
+
+    def test_cacheinvalid_whole_gm_no_args_emits_all(self):
+        """The no-argument form invalidates the whole GM address space."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_cacheinvalid_all(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
+                pl.system.cacheinvalid()
+                return updated
+
+        mlir = self._generate_mlir(Prog)
+        cmo_line = _cmo_cacheinvalid_line(mlir)
+        # Whole-GM form: `all #pto.address_space<gm>`, no ptr / partition view.
+        assert "all #pto.address_space<gm>" in cmo_line, f"whole-GM form not emitted: {cmo_line}"
+        assert "single_cache_line" not in cmo_line
+        assert "partition_tensor_view" not in cmo_line
+
+
+class TestB03TriAndGatherCodegen:
+    """Exact PTOAS spellings and attributes for the B03 operators."""
+
+    @staticmethod
+    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs
+        target = next((func for func in funcs if ir.is_incore_type(func.func_type)), funcs[0])
+        single = ir.Program([target], target.name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _ssa_pattern(logical: str) -> re.Pattern[str]:
+        name = logical.removeprefix("%")
+        suffix = ""
+        for candidate in ("_pview", "_view"):
+            if name.endswith(candidate):
+                name = name[: -len(candidate)]
+                suffix = candidate
+                break
+        return re.compile(rf"%{re.escape(name)}(?:__ssa_v\d+)?{re.escape(suffix)}")
+
+    @classmethod
+    def _resolve_ssa(cls, mlir: str, logical: str) -> str:
+        matches = cls._ssa_pattern(logical).findall(mlir)
+        assert matches, f"SSA corresponding to {logical} not found"
+        return matches[0]
+
+    @classmethod
+    def _alloc_tile_type(cls, mlir: str, ssa: str) -> str:
+        actual_ssa = cls._resolve_ssa(mlir, ssa)
+        line = next(
+            strip_loc(line)
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{actual_ssa} = pto.alloc_tile")
+        )
+        return line.rsplit(" : ", 1)[1]
+
+    @classmethod
+    def _assert_partition_view(
+        cls,
+        mlir: str,
+        *,
+        result: str,
+        source: str,
+        result_type: str,
+    ) -> None:
+        actual_result = cls._resolve_ssa(mlir, result)
+        actual_source = cls._resolve_ssa(mlir, source)
+        line = next(
+            line.strip()
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{actual_result} = pto.partition_view")
+        )
+        assert line.startswith(f"{actual_result} = pto.partition_view {actual_source}, offsets = [")
+        assert strip_loc(line).endswith(f" -> {result_type}")
+
+    @classmethod
+    def _assert_mgather(
+        cls,
+        mlir: str,
+        *,
+        operands: list[str],
+        operand_types: list[str],
+        result: str,
+        result_type: str,
+        attributes: str,
+    ) -> None:
+        line = next(strip_loc(line) for line in mlir.splitlines() if "pto.mgather" in line)
+        actual_operands = [cls._resolve_ssa(mlir, operand) for operand in operands]
+        actual_result = cls._resolve_ssa(mlir, result)
+        expected = (
+            f"pto.mgather ins({', '.join(actual_operands)} : {', '.join(operand_types)}) "
+            f"outs({actual_result} : {result_type}) {{{attributes}}}"
+        )
+        assert line == expected
+
+    def test_ttri_emits_upper_selector_and_partial_destination(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                mask: pl.Tile[[16, 32], pl.FP32] = pl.tile.tri(
+                    1, [16, 32], valid_shape=[9, 21], dtype=pl.FP32, upper=True
+                )
+                return pl.store(mask, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mask_ssa = self._resolve_ssa(mlir, "%mask")
+        mask_type = self._alloc_tile_type(mlir, "%mask")
+        line = next(strip_loc(line) for line in mlir.splitlines() if '"pto.ttri"' in line)
+        assert "%c1_i32 = arith.constant 1 : i32" in mlir
+        assert line == (
+            f'"pto.ttri"(%c1_i32, {mask_ssa}) {{upperOrLower = 1 : i32}} : (i32, {mask_type}) -> ()'
+        )
+        alloc = next(
+            line.strip()
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{mask_ssa} = pto.alloc_tile")
+        )
+        assert " valid_row = %c9_index valid_col = %c21_index : " in alloc
+
+    @pytest.mark.parametrize("dtype", [pl.INT8, pl.UINT8, pl.BF16])
+    def test_ttri_rejects_a5_only_dtypes_on_a2a3(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, out: pl.Tensor[[16, 32], dtype]):
+                mask: pl.Tile[[16, 32], dtype] = pl.tile.tri(0, [16, 32], valid_shape=[9, 21], dtype=dtype)
+                pl.store(mask, [0, 0], out)
+
+        with pytest.raises(ValueError, match="not supported on the 'a2a3' backend"):
+            self._generate_mlir(Prog)
+
+    @pytest.mark.parametrize("dtype", [pl.INT8, pl.UINT8, pl.BF16])
+    def test_ttri_accepts_extended_dtypes_on_a5(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, out: pl.Tensor[[16, 32], dtype]):
+                mask: pl.Tile[[16, 32], dtype] = pl.tile.tri(0, [16, 32], valid_shape=[9, 21], dtype=dtype)
+                pl.store(mask, [0, 0], out)
+
+        assert '"pto.ttri"' in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_tgatherb_emits_exact_two_input_name(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 128], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+            ) -> pl.Tensor[[8, 128], pl.FP16]:
+                src_tile: pl.Tile[[16, 128], pl.FP16] = pl.load(src, [0, 0], [16, 128])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8], valid_shape=[5, 5])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        src_type = self._alloc_tile_type(mlir, "%src_tile")
+        offset_type = self._alloc_tile_type(mlir, "%offset_tile")
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        src_ssa = self._resolve_ssa(mlir, "%src_tile")
+        offset_ssa = self._resolve_ssa(mlir, "%offset_tile")
+        gathered_ssa = self._resolve_ssa(mlir, "%gathered")
+        line = next(strip_loc(line) for line in mlir.splitlines() if "pto.tgatherb" in line)
+        assert line == (
+            f"pto.tgatherb ins({src_ssa}, {offset_ssa} : {src_type}, {offset_type}) "
+            f"outs({gathered_ssa} : {gathered_type})"
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols", "column", "aligned"),
+        [
+            (pl.UINT8, 256, 31, False),
+            (pl.UINT8, 256, 32, True),
+            (pl.FP16, 128, 15, False),
+            (pl.FP16, 128, 16, True),
+            (pl.FP32, 64, 7, False),
+            (pl.FP32, 64, 8, True),
+        ],
+    )
+    def test_tgatherb_materializes_unaligned_source_subview(self, dtype, output_cols, column, aligned):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+            ):
+                src_tile: pl.Tile[[16, 256], dtype] = pl.load(src, [0, 0], [16, 256])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tgatherb" in mlir
+        if aligned:
+            assert "pto.subview" in mlir
+            assert "pto.textract" not in mlir
+        else:
+            assert "pto.subview" not in mlir
+            assert "pto.textract" in mlir
+
+    def test_tgatherb_materializes_dynamic_column_subview_alignment(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+                column: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                src_view: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tgatherb" in mlir
+        assert "pto.subview" not in mlir
+        assert "pto.textract" in mlir
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols"),
+        [
+            (pl.UINT8, 256),
+            (pl.FP16, 128),
+            (pl.FP32, 64),
+        ],
+    )
+    def test_tgatherb_accepts_dynamic_row_subview_with_aligned_stride(self, dtype, output_cols):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 256], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+                row: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[32, 256], dtype] = pl.load(src, [0, 0], [32, 256])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [row, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        subview_line = next(line for line in mlir.splitlines() if "pto.subview" in line)
+        gather_line = next(line for line in mlir.splitlines() if "pto.tgatherb" in line)
+        subview_ssa = subview_line.split("=", maxsplit=1)[0].strip()
+        assert subview_ssa in gather_line
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols"),
+        [
+            (pl.UINT8, 256),
+            (pl.FP16, 128),
+            (pl.FP32, 64),
+        ],
+    )
+    def test_tgatherb_materializes_dynamic_row_subview_with_unaligned_stride(self, dtype, output_cols):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 255], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+                row: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[32, 255], dtype] = pl.load(src, [0, 0], [32, 255])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [row, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tgatherb" in mlir
+        assert "pto.subview" not in mlir
+        assert "pto.textract" in mlir
+
+    def test_tgatherb_materializes_nested_dynamic_column_subview_alignment(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+                column: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                outer: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                inner: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(outer, [16, 128], [0, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(inner, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tgatherb" in mlir
+        assert "pto.subview" not in mlir
+        assert "pto.textract" in mlir
+
+    def test_tgatherb_accepts_nested_static_offsets_with_aligned_total(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                outer: pl.Tile[[16, 240], pl.FP16] = pl.tile.slice(src_tile, [16, 240], [0, 1])
+                inner: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(outer, [16, 128], [0, 15])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(inner, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        assert "pto.tgatherb" in self._generate_mlir(Prog)
+
+    def test_mgather_row_emits_correct_name_and_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP32],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tmgather" not in mlir
+        mem_type = "!pto.partition_tensor_view<64x32xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes="coalesce = #pto<coalesce row>",
+        )
+
+    def test_mgather_elem_emits_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.INT32],
+                out: pl.Tensor[[8, 32], pl.FP32],
+            ) -> pl.Tensor[[8, 32], pl.FP32]:
+                idx_tile: pl.Tile[[8, 32], pl.INT32] = pl.load(idx, [0, 0], [8, 32])
+                gathered: pl.Tile[[8, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="elem")
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<256xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes="coalesce = #pto<coalesce elem>",
+        )
+
+    def test_mgather_a2a3_rejects_column_vector_row_indices(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[16, 1], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP16],
+            ):
+                idx_tile: pl.Tile[[16, 1], pl.INT32] = pl.load(idx, [0, 0], [16, 1])
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match=r"requires idx shape \[1, R\]"):
+            self._generate_mlir(Prog)
+        assert "pto.mgather" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_mgather_a2a3_requires_aligned_vec_rows(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 17], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 17], pl.FP16],
+            ):
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 17], pl.FP16] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="32-byte aligned"):
+            self._generate_mlir(Prog)
+        assert "pto.mgather" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_mgather_a2a3_requires_nd_source_for_vec_output(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[32, 64], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP16],
+            ):
+                mem_dn: pl.Tensor[
+                    [64, 32],
+                    pl.FP16,
+                    pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN),
+                ] = pl.tensor.view(mem, layout=pl.TensorLayout.DN)
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(mem_dn, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="requires an ND source tensor"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_emits_nondefault_out_of_bounds_mode(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP32],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(
+                    mem, idx_tile, coalesce="row", gather_oob="zero"
+                )
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<64x32xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes=("coalesce = #pto<coalesce row>, gatherOob = #pto<gather_oob zero>"),
+        )
+
+    def test_mgather_mat_row_emits_gm_index_partition(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="row",
+                    gather_oob="zero",
+                    target_memory=pl.MemorySpace.Mat,
+                    valid_shape=[9, 21],
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye,
+                    [0, 0],
+                    [16, 16],
+                    valid_shape=[16, 9],
+                    target_memory=pl.MemorySpace.Mat,
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<64x32xf16>"
+        idx_type = "!pto.partition_tensor_view<1x16xi32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview"],
+            operand_types=[mem_type, idx_type],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes=("coalesce = #pto<coalesce row>, gatherOob = #pto<gather_oob zero>"),
+        )
+        gathered_alloc = next(
+            line for line in mlir.splitlines() if "pto.alloc_tile" in line and "%gathered" in line
+        )
+        assert "loc=mat" in self._alloc_tile_type(mlir, "%gathered")
+        assert "valid_row = %c9_index" in gathered_alloc
+        assert "valid_col = %c21_index" in gathered_alloc
+
+    @pytest.mark.parametrize(
+        ("dtype", "dtype_text"),
+        [
+            (pl.FP8E4M3FN, "f8E4M3FN"),
+            (pl.FP8E5M2, "f8E5M2"),
+            (pl.HF8, "!pto.hif8"),
+        ],
+    )
+    def test_mgather_a5_low_precision_reaches_mat_codegen(self, dtype, dtype_text):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], dtype],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], dtype],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    target_memory=pl.MemorySpace.Mat,
+                )
+                eye_tile: pl.Tile[[16, 16], dtype] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        mem_type = f"!pto.partition_tensor_view<64x32x{dtype_text}>"
+        idx_type = "!pto.partition_tensor_view<1x16xi32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview"],
+            operand_types=[mem_type, idx_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes="coalesce = #pto<coalesce row>",
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "dtype_text"),
+        [
+            (pl.FP8E4M3FN, "f8E4M3FN"),
+            (pl.FP8E5M2, "f8E5M2"),
+            (pl.HF8, "!pto.hif8"),
+        ],
+    )
+    def test_mgather_a5_low_precision_reaches_mat_elem_codegen(self, dtype, dtype_text):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], dtype],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], dtype],
+                out: pl.Tensor[[16, 32], dtype],
+            ) -> pl.Tensor[[16, 32], dtype]:
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                gathered_vec: pl.Tile[[16, 32], dtype] = pl.move(gathered, target_memory=pl.MemorySpace.Vec)
+                return pl.store(gathered_vec, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        mem_type = f"!pto.partition_tensor_view<512x{dtype_text}>"
+        idx_type = "!pto.partition_tensor_view<16x32xi32>"
+        scratch_type = mem_type
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_partition_view(
+            mlir,
+            result="%scratch_pview",
+            source="%scratch_view",
+            result_type=scratch_type,
+        )
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview", "%scratch_pview"],
+            operand_types=[mem_type, idx_type, scratch_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes="coalesce = #pto<coalesce elem>",
+        )
+
+    @pytest.mark.parametrize("dtype", [pl.FP8E4M3FN, pl.FP8E5M2, pl.HF8])
+    def test_mgather_rejects_a5_only_dtypes_on_a2a3(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], dtype],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], dtype],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ):
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem, idx, target_memory=pl.MemorySpace.Mat
+                )
+                eye_tile: pl.Tile[[16, 16], dtype] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                pl.store(product, [0, 0], out)
+
+        with pytest.raises(ValueError, match="not supported on the 'a2a3' backend"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_mat_elem_emits_gm_scratch_partition(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.FP16],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                scratch: pl.Tensor[[256], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                gathered: pl.Tile[[16, 16], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    gather_oob="wrap",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 16], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<256xf16>"
+        idx_type = "!pto.partition_tensor_view<16x16xi32>"
+        scratch_type = "!pto.partition_tensor_view<256xf16>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_partition_view(
+            mlir,
+            result="%scratch_pview",
+            source="%scratch_view",
+            result_type=scratch_type,
+        )
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview", "%scratch_pview"],
+            operand_types=[mem_type, idx_type, scratch_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes=("coalesce = #pto<coalesce elem>, gatherOob = #pto<gather_oob wrap>"),
+        )
+
+    def test_mgather_mat_elem_rejects_overlapping_scratch_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[16, 16], pl.FP16],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ):
+                scratch: pl.Tensor[[256], pl.FP16] = pl.tensor.view(mem, [256])
+                gathered: pl.Tile[[16, 16], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 16], pl.FP32] = pl.matmul(eye_tile, gathered)
+                pl.store(product, [0, 0], out)
+
+        with pytest.raises(ValueError, match="scratch must not overlap mem"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_mat_elem_rejects_scratch_view_overlapping_idx(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.INT32],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.INT32],
+            ):
+                scratch: pl.Tensor[[256], pl.INT32] = pl.tensor.view(idx, [256])
+                gathered: pl.Tile[[16, 16], pl.INT32] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                gathered_vec: pl.Tile[[16, 16], pl.INT32] = pl.move(
+                    gathered, target_memory=pl.MemorySpace.Vec
+                )
+                pl.store(gathered_vec, [0, 0], out)
+
+        with pytest.raises(ValueError, match="scratch must not overlap idx"):
+            self._generate_mlir(Prog)
 
 
 if __name__ == "__main__":

@@ -61,6 +61,14 @@ def _ensure_arg_directions(program):
     return passes.derive_call_directions()(program)
 
 
+def _orch_func_from_program(program):
+    """Return the Orchestration function instance currently stored in program."""
+    for func in program.functions.values():
+        if func.func_type == ir.FunctionType.Orchestration:
+            return func
+    raise ValueError("No orchestration function found in program")
+
+
 def _finalize_for_codegen(program):
     """Run the two codegen-entry passes on a hand-built program.
 
@@ -71,8 +79,19 @@ def _finalize_for_codegen(program):
     codegen preconditions and both are no-ops when the program already went
     through the pass pipeline. Must run after DeriveCallDirections (a declared
     requirement of both passes).
+
+    Runs under an empty ``PassContext`` so the global roundtrip instrument does
+    not print/parse hand-built IR that is not meant to round-trip mid-pipeline.
     """
-    return passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
+    with passes.PassContext([]):
+        return passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
+
+
+def _finalize_handbuilt_for_codegen(program):
+    """Derive call directions then run codegen-entry passes on partial IR."""
+    with passes.PassContext([]):
+        program = _ensure_arg_directions(program)
+        return passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
 
 
 def _generate_orch_code(program) -> str:
@@ -119,7 +138,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
     Numeric literals (``= 0;``), casts, and scalar locals carry neither marker,
     so they never yield false positives.
     """
-    decl_re = re.compile(r"\b(?:const\s+Tensor\s*&|Tensor|TaskOutputTensors|Arg)\s+(\w+)")
+    decl_re = re.compile(r"\b(?:const\s+ChipTensor\s*&|ChipTensor|TaskOutputTensors|Arg)\s+(\w+)")
     declared_anywhere = set(decl_re.findall(code))
     # An SSA-versioned tensor temp is unambiguously a tensor regardless of whether
     # its declaration still exists, so an out-of-scope reference to one is always
@@ -134,7 +153,7 @@ def _out_of_scope_tensor_refs(code: str) -> list[str]:
         line = raw.strip()
         # Declarations and uses are each emitted on their own line (never sharing
         # a line with a scope brace), so resolve them against the current scope
-        # set first. Declarations are recorded before uses so a ``const Tensor& Y
+        # set first. Declarations are recorded before uses so a ``const ChipTensor& Y
         # = X`` line registers Y while still checking the RHS read of X.
         for m in decl_re.finditer(line):
             scopes[-1].add(m.group(1))

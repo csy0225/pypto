@@ -10,18 +10,39 @@ across layers:
 
 - Read `.claude/CLAUDE.md`
 - Read all relevant files in `.claude/rules/`
-- Follow `.claude/skills/*/SKILL.md` when the task matches a documented workflow
+- Follow `.claude/skills/*/SKILL.md` when the task matches a repository-local workflow
+- Follow the installed `pypto-developer` or `pypto-user` plugin skill when the
+  task matches a shared workflow
 
 Task mapping:
 
 - Testing: `.claude/skills/testing/SKILL.md`
 - Code review: `.claude/skills/code-review/SKILL.md`
-- Commit workflow: `.claude/skills/git-commit/SKILL.md`
-- PR workflow: `.claude/skills/github-pr/SKILL.md`
-- Issue workflows: `.claude/skills/create-issue/SKILL.md`,
-  `.claude/skills/fix-issue/SKILL.md`, `.claude/skills/fix-pr/SKILL.md`
-- Branch cleanup: `.claude/skills/clean-branches/SKILL.md`
 - Codegen comparison: `.claude/skills/compare-codegen/SKILL.md`
+- Shared Git, PR, issue, and branch workflows: `pypto-developer` plugin
+- Shared IR trace and in-core profiling workflows: `pypto-user` plugin
+
+## Shared Plugins
+
+Portable skills are published from `hw-native-sys/pypto-skills`; they are not
+vendored into this repository. Install the plugins needed for the current
+agent and scenario.
+
+Codex:
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-developer@pypto-skills
+codex plugin add pypto-user@pypto-skills
+```
+
+Claude Code:
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-developer@pypto-skills
+claude plugin install pypto-user@pypto-skills
+```
 
 When a Claude skill or agent refers to `Task`, a subagent, or Claude-only
 plugins:
@@ -36,7 +57,7 @@ plugins:
 - Keep public API changes synchronized across `include/pypto/`, `src/`,
   `python/bindings/`, and `python/pypto/pypto_core/*.pyi`
 - Update docs when behavior changes. English docs in `docs/en/dev/` are the
-  ground truth; keep `docs/zh-cn/dev/` aligned when English docs change
+  ground truth; keep `docs/zh/dev/` aligned when English docs change
 - Follow `.claude/rules/documentation.md` for markdown file placement; do not
   create markdown files outside `docs/` unless that rule explicitly allows it
 - Do not create temporary test scripts or examples outside `tests/` and
@@ -86,5 +107,5 @@ necessary hardware or environment is available.
 - `tests/ut/`: unit tests
 - `tests/st/`: system and hardware-dependent tests
 - `tests/lint/`: repo-specific lint and validation scripts
-- `docs/en/dev/`, `docs/zh-cn/dev/`: developer documentation
-- `examples/`: user-facing examples (kernels/, models/, utils/)
+- `docs/en/dev/`, `docs/zh/dev/`: developer documentation
+- `examples/`: user-facing examples (beginner/, intermediate/, advanced/, models/, runtime/, utils/)

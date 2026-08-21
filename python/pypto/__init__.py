@@ -19,10 +19,12 @@ from typing import cast
 from . import compile_profiling, ir, language, runtime
 from .pypto_core import (
     DataType,
+    Error,
     InternalError,
     LogLevel,
     check,
     codegen,
+    get_log_level,
     internal_check,
     internal_check_span,
     log_debug,
@@ -51,6 +53,7 @@ DT_UINT64: DataType = cast(DataType, DataType.UINT64)
 DT_FP4: DataType = cast(DataType, DataType.FP4)
 DT_FP8E4M3FN: DataType = cast(DataType, DataType.FP8E4M3FN)
 DT_FP8E5M2: DataType = cast(DataType, DataType.FP8E5M2)
+DT_FP8E8M0: DataType = cast(DataType, DataType.FP8E8M0)
 DT_FP16: DataType = cast(DataType, DataType.FP16)
 DT_FP32: DataType = cast(DataType, DataType.FP32)
 DT_BF16: DataType = cast(DataType, DataType.BF16)
@@ -68,9 +71,11 @@ __all__ = [
     "runtime",
     "testing",
     # Logging framework
+    "Error",
     "InternalError",
     "LogLevel",
     "set_log_level",
+    "get_log_level",
     "log_debug",
     "log_info",
     "log_warn",
@@ -97,6 +102,7 @@ __all__ = [
     "DT_FP4",
     "DT_FP8E4M3FN",
     "DT_FP8E5M2",
+    "DT_FP8E8M0",
     "DT_FP16",
     "DT_FP32",
     "DT_BF16",

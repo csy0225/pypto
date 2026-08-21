@@ -16,7 +16,7 @@ or ``pl.tile.add``.
 """
 
 from collections.abc import Sequence
-from typing import Any, NoReturn, TypeVar, overload
+from typing import Any, Literal, NoReturn, TypeVar, overload
 
 __all__ = [
     "add",
@@ -33,6 +33,8 @@ __all__ = [
     "minimum",
     "exp",
     "log",
+    "sin",
+    "cos",
     "neg",
     "abs",
     "recip",
@@ -79,18 +81,33 @@ __all__ = [
     "col_argmin",
     "cast",
     "cmp",
+    "and_",
+    "ands",
+    "or_",
+    "ors",
+    "xor",
+    "xors",
+    "not_",
+    "shl",
+    "shls",
+    "shr",
+    "shrs",
     "set_validshape",
-    "create_tile",
     "read",
     "write",
+    "assemble",
+    "gather_row",
+    "scatter_update",
+    "sort32",
+    "mrgsort",
 ]
 
-from pypto.ir.utils import _get_span_or_capture, resolve_cast_mode
+from pypto.ir.utils import _elem_dtype, _get_span_or_capture, resolve_cast_mode
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import MemorySpace, PadValue
+from pypto.pypto_core.ir import AtomicType, PadValue
 
-from ..typing import IntLike, Scalar, Tensor, Tile
+from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile
 from . import tensor_ops as _tensor
 from . import tile_ops as _tile
 
@@ -127,6 +144,131 @@ def _raise_type_dispatch_error(op_name: str, *args: object) -> NoReturn:
     raise TypeError(f"{qualified}: expected Tensor or Tile operands, got ({types})")
 
 
+# ---------------------------------------------------------------------------
+# Cross-path kwarg guards
+#
+# These wrappers accept the union of both levels' kwargs, so a kwarg that only
+# the *other* dispatch path can honour must raise rather than be dropped: a
+# silently discarded ``b_trans`` compiles wrong math, and a discarded scratch
+# tile leaves the caller's buffer dead while it still consumes UB budget.
+# Only a non-default value raises — spelling out the documented default keeps
+# working.
+#
+# **Every guard in this module raises ``TypeError``**, in both directions: an
+# argument the dispatched path cannot honour, and one it requires but did not
+# get. Both are "these arguments do not match this overload" — the class CPython
+# itself raises for an unexpected keyword or a missing required argument — not a
+# bad *value*. Deeper validation reached through these wrappers still raises
+# ``ValueError`` (``pypto::ValueError`` from a C++ ``CHECK`` is registered as a
+# Python ``ValueError`` subclass), so a direct-API caller guarding a whole call
+# should catch both; the split here is only about which layer rejected it.
+# The DSL path is unaffected either way: ``ast_parser`` catches ``(TypeError,
+# ValueError)`` and re-raises ``InvalidOperationError`` with a span.
+# ---------------------------------------------------------------------------
+
+# The ``@overload`` declarations mirror that rule with ``Literal[False]`` /
+# ``None`` defaults on the path that cannot honour a kwarg: the documented
+# default still type-checks, while a non-default value is rejected statically as
+# well as at runtime.
+
+# Remedies for kwargs the Tile dispatch path cannot honour. Module constants so
+# the guarded call sites stay one line per kwarg.
+_TILE_TRANSPOSE_REMEDY = (
+    "At tile level a transposed operand is an explicit zero-copy view, not an op flag: "
+    "wrap the operand with pl.tile.transpose_view(...) and pass it directly."
+)
+_TILE_C_MATRIX_NZ_REMEDY = (
+    "The tile matmul result layout is fixed by its Acc tile type; there is no "
+    "tile-level equivalent of this tensor-level flag."
+)
+_TILE_RSQRT_PRECISION_REMEDY = (
+    "The tile form selects precision by taking a scratch tile: pl.tile.rsqrt(tile, tmp)."
+)
+
+
+def _reject_tmp_for_tensor(op_name: str, tmp: Any, param: str = "tmp") -> None:
+    """Guard the Tensor path of an op whose Tile form carries a scratch operand."""
+    if tmp is not None:
+        raise TypeError(
+            f"pl.{op_name}: Tensor inputs must not pass {param} — the scratch tile is "
+            f"allocated during Tensor-to-Tile lowering"
+        )
+
+
+def _require_tmp_for_tile(op_name: str, tmp: Tile | None, requirement: str) -> Tile:
+    """Guard the Tile path of an op whose Tile form *requires* a scratch operand.
+
+    The mirror image of ``_reject_tmp_for_tensor``: tile buffer lifetimes are
+    user-managed, so the operand the Tensor path must omit is the same one the
+    Tile path cannot synthesize. Both directions raise ``TypeError`` — this is a
+    wrong-arguments-for-this-overload error, the same class CPython raises for a
+    missing required argument, not a bad *value*.
+
+    ``requirement`` completes the sentence "Tile inputs require ..." and carries
+    the per-op constraint on the scratch operand. Returns the operand so the call
+    site keeps the non-``None`` narrowing the inline ``is None`` check gave it.
+    """
+    if tmp is None:
+        raise TypeError(f"pl.{op_name}: Tile inputs require {requirement}")
+    return tmp
+
+
+# Scratch-operand requirements, shared by the ops that impose the same one.
+_TMP_ROW_REDUCTION_REQUIREMENT = (
+    "tmp_tile with the same dtype and rank as the input, and every dimension at least as large "
+    "as the corresponding input dimension"
+)
+_TMP_ROW_ARG_REDUCTION_REQUIREMENT = "tmp_tile with exactly the same shape and dtype as the input"
+_TMP_COL_ARG_REDUCTION_REQUIREMENT = (
+    "tmp_tile — the tile form takes caller-owned scratch, unlike pl.col_max / pl.col_min"
+)
+
+
+def _tmp_scratch_requirement(op_name: str) -> str:
+    """Requirement text for the bitwise ops, whose scratch operand is positional."""
+    return f"an explicit scratch tile — call pl.{op_name}(lhs, rhs, tmp) or pl.tile.{op_name}(lhs, rhs, tmp)"
+
+
+def _reject_tile_unsupported(op_name: str, /, **flags: tuple[bool, str]) -> None:
+    """Guard the Tile path against Tensor-only flags it cannot honour.
+
+    Each entry maps a kwarg name to ``(is_non_default, remedy)``. ``op_name`` is
+    positional-only so it cannot collide with a guarded kwarg of the same name.
+    """
+    for name, (given, remedy) in flags.items():
+        if given:
+            raise TypeError(f"pl.{op_name}: '{name}' is not supported for Tile operands. {remedy}")
+
+
+def _check_tile_matmul_out_dtype(result: Tile, out_dtype: int | DataType | None) -> None:
+    """Accept a Tile-path ``out_dtype`` only when it matches the deduced dtype.
+
+    ``tile.matmul``'s result dtype is fixed by the Cube accumulator, so the only
+    honourable request is the one already satisfied. The deduced dtype is read
+    off the built call rather than re-deriving the C++ rule here.
+
+    The Tile ``@overload`` narrows ``out_dtype`` to ``DataType | None``, so a raw
+    ``int`` dtype code is already a static error; this still accepts one at
+    runtime and rejects it, because the DSL parser reaches this wrapper
+    dynamically. ``DataType`` exposes no Python int conversion, so an int cannot
+    be verified against the deduction — and skipping verification is the very
+    defect this guard exists to prevent.
+    """
+    if out_dtype is None:
+        return
+    # ``deduced`` is None only if the built call were not tile/tensor-typed, which
+    # tile.matmul never produces — the guard just avoids a nonsense "deduced as
+    # None" message if that ever changes.
+    deduced = _elem_dtype(result.unwrap())
+    if deduced is not None and (not isinstance(out_dtype, DataType) or out_dtype != deduced):
+        raise TypeError(
+            f"pl.matmul: out_dtype={out_dtype} is not supported for Tile operands — the Cube "
+            f"accumulator fixes the result dtype, deduced as {deduced} here. Convert the result "
+            f"explicitly with pl.cast(result, <dtype>), or let pl.tile.store narrow it on the "
+            f"way to GM."
+        )
+
+
 def _is_scalar_like(v: object) -> bool:
     """True for Scalar, Python int/float, or raw Expr with ScalarType.
 
@@ -143,7 +285,7 @@ def _is_scalar_like(v: object) -> bool:
 def _to_scalar_expr(v: Any) -> _ir_core.Expr:
     """Coerce a scalar-like value to an ``Expr``.
 
-    Caller must have already passed :func:`_is_scalar_like`. ``Scalar`` is
+    Caller must have already passed ``_is_scalar_like``. ``Scalar`` is
     unwrapped, raw ``Expr`` is returned as-is, and Python ``int`` / ``float``
     are materialized as ``ConstInt`` / ``ConstFloat`` with the parser-pinned
     span (or frame-captured fallback).
@@ -233,20 +375,45 @@ def mul(lhs, rhs):
 
 
 @overload
-def div(lhs: Tensor, rhs: Tensor | int | float | Scalar) -> Tensor: ...
+def div(
+    lhs: Tensor,
+    rhs: Tensor | int | float | Scalar | _ir_core.Expr,
+    high_precision: bool = False,
+) -> Tensor: ...
 @overload
-def div(lhs: Tile, rhs: Tile | int | float | Scalar) -> Tile: ...
+def div(
+    lhs: Tile,
+    rhs: Tile | int | float | Scalar | _ir_core.Expr,
+    high_precision: bool = False,
+) -> Tile: ...
 @overload
-def div(lhs: Scalar, rhs: Scalar | int | float) -> Scalar: ...
-def div(lhs, rhs):
-    """Element-wise division, dispatched by input type."""
+def div(
+    lhs: Scalar,
+    rhs: Scalar | int | float,
+    high_precision: bool = False,
+) -> Scalar: ...
+def div(lhs, rhs, high_precision: bool = False):
+    """Element-wise division, dispatched by input type.
+
+    A scalar ``rhs`` against a Tile dispatches to ``tile.divs``.
+
+    Args:
+        high_precision: Select PTOAS's high-precision divide. Available for
+            Tensor/Tensor and Tile/Tile only -- a scalar divisor has no
+            high-precision form, so passing it there raises rather than silently
+            falling back.
+    """
     if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, float, Scalar, _ir_core.Expr)):
-        return _tensor.div(lhs, rhs)
+        return _tensor.div(lhs, rhs, high_precision=high_precision)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.div(lhs, rhs)
+        return _tile.div(lhs, rhs, high_precision=high_precision)
     if isinstance(lhs, Tile) and isinstance(rhs, (int, float, Scalar, _ir_core.Expr)):
+        if high_precision:
+            raise TypeError("pl.div: high_precision requires a Tile rhs")
         return _tile.divs(lhs, rhs)
     if _is_scalar_like(lhs) and _is_scalar_like(rhs):
+        if high_precision:
+            raise TypeError("pl.div: high_precision is only supported for Tensor or Tile division")
         return Scalar(expr=_to_scalar_expr(lhs) / _to_scalar_expr(rhs))
     _raise_type_dispatch_error("div", lhs, rhs)
 
@@ -388,13 +555,36 @@ def exp(input: T) -> T:
     raise TypeError(f"pl.exp: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def log(input: T) -> T:
-    """Element-wise natural logarithm, dispatched by input type."""
+def log(input: T, high_precision: bool = False) -> T:
+    """Element-wise natural logarithm, dispatched by input type.
+
+    Args:
+        input: Input tensor or tile.
+        high_precision: Select PTOAS's high-precision logarithm mode.
+    """
     if isinstance(input, Tensor):
-        return _tensor.log(input)
+        return _tensor.log(input, high_precision=high_precision)
     if isinstance(input, Tile):
-        return _tile.log(input)
+        return _tile.log(input, high_precision=high_precision)
     raise TypeError(f"pl.log: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def sin(input: T) -> T:
+    """Element-wise sine (input in radians), dispatched by input type. FP32 only."""
+    if isinstance(input, Tensor):
+        return _tensor.sin(input)
+    if isinstance(input, Tile):
+        return _tile.sin(input)
+    raise TypeError(f"pl.sin: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def cos(input: T) -> T:
+    """Element-wise cosine (input in radians), dispatched by input type. FP32 only."""
+    if isinstance(input, Tensor):
+        return _tensor.cos(input)
+    if isinstance(input, Tile):
+        return _tile.cos(input)
+    raise TypeError(f"pl.cos: expected Tensor or Tile, got {type(input).__name__}")
 
 
 def neg(input: T) -> T:
@@ -415,12 +605,17 @@ def abs(input: T) -> T:
     raise TypeError(f"pl.abs: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def recip(input: T) -> T:
-    """Element-wise reciprocal (1/x), dispatched by input type."""
+def recip(input: T, high_precision: bool = False) -> T:
+    """Element-wise reciprocal (1/x), dispatched by input type.
+
+    Args:
+        input: Input tensor or tile
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
+    """
     if isinstance(input, Tensor):
-        return _tensor.recip(input)
+        return _tensor.recip(input, high_precision=high_precision)
     if isinstance(input, Tile):
-        return _tile.recip(input)
+        return _tile.recip(input, high_precision=high_precision)
     raise TypeError(f"pl.recip: expected Tensor or Tile, got {type(input).__name__}")
 
 
@@ -433,17 +628,24 @@ def sqrt(input: T) -> T:
     raise TypeError(f"pl.sqrt: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def rsqrt(input: T, high_precision: bool = False) -> T:
+@overload
+def rsqrt(input: Tensor, high_precision: bool = ...) -> Tensor: ...
+@overload
+def rsqrt(input: Tile, high_precision: Literal[False] = ...) -> Tile: ...
+def rsqrt(input, high_precision: bool = False):
     """Element-wise reciprocal square root, dispatched by input type.
 
-    ``high_precision`` applies to the tensor path where the compiler inserts
-    the scratch allocation. At the tile level, callers that need the high-
-    precision path must call ``pl.tile.rsqrt(src, tmp=...)`` directly since
-    buffer lifetimes are user-managed there.
+    ``high_precision`` is Tensor-only: the compiler allocates the scratch tile
+    during Tensor-to-Tile lowering. ``tile.rsqrt`` carries no such attribute —
+    precision is selected purely by *passing* that scratch tile — so tile
+    callers use ``pl.tile.rsqrt(tile, tmp)`` directly and passing
+    ``high_precision=True`` with a Tile raises rather than silently yielding the
+    low-precision path.
     """
     if isinstance(input, Tensor):
         return _tensor.rsqrt(input, high_precision=high_precision)
     if isinstance(input, Tile):
+        _reject_tile_unsupported("rsqrt", high_precision=(high_precision, _TILE_RSQRT_PRECISION_REMEDY))
         return _tile.rsqrt(input)
     raise TypeError(f"pl.rsqrt: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -484,12 +686,17 @@ def row_expand(lhs: T, rhs: T) -> T:
     _raise_type_dispatch_error("row_expand", lhs, rhs)
 
 
-def row_expand_add(lhs: T, rhs: T) -> T:
-    """Row-wise broadcast addition, dispatched by input type."""
+@overload
+def row_expand_add(lhs: Tensor, rhs: Tensor) -> Tensor: ...
+@overload
+def row_expand_add(lhs: Tile, rhs: Tile, tmp: Tile | None = None) -> Tile: ...
+def row_expand_add(lhs, rhs, tmp: Tile | None = None):
+    """Row-wise broadcast addition; ``tmp`` is available only for Tile inputs."""
     if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
+        _reject_tmp_for_tensor("row_expand_add", tmp)
         return _tensor.row_expand_add(lhs, rhs)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.row_expand_add(lhs, rhs)
+        return _tile.row_expand_add(lhs, rhs, tmp)
     _raise_type_dispatch_error("row_expand_add", lhs, rhs)
 
 
@@ -593,7 +800,15 @@ def col_expand_expdif(lhs: T, rhs: T) -> T:
 
 
 def expands(target: Tensor | Tile, scalar: int | float | Scalar) -> Tensor | Tile:
-    """Expand scalar to target shape, dispatched by target type."""
+    """Expand scalar to target shape, dispatched by target type.
+
+    Note the argument order: the value being broadcast is the *second* argument.
+    ``target`` supplies the shape and dtype; it is not read.
+
+    Args:
+        target: Value whose shape the scalar is broadcast to.
+        scalar: Value to broadcast into every element.
+    """
     if isinstance(target, Tensor):
         return _tensor.expands(target, scalar)
     if isinstance(target, Tile):
@@ -602,7 +817,16 @@ def expands(target: Tensor | Tile, scalar: int | float | Scalar) -> Tensor | Til
 
 
 def reshape(input: T, shape: Sequence[IntLike]) -> T:
-    """Reshape operation, dispatched by input type."""
+    """Reshape operation, dispatched by input type.
+
+    A reshape is a zero-copy view, so it never widens the valid region: the
+    result holds real data in exactly the cells the input did, re-expressed in
+    ``shape``. Because a valid region is an origin-anchored box, not every input
+    region survives a repartition — reshaping a region that no box of ``shape``
+    can describe is rejected rather than silently rounded up to fully valid.
+    Reshapes that only add or drop fully-valid unit axes always work, as does a
+    region occupying a contiguous prefix of the buffer.
+    """
     if isinstance(input, Tensor):
         return _tensor.reshape(input, shape)
     if isinstance(input, Tile):
@@ -636,7 +860,16 @@ def reinterpret_view(
 
 
 def transpose(input: T, axis1: int, axis2: int) -> T:
-    """Transpose operation, dispatched by input type."""
+    """Transpose operation, dispatched by input type.
+
+    Args:
+        input: Value to transpose.
+        axis1: First axis to exchange. Must be a compile-time constant; negative
+            indexing is supported.
+        axis2: Second axis to exchange. Must differ from ``axis1`` after negative
+            indexing is resolved -- naming the same axis twice is rejected, not
+            treated as a no-op.
+    """
     if isinstance(input, Tensor):
         return _tensor.transpose(input, axis1, axis2)
     if isinstance(input, Tile):
@@ -659,6 +892,7 @@ def slice(
     offset: Sequence[IntLike],
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | _ir_core.Expr] | None = None,
+    pad_value: PadValue | int | float | None = None,
     clamp: bool = False,
 ) -> T:
     """Slice operation, dispatched by input type.
@@ -670,6 +904,14 @@ def slice(
     reduction); each must be a static unit dim of ``shape`` that is still fully
     valid after that intersection. ``None`` / ``[]`` drops nothing.
 
+    ``pad_value`` sets the padding mode for elements outside the effective valid
+    region, on either path. ``None`` carries the source's mode through. Accepts
+    ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or the literal
+    sugars ``0``, ``math.inf``, ``-math.inf`` (same spelling as [`fillpad`][pypto.language.fillpad]).
+    It only bites when the valid region is smaller than ``shape`` — which an
+    explicit ``valid_shape``, a partially-valid source, or (Tensor-only)
+    ``clamp=True`` can each bring about; passing it otherwise warns.
+
     ``clamp`` sanctions a window that runs off the end of the source: by default
     the slice asserts ``offset + shape`` stays inside the source and is rejected
     when that provably fails, whereas ``clamp=True`` lets the window overhang and
@@ -677,16 +919,16 @@ def slice(
     Tensor — an on-chip tile window has nothing that could clamp it.
     """
     if isinstance(input, Tensor):
-        return _tensor.slice(input, shape, offset, valid_shape, drop_dims, clamp=clamp)
+        return _tensor.slice(input, shape, offset, valid_shape, drop_dims, pad_value, clamp=clamp)
     if isinstance(input, Tile):
         if clamp:
-            raise ValueError(
+            raise TypeError(
                 "pl.slice: clamp=True is not supported for a Tile. An on-chip window has no "
                 "clamping mechanism, so offset + shape must stay inside the source tile. "
                 "Clamp the read at the tensor boundary instead — pl.load(..., clamp=True) or "
                 "pl.slice(tensor, ..., clamp=True) — and slice the resulting tile in bounds."
             )
-        return _tile.slice(input, shape, offset, valid_shape, drop_dims)
+        return _tile.slice(input, shape, offset, valid_shape, drop_dims, pad_value)
     raise TypeError(f"pl.slice: expected Tensor or Tile, got {type(input).__name__}")
 
 
@@ -737,7 +979,14 @@ def matmul(
     c_matrix_nz: bool = ...,
 ) -> Tensor: ...
 @overload
-def matmul(lhs: Tile, rhs: Tile) -> Tile: ...
+def matmul(
+    lhs: Tile,
+    rhs: Tile,
+    out_dtype: DataType | None = ...,
+    a_trans: Literal[False] = ...,
+    b_trans: Literal[False] = ...,
+    c_matrix_nz: Literal[False] = ...,
+) -> Tile: ...
 
 
 def matmul(
@@ -750,8 +999,21 @@ def matmul(
 ) -> T:
     """Matrix multiplication, dispatched by input type.
 
-    Tensor path accepts extra kwargs (out_dtype, a_trans, b_trans, c_matrix_nz).
-    Tile path ignores them.
+    ``a_trans`` / ``b_trans`` / ``c_matrix_nz`` are Tensor-only: a tensor value
+    carries no layout, so a flag is the only place the information can live. At
+    tile level transposition is a *type* property, so passing any of them with a
+    Tile operand raises rather than being dropped.
+
+    A transpose flag swaps its own operand's two trailing axes, so that operand
+    must be at least 2D — ``a_trans`` with a 1D ``lhs`` (or ``b_trans`` with a 1D
+    ``rhs``) raises rather than being ignored. On the mixed mat-vec / vec-mat
+    forms the flag applies to the matrix side: a ``lhs`` stored ``[K, M]`` with
+    ``a_trans=True`` against a ``[K]`` ``rhs`` deduces ``[M]``.
+
+    ``out_dtype`` is likewise Tensor-only. ``tile.matmul``'s result dtype is
+    fixed by the Cube accumulator (FP32 for float operands, INT32 for int), so
+    the Tile path accepts ``out_dtype`` only when it already agrees with that
+    deduction and raises otherwise.
 
     For Tensor inputs with rank > 2 on either operand, the call is lowered to
     ``tile.batch_matmul`` (with batch broadcasting) by ``ConvertTensorToTileOps``
@@ -762,7 +1024,15 @@ def matmul(
     if isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
         return _tensor.matmul(lhs, rhs, out_dtype, a_trans, b_trans, c_matrix_nz)
     if isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.matmul(lhs, rhs)
+        _reject_tile_unsupported(
+            "matmul",
+            a_trans=(a_trans, _TILE_TRANSPOSE_REMEDY),
+            b_trans=(b_trans, _TILE_TRANSPOSE_REMEDY),
+            c_matrix_nz=(c_matrix_nz, _TILE_C_MATRIX_NZ_REMEDY),
+        )
+        result = _tile.matmul(lhs, rhs)
+        _check_tile_matmul_out_dtype(result, out_dtype)
+        return result
     _raise_type_dispatch_error("matmul", lhs, rhs)
 
 
@@ -791,9 +1061,17 @@ def matmul_acc(
     rhs: Tensor,
     a_trans: bool = ...,
     b_trans: bool = ...,
+    init_cond: BoolLike | None = ...,
 ) -> Tensor: ...
 @overload
-def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile: ...
+def matmul_acc(
+    acc: Tile,
+    lhs: Tile,
+    rhs: Tile,
+    a_trans: Literal[False] = ...,
+    b_trans: Literal[False] = ...,
+    init_cond: BoolLike | None = ...,
+) -> Tile: ...
 
 
 def matmul_acc(
@@ -802,11 +1080,19 @@ def matmul_acc(
     rhs: T,
     a_trans: bool = False,
     b_trans: bool = False,
+    init_cond: BoolLike | None = None,
 ) -> T:
     """Matrix multiplication with accumulation, dispatched by input type.
 
-    Tensor path accepts extra kwargs (a_trans, b_trans).
-    Tile path ignores them.
+    ``a_trans`` / ``b_trans`` are Tensor-only for the same reason as in
+    [`matmul`][pypto.language.matmul] — at tile level transposition is a type property, not an op
+    flag — so passing either with Tile operands raises rather than being
+    dropped.
+
+    ``init_cond`` makes the accumulator's initial value conditional: on the steps
+    where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into, which is the split-K ``k == 0`` idiom. It applies to 2D
+    operands only.
 
     For Tensor inputs with rank > 2 on any of acc/lhs/rhs, the call is lowered
     to ``tile.batch_matmul_acc`` (with batch broadcasting on lhs/rhs vs the
@@ -814,96 +1100,116 @@ def matmul_acc(
     per-batch ``tile.matmul_acc`` by ``FlattenTileNdTo2D``.
     """
     if isinstance(acc, Tensor) and isinstance(lhs, Tensor) and isinstance(rhs, Tensor):
-        return _tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans)
+        return _tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans, init_cond)
     if isinstance(acc, Tile) and isinstance(lhs, Tile) and isinstance(rhs, Tile):
-        return _tile.matmul_acc(acc, lhs, rhs)
+        _reject_tile_unsupported(
+            "matmul_acc",
+            a_trans=(a_trans, _TILE_TRANSPOSE_REMEDY),
+            b_trans=(b_trans, _TILE_TRANSPOSE_REMEDY),
+        )
+        return _tile.matmul_acc(acc, lhs, rhs, init_cond)
     _raise_type_dispatch_error("matmul_acc", acc, lhs, rhs)
 
 
-def row_max(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_max(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_max(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_max(input, tmp_tile: Tile | None = None):
     """Row-wise max reduction, dispatched by input type.
 
     For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
     rank as the input, with every dimension at least as large as the input dimension.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the scratch tile is allocated during
+    Tensor-to-Tile lowering — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_max", tmp_tile, "tmp_tile")
         return _tensor.row_max(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_max on Tile requires tmp_tile with the same dtype and rank and every dimension "
-                "at least as large as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_max", tmp_tile, _TMP_ROW_REDUCTION_REQUIREMENT)
         return _tile.row_max(input, tmp_tile)
     raise TypeError(f"pl.row_max: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def row_sum(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_sum(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_sum(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_sum(input, tmp_tile: Tile | None = None):
     """Row-wise sum reduction, dispatched by input type.
 
     For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
     rank as the input, with every dimension at least as large as the input dimension.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the scratch tile is allocated during
+    Tensor-to-Tile lowering — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_sum", tmp_tile, "tmp_tile")
         return _tensor.row_sum(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_sum on Tile requires tmp_tile with the same dtype and rank and every dimension "
-                "at least as large as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_sum", tmp_tile, _TMP_ROW_REDUCTION_REQUIREMENT)
         return _tile.row_sum(input, tmp_tile)
     raise TypeError(f"pl.row_sum: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def row_min(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_min(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_min(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_min(input, tmp_tile: Tile | None = None):
     """Row-wise min reduction, dispatched by input type.
 
     For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
     rank as the input, with every dimension at least as large as the input dimension.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the scratch tile is allocated during
+    Tensor-to-Tile lowering — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_min", tmp_tile, "tmp_tile")
         return _tensor.row_min(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_min on Tile requires tmp_tile with the same dtype and rank and every dimension "
-                "at least as large as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_min", tmp_tile, _TMP_ROW_REDUCTION_REQUIREMENT)
         return _tile.row_min(input, tmp_tile)
     raise TypeError(f"pl.row_min: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def row_prod(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_prod(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_prod(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_prod(input, tmp_tile: Tile | None = None):
     """Row-wise product reduction, dispatched by input type.
 
     For Tile inputs, ``tmp_tile`` is required and must have the same dtype and
     rank as the input, with every dimension at least as large as the input dimension.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the scratch tile is allocated during
+    Tensor-to-Tile lowering — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_prod", tmp_tile, "tmp_tile")
         return _tensor.row_prod(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_prod on Tile requires tmp_tile with the same dtype and rank and every dimension "
-                "at least as large as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_prod", tmp_tile, _TMP_ROW_REDUCTION_REQUIREMENT)
         return _tile.row_prod(input, tmp_tile)
     raise TypeError(f"pl.row_prod: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def col_sum(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def col_sum(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def col_sum(input: Tile, tmp_tile: Tile | None = ...) -> Tile: ...
+def col_sum(input, tmp_tile: Tile | None = None):
     """Column-wise sum reduction, dispatched by input type.
 
     For Tile inputs, passing ``tmp_tile`` activates the binary-tree reduction
-    path; omitting it uses the sequential path. For Tensor inputs, ``tmp_tile``
-    is ignored — the tensor-to-tile conversion lowers to the sequential path.
+    path; omitting it uses the sequential path. Tensor inputs must omit it: the
+    tensor-to-tile conversion always lowers to the sequential path and allocates
+    its own scratch, so a ``tmp_tile`` there could not select the requested
+    strategy and raises instead.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("col_sum", tmp_tile, "tmp_tile")
         return _tensor.col_sum(input)
     if isinstance(input, Tile):
         return _tile.col_sum(input, tmp_tile)
@@ -946,66 +1252,80 @@ def col_prod(input: T) -> T:
     _raise_type_dispatch_error("col_prod", input)
 
 
-def row_argmax(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_argmax(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_argmax(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_argmax(input, tmp_tile: Tile | None = None):
     """Row-wise argmax (per-row max index, int32), dispatched by input type.
 
     For Tile inputs, tmp_tile is required with exactly the same shape and dtype.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the conversion injects the scratch tile — and
+    passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_argmax", tmp_tile, "tmp_tile")
         return _tensor.row_argmax(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_argmax on Tile requires tmp_tile with exactly the same shape and dtype as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_argmax", tmp_tile, _TMP_ROW_ARG_REDUCTION_REQUIREMENT)
         return _tile.row_argmax(input, tmp_tile)
     raise TypeError(f"pl.row_argmax: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def row_argmin(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def row_argmin(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def row_argmin(input: Tile, tmp_tile: Tile) -> Tile: ...
+def row_argmin(input, tmp_tile: Tile | None = None):
     """Row-wise argmin (per-row min index, int32), dispatched by input type.
 
     For Tile inputs, tmp_tile is required with exactly the same shape and dtype.
-    For Tensor inputs, tmp_tile is ignored.
+    Tensor inputs must omit it — the conversion injects the scratch tile — and
+    passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("row_argmin", tmp_tile, "tmp_tile")
         return _tensor.row_argmin(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError(
-                "row_argmin on Tile requires tmp_tile with exactly the same shape and dtype as the input"
-            )
+        tmp_tile = _require_tmp_for_tile("row_argmin", tmp_tile, _TMP_ROW_ARG_REDUCTION_REQUIREMENT)
         return _tile.row_argmin(input, tmp_tile)
     raise TypeError(f"pl.row_argmin: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def col_argmax(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def col_argmax(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def col_argmax(input: Tile, tmp_tile: Tile) -> Tile: ...
+def col_argmax(input, tmp_tile: Tile | None = None):
     """Column-wise argmax (per-column max index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required (unlike col_max). For Tensor inputs,
-    the conversion injects the tmp tile.
+    For Tile inputs, tmp_tile is required (unlike col_max). Tensor inputs must
+    omit it — the conversion injects the tmp tile — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("col_argmax", tmp_tile, "tmp_tile")
         return _tensor.col_argmax(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError("col_argmax on Tile requires tmp_tile argument")
+        tmp_tile = _require_tmp_for_tile("col_argmax", tmp_tile, _TMP_COL_ARG_REDUCTION_REQUIREMENT)
         return _tile.col_argmax(input, tmp_tile)
     raise TypeError(f"pl.col_argmax: expected Tensor or Tile, got {type(input).__name__}")
 
 
-def col_argmin(input: T, tmp_tile: Tile | None = None) -> T:
+@overload
+def col_argmin(input: Tensor, tmp_tile: None = ...) -> Tensor: ...
+@overload
+def col_argmin(input: Tile, tmp_tile: Tile) -> Tile: ...
+def col_argmin(input, tmp_tile: Tile | None = None):
     """Column-wise argmin (per-column min index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required (unlike col_min). For Tensor inputs,
-    the conversion injects the tmp tile.
+    For Tile inputs, tmp_tile is required (unlike col_min). Tensor inputs must
+    omit it — the conversion injects the tmp tile — and passing one raises.
     """
     if isinstance(input, Tensor):
+        _reject_tmp_for_tensor("col_argmin", tmp_tile, "tmp_tile")
         return _tensor.col_argmin(input)
     if isinstance(input, Tile):
-        if tmp_tile is None:
-            raise ValueError("col_argmin on Tile requires tmp_tile argument")
+        tmp_tile = _require_tmp_for_tile("col_argmin", tmp_tile, _TMP_COL_ARG_REDUCTION_REQUIREMENT)
         return _tile.col_argmin(input, tmp_tile)
     raise TypeError(f"pl.col_argmin: expected Tensor or Tile, got {type(input).__name__}")
 
@@ -1039,14 +1359,25 @@ def cast(
     target_type: int | DataType,
     mode: str | int = "round",
 ) -> Tensor | Tile | Scalar:
-    """Type casting, dispatched by input type."""
+    """Type casting, dispatched by input type.
+
+    Args:
+        input: Value to convert.
+        target_type: Destination dtype.
+        mode: Rounding mode, as a name or its int code -- ``"none"`` (0),
+            ``"rint"`` (1), ``"round"`` (2, the default), ``"floor"`` (3),
+            ``"ceil"`` (4), ``"trunc"`` (5), ``"odd"`` (6). A ``Scalar`` input
+            supports the default only and raises for any other mode.
+    """
     if isinstance(input, Tensor):
         return _tensor.cast(input, target_type, mode)
     if isinstance(input, Tile):
         return _tile.cast(input, target_type, mode)
     if _is_scalar_like(input):
+        # ``resolve_cast_mode`` runs first, so an invalid mode is still a ValueError;
+        # only a *valid* mode this path cannot honour reaches the TypeError below.
         if resolve_cast_mode(mode) != 2:
-            raise ValueError(f"cast: Scalar inputs do not support non-default mode, got mode={mode!r}")
+            raise TypeError(f"pl.cast: Scalar inputs do not support non-default mode, got mode={mode!r}")
         dtype = DataType(target_type) if isinstance(target_type, int) else target_type
         return Scalar(expr=_ir_core.cast(_to_scalar_expr(input), dtype))
     raise TypeError(f"pl.cast: expected Tensor, Tile, or Scalar, got {type(input).__name__}")
@@ -1071,6 +1402,180 @@ def cmp(lhs, rhs, cmp_type: int = 0):
     _raise_type_dispatch_error("cmp", lhs, rhs)
 
 
+# ---------------------------------------------------------------------------
+# Bitwise / shift ops
+#
+# The tile forms of xor/xors take an explicit ``tmp`` scratch tile because buffer
+# lifetimes are user-managed there; the tensor forms do not, since the conversion
+# pass allocates it. That Tile-only trailing operand follows ``row_expand_add`` and
+# the ``row_*`` / ``col_*`` reduction family above, which take the same
+# ``tmp_tile: Tile | None = None`` and reject it on the Tensor path via the shared
+# ``_reject_tmp_for_tensor`` guard.
+# ---------------------------------------------------------------------------
+
+
+@overload
+def and_(lhs: Tensor, rhs: Tensor | int | Scalar) -> Tensor: ...
+@overload
+def and_(lhs: Tile, rhs: Tile | int | Scalar) -> Tile: ...
+def and_(lhs, rhs):
+    """Element-wise bitwise AND, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, Scalar, _ir_core.Expr)):
+        return _tensor.and_(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.and_(lhs, rhs)
+    if isinstance(lhs, Tile) and _is_scalar_like(rhs):
+        return _tile.ands(lhs, rhs)
+    _raise_type_dispatch_error("and_", lhs, rhs)
+
+
+@overload
+def ands(lhs: Tensor, rhs: int | Scalar) -> Tensor: ...
+@overload
+def ands(lhs: Tile, rhs: int | Scalar) -> Tile: ...
+def ands(lhs, rhs):
+    """Element-wise bitwise AND with a scalar, dispatched by input type."""
+    if isinstance(lhs, Tensor):
+        return _tensor.ands(lhs, rhs)
+    if isinstance(lhs, Tile):
+        return _tile.ands(lhs, rhs)
+    _raise_type_dispatch_error("ands", lhs, rhs)
+
+
+@overload
+def or_(lhs: Tensor, rhs: Tensor | int | Scalar) -> Tensor: ...
+@overload
+def or_(lhs: Tile, rhs: Tile | int | Scalar) -> Tile: ...
+def or_(lhs, rhs):
+    """Element-wise bitwise OR, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, Scalar, _ir_core.Expr)):
+        return _tensor.or_(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.or_(lhs, rhs)
+    if isinstance(lhs, Tile) and _is_scalar_like(rhs):
+        return _tile.ors(lhs, rhs)
+    _raise_type_dispatch_error("or_", lhs, rhs)
+
+
+@overload
+def ors(lhs: Tensor, rhs: int | Scalar) -> Tensor: ...
+@overload
+def ors(lhs: Tile, rhs: int | Scalar) -> Tile: ...
+def ors(lhs, rhs):
+    """Element-wise bitwise OR with a scalar, dispatched by input type."""
+    if isinstance(lhs, Tensor):
+        return _tensor.ors(lhs, rhs)
+    if isinstance(lhs, Tile):
+        return _tile.ors(lhs, rhs)
+    _raise_type_dispatch_error("ors", lhs, rhs)
+
+
+@overload
+def xor(lhs: Tensor, rhs: Tensor | int | Scalar) -> Tensor: ...
+@overload
+def xor(lhs: Tile, rhs: Tile | int | Scalar, tmp: Tile) -> Tile: ...
+def xor(lhs, rhs, tmp=None):
+    """Element-wise bitwise XOR, dispatched by input type.
+
+    ``pto.txor`` needs a scratch buffer. Tile buffer lifetimes are user-managed,
+    so the tile path takes it as ``tmp``; the tensor path omits it because
+    ConvertTensorToTileOps allocates it — the same asymmetry ``rsqrt`` carries.
+    """
+    if isinstance(lhs, Tensor):
+        _reject_tmp_for_tensor("xor", tmp)
+        return _tensor.xor(lhs, rhs)
+    if isinstance(lhs, Tile):
+        tmp = _require_tmp_for_tile("xor", tmp, _tmp_scratch_requirement("xor"))
+        if isinstance(rhs, Tile):
+            return _tile.xor(lhs, rhs, tmp)
+        if _is_scalar_like(rhs):
+            return _tile.xors(lhs, rhs, tmp)
+    _raise_type_dispatch_error("xor", lhs, rhs)
+
+
+@overload
+def xors(lhs: Tensor, rhs: int | Scalar) -> Tensor: ...
+@overload
+def xors(lhs: Tile, rhs: int | Scalar, tmp: Tile) -> Tile: ...
+def xors(lhs, rhs, tmp=None):
+    """Element-wise bitwise XOR with a scalar, dispatched by input type.
+
+    See [`xor`][pypto.language.xor] for why only the tile path takes ``tmp``.
+    """
+    if isinstance(lhs, Tensor):
+        _reject_tmp_for_tensor("xors", tmp)
+        return _tensor.xors(lhs, rhs)
+    if isinstance(lhs, Tile):
+        tmp = _require_tmp_for_tile("xors", tmp, _tmp_scratch_requirement("xors"))
+        return _tile.xors(lhs, rhs, tmp)
+    _raise_type_dispatch_error("xors", lhs, rhs)
+
+
+def not_(input: T) -> T:
+    """Element-wise bitwise NOT, dispatched by input type (int16/uint16 only)."""
+    if isinstance(input, Tensor):
+        return _tensor.not_(input)
+    if isinstance(input, Tile):
+        return _tile.not_(input)
+    raise TypeError(f"pl.not_: expected Tensor or Tile, got {type(input).__name__}")
+
+
+@overload
+def shl(lhs: Tensor, rhs: Tensor | int | Scalar) -> Tensor: ...
+@overload
+def shl(lhs: Tile, rhs: Tile | int | Scalar) -> Tile: ...
+def shl(lhs, rhs):
+    """Element-wise bitwise left shift, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, Scalar, _ir_core.Expr)):
+        return _tensor.shl(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.shl(lhs, rhs)
+    if isinstance(lhs, Tile) and _is_scalar_like(rhs):
+        return _tile.shls(lhs, rhs)
+    _raise_type_dispatch_error("shl", lhs, rhs)
+
+
+@overload
+def shls(lhs: Tensor, rhs: int | Scalar) -> Tensor: ...
+@overload
+def shls(lhs: Tile, rhs: int | Scalar) -> Tile: ...
+def shls(lhs, rhs):
+    """Element-wise bitwise left shift by a scalar, dispatched by input type."""
+    if isinstance(lhs, Tensor):
+        return _tensor.shls(lhs, rhs)
+    if isinstance(lhs, Tile):
+        return _tile.shls(lhs, rhs)
+    _raise_type_dispatch_error("shls", lhs, rhs)
+
+
+@overload
+def shr(lhs: Tensor, rhs: Tensor | int | Scalar) -> Tensor: ...
+@overload
+def shr(lhs: Tile, rhs: Tile | int | Scalar) -> Tile: ...
+def shr(lhs, rhs):
+    """Element-wise bitwise right shift, dispatched by input type."""
+    if isinstance(lhs, Tensor) and isinstance(rhs, (Tensor, int, Scalar, _ir_core.Expr)):
+        return _tensor.shr(lhs, rhs)
+    if isinstance(lhs, Tile) and isinstance(rhs, Tile):
+        return _tile.shr(lhs, rhs)
+    if isinstance(lhs, Tile) and _is_scalar_like(rhs):
+        return _tile.shrs(lhs, rhs)
+    _raise_type_dispatch_error("shr", lhs, rhs)
+
+
+@overload
+def shrs(lhs: Tensor, rhs: int | Scalar) -> Tensor: ...
+@overload
+def shrs(lhs: Tile, rhs: int | Scalar) -> Tile: ...
+def shrs(lhs, rhs):
+    """Element-wise bitwise right shift by a scalar, dispatched by input type."""
+    if isinstance(lhs, Tensor):
+        return _tensor.shrs(lhs, rhs)
+    if isinstance(lhs, Tile):
+        return _tile.shrs(lhs, rhs)
+    _raise_type_dispatch_error("shrs", lhs, rhs)
+
+
 @overload
 def set_validshape(input: Tensor, valid_rows: IntLike, valid_cols: IntLike) -> Tensor: ...
 @overload
@@ -1079,33 +1584,16 @@ def set_validshape(input, valid_rows, valid_cols):
     """Update valid-shape metadata without data movement, dispatched by input type.
 
     .. note::
-        Internal API — intended for compiler-generated code. End users should
-        prefer ``pl.load(..., valid_shapes=...)`` plus ``pl.tile.fillpad``.
+        Prefer expressing the extent at its source where possible —
+        ``pl.load(..., valid_shape=...)`` or a slice's ``valid_shape=``. A tile
+        view (slice / reshape result) is rejected: it carries its valid extent in
+        its type, so there are no runtime operands to update.
     """
     if isinstance(input, Tensor):
         return _tensor.set_validshape(input, valid_rows, valid_cols)
     if isinstance(input, Tile):
         return _tile.set_validshape(input, valid_rows, valid_cols)
     raise TypeError(f"pl.set_validshape: expected Tensor or Tile, got {type(input).__name__}")
-
-
-# ---------------------------------------------------------------------------
-# Tile-only ops promoted to unified namespace
-# ---------------------------------------------------------------------------
-
-
-def create_tile(
-    shape: list[int],
-    dtype: DataType,
-    target_memory: MemorySpace = MemorySpace.Vec,
-) -> Tile:
-    """Create a tile at specific memory space.
-
-    ``target_memory`` defaults to ``Vec`` to match the underlying
-    ``tile.create`` wrapper — direct callers like
-    ``pl.create_tile(shape, dtype)`` (omitting target_memory) keep working.
-    """
-    return _tile.create(shape, dtype, target_memory)
 
 
 # ---------------------------------------------------------------------------
@@ -1153,3 +1641,119 @@ def write(
     if isinstance(dst, Tile):
         return _tile.write(dst, offset, value)
     raise TypeError(f"pl.write: expected Tensor or Tile, got {type(dst).__name__}")
+
+
+# ---------------------------------------------------------------------------
+# Sub-region write / gather / scatter / sort with type dispatch
+# ---------------------------------------------------------------------------
+
+# Remedy for the Tensor-only ``atomic`` combine mode on ``assemble``.
+_TILE_ATOMIC_REMEDY = (
+    "An atomic combine needs a global-memory destination, and a tile-to-tile assemble has "
+    "none. Write the accumulation into a Tensor target instead — inside an InCore function "
+    "that is pl.assemble(out_tensor, tile, offset, atomic=...)."
+)
+
+
+@overload
+def assemble(
+    target: Tensor, source: Tensor, offset: Sequence[IntLike], *, atomic: AtomicType = ...
+) -> Tensor: ...
+@overload
+def assemble(
+    target: Tile, source: Tile, offset: Sequence[IntLike], *, atomic: Literal[AtomicType.None_] = ...
+) -> Tile: ...
+def assemble(target, source, offset, *, atomic: AtomicType = AtomicType.None_):
+    """Write ``source`` into ``target`` at ``offset``, dispatched by target type.
+
+    ``atomic`` is Tensor-only: the combine lowers to an atomic-add store into
+    global memory, which a tile-to-tile assemble has no destination for. Passing
+    the documented default keeps working on both paths; any other value with a
+    Tile target raises.
+    """
+    if isinstance(target, Tensor) and isinstance(source, Tensor):
+        return _tensor.assemble(target, source, offset, atomic=atomic)
+    if isinstance(target, Tile) and isinstance(source, Tile):
+        _reject_tile_unsupported("assemble", atomic=(atomic != AtomicType.None_, _TILE_ATOMIC_REMEDY))
+        return _tile.assemble(target, source, offset)
+    _raise_type_dispatch_error("assemble", target, source)
+
+
+def gather_row(  # noqa: PLR0913
+    dst: T,
+    src: Tensor,
+    dst_offset: Sequence[IntLike],
+    src_offset: Sequence[IntLike],
+    shapes: Sequence[IntLike],
+    transpose: bool = False,
+    *,
+    valid_shape: Sequence[IntLike] | None = None,
+) -> T:
+    """Gather one GM row into a sub-region of an on-chip accumulator (DPS).
+
+    Dispatched on ``dst`` — the destination accumulator. ``src`` is a ``Tensor``
+    on both paths: this op always reads from global memory, so it is the
+    destination, not the source, that names the level.
+    """
+    args = (src, dst_offset, src_offset, shapes, transpose)
+    if isinstance(dst, Tensor):
+        return _tensor.gather_row(dst, *args, valid_shape=valid_shape)
+    if isinstance(dst, Tile):
+        return _tile.gather_row(dst, *args, valid_shape=valid_shape)
+    raise TypeError(f"pl.gather_row: expected Tensor or Tile destination, got {type(dst).__name__}")
+
+
+def scatter_update(input: T, *args: Any, **kwargs: Any) -> T:
+    """Update rows at positions given by a 2D index, dispatched by input type.
+
+    Accepts the same flexible call shapes as either level's wrapper — the
+    positional/keyword forms are identical on both, so the arguments are
+    forwarded unchanged.
+    """
+    if isinstance(input, Tensor):
+        return _tensor.scatter_update(input, *args, **kwargs)
+    if isinstance(input, Tile):
+        return _tile.scatter_update(input, *args, **kwargs)
+    raise TypeError(f"pl.scatter_update: expected Tensor or Tile, got {type(input).__name__}")
+
+
+def sort32(src: T, idx: T) -> T:
+    """Sort fixed 32-element blocks, permuting ``idx`` alongside ``src``.
+
+    Dispatched by input type. Returns sorted value-index pairs with a doubled
+    last dimension.
+    """
+    if isinstance(src, Tensor) and isinstance(idx, Tensor):
+        return _tensor.sort32(src, idx)
+    if isinstance(src, Tile) and isinstance(idx, Tile):
+        return _tile.sort32(src, idx)
+    _raise_type_dispatch_error("sort32", src, idx)
+
+
+def mrgsort(  # noqa: PLR0913
+    src0: T,
+    src1: T | None = None,
+    src2: T | None = None,
+    src3: T | None = None,
+    tmp: T | None = None,
+    *,
+    exhausted: bool = False,
+    block_len: int | Scalar | None = None,
+) -> T:
+    """Merge sort — format1 (single-list) or format2 (2-4 way), dispatched by input type.
+
+    ``tmp`` is Tile-only: at tensor level the scratch buffer is synthesized
+    during Tensor-to-Tile lowering, so passing one is rejected rather than
+    silently dropped. The tile path's format2 requires it, and ``pl.tile.mrgsort``
+    raises with the per-format guidance when it is missing.
+
+    ``exhausted`` is keyword-only here. The tile wrapper also accepts it as a
+    sixth positional argument; that spelling stays available as
+    ``pl.tile.mrgsort(...)``.
+    """
+    if isinstance(src0, Tensor):
+        _reject_tmp_for_tensor("mrgsort", tmp)
+        return _tensor.mrgsort(src0, src1, src2, src3, exhausted=exhausted, block_len=block_len)
+    if isinstance(src0, Tile):
+        return _tile.mrgsort(src0, src1, src2, src3, tmp, exhausted, block_len=block_len)
+    raise TypeError(f"pl.mrgsort: expected Tensor or Tile, got {type(src0).__name__}")

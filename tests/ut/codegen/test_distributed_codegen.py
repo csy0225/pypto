@@ -53,8 +53,8 @@ class TestDistributedCodegen:
         assert "orch, _args, config" in code
 
         # Verify call-site lowering: CHIP orchestrator → _submit_chip (the
-        # comm-less dispatch passes worker=-1; _submit_chip forwards to
-        # submit_next_level when DFX is off).
+        # comm-less dispatch passes None and _submit_chip resolves the chip;
+        # it forwards to submit_next_level when DFX is off).
         assert "_submit_chip" in code
         assert 'callables["chip_orch"]' in code
         assert "TaskArgs()" in code
@@ -159,12 +159,15 @@ class TestDistributedCodegen:
 
         @pl.program
         class Input:
+            @pl.function(level=pl.Level.POD, role=pl.Role.SubWorker)
+            def worker(x: pl.Tensor[[64], pl.FP32]):
+                pass
+
             @pl.function(level=pl.Level.POD, role=pl.Role.Orchestrator)
             def orch_with_loop(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                y: pl.Tensor[[64], pl.FP32] = x
                 for i in pl.range(0, 4):
-                    y = pl.add(y, x)
-                return y
+                    self.worker(x)
+                return x
 
         program = passes.convert_to_ssa()(Input)
         cg = codegen.DistributedCodegen()
@@ -172,6 +175,8 @@ class TestDistributedCodegen:
 
         assert "for " in code
         assert "in range(" in code
+        assert "submit_sub" in code
+        assert 'sub_ids["worker"]' in code
 
     def test_python_imports(self):
         """Generated code contains required Python imports."""
@@ -497,9 +502,9 @@ class TestDistributedCodegen:
         # Two torch.zeros().share_memory_() calls
         assert code.count("torch.zeros(") == 2
         assert code.count(".share_memory_()") == 2
-        # Parameter tensors still use make_tensor_arg(tensors[...])
-        assert 'make_tensor_arg(tensors["a' in code
-        assert 'make_tensor_arg(tensors["b' in code
+        # Plain host tensors use the worker-aware address-free wire helper.
+        assert 'make_tensor_arg(orch._worker, tensors["a' in code
+        assert 'make_tensor_arg(orch._worker, tensors["b' in code
 
     def test_host_orch_create_tensor_hoisted_to_alloc_intermediates(self):
         """HOST-orch tensor.create lifts to _alloc_intermediates(tensors).
@@ -546,7 +551,7 @@ class TestDistributedCodegen:
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        alloc_idx = code.find("def _alloc_intermediates(tensors):")
+        alloc_idx = code.find("def _alloc_intermediates(tensors, world_size=1):")
         host_idx = code.find("def host_orch(")
         assert alloc_idx >= 0, f"Missing _alloc_intermediates in:\n{code}"
         assert host_idx >= 0, f"Missing host_orch in:\n{code}"
@@ -595,9 +600,9 @@ class TestDistributedCodegen:
         cg = codegen.DistributedCodegen()
         code = cg.generate(program)
 
-        assert "def _alloc_intermediates(tensors):" in code
+        assert "def _alloc_intermediates(tensors, world_size=1):" in code
         # Body is just `pass` since there are no allocations to hoist.
-        alloc_idx = code.find("def _alloc_intermediates(tensors):")
+        alloc_idx = code.find("def _alloc_intermediates(tensors, world_size=1):")
         host_idx = code.find("def host_orch(")
         alloc_block = code[alloc_idx:host_idx]
         assert "    pass" in alloc_block
@@ -670,7 +675,7 @@ class TestDistributedCodegen:
 
         # Each tuple element should get its own tensors[...] alias
         assert code.count('tensors["') >= 2
-        # _submit_chip dispatch emitted for chip_orch (comm-less, worker=-1)
+        # _submit_chip dispatch emitted for chip_orch (comm-less, chip resolved at dispatch)
         assert "_submit_chip" in code
         # Two OUTPUT_EXISTING args for the two Out params
         assert code.count("TensorArgType.OUTPUT_EXISTING") == 2
@@ -729,7 +734,7 @@ class TestSubWorkerSourceGeneration:
         source = _emit_sub_worker_module(verify_fn)
         param_name = verify_fn.params[0].name_hint
         assert f"def _user_verify({param_name}):" in source
-        assert f"{param_name} = _tensor_from_continuous(args.tensor(0))" in source
+        assert f"{param_name} = _tensor_from_continuous(args[0])" in source
         assert f"_user_verify({param_name})" in source
 
     def test_sub_worker_source_imports_torch(self):

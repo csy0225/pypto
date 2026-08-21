@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +18,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/orchestration_op_registry.h"
@@ -70,9 +70,19 @@ static std::string EmitAsUint32(const ExprPtr& expr, CodegenBase& codegen) {
   return "static_cast<uint32_t>(" + str + ")";
 }
 
+static std::string EmitRuntimeTensorShapeDim(const ExprPtr& expr, const DataType& dtype, size_t axis,
+                                             size_t ndim, CodegenBase& codegen) {
+  if (dtype == DataType::FP4 && axis + 1 == ndim) {
+    if (auto extent = As<ConstInt>(expr)) return std::to_string(extent->value_ / 2);
+  }
+  std::string logical_dim = codegen.GenerateExprString(expr);
+  if (dtype != DataType::FP4 || axis + 1 != ndim) logical_dim = EmitAsUint32(expr, codegen);
+  return codegen.GetRuntimeTensorShapeDim(dtype, axis, ndim, logical_dim);
+}
+
 REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
   // tensor.create emits TensorCreateInfo for runtime memory allocation via alloc_tensors().
-  // The batched alloc_tensors call and const Tensor& binding are emitted by
+  // The batched alloc_tensors call and const ChipTensor& binding are emitted by
   // EmitBatchedAllocTensors at scope entry (SeqStmts).
   auto result_type = As<TensorType>(op->GetType());
   CHECK(result_type) << "tensor.create must return TensorType";
@@ -84,12 +94,21 @@ REGISTER_ORCHESTRATION_OP(tensor_create, ("tensor.create")) {
   oss << "uint32_t " << result_var << "_ci_shapes[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
-    std::string dim_expr = EmitAsUint32(result_type->shape_[i], codegen);
+    const std::string ir_dim_expr = codegen.GenerateExprString(result_type->shape_[i]);
+    std::string dim_expr = ir_dim_expr;
+    if ((result_type->dtype_ != DataType::FP4 || i + 1 != ndim) && !As<ConstInt>(result_type->shape_[i])) {
+      dim_expr = "static_cast<uint32_t>(" + dim_expr + ")";
+    }
     // Backends may override tensor.create shape without mutating IR.
     if (ndim == 1 && i == 0) {
       dim_expr = codegen.GetTensorCreateSizeExpr(result_var, dim_expr);
     }
-    oss << dim_expr;
+    auto const_extent = As<ConstInt>(result_type->shape_[i]);
+    if (result_type->dtype_ == DataType::FP4 && i + 1 == ndim && const_extent && dim_expr == ir_dim_expr) {
+      oss << const_extent->value_ / 2;
+    } else {
+      oss << codegen.GetRuntimeTensorShapeDim(result_type->dtype_, i, ndim, dim_expr);
+    }
   }
   oss << "};\n";
 
@@ -160,12 +179,12 @@ REGISTER_ORCHESTRATION_OP(tensor_read, ("tensor.read")) {
   // tensor.read(tensor, indices_tuple) -> scalar value
   //
   // Emit a call to the runtime's get_tensor_data<T>(tensor, ndims, indices).
-  // The runtime spin-waits on the producer task in TensorMap (for
-  // internally-allocated tensors) before reading, and reads immediately for
-  // external tensors with no producer entry. Using the API uniformly avoids
-  // both the missing producer-sync bug and the type-unsafe raw deref via
+  // The runtime owns the access policy: host-build-graph reads the registered
+  // host view of an external tensor and does not support task-produced tensors,
+  // while other runtimes may synchronize with a producer. Using the API
+  // uniformly preserves that policy and avoids the type-unsafe raw deref via
   // buffer.addr that a direct static_cast<T*>(ptr)[idx] would imply.
-  CHECK(op->args_.size() == 2) << "tensor.read requires 2 arguments";
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_) << "tensor.read requires 2 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   CHECK(!input_name.empty()) << "tensor.read input must be a variable";
@@ -210,12 +229,11 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
   // tensor.write(tensor, indices_tuple, value) -> write scalar value to tensor at indices
   //
   // Emit a call to the runtime's set_tensor_data<T>(tensor, ndims, indices, value).
-  // The runtime spin-waits on the producer task in TensorMap (and any
-  // tracked INOUT consumers) before writing, so cross-thread WAW/WAR
-  // hazards stay contained — same rationale as tensor.read using
-  // get_tensor_data<T>(). For external tensors with no TensorMap entry
-  // the write happens immediately (matches the previous raw store).
-  CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments";
+  // The runtime owns the access policy: host-build-graph updates the registered
+  // host view of an external tensor and does not support task-produced tensors,
+  // while other runtimes may synchronize with producers and consumers. This is
+  // the same reason tensor.read uses get_tensor_data<T>() instead of a raw store.
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_) << "tensor.write requires 3 arguments";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   CHECK(!input_name.empty()) << "tensor.write input must be a variable";
@@ -260,16 +278,20 @@ REGISTER_ORCHESTRATION_OP(tensor_write, ("tensor.write")) {
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
-  // tensor.slice(input, shape_tuple, offset_tuple[, valid_shape_tuple]) -> Generate array variables and call
-  // .view()
-  CHECK(op->args_.size() == 3 || op->args_.size() == 4)
-      << "tensor.slice requires 3 or 4 arguments (input, shape, offset[, valid_shape])";
+  // tensor.slice(input, shape_tuple, offset_tuple[, valid_shape_tuple[, drop_dims_tuple]])
+  // -> Generate a runtime view and, for rank-reducing scalar indices, reshape away
+  // the statically-unit axes recorded in drop_dims.
+  INTERNAL_CHECK_SPAN(op->args_.size() >= 3 && op->args_.size() <= 5, op->span_)
+      << "tensor.slice requires 3 to 5 arguments (input, shape, offset[, valid_shape[, drop_dims]])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
   CHECK(!input_name.empty()) << "tensor.slice input must be a variable";
 
   std::string ext_input_name = codegen.GetExternalTensorName(input_name);
   std::string result_var = codegen.GetCurrentResultTarget();
+
+  auto input_type = AsTensorTypeLike(op->args_[0]->GetType());
+  CHECK(input_type) << "tensor.slice input must be TensorType or DistributedTensorType";
 
   // Extract shape elements from MakeTuple
   auto shape_tuple = As<MakeTuple>(op->args_[1]);
@@ -280,19 +302,62 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
   CHECK(offset_tuple) << "tensor.slice offset must be MakeTuple";
 
   size_t ndim = shape_tuple->elements_.size();
+  CHECK(offset_tuple->elements_.size() == ndim) << "tensor.slice offset must have same rank as shape";
   std::ostringstream oss;
+
+  std::vector<std::string> runtime_offsets;
+  runtime_offsets.reserve(ndim);
+  for (size_t i = 0; i < ndim; ++i) {
+    const auto& offset = offset_tuple->elements_[i];
+    if (input_type->dtype_ != DataType::FP4 || i + 1 != ndim) {
+      runtime_offsets.push_back(EmitAsUint32(offset, codegen));
+      continue;
+    }
+
+    if (auto const_offset = As<ConstInt>(offset)) {
+      CHECK_SPAN(const_offset->value_ >= 0, op->span_)
+          << "tensor.slice packed FP4 last-axis offset must be non-negative, but got "
+          << const_offset->value_;
+      CHECK_SPAN(const_offset->value_ % 2 == 0, op->span_)
+          << "tensor.slice packed FP4 last-axis offset must be byte-aligned (even), but got "
+          << const_offset->value_;
+      runtime_offsets.push_back(std::to_string(const_offset->value_ / 2));
+      continue;
+    }
+
+    // Dynamic FP4 offsets remain legal, but must select the first nibble of a
+    // carrier byte. Evaluate once, assert alignment at runtime, then convert
+    // from logical nibble units to physical x2 carrier units.
+    const std::string logical_offset_var = result_var + "_logical_fp4_offset";
+    oss << "uint32_t " << logical_offset_var << " = " << EmitAsUint32(offset, codegen) << ";\n";
+    oss << "always_assert((" << logical_offset_var << " & 1u) == 0u);\n";
+    runtime_offsets.push_back("(" + logical_offset_var + " / 2)");
+  }
+
+  std::vector<bool> drop_dims(ndim, false);
+  if (op->args_.size() == 5) {
+    auto drop_dims_tuple = As<MakeTuple>(op->args_[4]);
+    CHECK(drop_dims_tuple) << "tensor.slice drop_dims must be MakeTuple";
+    for (const auto& dim_expr : drop_dims_tuple->elements_) {
+      auto dim = As<ConstInt>(dim_expr);
+      CHECK(dim) << "tensor.slice drop_dims entries must be ConstInt";
+      CHECK(dim->value_ >= 0 && static_cast<size_t>(dim->value_) < ndim)
+          << "tensor.slice drop_dims entry out of range: " << dim->value_;
+      drop_dims[static_cast<size_t>(dim->value_)] = true;
+    }
+  }
 
   // Generate offset array (emitted first so the shape clamp below can read it).
   oss << "uint32_t " << result_var << "_offsets[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
-    oss << EmitAsUint32(offset_tuple->elements_[i], codegen);
+    oss << runtime_offsets[i];
   }
   oss << "};\n";
 
   // Generate shape array, clamped to stay within the source tensor's extent.
-  // The #808 strided-Tensor runtime enforces ``offset[i] + shape[i] <= parent
-  // shapes[i]`` in ``Tensor::view`` and derives the dependency/extent footprint
+  // The #808 strided-ChipTensor runtime enforces ``offset[i] + shape[i] <= parent
+  // shapes[i]`` in ``ChipTensor::view`` and derives the dependency/extent footprint
   // from start_offset + strides; an over-extent view corrupts host-side
   // dependency tracking (scheduler timeout / device fault) rather than being a
   // benign no-op as it was under the old (raw_shapes, offsets) model. The clamp
@@ -306,28 +371,63 @@ REGISTER_ORCHESTRATION_OP(tensor_slice, ("tensor.slice")) {
     // unsigned, so an offset past the source extent would underflow and let std::min return
     // the original (over-extent) size — defeating the clamp. The ternary keeps it at 0.
     oss << "(" << result_var << "_offsets[" << i << "] >= " << ext_input_name << ".shapes[" << i
-        << "] ? 0u : std::min<uint32_t>(" << EmitAsUint32(shape_tuple->elements_[i], codegen) << ", "
+        << "] ? 0u : std::min<uint32_t>("
+        << EmitRuntimeTensorShapeDim(shape_tuple->elements_[i], input_type->dtype_, i, ndim, codegen) << ", "
         << ext_input_name << ".shapes[" << i << "] - " << result_var << "_offsets[" << i << "]))";
   }
   oss << "};\n";
 
-  if (op->args_.size() == 4) {
+  if (op->args_.size() >= 4) {
     auto valid_shape_tuple = As<MakeTuple>(op->args_[3]);
     CHECK(valid_shape_tuple) << "tensor.slice valid_shape must be MakeTuple";
-    CHECK(valid_shape_tuple->elements_.size() == ndim)
+    CHECK(valid_shape_tuple->elements_.empty() || valid_shape_tuple->elements_.size() == ndim)
         << "tensor.slice valid_shape must have same rank as shape";
   }
 
   // Runtime tensor views use shape+offset; valid_shape only affects IR metadata.
-  oss << "Tensor " << result_var << " = " << ext_input_name << ".view(" << result_var << "_shapes, "
-      << result_var << "_offsets);";
+  size_t drop_count = 0;
+  for (bool drop : drop_dims) drop_count += drop ? 1 : 0;
+  if (drop_count == 0) {
+    oss << "ChipTensor " << result_var << " = " << ext_input_name << ".view(" << result_var << "_shapes, "
+        << result_var << "_offsets);";
+  } else {
+    oss << "ChipTensor " << result_var << "_view = " << ext_input_name << ".view(" << result_var
+        << "_shapes, " << result_var << "_offsets);\n";
+    // A dynamically out-of-bounds scalar index clamps its dropped axis to
+    // zero. Preserve that full-view emptiness before removing the axis: the
+    // runtime intentionally leaves an empty view at the parent start offset
+    // with zero extent, so reviving non-zero shapes after rank reduction would
+    // make numel(), extent_elem(), and the address footprint disagree.
+    oss << "bool " << result_var << "_empty = " << result_var << "_view.numel() == 0;\n";
+    oss << "ChipTensor " << result_var << " = " << result_var << "_view;\n";
+    oss << result_var << ".ndims = " << (ndim - drop_count) << ";\n";
+    size_t dst_dim = 0;
+    for (size_t i = 0; i < ndim; ++i) {
+      if (drop_dims[i]) continue;
+      oss << result_var << ".shapes[" << dst_dim << "] = " << result_var << "_view.shapes[" << i << "];\n";
+      oss << result_var << ".strides[" << dst_dim << "] = " << result_var << "_view.strides[" << i << "];\n";
+      ++dst_dim;
+    }
+    // Tensor slice type deduction rejects dropping every axis, so shapes[0]
+    // always names a retained dimension. A zero there keeps numel() and the
+    // copied zero extent consistent without changing any non-empty view.
+    oss << "if (" << result_var << "_empty) " << result_var << ".shapes[0] = 0;\n";
+    oss << "uint64_t " << result_var << "_expected_stride = 1;\n";
+    oss << "bool " << result_var << "_contiguous = true;\n";
+    oss << "for (int32_t i = static_cast<int32_t>(" << result_var << ".ndims) - 1; i >= 0; --i) {\n";
+    oss << "  " << result_var << "_contiguous = " << result_var << "_contiguous && (" << result_var
+        << ".strides[i] == " << result_var << "_expected_stride);\n";
+    oss << "  " << result_var << "_expected_stride *= " << result_var << ".shapes[i];\n";
+    oss << "}\n";
+    oss << result_var << ".is_contiguous = " << result_var << "_empty || " << result_var << "_contiguous;";
+  }
   return oss.str();
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
   // tensor.reshape(input, shape_tuple[, valid_shape_tuple]) -> Generate shape array variable and call
-  // .reshape() on the runtime Tensor (see runtime/.../tensor.h: Tensor::reshape).
-  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+  // .reshape() on the runtime ChipTensor (see runtime/.../tensor.h: ChipTensor::reshape).
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
       << "tensor.reshape requires 2 or 3 arguments (input, shape[, valid_shape])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -335,6 +435,9 @@ REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
 
   std::string ext_input_name = codegen.GetExternalTensorName(input_name);
   std::string result_var = codegen.GetCurrentResultTarget();
+
+  auto input_type = AsTensorTypeLike(op->args_[0]->GetType());
+  CHECK(input_type) << "tensor.reshape input must be TensorType or DistributedTensorType";
 
   // Extract shape elements from MakeTuple
   auto shape_tuple = As<MakeTuple>(op->args_[1]);
@@ -347,7 +450,7 @@ REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
   oss << "uint32_t " << result_var << "_shapes[" << ndim << "] = {";
   for (size_t i = 0; i < ndim; ++i) {
     if (i > 0) oss << ", ";
-    oss << EmitAsUint32(shape_tuple->elements_[i], codegen);
+    oss << EmitRuntimeTensorShapeDim(shape_tuple->elements_[i], input_type->dtype_, i, ndim, codegen);
   }
   oss << "};\n";
 
@@ -358,8 +461,8 @@ REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
         << "tensor.reshape valid_shape must have same rank as shape";
   }
 
-  // Runtime Tensor::reshape requires the source to be contiguous; valid_shape only affects IR metadata.
-  oss << "Tensor " << result_var << " = " << ext_input_name << ".reshape(" << result_var << "_shapes, "
+  // Runtime ChipTensor::reshape requires the source to be contiguous; valid_shape only affects IR metadata.
+  oss << "ChipTensor " << result_var << " = " << ext_input_name << ".reshape(" << result_var << "_shapes, "
       << ndim << ");";
   return oss.str();
 }
@@ -367,20 +470,20 @@ REGISTER_ORCHESTRATION_OP(tensor_reshape, ("tensor.reshape")) {
 REGISTER_ORCHESTRATION_OP(tensor_reinterpret_view, ("tensor.reinterpret_view")) {
   CHECK_SPAN(false, op->span_)
       << "tensor.reinterpret_view is not supported in Orchestration functions because the runtime "
-         "Tensor API cannot change the element dtype of a view; place reinterpret_view inside an "
+         "ChipTensor API cannot change the element dtype of a view; place reinterpret_view inside an "
          "InCore function";
   return {};
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
-  // tensor.transpose(input, axis1, axis2) -> Tensor view with two axes swapped.
-  // Lowered to runtime Tensor::transpose(x, y), a zero-copy metadata swap of the
+  // tensor.transpose(input, axis1, axis2) -> ChipTensor view with two axes swapped.
+  // Lowered to runtime ChipTensor::transpose(x, y), a zero-copy metadata swap of the
   // two axes' shapes and strides (start_offset preserved; see runtime tensor.h:
-  // Tensor::transpose under the #808 strided model).
+  // ChipTensor::transpose under the #808 strided model).
   // The optional 4th `valid_shape` argument from the IR op is intentionally
   // ignored at the orchestration layer (it only affects IR metadata, mirroring
   // how tensor.reshape handles valid_shape here).
-  CHECK(op->args_.size() == 3 || op->args_.size() == 4)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3 || op->args_.size() == 4, op->span_)
       << "tensor.transpose requires 3 or 4 arguments (input, axis1, axis2[, valid_shape])";
 
   std::string input_name = codegen.TryGetVarName(op->args_[0]);
@@ -405,6 +508,10 @@ REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
   CHECK(axis2 >= 0 && axis2 < ndim) << "tensor.transpose axis2 out of range: " << axis2_const->value_
                                     << " for " << ndim << "D tensor";
   CHECK(axis1 != axis2) << "tensor.transpose axis1 and axis2 must be different, got " << axis1;
+  CHECK_SPAN(input_type->dtype_ != DataType::FP4 || (axis1 != ndim - 1 && axis2 != ndim - 1), op->span_)
+      << "tensor.transpose cannot move the packed FP4 last axis in Orchestration functions because the "
+         "runtime ChipTensor carries physical x2 elements; keep the last axis fixed or transpose inside an "
+         "InCore function";
 
   // If the optional valid_shape operand is present, validate its structure even though it is
   // intentionally not emitted at the orchestration layer (mirrors tensor.reshape / tensor.slice).
@@ -419,14 +526,14 @@ REGISTER_ORCHESTRATION_OP(tensor_transpose, ("tensor.transpose")) {
   std::string result_var = codegen.GetCurrentResultTarget();
 
   std::ostringstream oss;
-  oss << "Tensor " << result_var << " = " << ext_input_name << ".transpose(" << axis1 << ", " << axis2
+  oss << "ChipTensor " << result_var << " = " << ext_input_name << ".transpose(" << axis1 << ", " << axis2
       << ");";
   return oss.str();
 }
 
 REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
   // tensor.view(input[, shape[, valid_shape]], layout=...) is a metadata reinterpret over the
-  // same physical buffer. Runtime Tensor has no layout tag or arbitrary-stride
+  // same physical buffer. Runtime ChipTensor has no layout tag or arbitrary-stride
   // constructor, so shape-changing orchestration views lower to reshape only
   // for ND layouts. Layout-only keeps the legacy ND/DN alias/transpose
   // behavior.
@@ -457,11 +564,11 @@ REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
   if (op->args_.size() >= 2) {
     CHECK_SPAN(target_layout == src_layout, op->span_)
         << "tensor.view orchestration lowering cannot combine shape reinterpret with layout change: "
-        << "runtime Tensor::reshape has no arbitrary-stride layout view; pass only a shape argument "
+        << "runtime ChipTensor::reshape has no arbitrary-stride layout view; pass only a shape argument "
         << "(no layout change) in orchestration code or lower the view through PTO in-core codegen";
     CHECK_SPAN(src_layout == TensorLayout::ND && target_layout == TensorLayout::ND, op->span_)
         << "tensor.view orchestration lowering only supports shape reinterpret for ND layout tensors: "
-        << "runtime Tensor::reshape assumes row-major contiguous storage; lower non-ND views through "
+        << "runtime ChipTensor::reshape assumes row-major contiguous storage; lower non-ND views through "
         << "PTO in-core codegen";
     auto shape_tuple = As<MakeTuple>(op->args_[1]);
     auto tuple_type = As<TupleType>(op->args_[1]->GetType());
@@ -473,22 +580,25 @@ REGISTER_ORCHESTRATION_OP(tensor_view, ("tensor.view")) {
       ExprPtr shape_dim =
           shape_tuple ? shape_tuple->elements_[i]
                       : std::make_shared<TupleGetItemExpr>(op->args_[1], static_cast<int>(i), op->span_);
-      oss << EmitAsUint32(shape_dim, codegen);
+      oss << EmitRuntimeTensorShapeDim(shape_dim, input_type->dtype_, i, ndim, codegen);
     }
     oss << "};\n";
-    oss << "Tensor " << result_var << " = " << ext_input_name << ".reshape(" << result_var << "_shapes, "
+    oss << "ChipTensor " << result_var << " = " << ext_input_name << ".reshape(" << result_var << "_shapes, "
         << ndim << ");";
     return oss.str();
   }
 
   if (target_layout == src_layout) {
-    oss << "Tensor " << result_var << " = " << ext_input_name << ";";
+    oss << "ChipTensor " << result_var << " = " << ext_input_name << ";";
   } else {
     int64_t ndim = static_cast<int64_t>(input_type->shape_.size());
     INTERNAL_CHECK_SPAN(ndim >= 2, op->span_)
         << "Internal error: tensor.view cross-layout flip reached codegen with rank=" << ndim
         << "; DeduceTensorViewType is supposed to reject cross-layout flips below rank 2";
-    oss << "Tensor " << result_var << " = " << ext_input_name << ".transpose(" << (ndim - 2) << ", "
+    CHECK_SPAN(input_type->dtype_ != DataType::FP4, op->span_)
+        << "tensor.view cannot move the packed FP4 last axis during an Orchestration layout change because "
+           "the runtime ChipTensor carries physical x2 elements; lower the view through PTO in-core codegen";
+    oss << "ChipTensor " << result_var << " = " << ext_input_name << ".transpose(" << (ndim - 2) << ", "
         << (ndim - 1) << ");";
   }
 

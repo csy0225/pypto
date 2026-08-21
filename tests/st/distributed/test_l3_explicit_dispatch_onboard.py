@@ -32,7 +32,6 @@ Run on hardware via ``task-submit`` (one chip)::
 
     task-submit --device auto --device-num 1 --run 'cd <repo> && \
         export PYTHONPATH=<repo>/python:$PYTHONPATH && \
-        export PTO_ISA_ROOT=/path/to/pto-isa && \
         python -m pytest tests/st/distributed/test_l3_explicit_dispatch_onboard.py \
         -v --platform a2a3 --device $TASK_DEVICE'
 
@@ -130,7 +129,6 @@ def test_l3_explicit_dispatch_single_chip(test_config, device_ids, _no_leak_warn
         distributed_config=DistributedConfig(
             device_ids=device_ids[:1],
             num_sub_workers=1,
-            block_dim=3,
             aicpu_thread_num=4,
         ),
     )
@@ -187,7 +185,6 @@ def test_l3_explicit_dispatch_multi_chip(test_config, device_ids, _no_leak_warni
         distributed_config=DistributedConfig(
             device_ids=device_ids[:2],
             num_sub_workers=1,
-            block_dim=3,
             aicpu_thread_num=4,
         ),
     )
@@ -236,7 +233,6 @@ def test_l3_multi_program_shared_kv_cache(test_config, device_ids, _no_leak_warn
     dc = DistributedConfig(
         device_ids=device_ids[:1],
         num_sub_workers=1,
-        block_dim=3,
         aicpu_thread_num=4,
     )
     cfg = RunConfig(platform=test_config.platform, distributed_config=dc)

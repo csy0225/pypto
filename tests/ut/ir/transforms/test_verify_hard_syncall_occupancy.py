@@ -24,6 +24,7 @@ at compile time.
 Tests drive the full Default pipeline on Ascend910B (48 VECTOR / 24 CUBE cores).
 """
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import backend
@@ -122,7 +123,7 @@ def _soft_program(n: int):
             self,
             a: pl.Tensor[[n * TR, TC], pl.FP32],
             b: pl.Tensor[[n * TR, TC], pl.FP32],
-            ws: pl.Tensor[[n * 8], pl.INT32],
+            ws: pl.Tensor[[16], pl.INT32],
             out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
         ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
             i = pl.tile.get_block_idx()
@@ -138,7 +139,7 @@ def _soft_program(n: int):
             self,
             a: pl.Tensor[[n * TR, TC], pl.FP32],
             b: pl.Tensor[[n * TR, TC], pl.FP32],
-            ws: pl.Tensor[[n * 8], pl.INT32],
+            ws: pl.Tensor[[16], pl.INT32],
             out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
         ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
             with pl.spmd(n):
@@ -242,6 +243,47 @@ def _bare_kernel_program():
             pl.system.syncall(core_type="aiv_only")
             updated = pl.store(tile, [0, 0], out)
             return updated
+
+    return Prog
+
+
+def _aiv_default_mix_program_dual_dispatch_false(n: int):
+    """As ``_aiv_default_mix_program``, but the kernel states ``dual_aiv_dispatch=False``.
+
+    ``False`` means "NOT dual-dispatched", so this is a standalone AIV launch and the
+    mix barrier is just as unsatisfiable as in the plain case. The verifier used to key
+    on ``HasAttr``, which is true for a present-but-false attr, and so skipped the check
+    on exactly the kernels the attr says are *not* dual-dispatched.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def add(
+            self,
+            a: pl.Tensor[[n * TR, TC], pl.FP32],
+            b: pl.Tensor[[n * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
+            pl.func_attr({"dual_aiv_dispatch": False})
+            i = pl.tile.get_block_idx()
+            o = i * TR
+            ta = pl.load(a, [o, 0], [TR, TC])
+            tb = pl.load(b, [o, 0], [TR, TC])
+            pl.system.syncall()  # default core_type="mix" — no AIC participants in an AIV launch
+            out = pl.store(pl.add(ta, tb), [o, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[n * TR, TC], pl.FP32],
+            b: pl.Tensor[[n * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[n * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[n * TR, TC], pl.FP32]:
+            with pl.spmd(n):
+                out = self.add(a, b, out)
+            return out
 
     return Prog
 
@@ -418,12 +460,246 @@ def _cluster_spmd_program_no_sync(n: int):
     return Prog
 
 
+# ---------------------------------------------------------------------------
+# Launch-shape query widths. `pl.system.available_aiv_count()` /
+# `available_cluster_count()` resolve on device to that core type's own count,
+# so they fill it by construction — the verifier accepts them without a count
+# comparison, and rejects the query for the *other* core type.
+# ---------------------------------------------------------------------------
+
+
+def _aiv_query_program():
+    """AIV launch sized by available_aiv_count() — full occupancy by construction."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def add(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            i = pl.tile.get_block_idx()
+            o = i * TR
+            ta = pl.load(a, [o, 0], [TR, TC])
+            tb = pl.load(b, [o, 0], [TR, TC])
+            pl.system.syncall(core_type="aiv_only")  # HARD barrier
+            out = pl.store(pl.add(ta, tb), [o, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            with pl.spmd(pl.system.available_aiv_count(), sync_start=True):
+                out = self.add(a, b, out)
+            return out
+
+    return Prog
+
+
+def _aiv_query_program_no_sync():
+    """Same, without sync_start — occupancy holds but co-residency does not."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def add(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            i = pl.tile.get_block_idx()
+            o = i * TR
+            ta = pl.load(a, [o, 0], [TR, TC])
+            tb = pl.load(b, [o, 0], [TR, TC])
+            pl.system.syncall(core_type="aiv_only")  # HARD barrier
+            out = pl.store(pl.add(ta, tb), [o, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            with pl.spmd(pl.system.available_aiv_count()):  # no sync_start (DSL default False)
+                out = self.add(a, b, out)
+            return out
+
+    return Prog
+
+
+def _aiv_wrong_query_program():
+    """AIV launch sized by the *cluster* count — fills AICs, not the 48 AIVs."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def add(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            i = pl.tile.get_block_idx()
+            o = i * TR
+            ta = pl.load(a, [o, 0], [TR, TC])
+            tb = pl.load(b, [o, 0], [TR, TC])
+            pl.system.syncall(core_type="aiv_only")  # HARD barrier
+            out = pl.store(pl.add(ta, tb), [o, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[48 * TR, TC], pl.FP32],
+            b: pl.Tensor[[48 * TR, TC], pl.FP32],
+            out: pl.Out[pl.Tensor[[48 * TR, TC], pl.FP32]],
+        ) -> pl.Tensor[[48 * TR, TC], pl.FP32]:
+            with pl.spmd(pl.system.available_cluster_count(), sync_start=True):
+                out = self.add(a, b, out)
+            return out
+
+    return Prog
+
+
+def _mixed_query_program():
+    """Mixed kernel sized by available_cluster_count() — one block per core-group."""
+    M = K = NN = 64
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mixed(
+            self,
+            a: pl.Tensor[[M, K], pl.FP16],
+            b: pl.Tensor[[K, NN], pl.FP16],
+            bias: pl.Tensor[[M, NN], pl.FP32],
+            out: pl.Out[pl.Tensor[[M, NN], pl.FP32]],
+        ) -> pl.Tensor[[M, NN], pl.FP32]:
+            ta = pl.load(a, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+            tb = pl.load(b, [0, 0], [K, NN], target_memory=pl.Mem.Mat)
+            tal = pl.move(ta, target_memory=pl.Mem.Left)
+            tbl = pl.move(tb, target_memory=pl.Mem.Right)
+            tc = pl.matmul(tal, tbl)
+            tcv = pl.move(tc, target_memory=pl.Mem.Vec)
+            tbias = pl.load(bias, [0, 0], [M, NN])
+            tsum = pl.add(tcv, tbias)
+            pl.system.syncall(core_type="mix")  # HARD mix barrier
+            out = pl.store(tsum, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[M, K], pl.FP16],
+            b: pl.Tensor[[K, NN], pl.FP16],
+            bias: pl.Tensor[[M, NN], pl.FP32],
+            out: pl.Out[pl.Tensor[[M, NN], pl.FP32]],
+        ) -> pl.Tensor[[M, NN], pl.FP32]:
+            with pl.spmd(pl.system.available_cluster_count(), sync_start=True):
+                out = self.mixed(a, b, bias, out)
+            return out
+
+    return Prog
+
+
+def _mixed_wrong_query_program():
+    """Mixed kernel sized by the AIV count — fills AIVs, not the 24 core-groups."""
+    M = K = NN = 64
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def mixed(
+            self,
+            a: pl.Tensor[[M, K], pl.FP16],
+            b: pl.Tensor[[K, NN], pl.FP16],
+            bias: pl.Tensor[[M, NN], pl.FP32],
+            out: pl.Out[pl.Tensor[[M, NN], pl.FP32]],
+        ) -> pl.Tensor[[M, NN], pl.FP32]:
+            ta = pl.load(a, [0, 0], [M, K], target_memory=pl.Mem.Mat)
+            tb = pl.load(b, [0, 0], [K, NN], target_memory=pl.Mem.Mat)
+            tal = pl.move(ta, target_memory=pl.Mem.Left)
+            tbl = pl.move(tb, target_memory=pl.Mem.Right)
+            tc = pl.matmul(tal, tbl)
+            tcv = pl.move(tc, target_memory=pl.Mem.Vec)
+            tbias = pl.load(bias, [0, 0], [M, NN])
+            tsum = pl.add(tcv, tbias)
+            pl.system.syncall(core_type="mix")  # HARD mix barrier
+            out = pl.store(tsum, [0, 0], out)
+            return out
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            a: pl.Tensor[[M, K], pl.FP16],
+            b: pl.Tensor[[K, NN], pl.FP16],
+            bias: pl.Tensor[[M, NN], pl.FP32],
+            out: pl.Out[pl.Tensor[[M, NN], pl.FP32]],
+        ) -> pl.Tensor[[M, NN], pl.FP32]:
+            with pl.spmd(pl.system.available_aiv_count(), sync_start=True):
+                out = self.mixed(a, b, bias, out)
+            return out
+
+    return Prog
+
+
+def _legacy_function_attr_program(dispatch_spec: str):
+    """A legacy Function-level launch spec (core_num on a hand-written Spmd wrapper).
+
+    No pass produces this carrier any more — the spec rides the dispatch — but
+    hand-written and deserialized IR can still spell it, so the verifier keeps
+    reading it as a fallback. ``dispatch_spec`` is the literal dispatch suffix,
+    so a caller can either omit a spec (legacy attr applies) or override it.
+    """
+    n, tr, tc = 24, TR, TC
+    return pl.parse(f"""
+import pypto.language as pl
+
+@pl.program
+class LegacyProg:
+    @pl.function(type=pl.FunctionType.InCore)
+    def add(self, a: pl.Tensor[[{n * tr}, {tc}], pl.FP32], b: pl.Tensor[[{n * tr}, {tc}], pl.FP32],
+            out: pl.Out[pl.Tensor[[{n * tr}, {tc}], pl.FP32]]) -> pl.Tensor[[{n * tr}, {tc}], pl.FP32]:
+        i = pl.tile.get_block_idx()
+        o = i * {tr}
+        ta = pl.load(a, [o, 0], [{tr}, {tc}])
+        tb = pl.load(b, [o, 0], [{tr}, {tc}])
+        pl.system.syncall(core_type="aiv_only")
+        out = pl.store(pl.add(ta, tb), [o, 0], out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Spmd, attrs={{"core_num": {n}}})
+    def wrap(self, a: pl.Tensor[[{n * tr}, {tc}], pl.FP32], b: pl.Tensor[[{n * tr}, {tc}], pl.FP32],
+             out: pl.Out[pl.Tensor[[{n * tr}, {tc}], pl.FP32]]) -> pl.Tensor[[{n * tr}, {tc}], pl.FP32]:
+        out = self.add(a, b, out)
+        return out
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(self,
+                     a: pl.Tensor[[{n * tr}, {tc}], pl.FP32],
+                     b: pl.Tensor[[{n * tr}, {tc}], pl.FP32],
+                     out: pl.Out[pl.Tensor[[{n * tr}, {tc}], pl.FP32]],
+                     ) -> pl.Tensor[[{n * tr}, {tc}], pl.FP32]:
+        out = self.wrap(a, b, out{dispatch_spec})
+        return out
+""")
+
+
 class TestHardSyncallOccupancy:
     """Compile-time occupancy + sync_start check for the hard (FFTS) syncall (issue #1935)."""
 
     def test_partial_aiv_occupancy_rejected(self):
         """pl.spmd(24) < 48 AIV cores + hard aiv_only barrier is rejected at compile time."""
-        with pytest.raises(Exception, match="fill all 48 AIV cores"):
+        with pytest.raises(pypto.Error, match="fill all 48 AIV cores"):
             _run(_aiv_program(24))
 
     def test_full_aiv_occupancy_accepted(self):
@@ -432,12 +708,12 @@ class TestHardSyncallOccupancy:
 
     def test_over_aiv_occupancy_rejected(self):
         """pl.spmd(96) > 48 AIV cores is rejected (hard barrier needs exactly-full occupancy)."""
-        with pytest.raises(Exception, match="fill all 48 AIV cores"):
+        with pytest.raises(pypto.Error, match="fill all 48 AIV cores"):
             _run(_aiv_program(96))
 
     def test_full_aiv_occupancy_without_sync_start_rejected(self):
         """pl.spmd(48) at full occupancy but without sync_start is rejected (blocks not co-resident)."""
-        with pytest.raises(Exception, match="sync_start=True"):
+        with pytest.raises(pypto.Error, match="sync_start=True"):
             _run(_aiv_program_no_sync(48))
 
     def test_soft_form_not_checked(self):
@@ -454,22 +730,31 @@ class TestHardSyncallOccupancy:
 
     def test_mixed_partial_occupancy_rejected(self):
         """Mixed kernel + hard mix barrier at pl.spmd(12) < 24 core-groups is rejected."""
-        with pytest.raises(Exception, match="core-groups"):
+        with pytest.raises(pypto.Error, match="core-groups"):
             _run(_mixed_program(12))
 
     def test_mixed_full_occupancy_without_sync_start_rejected(self):
         """Mixed kernel at full 24 core-groups but without sync_start is rejected."""
-        with pytest.raises(Exception, match="sync_start=True"):
+        with pytest.raises(pypto.Error, match="sync_start=True"):
             _run(_mixed_program_no_sync(24))
 
     def test_standalone_default_mix_barrier_rejected(self):
         """A pure-AIV kernel with the default (mix) hard barrier can never complete (no AIC)."""
-        with pytest.raises(Exception, match="can never complete"):
+        with pytest.raises(pypto.Error, match="can never complete"):
             _run(_aiv_default_mix_program(48))
+
+    def test_standalone_default_mix_barrier_rejected_with_dual_dispatch_false(self):
+        """``dual_aiv_dispatch=False`` states the kernel is NOT dual-dispatched — still checked.
+
+        Regression: the guard read ``HasAttr``, which is true for a present-but-false
+        attr, so an explicit ``False`` suppressed the very check it should have left on.
+        """
+        with pytest.raises(pypto.Error, match="can never complete"):
+            _run(_aiv_default_mix_program_dual_dispatch_false(48))
 
     def test_spmd_submit_partial_occupancy_rejected(self):
         """pl.spmd_submit(core_num=24) carries the block count on the Submit — still checked."""
-        with pytest.raises(Exception, match="fill all 48 AIV cores"):
+        with pytest.raises(pypto.Error, match="fill all 48 AIV cores"):
             _run(_spmd_submit_program(24))
 
     def test_spmd_submit_full_occupancy_accepted(self):
@@ -478,12 +763,12 @@ class TestHardSyncallOccupancy:
 
     def test_spmd_submit_full_occupancy_without_sync_start_rejected(self):
         """pl.spmd_submit(core_num=48) at full occupancy but without sync_start is rejected."""
-        with pytest.raises(Exception, match="sync_start=True"):
+        with pytest.raises(pypto.Error, match="sync_start=True"):
             _run(_spmd_submit_program_no_sync(48))
 
     def test_cluster_spmd_partial_occupancy_rejected(self):
         """pl.cluster()-nested pl.spmd(24) (a Group with core_num) is checked and rejected."""
-        with pytest.raises(Exception, match="fill all 48 AIV cores"):
+        with pytest.raises(pypto.Error, match="fill all 48 AIV cores"):
             _run(_cluster_spmd_program(24))
 
     def test_cluster_spmd_full_occupancy_accepted(self):
@@ -492,8 +777,45 @@ class TestHardSyncallOccupancy:
 
     def test_cluster_spmd_full_occupancy_without_sync_start_rejected(self):
         """pl.cluster()-nested pl.spmd(48) at full occupancy but without sync_start is rejected."""
-        with pytest.raises(Exception, match="sync_start=True"):
+        with pytest.raises(pypto.Error, match="sync_start=True"):
             _run(_cluster_spmd_program_no_sync(48))
+
+    def test_aiv_query_width_accepted(self):
+        """A launch sized by available_aiv_count() fills the AIVs by construction."""
+        _run(_aiv_query_program())
+
+    def test_aiv_query_width_without_sync_start_rejected(self):
+        """Occupancy from the query still does not imply co-residency."""
+        with pytest.raises(pypto.Error, match="sync_start=True"):
+            _run(_aiv_query_program_no_sync())
+
+    def test_aiv_launch_with_cluster_query_rejected(self):
+        """available_cluster_count() sizes an AIV-only launch to the AIC count — rejected."""
+        with pytest.raises(pypto.Error, match=r"available_cluster_count\(\).*available_aiv_count\(\)"):
+            _run(_aiv_wrong_query_program())
+
+    def test_mixed_query_width_accepted(self):
+        """A mixed launch sized by available_cluster_count() fills every core-group."""
+        _run(_mixed_query_program())
+
+    def test_mixed_launch_with_aiv_query_rejected(self):
+        """available_aiv_count() sizes a mixed launch to the AIV count — rejected."""
+        with pytest.raises(pypto.Error, match=r"available_aiv_count\(\).*available_cluster_count\(\)"):
+            _run(_mixed_wrong_query_program())
+
+    def test_legacy_function_attr_is_used_when_dispatch_has_no_spec(self):
+        """A Function-level core_num still governs a dispatch that carries none."""
+        with pytest.raises(pypto.Error, match="fill all 48 AIV cores"):
+            _run(_legacy_function_attr_program(""))
+
+    def test_dispatch_spec_overrides_a_legacy_function_attr(self):
+        """The dispatch wins, matching EffectiveLaunchSpec's precedence.
+
+        A stale ``core_num=24`` on the callee must not reject a launch that
+        codegen actually emits as 48 blocks with sync_start — the verifier would
+        otherwise reject a program that compiles and runs correctly.
+        """
+        _run(_legacy_function_attr_program(', attrs={"core_num": 48, "sync_start": True}'))
 
 
 if __name__ == "__main__":

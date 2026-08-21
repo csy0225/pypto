@@ -985,9 +985,8 @@ class TestFlattenCallInClusterScope:
     ``FlattenScopeBody`` helper (lines 364-382), which keeps extracted
     temporaries *inside* the scope body (mirroring the ``pl.at()`` behaviour)
     so execution-context boundaries are preserved. The sibling Spmd scope
-    visitor (lines 414-420) reuses the same helper; see the
-    spmd-2-statement-body note in the deferred report for why it is not
-    exercised here.
+    visitor (lines 414-420) reuses the same helper and is covered by
+    ``test_nested_call_inside_spmd_scope`` below.
     """
 
     def test_nested_call_inside_cluster_scope(self):
@@ -1014,6 +1013,63 @@ class TestFlattenCallInClusterScope:
                     t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                     result: pl.Tensor[[64], pl.FP32] = pl.mul(t__tmp_v0, 2.0)
                 return result
+
+        After = passes.flatten_call_expr()(Before)
+        ir.assert_structural_equal(After, NormalizeIR(Expected))
+
+    def test_nested_call_inside_spmd_scope(self):
+        """A nested call arg in a ``pl.spmd()`` dispatch body keeps its temp inside.
+
+        The hoisted temporary leaves the SPMD body with two statements. That is a
+        *dispatch* body — the per-block work is in the callee, which reads the block
+        index internally — so it stays unwrapped (no ``InCoreScopeStmt``) and remains
+        expressible in the ``with pl.spmd(...)`` surface syntax.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    out = pl.add(x, x)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.spmd(4):
+                    out = self.worker(pl.add(x, 1.0), out)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def worker(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    out = pl.add(x, x)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.spmd(4):
+                    t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                    out = self.worker(t__tmp_v0, out)
+                return out
 
         After = passes.flatten_call_expr()(Before)
         ir.assert_structural_equal(After, NormalizeIR(Expected))
@@ -1063,6 +1119,97 @@ class TestFlattenCallInReturn:
                 t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 t__tmp_v1: pl.Tensor[[64], pl.FP32] = pl.mul(t__tmp_v0, 2.0)
                 return t__tmp_v1
+
+        After = passes.flatten_call_expr()(Before)
+        ir.assert_structural_equal(After, NormalizeIR(Expected))
+
+
+class TestFlattenCallInYield:
+    """Tests for flattening Call expressions that appear directly inside YieldStmt.
+
+    Regression tests for issue #2229: `pl.yield_(some_call(...))` (no intermediate
+    variable) used to leave a YieldStmt-wrapped Call untouched. Passes that rewrite
+    operations walk top-level AssignStmt/EvalStmt, so they silently skipped it — a
+    `tensor.add` carried by a loop stayed `tensor.add` through
+    ConvertTensorToTileOps while its operands became Tiles, and the tensor-level
+    type check then rejected its own operand.
+    """
+
+    def test_single_call_in_for_yield(self):
+        """`pl.yield_(pl.add(acc, x))` binds the call to a temp before the yield."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for _i, (acc,) in pl.range(1, 4, init_values=(x,)):
+                    total: pl.Tensor[[64], pl.FP32] = pl.yield_(pl.add(acc, x))
+                return total
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for _i, (acc,) in pl.range(1, 4, init_values=(x,)):
+                    t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(acc, x)
+                    total: pl.Tensor[[64], pl.FP32] = pl.yield_(t__tmp_v0)
+                return total
+
+        After = passes.flatten_call_expr()(Before)
+        ir.assert_structural_equal(After, NormalizeIR(Expected))
+
+    def test_nested_call_in_for_yield(self):
+        """A nested `pl.yield_(pl.mul(pl.add(...), 2.0))` extracts both calls."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for _i, (acc,) in pl.range(1, 4, init_values=(x,)):
+                    total: pl.Tensor[[64], pl.FP32] = pl.yield_(pl.mul(pl.add(acc, x), 2.0))
+                return total
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                for _i, (acc,) in pl.range(1, 4, init_values=(x,)):
+                    t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(acc, x)
+                    t__tmp_v1: pl.Tensor[[64], pl.FP32] = pl.mul(t__tmp_v0, 2.0)
+                    total: pl.Tensor[[64], pl.FP32] = pl.yield_(t__tmp_v1)
+                return total
+
+        After = passes.flatten_call_expr()(Before)
+        ir.assert_structural_equal(After, NormalizeIR(Expected))
+
+    def test_call_in_if_yield(self):
+        """An IfStmt yield gets the same treatment; temps stay inside their branch."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], flag: pl.Scalar[pl.INT32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                if flag > 0:
+                    out: pl.Tensor[[64], pl.FP32] = pl.yield_(pl.add(x, 1.0))
+                else:
+                    out: pl.Tensor[[64], pl.FP32] = pl.yield_(pl.mul(x, 2.0))
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], flag: pl.Scalar[pl.INT32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                if flag > 0:
+                    t__tmp_v0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
+                    out: pl.Tensor[[64], pl.FP32] = pl.yield_(t__tmp_v0)
+                else:
+                    t__tmp_v1: pl.Tensor[[64], pl.FP32] = pl.mul(x, 2.0)
+                    out: pl.Tensor[[64], pl.FP32] = pl.yield_(t__tmp_v1)
+                return out
 
         After = passes.flatten_call_expr()(Before)
         ir.assert_structural_equal(After, NormalizeIR(Expected))

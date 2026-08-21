@@ -19,6 +19,12 @@ import pypto.language as pl
 import pytest
 from pypto import ir
 from pypto.ir.printer import python_print
+from pypto.language.parser.diagnostics import ParserSyntaxError
+
+
+def _flatten_seq(stmt) -> list:
+    """Return a body's statement list, treating a bare Stmt as a 1-element body."""
+    return list(stmt.stmts) if isinstance(stmt, ir.SeqStmts) else [stmt]
 
 
 def _first_runtime_scope(stmt):
@@ -112,7 +118,7 @@ def test_manual_scope_alias_parses_to_same_ir():
 
 
 def test_scope_rejects_positional_args():
-    with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
+    with pytest.raises(ParserSyntaxError):
 
         @pl.program
         class _Prog:
@@ -124,7 +130,7 @@ def test_scope_rejects_positional_args():
 
 
 def test_auto_scope_rejected_in_default_mode():
-    with pytest.raises(Exception):  # noqa: B017 — AUTO scope requires auto_scope=False
+    with pytest.raises(ParserSyntaxError):  # AUTO scope requires auto_scope=False
 
         @pl.program
         class _Prog:
@@ -162,7 +168,16 @@ def test_loop_carried_yield_outside_scope_ok():
                 acc = pl.yield_(nxt)
             return acc
 
-    assert Prog.get_function("orch") is not None
+    orch = Prog.get_function("orch")
+    assert orch is not None
+
+    # The scope wraps the per-iteration work; the yield stays a direct for-body
+    # child (not swallowed into the scope).
+    for_stmt = next(s for s in _flatten_seq(orch.body) if isinstance(s, ir.ForStmt))
+    body_stmts = _flatten_seq(for_stmt.body)
+    assert isinstance(body_stmts[0], ir.ScopeStmt)
+    assert isinstance(body_stmts[-1], ir.YieldStmt)
+    assert len(for_stmt.iter_args) == 1
 
 
 def test_manual_scope_in_if_branch_registers_yield_var():
@@ -199,7 +214,7 @@ def test_manual_scope_in_if_branch_registers_yield_var():
 
 
 def test_auto_scope_rejected_inside_manual_scope():
-    with pytest.raises(Exception):  # noqa: B017 — runtime forbids AUTO nested in MANUAL
+    with pytest.raises(ParserSyntaxError):  # runtime forbids AUTO nested in MANUAL
 
         @pl.program
         class _Prog:

@@ -286,14 +286,14 @@ def test_tile_load_store():
     tensor = _tensor_var("t", [256, 256])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(64), _int(64))
-    valid_shapes = _make_tuple(_int(64), _int(64))
+    valid_shape = _make_tuple(_int(64), _int(64))
     tile = _tile_var("tile", [64, 64])
     output = _tensor_var("out", [256, 256])
     off2 = _make_tuple(_int(64), _int(0))
 
     load_call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     store_call = _op_call("tile.store", [tile, off2, output])
@@ -334,6 +334,105 @@ def test_tile_compute_ops():
     func = _simple_function("f", [a, b], assign)
     code = torch_codegen(func)
     assert "torch.add(a, b)" in code
+
+
+# (op leaf, expected torch snippet) for the integer bitwise / shift family. The
+# reference map registers these for the `tensor` and `tile` prefixes from one shared
+# loop, so both namespaces are asserted below (issue #2216).
+_BITWISE_REFERENCE = [
+    ("and", "torch.bitwise_and(a, b)"),
+    ("or", "torch.bitwise_or(a, b)"),
+    ("xor", "torch.bitwise_xor(a, b)"),
+    ("shl", "(a << b)"),
+    ("shr", "(a >> b)"),
+]
+
+
+@pytest.mark.parametrize(("op_leaf", "expected"), _BITWISE_REFERENCE)
+def test_tensor_bitwise_ops(op_leaf, expected):
+    """Tensor bitwise/shift ops have a torch reference implementation."""
+    a = _tensor_var("a", [64, 64], DataType.INT16)
+    b = _tensor_var("b", [64, 64], DataType.INT16)
+    out = _tensor_var("out", [64, 64], DataType.INT16)
+
+    call = _op_call(f"tensor.{op_leaf}", [a, b])
+    func = _simple_function("f", [a, b], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+@pytest.mark.parametrize(("op_leaf", "expected"), _BITWISE_REFERENCE)
+def test_tile_bitwise_ops_still_covered(op_leaf, expected):
+    """Moving the tile entries into the shared prefix loop must not drop them."""
+    a = _tile_var("a", [64, 64], DataType.INT16)
+    b = _tile_var("b", [64, 64], DataType.INT16)
+    out = _tile_var("out", [64, 64], DataType.INT16)
+
+    # tile.xor takes a trailing scratch operand that the reference ignores.
+    if op_leaf == "xor":
+        tmp = _tile_var("tmp", [64, 64], DataType.INT16)
+        call = _op_call("tile.xor", [a, b, tmp])
+        func = _simple_function("f", [a, b, tmp], ir.AssignStmt(out, call, _span()))
+    else:
+        call = _op_call(f"tile.{op_leaf}", [a, b])
+        func = _simple_function("f", [a, b], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+@pytest.mark.parametrize(
+    ("op_leaf", "expected"),
+    [
+        ("ands", "torch.bitwise_and(a, 3)"),
+        ("ors", "torch.bitwise_or(a, 3)"),
+        ("xors", "torch.bitwise_xor(a, 3)"),
+        ("shls", "(a << 3)"),
+        ("shrs", "(a >> 3)"),
+    ],
+)
+def test_tensor_bitwise_scalar_ops(op_leaf, expected):
+    """The tensor-scalar bitwise/shift forms have a torch reference too."""
+    a = _tensor_var("a", [64], DataType.INT16)
+    out = _tensor_var("out", [64], DataType.INT16)
+
+    call = _op_call(f"tensor.{op_leaf}", [a, ir.ConstInt(3, DataType.INT16, _span())])
+    func = _simple_function("f", [a], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+def test_bitwise_not_reference():
+    """tensor.not / tile.not map to torch.bitwise_not."""
+    for prefix, var_factory in (("tensor", _tensor_var), ("tile", _tile_var)):
+        a = var_factory("a", [64], DataType.INT16)
+        out = var_factory("out", [64], DataType.INT16)
+        call = _op_call(f"{prefix}.not", [a])
+        func = _simple_function("f", [a], ir.AssignStmt(out, call, _span()))
+        assert "torch.bitwise_not(a)" in torch_codegen(func)
+
+
+def test_tile_sels_and_prelu():
+    """Selection and PReLU debug codegen must ignore scratch operands."""
+    mask = _tile_var("mask", [16, 32], DataType.UINT8)
+    src = _tile_var("src", [16, 16])
+    slope = _tile_var("slope", [16, 16])
+    sels_tmp = _tile_var("sels_tmp", [1, 32], DataType.UINT8)
+    prelu_tmp = _tile_var("prelu_tmp", [17, 32], DataType.UINT8)
+    sels_out = _tile_var("sels_out", [16, 16])
+    prelu_out = _tile_var("prelu_out", [16, 16])
+
+    sels_call = _op_call("tile.sels", [mask, src, sels_tmp, _float(-1.0)])
+    prelu_call = _op_call("tile.prelu", [src, slope, prelu_tmp])
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(sels_out, sels_call, _span()),
+            ir.AssignStmt(prelu_out, prelu_call, _span()),
+        ],
+        _span(),
+    )
+    func = _simple_function("f", [mask, src, slope, sels_tmp, prelu_tmp], body)
+
+    code = torch_codegen(func)
+
+    assert "torch.where(mask, src, -1.0)" in code
+    assert "torch.where(src > 0, src, src * slope)" in code
 
 
 def test_tile_matmul_acc():
@@ -738,6 +837,69 @@ def test_cross_core_split_merge_preserves_region_attrs():
     assert tuple(merged.shape) == (2, 4)
     assert getattr(merged, "_pypto_valid_shape", None) == (2, 3)
     assert getattr(merged, "_pypto_full_shape", None) == (2, 4)
+
+
+def test_cross_core_rebalanced_split_slices_at_the_box_but_starts_at_the_stride():
+    """`lane_stride` moves lane 1's START; the slice WIDTH stays the physical box.
+
+    A ragged boundary rebalanced onto its valid region (16-row box, 13 valid,
+    stride 7) gives both lanes the compiler's 8-row box — lane 0 rows 0-7 and
+    lane 1 rows 7-14 — with per-lane valid extents 7 and 6. Cutting at the
+    stride instead would hand the lanes 7- and 9-row payloads that no longer
+    match the tile types the IR carries.
+    """
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    set_lane = ns["_set_subblock_idx"]
+
+    tile = torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2)
+    setattr(tile, "_pypto_valid_shape", (13, 2))
+    setattr(tile, "_pypto_full_shape", (16, 2))
+
+    rt.push_to_aiv(tile, 3, 7)
+    set_lane(0)
+    lane0 = rt.pop_from_aic(3)
+    set_lane(1)
+    lane1 = rt.pop_from_aic(3)
+
+    assert tuple(lane0.shape) == (8, 2)
+    assert tuple(lane1.shape) == (8, 2)
+    # Lane 1 begins at the stride, not at the box half.
+    assert torch.equal(lane0, tile[0:8])
+    assert torch.equal(lane1, tile[7:15])
+    # clamp(13 - lane * 7, 0, 7) -> 7 and 6.
+    assert getattr(lane0, "_pypto_valid_shape", None) == (7, 2)
+    assert getattr(lane1, "_pypto_valid_shape", None) == (6, 2)
+
+
+def test_cross_core_odd_split_rejects_lanes_that_are_not_one_apart():
+    """The _ODD codes exist to say "lane 1 is one cell shorter" — enforce it."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    tile = torch.zeros(16, 2, dtype=torch.float32)
+    setattr(tile, "_pypto_valid_shape", (13, 2))
+
+    # Box partition (stride 8) over 13 valid rows gives 8 and 5.
+    with pytest.raises(ValueError, match="lanes one cell apart"):
+        rt.push_to_aiv(tile, 3)
+
+
+def test_cross_core_vector_to_cube_rejects_the_odd_codes():
+    """pto-isa has no odd Vector -> Cube transport, so the runtime refuses it."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    tile = torch.zeros(8, 2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Unsupported odd split mode for push_to_aic"):
+        rt.push_to_aic(tile, 3)
+    with pytest.raises(ValueError, match="Unsupported odd split mode for pop_from_aiv"):
+        rt.pop_from_aiv(4)
 
 
 def test_cross_core_no_split_dual_dispatch_runtime_pipe_pairing():
@@ -1202,8 +1364,8 @@ def test_tensor_fillpad_min_uses_valid_shape():
     result = _tensor_var("result", [8, 64], DataType.FP32)
     shapes = _make_tuple(_int(8), _int(64))
     offsets = _make_tuple(_int(0), _int(0))
-    valid_shapes = _make_tuple(_int(8), _int(32))
-    sliced = _op_call("tensor.slice", [src, shapes, offsets, valid_shapes])
+    valid_shape = _make_tuple(_int(8), _int(32))
+    sliced = _op_call("tensor.slice", [src, shapes, offsets, valid_shape])
     padded = _op_call("tensor.fillpad", [sliced], {"pad_value": ir.PadValue.min})
     assign = ir.AssignStmt(result, padded, _span())
     ret = ir.ReturnStmt([result], _span())
@@ -1221,21 +1383,21 @@ def test_tensor_fillpad_min_uses_valid_shape():
 
 
 # ---------------------------------------------------------------------------
-# Test: valid_shapes masking in tile.load
+# Test: valid_shape masking in tile.load
 # ---------------------------------------------------------------------------
 
 
-def test_tile_load_valid_shapes_masks_invalid():
-    """tile.load should zero out data beyond valid_shapes."""
+def test_tile_load_valid_shape_masks_invalid():
+    """tile.load should zero out data beyond valid_shape."""
     tensor = _tensor_var("t", [8, 8])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(8), _int(8))
-    valid_shapes = _make_tuple(_int(4), _int(4))
+    valid_shape = _make_tuple(_int(4), _int(4))
     tile = _tile_var("tile", [8, 8])
 
     call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     assign = ir.AssignStmt(tile, call, _span())
@@ -1256,23 +1418,23 @@ def test_tile_load_valid_shapes_masks_invalid():
     assert result[7, 7] == 0.0
 
 
-def test_tile_load_passes_valid_shapes():
-    """tile.load codegen should pass valid_shapes as 4th arg to _tile_load."""
+def test_tile_load_passes_valid_shape():
+    """tile.load codegen should pass valid_shape as 4th arg to _tile_load."""
     tensor = _tensor_var("t", [64, 64])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(32), _int(32))
-    valid_shapes = _make_tuple(_int(16), _int(16))
+    valid_shape = _make_tuple(_int(16), _int(16))
     tile = _tile_var("tile", [32, 32])
 
     call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     assign = ir.AssignStmt(tile, call, _span())
     func = _simple_function("f", [tensor], assign)
     code = torch_codegen(func)
-    # Should pass all 4 args including valid_shapes
+    # Should pass all 4 args including valid_shape
     assert "_tile_load(t, (0, 0), (32, 32), (16, 16))" in code
 
 
@@ -1303,6 +1465,61 @@ def test_variable_name_uniquing():
     assert cg._unique_name("a") == "a"
     assert cg._unique_name("a") == "a_1"
     assert cg._unique_name("a") == "a_2"
+
+
+def test_var_semantic_key_separates_unknown_span_vars():
+    """Two distinct vars must not share a key, even with no source location.
+
+    The regression this guards: keying on name/type/span merged two unknown-span
+    vars that agreed on name and type, so ``_name_of`` handed them one generated
+    name and the emitted Torch code could merge their values.
+    """
+    type_ = ir.ScalarType(DataType.INT64)
+    a = ir.Var("x", type_, ir.Span.unknown())
+    b = ir.Var("x", type_, ir.Span.unknown())
+
+    assert TorchCodegen._var_semantic_key(a) != TorchCodegen._var_semantic_key(b)
+
+
+def test_var_semantic_key_carries_no_span_coordinates():
+    """The key must not embed span coordinates at all.
+
+    An unknown span used to contribute the sentinel ("", -1, -1, -1, -1), which
+    reads as a real source location. Identity now comes from ``unique_id``, so
+    no span tuple — real or sentinel — belongs in the key.
+    """
+    var = ir.Var("x", ir.ScalarType(DataType.INT64), ir.Span("f.py", 3, 7, 3, 9))
+
+    key = TorchCodegen._var_semantic_key(var)
+
+    assert ("f.py", 3, 7, 3, 9) not in key
+    assert ("", -1, -1, -1, -1) not in key
+    assert var.unique_id in key
+
+
+def test_var_semantic_key_is_stable_across_wrappers():
+    """Two Python wrappers of one underlying Var must agree.
+
+    This is the property the key exists for: ``id(var)`` is not stable across
+    visits, so a per-wrapper identity would split one variable into two names.
+    """
+    type_ = ir.ScalarType(DataType.INT64)
+    a = ir.Var("x", type_, ir.Span.unknown())
+    add = ir.Add(a, a, DataType.INT64, ir.Span.unknown())
+    left, right = add.left, add.right
+    assert isinstance(left, ir.Var) and isinstance(right, ir.Var)
+
+    assert TorchCodegen._var_semantic_key(left) == TorchCodegen._var_semantic_key(a)
+    assert TorchCodegen._var_semantic_key(right) == TorchCodegen._var_semantic_key(a)
+
+
+def test_var_semantic_key_distinguishes_spans():
+    """Same name and type, different vars -> different keys."""
+    type_ = ir.ScalarType(DataType.INT64)
+    a = ir.Var("x", type_, ir.Span("f.py", 1, 1, 1, 2))
+    b = ir.Var("x", type_, ir.Span("f.py", 9, 1, 9, 2))
+
+    assert TorchCodegen._var_semantic_key(a) != TorchCodegen._var_semantic_key(b)
 
 
 if __name__ == "__main__":

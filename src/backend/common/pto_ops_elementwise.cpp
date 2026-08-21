@@ -14,7 +14,9 @@
  * @brief PTO codegen registration for elementwise / compute tile ops.
  */
 
+#include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -24,14 +26,18 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
-#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 #include "src/backend/common/pto_ops_internal.h"
 
 namespace pypto {
@@ -59,7 +65,6 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       // Tile x Tile binary ops
       "tile.add",
       "tile.and",
-      "tile.div",
       "tile.fmod",
       "tile.maximum",
       "tile.minimum",
@@ -77,18 +82,21 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       // Unary ops
       "tile.abs",
       "tile.exp",
-      "tile.log",
       "tile.sqrt",
-      "tile.recip",
       "tile.not",
+      "tile.prelu",
       "tile.relu",
       // Tile x Scalar ops
       "tile.adds",
+      "tile.subs",
       "tile.muls",
       "tile.divs",
       "tile.fmods",
       "tile.maximums",
       "tile.lrelu",
+      "tile.sels",
+      // Gather operands and result are linearly addressed.
+      "tile.gatherb",
       // Ternary scalar ops (Tile x Scalar x Tile)
       "tile.addsc",
       "tile.subsc",
@@ -98,9 +106,29 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
 
 // Helper function for N-ary operations (unary, binary, ternary, etc.)
 static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t arity, const CallPtr& op,
-                                      codegen::CodegenBase& codegen_base) {
+                                      codegen::CodegenBase& codegen_base,
+                                      std::optional<size_t> i32_operand_idx = std::nullopt) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, pto_op_name, arity);
+  if (i32_operand_idx.has_value()) {
+    INTERNAL_CHECK_SPAN(*i32_operand_idx < op->args_.size(), op->span_)
+        << "Internal error: " << pto_op_name << " i32 operand index " << *i32_operand_idx
+        << " is outside the " << op->args_.size() << " input operands";
+    std::vector<std::pair<std::string, std::string>> ins;
+    ins.reserve(op->args_.size());
+    for (size_t i = 0; i < op->args_.size(); ++i) {
+      const ExprPtr& arg = op->args_[i];
+      std::string operand = codegen.GetExprAsCode(arg);
+      std::string type = codegen.GetExprTypeAnnotation(arg);
+      if (i == *i32_operand_idx) {
+        operand = codegen.EmitCastToI32(arg, operand);
+        type = codegen.GetTypeString(DataType::INT32);
+      }
+      ins.emplace_back(std::move(operand), std::move(type));
+    }
+    EmitInsOuts(codegen, pto_op_name, ins);
+    return "";
+  }
   // The pto.tcolexpand* family requires materialized tile data — their hardware
   // lowering reads physical tile rows/cols from the operand type, which is
   // incorrect for a pto.subview alias.  Other tile ops (tmov, tfillpad, tadd,
@@ -145,6 +173,22 @@ static std::string MakeNaryCodegenPTO(const std::string& pto_op_name, size_t ari
   return "";
 }
 
+static std::string GemvAccPhaseAttr(const CallPtr& op) {
+  const auto acc_phase = op->GetKwarg<std::string>("acc_phase", "unspecified");
+  CHECK(acc_phase == "unspecified" || acc_phase == "partial" || acc_phase == "final")
+      << "GEMV acc_phase must be one of {unspecified, partial, final}, but got " << acc_phase;
+  if (acc_phase == "unspecified") return "";
+  return " {accPhase = #pto<acc_phase " + acc_phase + ">}";
+}
+
+static std::string MakeGemvCodegenPTO(const std::string& pto_op_name, size_t arity, const CallPtr& op,
+                                      codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, arity);
+  codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen) + GemvAccPhaseAttr(op));
+  return "";
+}
+
 static std::string MakeTileSelCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, "pto.tsel", 4);
@@ -157,8 +201,8 @@ static std::string MakeTileSelCodegenPTO(const CallPtr& op, codegen::CodegenBase
 // address before codegen (required at --pto-level=level3).
 static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 4) << "tile.transpose requires 4 arguments (src, axis0, axis1, tmp), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 4, op->span_)
+      << "tile.transpose requires 4 arguments (src, axis0, axis1, tmp), got " << op->args_.size();
 
   std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -192,8 +236,8 @@ struct SingleOperandOp {
 static std::string MakeSingleOperandCodegenPTO(const SingleOperandOp& spec, const CallPtr& op,
                                                codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << spec.ir_name << " requires 2 arguments" << spec.arg_desc << ", got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << spec.ir_name << " requires 2 arguments" << spec.arg_desc << ", got " << op->args_.size();
   const ir::ExprPtr& operand = op->args_[spec.operand_idx];
   EmitInsOuts(codegen, spec.pto_op,
               {{codegen.GetExprAsCode(operand), codegen.GetExprTypeAnnotation(operand)}});
@@ -215,6 +259,26 @@ static std::string MakeModalCodegenPTO(const std::string& pto_op_name, size_t ar
   std::string config_attr =
       std::string("{") + attr_key + " = #pto<" + attr_kind + " " + modes.at(mode) + ">}";
   codegen.Emit(pto_op_name + " " + GenerateInsOutsClause(op, codegen, config_attr));
+  return "";
+}
+
+// Emit the default PTO form without an explicit precision attribute, or append
+// the exact PTOAS enum attribute after outs(...) for high-precision mode.
+// Unlike cmp/cvt attributes, precision-op assembly formats place their
+// attr-dict after the complete ins()/outs() clause.
+static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_t arity,
+                                           const char* attr_kind, const CallPtr& op,
+                                           codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, arity);
+  const bool high_precision = op->GetKwarg<bool>("high_precision", false);
+  std::string code = pto_op_name + " " + GenerateInsOutsClause(op, codegen);
+  if (high_precision) {
+    code += " {precisionType = #pto<";
+    code += attr_kind;
+    code += " high_precision>}";
+  }
+  codegen.Emit(code);
   return "";
 }
 
@@ -243,8 +307,9 @@ static std::string MakeAssignCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                     codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "Operation:[" << pto_op_name
-                               << "] requires 2 arguments (start, shape), but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 arguments (start, shape), but got "
+      << op->args_.size();
   bool descending = op->GetKwarg<bool>("descending");
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -265,6 +330,64 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   return "";
 }
 
+// TTRI's upper/lower selector is only accepted through the generic MLIR form.
+// Shape and optional valid_shape operands are type-only and are not emitted.
+static std::string MakeTriCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
+      << "Operation:[pto.ttri] requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
+      << op->args_.size();
+  auto result_type = As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK(result_type) << "tile.tri result must be a TileType";
+  const auto* handler = codegen.GetBackendHandler();
+  INTERNAL_CHECK(handler) << "tile.tri requires a backend handler";
+  if (handler->GetPtoTargetArch() == "a2a3") {
+    CHECK_SPAN(result_type->dtype_ != DataType::INT8 && result_type->dtype_ != DataType::UINT8 &&
+                   result_type->dtype_ != DataType::BF16,
+               op->span_)
+        << "tile.tri dtype " << result_type->dtype_.ToString()
+        << " is not supported on the 'a2a3' backend; use the A5 backend";
+  }
+  const bool upper = op->GetKwarg<bool>("upper", false);
+  const std::string diagonal = codegen.GetExprAsCode(op->args_[0]);
+  const std::string diagonal_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  const std::string dst = codegen.GetCurrentResultTarget();
+  const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+
+  std::ostringstream oss;
+  oss << "\"pto.ttri\"(" << diagonal << ", " << dst << ") {upperOrLower = " << (upper ? 1 : 0)
+      << " : i32} : (" << diagonal_type << ", " << dst_type << ") -> ()";
+  codegen.Emit(oss.str());
+  return "";
+}
+
+static std::string MakeGatherbCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tgatherb", 2);
+  auto src = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(src) << "tile.gatherb src must be a Var or IterArg";
+  auto src_type = As<ir::TileType>(src->GetType());
+  INTERNAL_CHECK(src_type) << "tile.gatherb src must be a TileType";
+  const std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
+  if (const auto* subview = codegen.GetSubviewMaterialization(src_ssa)) {
+    CHECK_SPAN(subview->byte_offset_mod_32 == 0, op->span_)
+        << "tile.gatherb source subview byte offset must be provably 32-byte aligned";
+  }
+  if (src_type->memref_.has_value()) {
+    auto byte_offset = As<ir::ConstInt>((*src_type->memref_)->byte_offset_);
+    CHECK_SPAN(byte_offset, op->span_)
+        << "tile.gatherb source base byte offset must be statically known and 32-byte aligned";
+    // PtoAS memory planning deliberately keeps root-allocation offsets at the -1
+    // sentinel. Concrete offsets are assigned by the conventional planner.
+    if (byte_offset->value_ >= 0) {
+      CHECK_SPAN(byte_offset->value_ % 32 == 0, op->span_)
+          << "tile.gatherb source base byte offset must be 32-byte aligned";
+    }
+  }
+  codegen.Emit("pto.tgatherb " + GenerateInsOutsClause(op, codegen));
+  return "";
+}
+
 // Helper function for Random: emits pto.trandom.
 // IR tile.random(key0, key1, counter0..3, shape) carries the shape tuple as the
 // last arg for type deduction only; the hardware reads the destination extent
@@ -281,7 +404,7 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
 static std::string MakeRandomCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                         codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 7 || op->args_.size() == 8)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 7 || op->args_.size() == 8, op->span_)
       << "Operation:[" << pto_op_name
       << "] requires 7 or 8 arguments (key0, key1, counter0, counter1, counter2, "
          "counter3, shape, [valid_shape]), but got "
@@ -322,10 +445,136 @@ static std::string MakeRandomCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                        codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 1) << "Operation:" << pto_op_name << "] requires 1 argument, but got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << "Operation:" << pto_op_name << "] requires 1 argument, but got " << op->args_.size();
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   codegen.Emit(pto_op_name + " ins(" + src + " | !pto.partition_tensor_view<MxNxdtype>)");
+  return "";
+}
+
+static std::string MakeSelsCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tsels", 4);
+  auto mask_type = As<ir::TileType>(op->args_[0]->GetType());
+  auto src_type = As<ir::TileType>(op->args_[1]->GetType());
+  auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
+  INTERNAL_CHECK(mask_type && src_type && tmp_type);
+  const auto* handler = codegen.GetBackendHandler();
+  const bool is_a5 = handler->GetPtoTargetArch() == "a5";
+  const auto dtype = src_type->dtype_;
+  const bool supported_on_a2a3 = dtype == DataType::INT16 || dtype == DataType::UINT16 ||
+                                 dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+                                 dtype == DataType::FP16 || dtype == DataType::FP32;
+  CHECK_SPAN(supported_on_a2a3 || is_a5, op->span_)
+      << "tile.sels with integer src dtype " << src_type->dtype_.ToString()
+      << " is only supported on the 'a5' backend; A2/A3 supports 16/32-bit integers, FP16, and FP32";
+
+  auto dst_var = codegen.GetCurrentResultVar();
+  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.sels requires an assignment target";
+  auto dst_type = As<ir::TileType>(dst_var->GetType());
+  INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.sels result must be a TileType";
+
+  std::vector<std::pair<std::string_view, std::shared_ptr<const ir::TileType>>> operands = {
+      {"mask", mask_type}, {"src", src_type}, {"tmp", tmp_type}, {"dst", dst_type}};
+  std::vector<std::pair<std::string_view, ir::MemRefPtr>> regions;
+  regions.reserve(operands.size());
+  for (const auto& [name, type] : operands) {
+    INTERNAL_CHECK_SPAN(type->memref_.has_value(), op->span_)
+        << "Internal error: tile.sels " << name << " must carry a MemRef before PTO codegen";
+    regions.emplace_back(name, *type->memref_);
+  }
+  CHECK_SPAN(!ir::MemRef::MayAlias(regions[0].second, regions[3].second), op->span_)
+      << "tile.sels requires mask and dst to use non-overlapping memory regions";
+  if (!is_a5) {
+    for (const size_t other : {size_t{0}, size_t{1}}) {
+      CHECK_SPAN(!ir::MemRef::MayAlias(regions[2].second, regions[other].second), op->span_)
+          << "tile.sels on A2/A3 requires tmp not to overlap mask or src, but tmp overlaps "
+          << regions[other].first;
+    }
+  }
+  return MakeNaryCodegenPTO("pto.tsels", 4, op, codegen_base);
+}
+
+static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tprelu", 3);
+  auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+  auto slope_type = As<ir::TileType>(op->args_[1]->GetType());
+  auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
+  INTERNAL_CHECK(src_type && slope_type && tmp_type);
+
+  auto dst_var = codegen.GetCurrentResultVar();
+  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.prelu requires an assignment target";
+  auto dst_type = As<ir::TileType>(dst_var->GetType());
+  INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.prelu result must be a TileType";
+
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a5") {
+    INTERNAL_CHECK_SPAN(src_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu src must carry a MemRef before PTO codegen";
+    INTERNAL_CHECK_SPAN(slope_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu slope must carry a MemRef before PTO codegen";
+    INTERNAL_CHECK_SPAN(tmp_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu tmp must carry a MemRef before PTO codegen";
+    INTERNAL_CHECK_SPAN(dst_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu dst must carry a MemRef before PTO codegen";
+    CHECK_SPAN(!ir::MemRef::MayAlias(*src_type->memref_, *dst_type->memref_), op->span_)
+        << "tile.prelu on A5 requires dst not to overlap src";
+    CHECK_SPAN(!ir::MemRef::MayAlias(*slope_type->memref_, *dst_type->memref_), op->span_)
+        << "tile.prelu on A5 requires dst not to overlap slope";
+    EmitInsOuts(codegen, "pto.tprelu",
+                {{codegen.GetExprAsCode(op->args_[0]), codegen.GetExprTypeAnnotation(op->args_[0])},
+                 {codegen.GetExprAsCode(op->args_[1]), codegen.GetExprTypeAnnotation(op->args_[1])},
+                 {codegen.GetExprAsCode(op->args_[2]), codegen.GetExprTypeAnnotation(op->args_[2])}});
+    return "";
+  }
+
+  CHECK_SPAN(tmp_type->dtype_ == DataType::UINT8, op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp scratch, but got " << tmp_type->dtype_.ToString();
+  const auto src_valid_shape = ir::GetValidShape(src_type);
+  const auto tmp_valid_shape = ir::GetValidShape(tmp_type);
+  const auto required_rows = ir::MakeAdd(
+      src_valid_shape[0], std::make_shared<ir::ConstInt>(1, DataType::INDEX, op->span_), op->span_);
+  ir::ExprPtr required_cols;
+  if (auto const_cols = As<ir::ConstInt>(src_valid_shape[1])) {
+    required_cols =
+        std::make_shared<ir::ConstInt>((const_cols->value_ + 7) / 8, DataType::INDEX, const_cols->span_);
+  } else {
+    required_cols = ir::MakeFloorDiv(
+        ir::MakeAdd(src_valid_shape[1],
+                    std::make_shared<ir::ConstInt>(7, DataType::INDEX, src_valid_shape[1]->span_),
+                    src_valid_shape[1]->span_),
+        std::make_shared<ir::ConstInt>(8, DataType::INDEX, src_valid_shape[1]->span_),
+        src_valid_shape[1]->span_);
+  }
+  CHECK_SPAN(ir::ProveValidExtentLessEqual(required_rows, tmp_type->shape_[0]) == ir::ProofResult::kTrue,
+             op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp physical rows >= src valid rows + 1";
+  CHECK_SPAN(ir::ProveValidExtentLessEqual(required_cols, tmp_valid_shape[1]) == ir::ProofResult::kTrue,
+             op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp valid columns >= ceil(src valid columns / 8)";
+
+  std::vector<std::pair<std::string_view, std::shared_ptr<const ir::TileType>>> operands = {
+      {"src", src_type}, {"slope", slope_type}, {"tmp", tmp_type}, {"dst", dst_type}};
+  std::vector<std::pair<std::string_view, ir::MemRefPtr>> regions;
+  regions.reserve(operands.size());
+  for (const auto& [name, type] : operands) {
+    INTERNAL_CHECK_SPAN(type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu " << name << " must carry a MemRef before PTO codegen";
+    regions.emplace_back(name, *type->memref_);
+  }
+  for (size_t i = 0; i < regions.size(); ++i) {
+    for (size_t j = i + 1; j < regions.size(); ++j) {
+      CHECK_SPAN(!ir::MemRef::MayAlias(regions[i].second, regions[j].second), op->span_)
+          << "tile.prelu on A2/A3 requires src, slope, tmp, and dst to use pairwise non-overlapping "
+             "memory regions, but "
+          << regions[i].first << " overlaps " << regions[j].first;
+    }
+  }
+
+  EmitInsOuts(codegen, "pto.tprelu",
+              {{codegen.GetExprAsCode(op->args_[0]), codegen.GetExprTypeAnnotation(op->args_[0])},
+               {codegen.GetExprAsCode(op->args_[1]), codegen.GetExprTypeAnnotation(op->args_[1])},
+               {codegen.GetExprAsCode(op->args_[2]), codegen.GetExprTypeAnnotation(op->args_[2])}});
   return "";
 }
 
@@ -333,17 +582,15 @@ struct SimpleOpEntry {
   const char* op_name;
   const char* pto_op_name;
   size_t arity;
+  std::optional<size_t> i32_operand_idx = std::nullopt;
 };
 
 // clang-format off
 static const SimpleOpEntry kSimpleOps[] = {
-    // Memory operations
-    {"tile.mgather",         "pto.tmgather",         2},
     // Tile x Tile arithmetic operations
     {"tile.add",             "pto.tadd",             2},
     {"tile.sub",             "pto.tsub",             2},
     {"tile.mul",             "pto.tmul",             2},
-    {"tile.div",             "pto.tdiv",             2},
     {"tile.rem",             "pto.trem",             3},  // src0, src1, tmp
     // Tile x Tile partial-combine operations
     {"tile.part_add",        "pto.tpartadd",         2},
@@ -360,14 +607,11 @@ static const SimpleOpEntry kSimpleOps[] = {
     // Tile x Tile comparison/selection operations
     {"tile.maximum",         "pto.tmax",             2},
     {"tile.minimum",         "pto.tmin",             2},
-    {"tile.prelu",           "pto.tprelu",           2},
     // Unary operations
     {"tile.abs",             "pto.tabs",             1},
     {"tile.exp",             "pto.texp",             1},
-    {"tile.log",             "pto.tlog",             1},
     {"tile.sqrt",            "pto.tsqrt",            1},
     // tile.rsqrt is registered with a custom codegen handler below (supports 1 or 2 args).
-    {"tile.recip",           "pto.trecip",           1},
     {"tile.neg",             "pto.tneg",             1},
     {"tile.not",             "pto.tnot",             1},
     {"tile.relu",            "pto.trelu",            1},
@@ -381,11 +625,11 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.divs",            "pto.tdivs",            2},
     {"tile.rems",            "pto.trems",            3},  // src0, scalar, tmp
     {"tile.fmods",           "pto.tfmods",           2},
-    {"tile.ands",            "pto.tands",            2},
-    {"tile.ors",             "pto.tors",             2},
-    {"tile.xors",            "pto.txors",            3},  // src0, scalar, tmp
-    {"tile.shls",            "pto.tshls",            2},
-    {"tile.shrs",            "pto.tshrs",            2},
+    {"tile.ands",            "pto.tands",            2, 1},
+    {"tile.ors",             "pto.tors",             2, 1},
+    {"tile.xors",            "pto.txors",            3, 1},  // src0, scalar, tmp
+    {"tile.shls",            "pto.tshls",            2, 1},
+    {"tile.shrs",            "pto.tshrs",            2, 1},
     {"tile.maximums",        "pto.tmaxs",            2},
     {"tile.minimums",        "pto.tmins",            2},
     {"tile.lrelu",           "pto.tlrelu",           2},
@@ -413,7 +657,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.col_expand_max",  "pto.tcolexpandmax",    2},
     {"tile.col_expand_min",  "pto.tcolexpandmin",    2},
     {"tile.col_expand_expdif", "pto.tcolexpandexpdif", 2},
-    {"tile.row_expand_add",  "pto.trowexpandadd",    2},
     {"tile.row_expand_div",  "pto.trowexpanddiv",    2},
     {"tile.row_expand_mul",  "pto.trowexpandmul",    2},
     {"tile.row_expand_sub",  "pto.trowexpandsub",    2},
@@ -427,16 +670,14 @@ static const SimpleOpEntry kSimpleOps[] = {
     // Matrix multiplication operations (PipeType::M → CUBE/AIC core)
     {"tile.matmul",          "pto.tmatmul",          2},
     {"tile.matmul_mx",       "pto.tmatmul.mx",       4},
-    {"tile.matmul_mx_acc",   "pto.tmatmul.mx.acc",   5},
     {"tile.matmul_mx_bias",  "pto.tmatmul.mx.bias",  5},
-    // tile.matmul_acc and tile.gemv_acc have custom codegen (in-place accumulation)
+    // tile.matmul_acc / tile.gemv_acc / tile.matmul_mx_acc have custom codegen
+    // (in-place accumulation: ptoas requires ins(acc) == outs).
     {"tile.matmul_bias",     "pto.tmatmul.bias",     3},
-    {"tile.gemv",            "pto.tgemv",            2},
     // tile.gemv_acc has custom codegen (in-place accumulation)
-    {"tile.gemv_bias",       "pto.tgemv.bias",       3},
     // Data movement/layout operations
     {"tile.concat",          "pto.tconcat",          2},
-    // tile.move has custom codegen (no-op elision for same-space same-address moves)
+    // tile.move has custom codegen (PTOAS same-handle elision and baked-address validation)
     {"tile.move_fp",         "pto.tmov.fp",          2},
     // tile.transpose has custom codegen (MakeTileTransposeCodegenPTO): pto.ttrans needs
     // ins(%src, %tmp : tile_type, tile_type) where %tmp is a scratch workspace tile, NOT
@@ -446,7 +687,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     // would emit the tuple as a PTO operand — not what pto.textract expects.
     // Gather/scatter operations
     {"tile.gather",          "pto.tgather",          3},
-    {"tile.gatherb",         "pto.tgatherb",         2},
     // tile.scatter and tile.scatter_mask are registered with custom codegen
     // handlers below (DPS — dst is `args_[0]`, aliased to the result via
     // set_output_reuses_input(0)).
@@ -463,9 +703,10 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     if (exclude_ops.count(entry.op_name) > 0) continue;
     std::string pto_op = entry.pto_op_name;
     size_t arity = entry.arity;
+    std::optional<size_t> i32_operand_idx = entry.i32_operand_idx;
     auto reg_entry = backend.RegisterOp(entry.op_name);
-    reg_entry.f_codegen([pto_op, arity](const CallPtr& op, codegen::CodegenBase& codegen) {
-      return MakeNaryCodegenPTO(pto_op, arity, op, codegen);
+    reg_entry.f_codegen([pto_op, arity, i32_operand_idx](const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeNaryCodegenPTO(pto_op, arity, op, codegen, i32_operand_idx);
     });
     if (RequiresRowMajorLayout(entry.op_name)) {
       for (size_t i = 0; i < arity; ++i) {
@@ -475,31 +716,78 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     }
   }
 
+  if (exclude_ops.count("tile.sels") == 0) {
+    auto entry = backend.RegisterOp("tile.sels");
+    entry.f_codegen(MakeSelsCodegenPTO);
+    for (size_t i = 0; i < 4; ++i) {
+      entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    entry.set_output_layout(ir::TileLayout::row_major);
+  }
+
+  if (exclude_ops.count("tile.prelu") == 0) {
+    auto entry = backend.RegisterOp("tile.prelu");
+    entry.f_codegen(MakePreluCodegenPTO);
+    for (size_t i = 0; i < 3; ++i) {
+      entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    entry.set_output_layout(ir::TileLayout::row_major);
+  }
+
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
     if (exclude_ops.count(op_name) > 0) return;
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
 
-  // tile.move → pto.tmov with no-op elision.
-  // When MemoryReuse inserts a tile.move between two MemRefs that end up at the
-  // same physical address after AllocateMemoryAddr (e.g. acc→acc at the same Acc
-  // offset), the move is a no-op. Elide it to avoid emitting pto.tmov with
-  // unsupported same-space address pairs (fixes #1310).
+  auto register_precision_op = [&](const char* op_name, const char* pto_op_name, size_t arity,
+                                   const char* attr_kind) {
+    if (exclude_ops.count(op_name) > 0) return;
+    auto reg_entry = backend.RegisterOp(op_name);
+    reg_entry.f_codegen([pto_op = std::string(pto_op_name), arity, attr_kind = std::string(attr_kind)](
+                            const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakePrecisionCodegenPTO(pto_op, arity, attr_kind.c_str(), op, codegen);
+    });
+    for (size_t i = 0; i < arity; ++i) {
+      reg_entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    reg_entry.set_output_layout(ir::TileLayout::row_major);
+  };
+  register_precision_op("tile.div", "pto.tdiv", 2, "div_precision");
+  register_precision_op("tile.log", "pto.tlog", 1, "log_precision");
+  register_precision_op("tile.recip", "pto.trecip", 1, "recip_precision");
+
+  // tile.row_expand_add follows the PTOAS overloads with and without tmp.
+  // Its row-sensitive layout contract is validated by the IR op: the generic
+  // backend layout repair may reshape [M, 1] to [1, M], which changes semantics.
+  if (exclude_ops.count("tile.row_expand_add") == 0) {
+    auto reg_entry = backend.RegisterOp("tile.row_expand_add");
+    reg_entry.f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      const size_t arity = op->args_.size();
+      INTERNAL_CHECK_SPAN(arity == 2 || arity == 3, op->span_)
+          << "tile.row_expand_add requires 2 or 3 arguments, but got " << arity;
+      return MakeNaryCodegenPTO("pto.trowexpandadd", arity, op, codegen);
+    });
+  }
+
+  // tile.move → pto.tmov.
   //
-  // Do NOT elide when TileView layouts differ (e.g. A5 V→C ND→NZ adapt before
-  // tpush_to_aic). MemoryReuse may still co-locate the *_nz tile with the cast
-  // result at the same Vec addr; eliding then drops the real tmov and TPUSH keeps
-  // RowMajor while AIC TPOP expects Mat ColMajor — silent numerical FAIL.
+  // tile.move is registered not_inplace_safe(), so the PyPTO and DSA-RP
+  // planners must assign distinct source and destination addresses. Validate
+  // that invariant here as well: explicit MemRef bindings and hand-built IR can
+  // bypass planner-created no-alias constraints, and TMOV does not support an
+  // in-place same-address instruction.
   reg("tile.move", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "tile.move requires 1 argument, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+        << "tile.move requires 1 argument, got " << op->args_.size();
 
-    // Under memory_planner=PtoAS there is no baked address: AllocateMemoryAddr is
-    // skipped and every `byte_offset_` is still the -1 sentinel, so the offset
-    // comparison below would see `-1 == -1` and elide EVERY move — including the
-    // loop-carry write-back YieldFixupMutator inserts. There, two vars denote one
-    // buffer exactly when they collapsed onto the same tile_buf handle.
+    // Under memory_planner=PtoAS there is no baked address (AllocateMemoryAddr
+    // and the reuse-packer's not_inplace_safe gate are both skipped). A
+    // redundant loop-carry write-back that YieldFixupMutator inserts collapses
+    // onto a single tile_buf handle, and PTO codegen re-points the producer at
+    // the phi handle (#1956/#1985). Elide only that exact case — src and dst
+    // denote one handle — so we never emit an illegal same-handle pto.tmov.
     if (!codegen.EmitTileAddr()) {
       std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
       if (!src_ssa.empty() && src_ssa == codegen.GetCurrentResultTarget()) {
@@ -509,31 +797,25 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       return std::string("");
     }
 
-    auto src_var = AsVarLike(op->args_[0]);
-    auto dst_var = codegen.GetCurrentResultVar();
+    const auto src_var = AsVarLike(op->args_[0]);
+    const auto dst_var = codegen.GetCurrentResultVar();
     if (src_var && dst_var) {
-      auto src_tile = As<ir::TileType>(src_var->GetType());
-      auto dst_tile = As<ir::TileType>(dst_var->GetType());
+      const auto src_tile = As<ir::TileType>(src_var->GetType());
+      const auto dst_tile = As<ir::TileType>(dst_var->GetType());
       if (src_tile && dst_tile && src_tile->memref_.has_value() && dst_tile->memref_.has_value()) {
-        auto src_space = src_tile->GetMemorySpace();
-        auto dst_space = dst_tile->GetMemorySpace();
+        const auto src_space = src_tile->GetMemorySpace();
+        const auto dst_space = dst_tile->GetMemorySpace();
         if (src_space.has_value() && dst_space.has_value() && *src_space == *dst_space) {
-          auto src_offset = As<ir::ConstInt>((*src_tile->memref_)->byte_offset_);
-          auto dst_offset = As<ir::ConstInt>((*dst_tile->memref_)->byte_offset_);
-          if (src_offset && dst_offset && src_offset->value_ == dst_offset->value_) {
-            const auto src_view = ir::tile_view_semantics::GetEffectiveTileView(*src_tile);
-            const auto dst_view = ir::tile_view_semantics::GetEffectiveTileView(*dst_tile);
-            const bool same_layout = src_view.blayout == dst_view.blayout &&
-                                     src_view.slayout == dst_view.slayout &&
-                                     src_view.fractal == dst_view.fractal;
-            if (same_layout) {
-              // Alias the destination to the source SSA value so downstream
-              // references use the source's defined buffer, not the destination's
-              // alloc_tile (which would be unwritten after eliding the tmov).
-              codegen.SetCurrentResultBuf(codegen.GetExprAsCode(op->args_[0]));
-              return std::string("");  // no-op: same space, same address, same layout
-            }
-            // Different layout at the same address: keep pto.tmov (ND↔NZ adapt).
+          const ir::MemRefPtr& src_memref = *src_tile->memref_;
+          const ir::MemRefPtr& dst_memref = *dst_tile->memref_;
+          if (src_memref && dst_memref && src_memref->byte_offset_ && dst_memref->byte_offset_ &&
+              ir::AreExprsEqual(src_memref->byte_offset_, dst_memref->byte_offset_)) {
+            const auto const_offset = As<ir::ConstInt>(src_memref->byte_offset_);
+            const std::string address = const_offset ? "byte offset " + std::to_string(const_offset->value_)
+                                                     : "the same symbolic byte offset";
+            CHECK_SPAN(false, op->span_)
+                << "tile.move requires distinct source and destination addresses in "
+                << ir::MemorySpaceToString(*src_space) << ", but both resolve to " << address;
           }
         }
       }
@@ -594,7 +876,8 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     backend.RegisterOp("tile.rsqrt")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
           size_t arity = op->args_.size();
-          CHECK(arity == 1 || arity == 2) << "tile.rsqrt requires 1 or 2 arguments, but got " << arity;
+          INTERNAL_CHECK_SPAN(arity == 1 || arity == 2, op->span_)
+              << "tile.rsqrt requires 1 or 2 arguments, but got " << arity;
           return MakeNaryCodegenPTO("pto.trsqrt", arity, op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
@@ -608,7 +891,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     backend.RegisterOp("tile.col_sum")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
           auto& codegen = AsPto(codegen_base);
-          CHECK(op->args_.size() == 1 || op->args_.size() == 2)
+          INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
               << "tile.col_sum requires 1 or 2 arguments, but got " << op->args_.size();
           std::string config_attr = op->args_.size() == 2 ? " {isBinary = true}" : "";
           codegen.Emit("pto.tcolsum " + GenerateInsOutsClause(op, codegen, config_attr));
@@ -639,10 +922,27 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   reg("tile.assign", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeAssignCodegenPTO("pto.tassign", op, codegen);
   });
+  if (exclude_ops.count("tile.gatherb") == 0) {
+    backend.RegisterOp("tile.gatherb")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeGatherbCodegenPTO(op, codegen);
+        })
+        .set_input_layout(0, ir::TileLayout::row_major)
+        .set_input_layout(1, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
+  }
 
   reg("tile.ci", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeCiCodegenPTO("pto.tci", op, codegen);
   });
+
+  if (exclude_ops.count("tile.tri") == 0) {
+    backend.RegisterOp("tile.tri")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTriCodegenPTO(op, codegen);
+        })
+        .set_output_layout(ir::TileLayout::row_major);
+  }
 
   // tile.random (TRANDOM): output must be row_major per ISA
   if (exclude_ops.count("tile.random") == 0) {
@@ -662,10 +962,24 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   // guarantees that the output shares the MemRef of the accumulator input
   // (via set_output_reuses_input), so we use the result buffer (dst) as the
   // accumulator operand instead of the IR-level input arg.
-  auto make_acc_codegen = [](const std::string& pto_op) {
-    return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
+  //
+  // The optional `init_cond` operand (args_[3]) makes the accumulator's initial
+  // value conditional: where it holds, `dst` is overwritten with `lhs @ rhs`
+  // rather than accumulated into.  The ISA carries this as one bit of the MAD's
+  // Xt register, but the `pto.*` tile ops expose it only as the choice between
+  // the accumulating and the non-accumulating op, so a runtime predicate lowers
+  // to a branch over the two.  No phi is needed: both arms write `dst` in place.
+  // `supports_init_cond` must track the op's own type deduction: `tile.gemv_acc`
+  // still accepts exactly 3 arguments, so accepting a 4th here would only create
+  // an unreachable branch behind a `CHECK` that fires earlier in deduction.
+  auto make_acc_codegen = [](const std::string& pto_op, const std::string& init_pto_op,
+                             bool supports_init_cond) {
+    return [pto_op, init_pto_op, supports_init_cond](const ir::CallPtr& op,
+                                                     codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      CHECK(op->args_.size() == 3) << pto_op << " requires 3 arguments: acc, lhs, rhs";
+      INTERNAL_CHECK_SPAN(op->args_.size() == 3 || (supports_init_cond && op->args_.size() == 4), op->span_)
+          << pto_op << " requires 3 arguments (acc, lhs, rhs)"
+          << (supports_init_cond ? " or 4 with init_cond" : "") << ", but got " << op->args_.size();
 
       std::string dst = codegen.GetCurrentResultTarget();
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
@@ -673,18 +987,108 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
       std::string lhs_type = codegen.GetExprTypeAnnotation(op->args_[1]);
       std::string rhs_type = codegen.GetExprTypeAnnotation(op->args_[2]);
+      const std::string acc_phase = GemvAccPhaseAttr(op);
+
+      // ins() carries the accumulator only on the accumulating form; the
+      // initializing form reads lhs/rhs alone and writes dst from scratch.
+      auto build = [&](bool initializing) {
+        std::vector<std::string> operands = {lhs, rhs};
+        std::vector<std::string> types = {lhs_type, rhs_type};
+        if (!initializing) {
+          operands.insert(operands.begin(), dst);
+          types.insert(types.begin(), dst_type);
+        }
+        std::ostringstream inst;
+        inst << (initializing ? init_pto_op : pto_op) << " ins(";
+        for (size_t i = 0; i < operands.size(); ++i) {
+          if (i > 0) inst << ", ";
+          inst << operands[i];
+        }
+        // Type annotations must be all present or all absent: the `: t0, t1, ...`
+        // clause is positional, so emitting a filtered subset would bind the
+        // remaining types to the wrong operands. Mirrors make_mx_acc_codegen.
+        const bool any_type_present =
+            std::any_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
+        const bool all_types_present =
+            std::all_of(types.begin(), types.end(), [](const std::string& t) { return !t.empty(); });
+        INTERNAL_CHECK(!any_type_present || all_types_present)
+            << "Internal error: " << (initializing ? init_pto_op : pto_op)
+            << " operand type annotations must all be present or all absent, got a partial set";
+        if (all_types_present) {
+          inst << " : ";
+          for (size_t i = 0; i < types.size(); ++i) {
+            if (i > 0) inst << ", ";
+            inst << types[i];
+          }
+        }
+        inst << ") outs(" << dst;
+        if (!dst_type.empty()) inst << " : " << dst_type;
+        inst << ")" << acc_phase;
+        return inst.str();
+      };
+
+      if (op->args_.size() == 3) {
+        codegen.Emit(build(/*initializing=*/false));
+        return "";
+      }
+
+      // A literal predicate picks one arm outright; only a runtime one branches.
+      if (auto init_const = As<ir::ConstInt>(op->args_[3])) {
+        codegen.Emit(build(/*initializing=*/init_const->value_ != 0));
+        return "";
+      }
+
+      // Resolve the condition before opening the region so any instruction its
+      // evaluation emits lands outside (and so dominates) both arms.
+      std::string cond = codegen.GetExprAsCode(op->args_[3]);
+      codegen.EmitStructural("scf.if " + cond + " {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/true));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("} else {");
+      codegen.IncreaseIndent();
+      codegen.Emit(build(/*initializing=*/false));
+      codegen.DecreaseIndent();
+      codegen.EmitStructural("}");
+      return "";
+    };
+  };
+
+  // MX in-place acc (5 operands): same c_in==dst contract as make_acc_codegen,
+  // kept separate so the non-MX 3-arg helper stays untouched.
+  auto make_mx_acc_codegen = [](const std::string& pto_op) {
+    return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
+      auto& codegen = AsPto(codegen_base);
+      INTERNAL_CHECK_SPAN(op->args_.size() == 5, op->span_)
+          << pto_op << " requires 5 arguments: acc, lhs, lhs_scale, rhs, rhs_scale, but got "
+          << op->args_.size();
+
+      std::string dst = codegen.GetCurrentResultTarget();
+      INTERNAL_CHECK(!dst.empty()) << "Internal error: " << pto_op
+                                   << " Acc SSA must resolve (in-place c_in==dst)";
+      std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
 
       std::ostringstream acc_inst;
-      acc_inst << pto_op << " ins(" << dst << ", " << lhs << ", " << rhs;
-      std::vector<std::string> ins_type_parts;
-      for (const auto& t : {dst_type, lhs_type, rhs_type}) {
-        if (!t.empty()) ins_type_parts.push_back(t);
+      acc_inst << pto_op << " ins(" << dst;
+      std::vector<std::string> operand_types = {dst_type};
+      for (size_t i = 1; i < op->args_.size(); ++i) {
+        acc_inst << ", " << codegen.GetExprAsCode(op->args_[i]);
+        operand_types.push_back(codegen.GetExprTypeAnnotation(op->args_[i]));
       }
-      if (!ins_type_parts.empty()) {
+      // Type annotations must be all present or all absent; a partial set
+      // would desync the `: t0, t1, ...` clause from operand positions.
+      const bool any_type_present = std::any_of(operand_types.begin(), operand_types.end(),
+                                                [](const std::string& t) { return !t.empty(); });
+      const bool all_types_present = std::all_of(operand_types.begin(), operand_types.end(),
+                                                 [](const std::string& t) { return !t.empty(); });
+      INTERNAL_CHECK(!any_type_present || all_types_present)
+          << "Internal error: " << pto_op
+          << " operand type annotations must all be present or all absent, got a partial set";
+      if (all_types_present) {
         acc_inst << " : ";
-        for (size_t i = 0; i < ins_type_parts.size(); ++i) {
+        for (size_t i = 0; i < operand_types.size(); ++i) {
           if (i > 0) acc_inst << ", ";
-          acc_inst << ins_type_parts[i];
+          acc_inst << operand_types[i];
         }
       }
       acc_inst << ") outs(" << dst;
@@ -695,8 +1099,15 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     };
   };
 
-  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc"));
-  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc"));
+  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul", /*supports_init_cond=*/true));
+  reg("tile.gemv", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeGemvCodegenPTO("pto.tgemv", 2, op, codegen);
+  });
+  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv", /*supports_init_cond=*/false));
+  reg("tile.matmul_mx_acc", make_mx_acc_codegen("pto.tmatmul.mx.acc"));
+  reg("tile.gemv_bias", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeGemvCodegenPTO("pto.tgemv.bias", 3, op, codegen);
+  });
 }
 }  // namespace backend
 }  // namespace pypto

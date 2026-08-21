@@ -25,7 +25,7 @@ from pypto.language.parser.type_resolver import TypeResolver
 from pypto.language.typing.dynamic import DynVar
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 
 _DEFAULT_TILEVIEW_ANNOTATIONS_WITH_MEMORY = [
@@ -45,12 +45,37 @@ _NON_DEFAULT_TILEVIEW_ANNOTATION = (
 )
 
 
+def _static_shape(type_: "ir.TensorType | ir.TileType") -> list[int]:
+    """Return a Tensor/Tile type's static shape as plain ints."""
+    dims = []
+    for dim in type_.shape:
+        assert isinstance(dim, ir.ConstInt), f"expected a static dim, got {type(dim).__name__}"
+        dims.append(dim.value)
+    return dims
+
+
+def _body_assigns(func: ir.Function) -> list[ir.AssignStmt]:
+    """Return the function body's top-level AssignStmts, in source order."""
+    body = func.body
+    stmts = list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+    return [s for s in stmts if isinstance(s, ir.AssignStmt)]
+
+
 def _make_resolver(
     closure_vars: dict | None = None, scope_lookup: "Callable[[str], Any | None] | None" = None
 ) -> TypeResolver:
     """Create a TypeResolver with ExprEvaluator from closure_vars."""
     ev = ExprEvaluator(closure_vars=closure_vars or {})
     return TypeResolver(expr_evaluator=ev, scope_lookup=scope_lookup)
+
+
+def _const_ints(exprs: "Sequence[ir.Expr]") -> list[int]:
+    """Extract the compile-time integer values from a list of IR expressions."""
+    values = []
+    for expr in exprs:
+        assert isinstance(expr, ir.ConstInt), f"expected ConstInt, got {type(expr).__name__}"
+        values.append(expr.value)
+    return values
 
 
 class TestTypeResolver:
@@ -87,6 +112,24 @@ class TestTypeResolver:
 
             assert isinstance(result, ir.TensorType)
             assert result.dtype == expected_dtype
+
+    @pytest.mark.parametrize(
+        ("annotation", "expected_type"),
+        [
+            ("pl.PrefetchAsyncContext", ir.PrefetchAsyncContextType),
+            ("pl.AsyncEvent", ir.AsyncEventType),
+            ("pl.AsyncSession", ir.AsyncSessionType),
+            ("pl.PrefetchAsyncContextType", ir.PrefetchAsyncContextType),
+            ("pl.AsyncEventType", ir.AsyncEventType),
+            ("pl.AsyncSessionType", ir.AsyncSessionType),
+        ],
+    )
+    def test_resolve_prefetch_handle_wrapper_and_legacy_type_names(self, annotation, expected_type):
+        """Public wrapper names and legacy IR type aliases resolve identically."""
+        resolver = _make_resolver()
+        node = ast.parse(annotation, mode="eval").body
+
+        assert isinstance(resolver.resolve_type(node), expected_type)
 
     def test_resolve_dtype_attribute(self):
         """Test resolving dtype from attribute access."""
@@ -212,6 +255,35 @@ class TestTypeResolver:
 
         assert "pl.TileView(" in printed
         assert "valid_shape=[16, 64]" in printed
+
+    @pytest.mark.parametrize(
+        ("compact", "printed_name"),
+        [
+            (ir.CompactMode.normal, "normal"),
+        ],
+    )
+    def test_tileview_compact_mode_printer_roundtrip(self, compact, printed_name):
+        """A non-default compact mode survives Python print and parse."""
+        span = ir.Span.unknown()
+        original = ir.TileType(
+            [32, 32],
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=[32, 16], compact=compact),
+            memory_space=ir.MemorySpace.Right,
+        )
+
+        printed = ir.python_print_type(original)
+        assert f"compact=pl.CompactMode.{printed_name}" in printed
+
+        reparsed = _make_resolver().resolve_type(ast.parse(printed, mode="eval").body)
+        assert isinstance(reparsed, ir.TileType)
+        assert reparsed.tile_view is not None
+        assert reparsed.tile_view.compact == compact
+        ir.assert_structural_equal(
+            ir.Var("value", original, span),
+            ir.Var("value", reparsed, span),
+            enable_auto_mapping=True,
+        )
 
     @pytest.mark.parametrize("annotation", _DEFAULT_TILEVIEW_ANNOTATIONS)
     def test_tile_type_text_roundtrip_is_stable_after_canonicalization(self, annotation: str):
@@ -566,7 +638,12 @@ class TestDynamicShapeResolution:
         node = ast.parse("pl.Tile[[N, 64], pl.FP32]", mode="eval").body
         result = resolver.resolve_type(node)
         assert isinstance(result, ir.TileType)
+        # Dim 0 is the dynamic N; dim 1 stays the static 64
         assert isinstance(result.shape[0], ir.Var)
+        assert result.shape[0].name_hint == "N"
+        assert isinstance(result.shape[1], ir.ConstInt)
+        assert result.shape[1].value == 64
+        assert result.dtype == DataType.FP32
 
     # --- Error cases ---
 
@@ -1144,7 +1221,18 @@ class TestClosureVarsInFunctionBody:
             result: pl.Tensor[tensor_shape, dtype] = pl.tile.store(a, offsets=[0, 0], output_tensor=out)
             return result
 
-        assert isinstance(func, ir.Function)
+        # Closure shape/dtype flow into both the params and the in-body annotations
+        for param in func.params:
+            assert isinstance(param.type, ir.TensorType)
+            assert _static_shape(param.type) == [128, 128]
+            assert param.type.dtype == DataType.FP32
+
+        tile_stmt, store_stmt = _body_assigns(func)
+        assert isinstance(tile_stmt.var.type, ir.TileType)
+        assert _static_shape(tile_stmt.var.type) == [64, 64]
+        assert tile_stmt.var.type.dtype == DataType.FP32
+        assert isinstance(store_stmt.var.type, ir.TensorType)
+        assert _static_shape(store_stmt.var.type) == [128, 128]
 
     def test_shapes_kwarg_from_variable(self):
         """User passes shapes= kwarg as a closure variable (t.py pattern)."""
@@ -1158,7 +1246,10 @@ class TestClosureVarsInFunctionBody:
             result: pl.Tensor[[128, 128], pl.FP32] = pl.tile.store(a, offsets=[0, 0], output_tensor=out)
             return result
 
-        assert isinstance(func, ir.Function)
+        # The shapes= kwarg resolved to the closure's [32, 32], sizing the loaded tile
+        tile_stmt = _body_assigns(func)[0]
+        assert isinstance(tile_stmt.var.type, ir.TileType)
+        assert _static_shape(tile_stmt.var.type) == [32, 32]
 
     def test_int_kwarg_from_closure(self):
         """User passes an int kwarg (like axis) from closure."""
@@ -1171,7 +1262,12 @@ class TestClosureVarsInFunctionBody:
             result: pl.Tensor[[128, 64], pl.FP32] = pl.transpose(x, axis1=0, axis2=swap_axis)
             return result
 
-        assert isinstance(func, ir.Function)
+        # axis2 picked up the closure's 1, not a default or axis1's 0
+        call = _body_assigns(func)[0].value
+        assert isinstance(call, ir.Call)
+        axis2 = call.args[2]
+        assert isinstance(axis2, ir.ConstInt)
+        assert axis2.value == 1
 
     def test_dtype_kwarg_from_closure(self):
         """User passes dtype= kwarg from closure variable."""
@@ -1182,7 +1278,13 @@ class TestClosureVarsInFunctionBody:
             result: pl.Tensor[[64, 64], pl.FP16] = pl.cast(x, target_type=out_dtype)
             return result
 
-        assert isinstance(func, ir.Function)
+        # The dtype= closure var drove the cast's result type to FP16
+        cast_stmt = _body_assigns(func)[0]
+        assert isinstance(cast_stmt.var.type, ir.TensorType)
+        assert cast_stmt.var.type.dtype == DataType.FP16
+        param_type = func.params[0].type
+        assert isinstance(param_type, ir.TensorType)
+        assert param_type.dtype == DataType.FP32
 
     def test_full_parametrized_kernel(self):
         """Realistic pattern: fully parametrized kernel (the t.py use case)."""
@@ -1220,7 +1322,19 @@ class TestClosureVarsInFunctionBody:
                 result: pl.Tensor[shape, dtype] = pl.tile.store(a, offsets=[0, 0], output_tensor=out)
                 return result
 
-        assert isinstance(Prog, ir.Program)
+        # Closure shapes resolve the same way inside @pl.program methods
+        compute = Prog.get_function("compute")
+        assert compute is not None
+
+        tensor_types = [p.type for p in compute.params if isinstance(p.type, ir.TensorType)]
+        assert len(tensor_types) == 2
+        for tensor_type in tensor_types:
+            assert _static_shape(tensor_type) == [128, 128]
+            assert tensor_type.dtype == DataType.FP32
+
+        tile_stmt = _body_assigns(compute)[0]
+        assert isinstance(tile_stmt.var.type, ir.TileType)
+        assert _static_shape(tile_stmt.var.type) == [64, 64]
 
 
 class TestDynamicShapeEdgeCases:
@@ -1309,13 +1423,17 @@ class TestDynamicShapeEdgeCases:
             result: pl.Tensor[[128, 128], pl.FP32] = pl.tile.store(a, offsets=[0, 0], output_tensor=out)
             return result
 
-        assert isinstance(func, ir.Function)
+        # The variable-as-shape annotation sized the tile to [32, 32]
+        tile_stmt = _body_assigns(func)[0]
+        assert isinstance(tile_stmt.var.type, ir.TileType)
+        assert _static_shape(tile_stmt.var.type) == [32, 32]
+        assert tile_stmt.var.type.dtype == DataType.FP32
 
     def test_shape_variable_not_defined_raises_error(self):
         """User typos variable name — should get a clear error."""
         shape = [128, 64]  # noqa: F841 — intentionally unused; typo below
 
-        with pytest.raises(Exception, match="shaep|Cannot resolve|Unknown|undefined"):
+        with pytest.raises(NameError, match=r"shaep|Cannot resolve|Unknown|undefined"):
 
             @pl.function
             def func(x: pl.Tensor[shaep, pl.FP32]) -> pl.Tensor[shaep, pl.FP32]:  # noqa: F821
@@ -1325,7 +1443,7 @@ class TestDynamicShapeEdgeCases:
         """User accidentally passes a string as shape."""
         shape = "128x64"
 
-        with pytest.raises(Exception, match="must be a list or tuple|Failed to evaluate"):
+        with pytest.raises(ParserTypeError, match=r"must be a list or tuple|Failed to evaluate"):
 
             @pl.function
             def func(x: pl.Tensor[shape, pl.FP32]) -> pl.Tensor[shape, pl.FP32]:
@@ -1335,7 +1453,7 @@ class TestDynamicShapeEdgeCases:
         """User accidentally uses floats in shape."""
         shape = [128.0, 64.0]
 
-        with pytest.raises(Exception, match="must be int|element"):
+        with pytest.raises(ParserTypeError, match=r"must be int|element"):
 
             @pl.function
             def func(x: pl.Tensor[shape, pl.FP32]) -> pl.Tensor[shape, pl.FP32]:
@@ -1391,14 +1509,16 @@ class TestLayoutResolution:
         [
             ("pl.NZ", ir.TensorLayout.NZ),
             ("pl.ND", ir.TensorLayout.ND),
+            ("pl.MX_A_ZZ", ir.TensorLayout.MX_A_ZZ),
+            ("pl.MX_B_NN", ir.TensorLayout.MX_B_NN),
         ],
     )
     def test_resolve_tensor_with_layout(self, layout_str, expected_layout):
         """Tensor layout syntax preserves non-default layouts and canonicalizes ND.
 
-        ``pl.DN`` is covered separately by ``test_resolve_tensor_with_dn_layout_warns``
-        — it emits a ``DeprecationWarning`` (RFC #1300 supplementary 1) so we
-        verify that warning explicitly rather than swallowing it here.
+        ``pl.DN`` is covered separately by ``test_resolve_tensor_with_dn_layout_rejected``
+        — the layout-only shorthand is not an accepted annotation (RFC #1300
+        supplementary 1), so it cannot be parametrized alongside the valid ones.
         """
         resolver = _make_resolver()
         node = ast.parse(f"pl.Tensor[[64, 128], pl.FP16, {layout_str}]", mode="eval").body
@@ -1413,19 +1533,35 @@ class TestLayoutResolution:
             assert result.tensor_view is not None
             assert result.tensor_view.layout == expected_layout
 
-    def test_resolve_tensor_with_dn_layout_warns(self):
-        """``pl.Tensor[..., pl.DN]`` shorthand is deprecated (RFC #1300 supp. 1).
+    def test_resolve_tensor_with_dn_layout_rejected(self):
+        """``pl.Tensor[..., pl.DN]`` shorthand is rejected (RFC #1300 supp. 1).
 
-        The parser still resolves it to a DN-tagged TensorView for backward
-        compatibility, but emits a ``DeprecationWarning`` pointing users at
-        migration paths (drop the marker, use ``pl.transpose``, or write an
-        explicit ``pl.TensorView(stride=..., layout=DN)``).
+        The error points users at the migration paths (drop the marker, use
+        ``pl.transpose``, or write an explicit
+        ``pl.TensorView(stride=..., layout=DN)``).
         """
         resolver = _make_resolver()
         node = ast.parse("pl.Tensor[[64, 128], pl.FP16, pl.DN]", mode="eval").body
 
-        with pytest.warns(DeprecationWarning, match="pl.DN"):
-            result = resolver.resolve_type(node)
+        with pytest.raises(ParserTypeError, match=r"pl\.Tensor\[\.\.\., pl\.DN\] is not supported"):
+            resolver.resolve_type(node)
+
+    def test_resolve_tensor_with_dn_layout_via_variable_rejected(self):
+        """A DN layout held in a variable is rejected, quoted by its source spelling."""
+        resolver = _make_resolver({"MY_LAYOUT": ir.TensorLayout.DN})
+        node = ast.parse("pl.Tensor[[64, 128], pl.FP16, MY_LAYOUT]", mode="eval").body
+
+        with pytest.raises(ParserTypeError, match=r"pl\.Tensor\[\.\.\., MY_LAYOUT\] is not supported"):
+            resolver.resolve_type(node)
+
+    def test_resolve_tensor_with_dn_tensor_view_accepted(self):
+        """An explicit DN ``pl.TensorView`` stays valid — only the shorthand is gone."""
+        resolver = _make_resolver()
+        node = ast.parse(
+            "pl.Tensor[[64, 128], pl.FP16, pl.TensorView(stride=[1, 64], layout=pl.DN)]",
+            mode="eval",
+        ).body
+        result = resolver.resolve_type(node)
 
         assert isinstance(result, ir.TensorType)
         assert result.tensor_view is not None
@@ -1439,6 +1575,9 @@ class TestLayoutResolution:
 
         assert isinstance(result, ir.TensorType)
         assert result.tensor_view is None
+        # Omitting the layout must not disturb the shape or dtype
+        assert _static_shape(result) == [64, 128]
+        assert result.dtype == DataType.FP16
 
     def test_resolve_tensor_layout_invalid(self):
         """Invalid layout raises ParserTypeError."""
@@ -1476,6 +1615,24 @@ class TestLayoutResolution:
         assert result.tensor_view is not None
         assert result.tensor_view.layout == ir.TensorLayout.NZ
 
+    def test_bare_layout_name_wins_over_shadowing_closure_view(self):
+        """`NZ` is the layout even when a closure variable of that name holds a view.
+
+        Layout names took precedence over closure variables before views were
+        reachable by name; resolving views by name must not change that.
+        """
+        resolver = _make_resolver(
+            closure_vars={"NZ": ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)}
+        )
+        node = ast.parse("pl.Tensor[[64, 128], pl.FP16, NZ]", mode="eval").body
+        result = resolver.resolve_type(node)
+
+        assert isinstance(result, ir.TensorType)
+        tv = result.tensor_view
+        assert tv is not None
+        assert tv.layout == ir.TensorLayout.NZ
+        assert len(tv.stride) == 0
+
     def test_resolve_layout_from_closure(self):
         """Layout from closure variable."""
         resolver = _make_resolver(closure_vars={"my_layout": ir.TensorLayout.NZ})
@@ -1493,6 +1650,55 @@ class TestLayoutResolution:
 
         with pytest.raises(ParserTypeError, match="must be a TensorLayout"):
             resolver.resolve_type(node)
+
+    def test_unknown_bare_layout_hint_omits_dn(self):
+        """A bad bare layout must not be told to try ``pl.DN`` — the slot rejects it.
+
+        The hint is the user's next move, so pointing at DN would walk them from
+        this error straight into the DN rejection.
+        """
+        resolver = _make_resolver()
+        node = ast.parse("pl.Tensor[[64, 128], pl.FP16, pl.INVALID]", mode="eval").body
+
+        with pytest.raises(ParserTypeError) as exc_info:
+            resolver.resolve_type(node)
+
+        hint = exc_info.value.hint
+        assert hint is not None
+        assert "pl.DN" not in hint
+        assert "pl.NZ" in hint
+
+    def test_unknown_tensorview_layout_hint_keeps_dn(self):
+        """Inside pl.TensorView(layout=...) DN is legal, so the hint still offers it."""
+        resolver = _make_resolver()
+        node = ast.parse(
+            "pl.Tensor[[64, 128], pl.FP16, pl.TensorView(stride=[128, 1], layout=pl.INVALID)]",
+            mode="eval",
+        ).body
+
+        with pytest.raises(ParserTypeError) as exc_info:
+            resolver.resolve_type(node)
+
+        hint = exc_info.value.hint
+        assert hint is not None
+        assert "pl.DN" in hint
+
+    def test_resolve_layout_closure_tensorview_accepted(self):
+        """A closure TensorView is a valid slot-3 value, not a rejected layout (issue #2211).
+
+        Sibling of test_resolve_layout_closure_invalid_type: slot 3 takes either a
+        TensorLayout or a TensorView, so only the former's rejection is a real error.
+        """
+        resolver = _make_resolver(
+            closure_vars={"my_view": ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)}
+        )
+        node = ast.parse("pl.Tensor[[64, 128], pl.FP16, my_view]", mode="eval").body
+        result = resolver.resolve_type(node)
+
+        assert isinstance(result, ir.TensorType)
+        tv = result.tensor_view
+        assert tv is not None
+        assert _const_ints(tv.stride) == [128, 1]
 
     def test_resolve_tensor_layout_with_dynamic_shape(self):
         """Layout works with dynamic shapes."""
@@ -1599,10 +1805,12 @@ class TestLayoutIntegration:
         [
             (pl.ND, ir.TensorLayout.ND),
             (pl.NZ, ir.TensorLayout.NZ),
+            (pl.MX_A_ZZ, ir.TensorLayout.MX_A_ZZ),
+            (pl.MX_B_NN, ir.TensorLayout.MX_B_NN),
         ],
     )
     def test_parametrized_layout(self, layout, expected):
-        """pytest.mark.parametrize with layout (non-deprecated layouts only)."""
+        """pytest.mark.parametrize with layout (every layout the bare slot accepts)."""
 
         @pl.function
         def func(
@@ -1618,26 +1826,34 @@ class TestLayoutIntegration:
             assert param_type.tensor_view is not None
             assert param_type.tensor_view.layout == expected
 
-    def test_function_with_dn_layout_warns(self):
-        """@pl.function with ``pl.DN`` shorthand emits ``DeprecationWarning``.
+    def test_function_with_dn_param_layout_rejected(self):
+        """@pl.function rejects the ``pl.DN`` shorthand (RFC #1300 supplementary 1).
 
-        Backwards-compatible — the layout still resolves to DN — but the
-        shorthand is deprecated (RFC #1300 supplementary 1). Users should
-        drop the marker, derive DN at use site via ``pl.transpose``, or
-        write an explicit ``pl.TensorView(stride=..., layout=DN)``.
+        Users should drop the marker, derive DN at use site via
+        ``pl.transpose``, or write an explicit
+        ``pl.TensorView(stride=..., layout=DN)``.
         """
-        with pytest.warns(DeprecationWarning, match="pl.DN"):
+        with pytest.raises(ParserTypeError, match=r"pl\.Tensor\[\.\.\., pl\.DN\] is not supported"):
 
             @pl.function
             def func(
                 x: pl.Tensor[[16, 1], pl.FP16, pl.DN],
-            ) -> pl.Tensor[[16, 1], pl.FP16, pl.DN]:
+            ) -> pl.Tensor[[16, 1], pl.FP16]:
                 return x
 
-        param_type = func.params[0].type
-        assert isinstance(param_type, ir.TensorType)
-        assert param_type.tensor_view is not None
-        assert param_type.tensor_view.layout == ir.TensorLayout.DN
+    def test_function_with_dn_return_layout_rejected(self):
+        """The return annotation is checked too, not just the parameters.
+
+        A parameter carrying DN aborts decoration before the return annotation
+        is ever resolved, so that path needs its own case.
+        """
+        with pytest.raises(ParserTypeError, match=r"pl\.Tensor\[\.\.\., pl\.DN\] is not supported"):
+
+            @pl.function
+            def func(
+                x: pl.Tensor[[16, 1], pl.FP16],
+            ) -> pl.Tensor[[16, 1], pl.FP16, pl.DN]:
+                return x
 
 
 class TestValidateAnnotationConsistency:
@@ -1734,7 +1950,10 @@ class TestTensorViewResolution:
         result = resolver.resolve_type(node)
 
         assert isinstance(result, ir.TensorType)
+        # An all-default TensorView canonicalizes away entirely
         assert result.tensor_view is None
+        assert _static_shape(result) == [64, 128]
+        assert result.dtype == DataType.FP32
 
     def test_resolve_tensor_with_tensorview_valid_shape(self):
         """TensorView with valid_shape creates correct tensor_view."""
@@ -1903,8 +2122,95 @@ class TestTensorViewResolution:
         result = resolver.resolve_type(node)
 
         assert isinstance(result, ir.TensorType)
+        # The all-default TensorView canonicalizes away, but the MemRef survives
         assert result.tensor_view is None
         assert result.memref is not None
+        # byte_offset_ is a ConstInt Expr, so `== 0` would build a truthy Eq node
+        # rather than compare -- read through .value.
+        assert isinstance(result.memref.byte_offset_, ir.ConstInt)
+        assert result.memref.byte_offset_.value == 0
+        assert result.memref.size_ == 256  # a plain int, so `==` is a real compare
+        assert _static_shape(result) == [64, 128]
+        assert result.dtype == DataType.FP32
+
+    def test_tensorview_from_closure(self):
+        """A variable holding an ir.TensorView is accepted in slot 3 (issue #2211)."""
+        strided = ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)
+        resolver = _make_resolver(closure_vars={"STRIDED": strided})
+        node = ast.parse("pl.Tensor[[32, 64], pl.FP32, STRIDED]", mode="eval").body
+        result = resolver.resolve_type(node)
+
+        assert isinstance(result, ir.TensorType)
+        tv = result.tensor_view
+        assert tv is not None
+        assert tv.layout == ir.TensorLayout.ND
+        assert _const_ints(tv.stride) == [128, 1]
+
+    def test_tensorview_from_closure_matches_inline(self):
+        """The closure form resolves identically to the same view written inline."""
+        strided = ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)
+        inline_src = "pl.Tensor[[32, 64], pl.FP32, pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)]"
+
+        from_closure = _make_resolver(closure_vars={"STRIDED": strided}).resolve_type(
+            ast.parse("pl.Tensor[[32, 64], pl.FP32, STRIDED]", mode="eval").body
+        )
+        from_inline = _make_resolver().resolve_type(ast.parse(inline_src, mode="eval").body)
+        assert isinstance(from_closure, ir.TensorType)
+        assert isinstance(from_inline, ir.TensorType)
+
+        span = ir.Span.unknown()
+        assert ir.structural_equal(
+            ir.Var("value", from_closure, span),
+            ir.Var("value", from_inline, span),
+            enable_auto_mapping=True,
+        )
+
+    def test_tensorview_from_closure_not_aliased_between_annotations(self):
+        """One closure view reused by several annotations must not alias between them.
+
+        TensorType stores the view by value, so mutating one resolved type's view
+        must leave the other — and the closure variable itself — untouched.
+        """
+        strided = ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)
+        resolver = _make_resolver(closure_vars={"STRIDED": strided})
+        ann = ast.parse("pl.Tensor[[32, 64], pl.FP32, STRIDED]", mode="eval").body
+
+        first = resolver.resolve_type(ann)
+        second = resolver.resolve_type(ann)
+        assert isinstance(first, ir.TensorType)
+        assert isinstance(second, ir.TensorType)
+        first_view, second_view = first.tensor_view, second.tensor_view
+        assert first_view is not None
+        assert second_view is not None
+
+        first_view.layout = ir.TensorLayout.NZ
+        assert second_view.layout == ir.TensorLayout.ND
+        assert strided.layout == ir.TensorLayout.ND
+
+    def test_tensorview_from_closure_four_args(self):
+        """A closure TensorView also works in the 4-arg [.., view, memref] form."""
+        strided = ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)
+        resolver = _make_resolver(closure_vars={"STRIDED": strided})
+        node = ast.parse("pl.Tensor[[32, 64], pl.FP32, STRIDED, pl.MemRef(0, 256, 1)]", mode="eval").body
+        result = resolver.resolve_type(node)
+
+        assert isinstance(result, ir.TensorType)
+        assert result.memref is not None
+        tv = result.tensor_view
+        assert tv is not None
+        assert _const_ints(tv.stride) == [128, 1]
+
+    def test_tensorview_from_closure_distributed_tensor(self):
+        """DistributedTensor shares the slot-3 resolution path."""
+        strided = ir.TensorView(stride=[128, 1], layout=ir.TensorLayout.ND)
+        resolver = _make_resolver(closure_vars={"STRIDED": strided})
+        node = ast.parse("pl.DistributedTensor[[32, 64], pl.FP32, STRIDED]", mode="eval").body
+        result = resolver.resolve_type(node)
+
+        assert isinstance(result, ir.DistributedTensorType)
+        tv = result.tensor_view
+        assert tv is not None
+        assert _const_ints(tv.stride) == [128, 1]
 
 
 class TestTensorViewIntegration:

@@ -16,15 +16,15 @@ implementations of:
   assemble into ``ChipCallable``, locate runtime binaries.
 - :func:`execute_on_device`: Run a ``ChipCallable`` on device via ``ChipWorker``.
 - :func:`validate_golden`: Compare actual outputs against golden reference.
-- :func:`ensure_pto_isa_root`: Manage PTO-ISA repository (clone/checkout).
 
 These functions keep orchestration in PyPTO while relying on the installed
 runtime packages for two integration surfaces:
 
 - ``simpler`` provides the ``_task_interface`` nanobind C++ module.
 - ``simpler_setup`` provides the kernel compiler plus packaged runtime sources,
-  binaries, and ``pto_isa.pin`` for non-source installs. In a source checkout,
-  those assets come from the ``runtime/`` git submodule instead.
+  binaries, and ``pto_isa.pin`` for non-source installs, and owns the only
+  PTO-ISA resolver. In a source checkout, those assets come from the
+  ``runtime/`` git submodule instead.
 """
 
 from __future__ import annotations
@@ -47,17 +47,22 @@ from typing import Any
 import torch
 
 from pypto._external_source import kernel_binary_cache_path
+from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
-from .elf_parser import extract_text_section
+from ._binary_cache import (
+    BinaryCacheContext,
+    binary_context_lock,
+    prepare_binary_context,
+    record_binary_context,
+)
+from .elf_parser import elf_build_id_64, extract_text_section
 from .kernel_compiler import KernelCompiler
+from .pto_isa import ensure_pto_isa_root
 from .task_interface import (
     CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
-    ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
     Worker,  # pyright: ignore[reportAttributeAccessIssue]
-    make_tensor_arg,  # pyright: ignore[reportAttributeAccessIssue]
-    scalar_to_uint64,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
 logger = logging.getLogger(__name__)
@@ -124,223 +129,93 @@ def _kernel_cache_file(
     )
 
 
+def _clean_git_revision(repo_root: Path) -> tuple[bool, str | None]:
+    """Return ``(is_checkout, HEAD)`` when *repo_root* is a clean checkout.
+
+    ``is_checkout`` remains true for a dirty or unreadable checkout. Callers use
+    that distinction to avoid falling back to packaged revision metadata that
+    does not describe the source files which will actually be compiled.
+    """
+    if not (repo_root / ".git").exists():
+        return False, None
+    try:
+        revision_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        status_result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=normal"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True, None
+
+    revision = revision_result.stdout.strip()
+    if (
+        revision_result.returncode != 0
+        or status_result.returncode != 0
+        or not revision
+        or status_result.stdout.strip()
+    ):
+        return True, None
+    return True, revision
+
+
+def _runtime_revision(compiler: KernelCompiler) -> str | None:
+    """Return the runtime source/build revision used by *compiler*."""
+    project_root = getattr(compiler, "project_root", None)
+    if project_root is not None:
+        is_checkout, revision = _clean_git_revision(Path(project_root))
+        if is_checkout:
+            return revision
+
+    # Wheels carry the runtime sources under simpler_setup/_assets without a
+    # .git directory. The runtime binding embeds the source commit at build time
+    # so the wheel still has a stable compatibility identity.
+    try:
+        task_interface = import_module("_task_interface")
+    except ImportError:
+        return None
+    revision = getattr(task_interface, "__build_commit__", "")
+    return revision.strip() if isinstance(revision, str) and revision.strip() else None
+
+
+def _current_binary_context(
+    compiler: KernelCompiler,
+    *,
+    platform: str,
+    runtime_name: str,
+    pto_isa_root: str,
+) -> BinaryCacheContext | None:
+    """Build the compatibility identity for generated binary reuse."""
+    runtime_revision = _runtime_revision(compiler)
+    _, pto_isa_revision = _clean_git_revision(Path(pto_isa_root))
+    if runtime_revision is None or pto_isa_revision is None:
+        return None
+    return BinaryCacheContext(
+        platform=platform,
+        runtime_name=runtime_name,
+        runtime_revision=runtime_revision,
+        pto_isa_revision=pto_isa_revision,
+    )
+
+
 # ---------------------------------------------------------------------------
 # PTO-ISA management
 # ---------------------------------------------------------------------------
 
-_PTO_ISA_HTTPS = "https://github.com/hw-native-sys/pto-isa.git"
-_PTO_ISA_SSH = "git@github.com:hw-native-sys/pto-isa.git"
-_PTO_ISA_HTTPS_FALLBACK = "https://gitcode.com/luohuan40/pto-isa.git"
-_PTO_ISA_SSH_FALLBACK = "git@gitcode.com:luohuan40/pto-isa.git"
-_PTO_ISA_PRIMARY_CLONE_TIMEOUT = 60
-_PTO_ISA_FALLBACK_CLONE_TIMEOUT = 300
-_PROJECT_ROOT = Path(__file__).parents[3]
-_PTO_ISA_PIN_PATH = _PROJECT_ROOT / "runtime" / "pto_isa.pin"
-
-
-def _get_pto_isa_clone_path() -> Path:
-    """Return the default path where PTO-ISA is cloned."""
-    return _PROJECT_ROOT / "build_output" / "_deps" / "pto-isa"
-
-
-def _get_runtime_pto_isa_pin_path() -> Path:
-    """Locate the runtime pin in a source checkout or installed runtime package."""
-    if _PTO_ISA_PIN_PATH.parent.is_dir():
-        return _PTO_ISA_PIN_PATH
-
-    try:
-        runtime_root = getattr(import_module("simpler_setup.environment"), "PROJECT_ROOT")
-    except (ImportError, AttributeError):
-        return _PTO_ISA_PIN_PATH
-    return Path(runtime_root) / "pto_isa.pin"
-
-
-def _read_runtime_pto_isa_pin() -> str | None:
-    """Return the runtime's pinned PTO-ISA commit, or ``None`` when unavailable."""
-    pin_path = _get_runtime_pto_isa_pin_path()
-    try:
-        commit = pin_path.read_text(encoding="utf-8").strip()
-    except OSError as e:
-        logger.warning(
-            f"Failed to read runtime PTO-ISA pin at {pin_path}: {e}; falling back to the latest remote HEAD"
-        )
-        return None
-
-    if not commit:
-        logger.warning(f"Runtime PTO-ISA pin at {pin_path} is empty; falling back to the latest remote HEAD")
-        return None
-    return commit
-
-
-def _clone_pto_isa(clone_path: Path, primary_url: str, fallback_url: str) -> bool:
-    """Clone pto-isa, trying *primary_url* first with a short timeout.
-
-    Returns:
-        ``True`` if the clone succeeded (based on return code), ``False`` otherwise.
-    """
-    clone_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        result = subprocess.run(
-            ["git", "clone", primary_url, str(clone_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_PTO_ISA_PRIMARY_CLONE_TIMEOUT,
-        )
-        if result.returncode == 0:
-            return True
-    except subprocess.TimeoutExpired:
-        logger.warning(
-            f"Cloning pto-isa from {primary_url} timed out after "
-            f"{_PTO_ISA_PRIMARY_CLONE_TIMEOUT}s; falling back to {fallback_url}"
-        )
-    except Exception as e:
-        logger.warning(f"Cloning pto-isa from {primary_url} failed: {e}; falling back to {fallback_url}")
-
-    # Clean up any partial clone before retrying with the fallback.
-    if clone_path.exists():
-        shutil.rmtree(clone_path, ignore_errors=True)
-    try:
-        result = subprocess.run(
-            ["git", "clone", fallback_url, str(clone_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_PTO_ISA_FALLBACK_CLONE_TIMEOUT,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
-            return False
-    except Exception as e:
-        logger.warning(f"Failed to clone pto-isa: {e}")
-        return False
-    return True
-
-
-def ensure_pto_isa_root(clone_protocol: str = "https") -> str | None:
-    """Ensure ``PTO_ISA_ROOT`` is available, either from env or by cloning.
-
-    Args:
-        clone_protocol: ``"https"`` or ``"ssh"``.
-
-    Returns:
-        PTO-ISA root path if successful, ``None`` otherwise.
-    """
-    existing_root = os.environ.get("PTO_ISA_ROOT")
-    if existing_root:
-        return existing_root
-
-    resolved_commit = _read_runtime_pto_isa_pin()
-    clone_path = _get_pto_isa_clone_path()
-    include_dir = clone_path / "include"
-
-    if not (clone_path.exists() and include_dir.exists() and include_dir.is_dir()):
-        if clone_protocol == "https":
-            primary_url, fallback_url = _PTO_ISA_HTTPS, _PTO_ISA_HTTPS_FALLBACK
-        else:
-            primary_url, fallback_url = _PTO_ISA_SSH, _PTO_ISA_SSH_FALLBACK
-        if not _clone_pto_isa(clone_path, primary_url, fallback_url):
-            return None
-        if resolved_commit and not _checkout_pto_isa_commit(clone_path, resolved_commit):
-            return None
-    elif resolved_commit:
-        if not _checkout_pto_isa_commit(clone_path, resolved_commit):
-            return None
-    else:
-        _update_pto_isa_to_latest(clone_path)
-
-    if not include_dir.exists():
-        return None
-
-    resolved = str(clone_path.resolve())
-    os.environ["PTO_ISA_ROOT"] = resolved
-    return resolved
-
-
-def _checkout_pto_isa_commit(clone_path: Path, commit: str) -> bool:
-    """Checkout *commit* and verify that the managed clone resolves to it."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=5,
-        )
-        current = result.stdout.strip()
-        target = subprocess.run(
-            ["git", "rev-parse", f"{commit}^{{commit}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=5,
-        )
-        target_revision = target.stdout.strip() if target.returncode == 0 else ""
-        if not target_revision or current != target_revision:
-            subprocess.run(
-                ["git", "fetch", "origin"],
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=30,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "checkout", commit],
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=30,
-                check=True,
-            )
-            target_revision = subprocess.run(
-                ["git", "rev-parse", f"{commit}^{{commit}}"],
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=5,
-            ).stdout.strip()
-        checked_out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=5,
-        ).stdout.strip()
-        if checked_out != target_revision:
-            logger.warning(f"Failed to verify pto-isa commit {commit}: HEAD is {checked_out or 'unknown'}")
-            return False
-        return True
-    except (OSError, subprocess.SubprocessError) as e:
-        logger.warning(f"Failed to checkout pto-isa commit {commit}: {e}")
-        return False
-
-
-def _update_pto_isa_to_latest(clone_path: Path) -> None:
-    """Fetch and reset existing clone to the remote default branch."""
-    try:
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=30,
-            check=True,
-        )
-        subprocess.run(
-            ["git", "reset", "--hard", "origin/HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=30,
-            check=True,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to update pto-isa to latest: {e}")
+# Re-exported from ``.pto_isa`` so this module keeps its historical entry point
+# and so tests can monkey-patch the name used by ``_compile_and_assemble_locked``
+# below. The implementation lives there because resolving the pin must not
+# require the Simpler-backed ``task_interface`` extension this module imports.
 
 
 # ---------------------------------------------------------------------------
@@ -477,8 +352,158 @@ def compile_single_orchestration(
 # compile_and_assemble
 # ---------------------------------------------------------------------------
 
+# ``hid`` (ELF Build-ID 64 of an orchestration ``.so``, lowercase hex) → that
+# orchestration's display name (see ``callable_display_name``). The runtime
+# identifies a callable in its ``[STRACE]`` timing markers by this hash alone (it
+# never emits a name), so recording the pairing at assemble time is what lets
+# ``pypto.runtime.benchmark`` label a measured dispatch readably. Process-wide and
+# append-only: ``hid`` is content-derived, so two entries can only collide when
+# the ``.so`` bytes are identical — in which case the name is identical too.
+_CALLABLE_NAMES: dict[str, str] = {}
+
+
+def callable_display_name(orchestration: dict[str, Any]) -> str:
+    """A human-readable, per-program name for an ``ORCHESTRATION`` manifest entry.
+
+    The manifest's ``function_name`` is the fixed AICPU entry symbol the runtime
+    dlsym's — ``aicpu_orchestration_entry`` for *every* program — so it cannot
+    tell two callables apart. The generated source file is named after the
+    orchestration itself (``orchestration/prefill_fwd.cpp``, and for an L3 build
+    its ``next_levels/<name>/`` directory matches), so its stem is the
+    distinguishing name. Falls back to ``function_name`` if ``source`` is absent.
+    """
+    source = orchestration.get("source")
+    return Path(source).stem if source else str(orchestration.get("function_name", ""))
+
+
+def register_callable_identity(orch_so: bytes, name: str) -> str:
+    """Record ``hid → name`` for an orchestration ``.so`` and return the hid.
+
+    *orch_so* must be the exact buffer handed to the runtime (the same bytes it
+    hashes in ``record_device_orch_callable``), so the computed hid matches the
+    ``hid=`` field of that callable's ``[STRACE]`` markers.
+
+    Args:
+        orch_so: Complete orchestration shared-object bytes.
+        name: Display name for the callable — see :func:`callable_display_name`.
+
+    Returns:
+        The callable's hid — :func:`~pypto.runtime.elf_parser.elf_build_id_64`
+        formatted as lowercase hex, matching the marker wire format.
+    """
+    hid = f"{elf_build_id_64(orch_so):x}"
+    _CALLABLE_NAMES.setdefault(hid, name)
+    return hid
+
+
+def callable_name(hid: str) -> str | None:
+    """The orchestration's display name for *hid*, or ``None`` if unknown.
+
+    Returns ``None`` when the callable was not assembled in this process, or on a
+    ``*sim`` platform: the sim host seeds the marker hid with the runtime's
+    ``callable_id`` rather than the ELF Build-ID, so marker hids do not match the
+    hashes recorded here.
+    """
+    return _CALLABLE_NAMES.get(hid.lower())
+
+
+def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
+    """Explain why a build output has no runtime manifest."""
+    config_path = work_dir / "kernel_config.py"
+    kernels_dir = work_dir / "kernels"
+    raw_pto_count = sum(1 for _ in kernels_dir.rglob("*.pto"))
+    if raw_pto_count == 0:
+        return FileNotFoundError(
+            f"Cannot execute PyPTO artifact '{work_dir}': required '{config_path}' is missing.\n"
+            f"No raw .pto kernel files were found under '{kernels_dir}' either. This directory "
+            "cannot be loaded as a single-chip PyPTO artifact; it may be incomplete or use a "
+            "different build layout.\n"
+            "Recompile the program and inspect any earlier codegen error."
+        )
+
+    ptoas_root = os.environ.get("PTOAS_ROOT")
+    configuration_step: str | None = None
+    if ptoas_root:
+        ptoas_path = Path(ptoas_root) / "ptoas"
+        if ptoas_path.is_file() and os.access(ptoas_path, os.X_OK):
+            environment_status = (
+                f"ptoas is now available at '{ptoas_path}', but this artifact was generated "
+                "without it and must be recompiled."
+            )
+        else:
+            environment_status = (
+                f"PTOAS_ROOT is set to '{ptoas_root}', but the expected executable "
+                f"'{ptoas_path}' does not exist or is not executable."
+            )
+            configuration_step = (
+                "Correct or remove the invalid PTOAS_ROOT setting:\n"
+                "       export PTOAS_ROOT=/path/to/ptoas-bin\n"
+                "     Or use a ptoas executable from PATH instead:\n"
+                "       unset PTOAS_ROOT\n"
+                "       export PATH=/path/to/ptoas-bin:$PATH\n"
+                "     On a managed PyPTO development machine, reset the invalid override first:\n"
+                "       unset PTOAS_ROOT\n"
+                '       eval "$(pypto-setup --export)"'
+            )
+    else:
+        ptoas_path = shutil.which("ptoas")
+        if ptoas_path:
+            environment_status = (
+                f"ptoas is now available on PATH at '{ptoas_path}', but this artifact was "
+                "generated without it and must be recompiled."
+            )
+        else:
+            environment_status = "PTOAS_ROOT is not set and 'ptoas' was not found on PATH."
+            configuration_step = (
+                "Configure ptoas with one of these options:\n"
+                "       export PTOAS_ROOT=/path/to/ptoas-bin\n"
+                "     Or:\n"
+                "       export PATH=/path/to/ptoas-bin:$PATH\n"
+                "     On a managed PyPTO development machine, run:\n"
+                '       eval "$(pypto-setup --export)"'
+            )
+
+    recovery_steps = []
+    if configuration_step is not None:
+        recovery_steps.append(configuration_step)
+    recovery_steps.extend(
+        [
+            "Restart the Python process and rerun the program so the artifact is recompiled.",
+            "If calling ir.compile() directly, use skip_ptoas=False.",
+        ]
+    )
+    recovery_text = "\n".join(f"  {index}. {step}" for index, step in enumerate(recovery_steps, start=1))
+
+    return FileNotFoundError(
+        f"Cannot execute PyPTO artifact '{work_dir}': required '{config_path}' was not generated.\n"
+        "Reason:\n"
+        f"  Found {raw_pto_count} raw .pto kernel file(s) under '{kernels_dir}'.\n"
+        "  This is a compile-only artifact produced with skip_ptoas=True. That mode intentionally "
+        "omits kernel_config.py and cannot be executed. @pl.jit selects it automatically when "
+        "ptoas is unavailable.\n"
+        "PTOAS check:\n"
+        f"  {environment_status}\n"
+        f"How to fix:\n{recovery_text}"
+    )
+
 
 def compile_and_assemble(
+    work_dir: Path,
+    platform: str,
+) -> tuple[ChipCallable, str, dict[str, Any]]:
+    """Compile and assemble one chip artifact under a work-directory lock.
+
+    Serializing the complete cache transaction prevents concurrent callers
+    from pairing a context stamp with binaries produced for another runtime or
+    platform.
+    """
+    if not (work_dir / "kernel_config.py").exists():
+        raise _missing_kernel_config_error(work_dir)
+    with binary_context_lock(work_dir):
+        return _compile_and_assemble_locked(work_dir, platform)
+
+
+def _compile_and_assemble_locked(
     work_dir: Path,
     platform: str,
 ) -> tuple[ChipCallable, str, dict[str, Any]]:
@@ -497,14 +522,21 @@ def compile_and_assemble(
         callable, the runtime name (e.g. ``"tensormap_and_ringbuffer"``),
         and the full ``RUNTIME_CONFIG`` dict loaded from
         ``kernel_config.py``. Callers can read defaults such as
-        ``block_dim`` / ``aicpu_thread_num`` from ``runtime_config`` —
-        keys are only present when the producer of the artifact opted
-        to bake them in.
+        ``aicpu_thread_num`` from ``runtime_config`` — keys are only
+        present when the producer of the artifact opted to bake them in.
+
+    Raises:
+        FileNotFoundError: If ``kernel_config.py`` is missing. Compile-only
+            artifacts include the detected ptoas configuration and recovery
+            steps in the error.
+
+    Notes:
+        The caller must hold :func:`binary_context_lock` for *work_dir*.
     """
     # Load kernel_config.py
     config_path = work_dir / "kernel_config.py"
     if not config_path.exists():
-        raise FileNotFoundError(f"kernel_config.py not found in {work_dir}")
+        raise _missing_kernel_config_error(work_dir)
 
     spec = importlib.util.spec_from_file_location("_kernel_config", str(config_path))
     if spec is None or spec.loader is None:
@@ -517,19 +549,47 @@ def compile_and_assemble(
     runtime_config = getattr(kernel_config, "RUNTIME_CONFIG", {})
     # Default to the runtime that ``pto_backend`` bakes into every generated
     # ``kernel_config.py``; only legacy / hand-written configs omit the key.
-    runtime_name = runtime_config.get("runtime", "tensormap_and_ringbuffer")
+    runtime_name = runtime_config.get("runtime", runtime_kind_to_name(RuntimeKind.TENSORMAP_AND_RINGBUFFER))
 
-    # Ensure PTO-ISA root
-    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
-    if pto_isa_root is None:
-        raise OSError(
-            "PTO_ISA_ROOT could not be resolved.\n"
-            "Please set it to the PTO-ISA root directory, e.g.:\n"
-            "  export PTO_ISA_ROOT=/path/to/pto-isa"
-        )
+    # Resolve the pinned PTO-ISA checkout (raises with an actionable message
+    # when the pin cannot be honoured).
+    pto_isa_root = ensure_pto_isa_root()
 
     # Create compiler
     compiler = KernelCompiler(platform=platform)
+
+    # Generated binaries include runtime and PTO-ISA headers. A runtime bump can
+    # therefore make both cache/*.bin and source-adjacent .so/.o files ABI
+    # incompatible even though their paths did not change. Validate the whole
+    # sub-build before the first cache lookup; legacy artifacts have no stamp and
+    # are rebuilt once.
+    binary_context = _current_binary_context(
+        compiler,
+        platform=platform,
+        runtime_name=runtime_name,
+        pto_isa_root=pto_isa_root,
+    )
+    invalidated = prepare_binary_context(work_dir, binary_context)
+    if invalidated:
+        if binary_context is None:
+            logger.warning(
+                "Could not determine the current Simpler/PTO-ISA revision; invalidated %d cached "
+                "PyPTO binary file(s) under %s and will rebuild from generated C++",
+                invalidated,
+                work_dir,
+            )
+        else:
+            logger.info(
+                "Cached PyPTO binaries under %s have no matching build context for "
+                "runtime %s@%s, platform %s, PTO-ISA %s; invalidated %d file(s) and "
+                "will rebuild from generated C++",
+                work_dir,
+                runtime_name,
+                binary_context.runtime_revision[:12],
+                platform,
+                binary_context.pto_isa_revision[:12],
+                invalidated,
+            )
 
     # --- Parallel compilation ---
 
@@ -587,12 +647,23 @@ def compile_and_assemble(
 
     # Assemble ChipCallable
     orch_sig = orchestration.get("signature", [])
+    func_name = orchestration["function_name"]
     chip_callable = ChipCallable.build(
         signature=orch_sig,
-        func_name=orchestration["function_name"],
+        func_name=func_name,
         binary=orch_so_binary,
         children=kernel_binaries,
     )
+    # ``orch_so_binary`` is the buffer the runtime hashes into the ``hid=`` of this
+    # callable's [STRACE] markers; pair it with the per-program display name (NOT
+    # ``func_name``, the shared AICPU entry symbol) so benchmark timing can be
+    # attributed to a readable orchestration rather than an opaque hash.
+    register_callable_identity(orch_so_binary, callable_display_name(orchestration))
+
+    # A stamp denotes a complete, successfully assembled binary set. Do not
+    # write it earlier: a failed kernel/orchestration compile must leave the
+    # partial cache untrusted on the next attempt.
+    record_binary_context(work_dir, binary_context)
 
     return chip_callable, runtime_name, runtime_config
 
@@ -604,16 +675,16 @@ def compile_and_assemble(
 
 def execute_on_device(  # noqa: PLR0913
     chip_callable: ChipCallable,
-    orch_args: ChipStorageTaskArgs,
+    orch_args: list[Any],
     platform: str,
     runtime_name: str,
     device_id: int,
     *,
     level: int = 2,
-    block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
+    enable_sdma: bool = False,
     output_prefix: str | None = None,
-    enable_l2_swimlane: bool = False,
+    enable_chip_swimlane: int | bool = 0,
     enable_dump_args: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
@@ -631,7 +702,9 @@ def execute_on_device(  # noqa: PLR0913
 
     Args:
         chip_callable: Assembled callable (orchestration + kernels).
-        orch_args: Tensor/scalar arguments.
+        orch_args: Ordered host tensors, worker-owned tensors, and scalar
+            arguments. They are converted to the runtime's address-free
+            ``TaskArgs`` only after the owning Worker is known.
         platform: Target execution platform (e.g. ``"a2a3sim"``).
         runtime_name: Runtime implementation name (e.g. ``"tensormap_and_ringbuffer"``).
         device_id: NPU device index.
@@ -639,30 +712,23 @@ def execute_on_device(  # noqa: PLR0913
             supported; passing any other value raises ``ValueError``. The
             parameter exists so callers can plumb level through ahead of L3
             user-API support.
-        block_dim: Number of logical SPMD blocks to dispatch. ``None``
-            (default) leaves the field unset on the underlying
-            ``ChipCallConfig``, so the simpler runtime's own default
-            (``ChipCallConfig::block_dim = 0``, the "auto" sentinel)
-            applies — DeviceRunner resolves it at ``run()`` time to the
-            max the AICore stream allows (``aclrtGetStreamResLimit`` on
-            onboard, ``PLATFORM_MAX_BLOCKDIM`` on sim). Any positive
-            value is taken as an explicit cap and validated against the
-            same stream-resource limits; over-capacity requests are
-            rejected with a clear error
-            (``max_block_dim=... cube=... vector=...``). Callers that
-            know the kernel's required block count should pass it
-            explicitly rather than relying on auto-resolution.
         aicpu_thread_num: Number of AICPU threads. ``None`` leaves the
             field unset and uses the simpler runtime default.
+        enable_sdma: Whether the worker must provision the SDMA workspace
+            required by prefetch artifacts. Defaults to ``False`` for legacy,
+            hand-built, and non-prefetch callables.
         output_prefix: Directory under which the runtime writes diagnostic
-            artifacts (``l2_swimlane_records.json`` / ``args_dump/`` /
+            artifacts (``chip_swimlane_records.json`` / ``args_dump/`` /
             ``pmu.csv`` / ``deps.json`` / ``scope_stats/``). Required
             whenever any ``enable_*`` DFX flag is set — Simpler's
             ``CallConfig::validate()`` would otherwise reject the call.
             Passing it with all flags off creates no artefacts.
-        enable_l2_swimlane: Capture per-task L2 perf records
-            (``l2_swimlane_records.json``). Mirrors runtime's
-            ``--enable-l2-swimlane`` pytest flag.
+        enable_chip_swimlane: Chip swimlane collection **level** for the
+            per-task perf records (``chip_swimlane_records.json``). ``0`` off;
+            ``1`` AICore timing; ``2`` plus AICPU dispatch / finish; ``3`` plus
+            scheduler phases; ``4`` plus orchestrator phases. ``True`` requests
+            the full level (``4``), matching the runtime harness's bare
+            ``--enable-chip-swimlane``.
         enable_dump_args: Per-task argument dump level into
             ``<output_prefix>/args_dump/``. ``0`` off; ``1`` partial
             (only ``pl.dump_tag`` / ``dumps=`` marked tensors); ``2`` full
@@ -686,7 +752,7 @@ def execute_on_device(  # noqa: PLR0913
         ``None``. The dispatch writes device results back into the host
         tensors in *orch_args* in place; per-run timing is no longer
         returned — read it from the runtime's ``[STRACE]`` log markers
-        (simpler PR #1177) or the L2 swimlane records instead.
+        (simpler PR #1177) or the chip swimlane records instead.
 
     Raises:
         ValueError: If ``level != 2`` (L3 not yet exposed), or any DFX flag
@@ -698,13 +764,23 @@ def execute_on_device(  # noqa: PLR0913
             f"L3 execution is not yet exposed at the pypto user-API layer."
         )
 
+    from .runner import _normalize_swimlane_level  # noqa: PLC0415
+
+    # Validate the level here too, so both entry points reject an out-of-range
+    # request identically instead of letting the CallConfig setter clamp it.
+    enable_chip_swimlane = _normalize_swimlane_level(enable_chip_swimlane, "enable_chip_swimlane")
+
     any_dfx = (
-        enable_l2_swimlane or enable_dump_args > 0 or enable_pmu > 0 or enable_dep_gen or enable_scope_stats
+        enable_chip_swimlane > 0
+        or enable_dump_args > 0
+        or enable_pmu > 0
+        or enable_dep_gen
+        or enable_scope_stats
     )
     if any_dfx and not output_prefix:
         raise ValueError(
             "execute_on_device: output_prefix is required when any DFX flag "
-            "(enable_l2_swimlane / enable_dump_args / enable_pmu / enable_dep_gen / "
+            "(enable_chip_swimlane / enable_dump_args / enable_pmu / enable_dep_gen / "
             "enable_scope_stats) is enabled — runtime CallConfig::validate() would "
             "otherwise reject the call."
         )
@@ -712,15 +788,14 @@ def execute_on_device(  # noqa: PLR0913
     from .worker import ChipWorker as _PyptoWorker  # noqa: PLC0415
 
     cfg = CallConfig()
-    if block_dim is not None:
-        cfg.block_dim = block_dim
     if aicpu_thread_num is not None:
         cfg.aicpu_thread_num = aicpu_thread_num
-    # CallConfig nanobind setters: ``enable_l2_swimlane`` / ``enable_dep_gen``
-    # take `bool`; ``enable_pmu`` is a raw ``int32_t`` (0 disabled, >0 event
-    # type); ``enable_dump_args`` is a dump level (0 off, 1 partial, 2 full)
-    # — the setter also accepts a bool (True→1 partial, False→0).
-    cfg.enable_l2_swimlane = enable_l2_swimlane
+    # CallConfig nanobind setters: ``enable_chip_swimlane`` accepts a bool or
+    # level, while ``enable_dep_gen`` takes `bool`; ``enable_pmu`` is a raw
+    # ``int32_t`` (0 disabled, >0 event type); ``enable_dump_args`` is a dump
+    # level (0 off, 1 partial, 2 full) whose setter also accepts a bool
+    # (True→1 partial, False→0).
+    cfg.enable_chip_swimlane = enable_chip_swimlane
     cfg.enable_dump_args = enable_dump_args
     cfg.enable_pmu = enable_pmu
     cfg.enable_dep_gen = enable_dep_gen
@@ -729,22 +804,40 @@ def execute_on_device(  # noqa: PLR0913
         cfg.output_prefix = output_prefix
 
     env = runtime_env or {}
-    active = _PyptoWorker.current(level=level, platform=platform, device_id=device_id, runtime=runtime_name)
+    active = _PyptoWorker.current(
+        level=level,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime_name,
+        require_sdma=enable_sdma,
+    )
     with _temporary_env(env):
         if active is not None:
-            active._run_chip(chip_callable, orch_args, cfg)
+            from .runner import _coerced_to_orch_args  # noqa: PLC0415
+
+            wire_args = _coerced_to_orch_args(orch_args, active._impl)
+            active._run_chip(chip_callable, wire_args, cfg)
             return
-        worker = Worker(level=level, device_id=device_id, platform=platform, runtime=runtime_name)
+        worker = Worker(
+            level=level,
+            device_id=device_id,
+            platform=platform,
+            runtime=runtime_name,
+            enable_sdma=enable_sdma,
+        )
         # Prewarm with this dispatch's own config so the single run below hits the
         # prebuilt runtime-arena cache instead of paying the ~800ms cold build
         # inside the timed dispatch. No-op without a prebuilt arena.
         worker.init(prewarm_config=cfg)
         try:
+            from .runner import _coerced_to_orch_args  # noqa: PLC0415
+
+            wire_args = _coerced_to_orch_args(orch_args, worker)
             # Simpler's L2 ABI now dispatches by callable id (see runtime PR #710);
             # register the callable, run it, then close — close() runs finalize()
             # so explicit unregister is unnecessary here.
             cid = worker.register(chip_callable)
-            worker.run(cid, orch_args, cfg)
+            worker.run(cid, wire_args, cfg)
         finally:
             worker.close()
 
@@ -765,7 +858,7 @@ def validate_golden(
     Positions where the golden holds ``NaN`` are treated as *don't-care* and are
     excluded from the comparison. Tests use this to mark output regions that the
     kernel leaves undefined by contract — e.g. the area outside a tile's
-    ``valid_shapes``, or an oversized scratch buffer's unused tail. (The runtime
+    ``valid_shape``, or an oversized scratch buffer's unused tail. (The runtime
     no longer zero-fills pure-output buffers, so such regions hold pooled-allocator
     garbage rather than 0.) A golden with no ``NaN`` compares every element, so this
     is fully backward-compatible.
@@ -810,15 +903,16 @@ def validate_golden(
 # Tensor argument construction
 # ---------------------------------------------------------------------------
 
-# Return type for build_orch_args_from_inputs.
-_OrchArgsTuple = tuple[ChipStorageTaskArgs, dict[str, Any], dict[str, torch.Tensor], dict[str, torch.Tensor]]
+# Return type for build_orch_args_from_inputs. The first element deliberately
+# remains unmaterialized until execute_on_device has selected its owning Worker.
+_OrchArgsTuple = tuple[list[Any], dict[str, Any], dict[str, torch.Tensor], dict[str, torch.Tensor]]
 
 
 def _collect_orch_args(
     items: list[tuple[str, torch.Tensor | ctypes._SimpleCData]],
     is_output: Callable[[str], bool],
 ) -> _OrchArgsTuple:
-    """Shared logic for building ``ChipStorageTaskArgs`` from ``(name, value)`` pairs.
+    """Normalize ordered ``(name, value)`` pairs for worker-owned packing.
 
     Args:
         items: Ordered ``(name, value)`` pairs.  Each value is either a
@@ -827,9 +921,11 @@ def _collect_orch_args(
             output to be validated.
 
     Returns:
-        ``(orch_args, all_tensors, inputs, outputs)``.
+        ``(orch_args, all_tensors, inputs, outputs)``. ``orch_args`` is an
+        ordered Python list; :func:`execute_on_device` turns it into
+        address-free ``TaskArgs`` after selecting the Worker.
     """
-    orch_args = ChipStorageTaskArgs()
+    orch_args: list[Any] = []
     all_tensors: dict[str, Any] = {}
     inputs: dict[str, torch.Tensor] = {}
     outputs: dict[str, torch.Tensor] = {}
@@ -837,14 +933,14 @@ def _collect_orch_args(
     for name, val in items:
         if isinstance(val, torch.Tensor):
             val = val.cpu().contiguous()
-            orch_args.add_tensor(make_tensor_arg(val))
+            orch_args.append(val)
             all_tensors[name] = val
             if is_output(name):
                 outputs[name] = val
             else:
                 inputs[name] = val
         elif isinstance(val, ctypes._SimpleCData):
-            orch_args.add_scalar(scalar_to_uint64(val))
+            orch_args.append(val)
             all_tensors[name] = val.value
 
     return orch_args, all_tensors, inputs, outputs
@@ -854,7 +950,7 @@ def build_orch_args_from_inputs(
     inputs_result: list[tuple[str, Any]],
     output_names: set[str],
 ) -> _OrchArgsTuple:
-    """Build ``ChipStorageTaskArgs`` from pre-generated ``(name, value)`` tuples.
+    """Normalize pre-generated ``(name, value)`` tuples for device dispatch.
 
     This variant is used by the test harness path where inputs come from
     ``golden.py``'s ``generate_inputs()`` function rather than ``TensorSpec``.

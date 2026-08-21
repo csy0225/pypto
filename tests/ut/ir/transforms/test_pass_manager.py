@@ -11,10 +11,8 @@
 
 import os
 
-import pypto.language as pl
 import pytest
-from pypto import DataType, backend, ir, passes
-from pypto.backend import BackendType
+from pypto import DataType, ir, passes
 
 TENSOR_ONLY_PASSES = [
     "OutlineHierarchyScopes",
@@ -35,9 +33,11 @@ TENSOR_OPTIMIZATION_PASSES = [
     *TENSOR_ONLY_PASSES,
     "LowerCompositeOps",
     "FlattenTileNdTo2D",
+    "LegalizeTileCast",
     "AutoTileMatmulL0",
     "CanonicalizeTileSlice",
     "InferTileMemorySpace",
+    "InsertMxScaleAddr",
     "ResolveBackendOpLayouts",
     "LowerAutoVectorSplit",
     "ExpandMixedKernel",
@@ -46,6 +46,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "StampTfreeSplit",
     "NormalizeReturnOrder",
     "SkewCrossCorePipeline",
+    "LowerPipelineToSlots",
     "LowerPipelineLoops",
     "CanonicalizeIOOrder",
     "MaterializeTensorStrides",
@@ -65,68 +66,9 @@ TENSOR_OPTIMIZATION_PASSES = [
     "Simplify",
     "MaterializeRuntimeScopes",
     "ClassifyIterArgCarry",
+    "InsertCommFence",
+    "MaterializeValidShapeSymbols",
 ]
-
-DEBUG_TILE_OPTIMIZATION_PASSES = [
-    "InlineFunctions",
-    "UnrollLoops",
-    "CtrlFlowTransform",
-    "ConvertToSSA",
-    "Simplify",
-    "NormalizeStmtStructure",
-    "FlattenCallExpr",
-    "LowerCompositeOps",
-    "FlattenTileNdTo2D",
-    "AutoTileMatmulL0",
-    "CanonicalizeTileSlice",
-    "InferTileMemorySpace",
-    "ResolveBackendOpLayouts",
-    "LowerAutoVectorSplit",
-    "ExpandMixedKernel",
-    "InjectGMPipeBuffer",
-    "SplitVectorKernel",
-    "StampTfreeSplit",
-    "NormalizeReturnOrder",
-    "SkewCrossCorePipeline",
-    "LowerPipelineLoops",
-    "CanonicalizeIOOrder",
-    "MaterializeTensorStrides",
-    "InitMemRef",
-    "MaterializeSemanticAliases",
-    "MemoryReuse",
-    "AllocateMemoryAddr",
-    "FoldNoOpReshape",
-    "FuseCreateAssembleToSlice",
-    "DeriveCallDirections",
-    "AutoDeriveTaskDependencies",
-    "ExpandManualPhaseFence",
-    "SynthesizeAllReduceSignals",
-    "MaterializeCommDomainScopes",
-    "LowerHostTensorCollectives",
-    "MaterializeDistTensorCtx",
-    "Simplify",
-    "MaterializeRuntimeScopes",
-    "ClassifyIterArgCarry",
-]
-
-
-def _build_tile_only_program():
-    @pl.program
-    class TileOnlyProgram:
-        @pl.function(type=pl.FunctionType.InCore)
-        def kernel(
-            self,
-            a: pl.Tensor[[16, 16], pl.FP32],
-            b: pl.Tensor[[16, 16], pl.FP32],
-            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
-        ) -> pl.Tensor[[16, 16], pl.FP32]:
-            tile_a = pl.load(a, [0, 0], [16, 16])
-            tile_b = pl.load(b, [0, 0], [16, 16])
-            result = pl.add(tile_a, tile_b)
-            out = pl.store(result, [0, 0], out)
-            return out
-
-    return TileOnlyProgram
 
 
 class TestOptimizationStrategy:
@@ -135,15 +77,6 @@ class TestOptimizationStrategy:
     def test_optimization_strategy_values(self):
         """Test that all optimization strategies exist."""
         assert ir.OptimizationStrategy.Default is not None
-        assert ir.OptimizationStrategy.DebugTileOptimization is not None
-
-    def test_optimization_strategy_values_are_different(self):
-        """Test that optimization strategies have different values."""
-        strategies = [
-            ir.OptimizationStrategy.Default,
-            ir.OptimizationStrategy.DebugTileOptimization,
-        ]
-        assert len(strategies) == len(set(strategies))
 
 
 class TestPassManagerBasics:
@@ -156,13 +89,12 @@ class TestPassManagerBasics:
         assert pm.strategy == ir.OptimizationStrategy.Default
         assert pm.pass_names == TENSOR_OPTIMIZATION_PASSES
 
-    def test_pass_manager_get_strategy_debug_tile_optimization(self):
-        """Test getting DebugTileOptimization strategy PassManager."""
-        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.DebugTileOptimization)
-        assert pm is not None
-        assert pm.strategy == ir.OptimizationStrategy.DebugTileOptimization
-        assert pm.pass_names == DEBUG_TILE_OPTIMIZATION_PASSES
-        assert not set(TENSOR_ONLY_PASSES).intersection(pm.pass_names)
+    def test_pass_manager_rejects_unknown_strategy(self):
+        """An unsupported strategy value raises instead of silently running Default."""
+        with pytest.raises(ValueError, match="Unsupported optimization strategy"):
+            # Deliberately ill-typed: the guard exists for values the type system
+            # rules out, so exercising it requires stepping outside the annotation.
+            ir.PassManager.get_strategy("NotAStrategy")  # type: ignore[arg-type]
 
     def test_auto_scope_deps_switch_forwarded_to_pass_factory(self, monkeypatch):
         """PassManager forwards the high-level AUTO-scope deps switch."""
@@ -224,19 +156,6 @@ class TestPassManagerExecution:
         assert pm.strategy == ir.OptimizationStrategy.Default
         assert result is not program
         assert func.name == "test_func"
-
-    def test_tile_strategies_run_on_tile_only_program(self):
-        """Test tile-only strategies on an already-tiled program."""
-        program = _build_tile_only_program()
-
-        backend.reset_for_testing()
-        backend.set_backend_type(BackendType.Ascend910B)
-        tile_result = ir.PassManager.get_strategy(ir.OptimizationStrategy.DebugTileOptimization).run_passes(
-            program
-        )
-
-        assert isinstance(tile_result, ir.Program)
-        assert tile_result.name == program.name
 
 
 class TestPassManagerMultipleInstances:
@@ -353,6 +272,20 @@ class TestPassManagerPlannerGate:
         with pytest.raises(RuntimeError, match="memory_planner"):
             pm.run_passes(self._trivial_program())
 
+    def test_construct_pypto_run_dsa_rp_raises(self):
+        """A pipeline built for legacy PyPTO cannot silently switch to DSA-RP."""
+        pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            with pytest.raises(RuntimeError, match="memory_planner"):
+                pm.run_passes(self._trivial_program())
+
+    def test_construct_dsa_rp_run_pypto_raises(self):
+        """A pipeline built for DSA-RP cannot silently switch to legacy PyPTO."""
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            pm = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+        with pytest.raises(RuntimeError, match="memory_planner"):
+            pm.run_passes(self._trivial_program())
+
     def test_construct_and_run_same_planner_ok(self):
         """Matched planner at construction and run -> the guard does not fire (both the
         default PYPTO and an explicit PTOAS context)."""
@@ -361,6 +294,9 @@ class TestPassManagerPlannerGate:
         with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
             pm_ptoas = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
             pm_ptoas._check_planner_consistency()  # PTOAS == PTOAS, no raise
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.DSA_RP):
+            pm_dsa_rp = ir.PassManager.get_strategy(ir.OptimizationStrategy.Default)
+            pm_dsa_rp._check_planner_consistency()  # DSA_RP == DSA_RP, no raise
 
 
 class TestPassManagerDumpIR:

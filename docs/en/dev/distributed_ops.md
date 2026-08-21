@@ -9,23 +9,19 @@ storage is a slice of a symmetric, per-rank communication window allocated by
 `pld.alloc_window_buffer`. Verifiers in this family generally reject plain
 `TensorType` (strict kind-trait matching — `As<DistributedTensorType>` does
 not match a plain `TensorType`), so a non-window-bound tensor can never be fed
-into a cross-rank slot by accident. **Two documented exceptions:**
-`pld.tensor.put` (and its lowered `pld.tile.put`) accepts a plain `Tensor` on
-the `src` side via `AsTensorTypeLike` — TPUT only needs a readable local GM
-region for the source, so kernels can push directly from host-backed inputs
-without first staging through a window buffer; `dst` still requires a
-window-bound `DistributedTensor`.
-`pld.tensor.get` (and its lowered `pld.tile.get`) accepts a plain `Tensor` on
-the `dst` side via `AsTensorTypeLike` — TGET only needs a writable local GM
-region to receive into, so kernels can TGET directly into host-backed output
-tensors; `src` still requires a window-bound `DistributedTensor`.
+into a cross-rank slot by accident. **Two documented exceptions**, both matched
+via `AsTensorTypeLike` and detailed under Namespacing below: `put`/`tile.put`
+accept a plain `Tensor` as `src`, and `get`/`tile.get` accept one as `dst` —
+TPUT/TGET only need a readable/writable *local* GM region on that side. The
+window-bound side (`put.dst`, `get.src`) still requires a `DistributedTensor`.
 
-There are **twelve ops** and **four ABI enums**:
+There are **fifteen ops** and **four ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
 | `pld.tile.remote_load` | pull (read peer → local tile) | `TileType` | TLOAD |
 | `pld.tile.remote_store` | push (write local tile → peer) | `Unknown` (side effect) | TSTORE |
+| `pld.tensor.remote_store` | push (write local tensor-level value → peer); lowered 1:1 to `pld.tile.remote_store` | `Unknown` (side effect) | TSTORE |
 | `pld.tensor.get` | pull (read peer → local GM) | `Unknown` (side effect) | TGET |
 | `pld.tensor.put` | push (write local → peer) | `Unknown` (side effect) | TPUT |
 | `pld.tensor.allreduce` | collective reduce over window slices | `DistributedTensorType` (same as src) | builtin collective |
@@ -34,10 +30,12 @@ There are **twelve ops** and **four ABI enums**:
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes the full MAX_RECV-row block per destination into a flat 2D staging window (transfer size is the full per-destination capacity block), and publishes `min(send_counts[dest], MAX_RECV)` into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver can skip rows beyond its count; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
+| `pld.system.defer_wait` | defer this task's logical completion on a local counter | `Unknown` (side effect) | Simpler completion runtime (no PTOAS wait op) |
 
-The five side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
+The seven side-effect-only ops produce [`UnknownType`](ir/02-types.md): they
 exist for their cross-rank effect, not for an SSA value a consumer reads.
 
 ## Namespacing: why `tile.*` vs `tensor.*` vs `system.*`
@@ -49,37 +47,77 @@ The namespace encodes the IR level the op lives at, not an arbitrary grouping:
 - **`pld.tile.remote_store`** consumes a *tile* (the symmetric write companion
   of `remote_load`), so it is a sibling of `tile.store` and lives in
   `pld.tile`.
-- **`pld.tensor.get`** reads and writes *tensor* (GM) operands — `dst` may be a
-  window-bound `DistributedTensor` or a plain `Tensor` (TGET only needs a
-  writable local GM region to receive into) while `src` must be a window-bound
-  `DistributedTensor` (the peer needs a window slot to read from). The VEC
-  staging tile that TGET bounces through is materialised by
-  `ConvertTensorToTileOps` as an internal `pld.tile.get`, never on the DSL
-  surface. It is therefore a sibling of `pld.tensor.alloc_window_buffer` /
-  `pld.tensor.window`, **not** of the tile-producing `remote_load`.
-- **`pld.tensor.put`** reads and writes *tensor* (GM) operands — `dst` is a
-  window-bound `DistributedTensor` (the peer needs a window slot to receive
-  into) while `src` accepts either a window-bound `DistributedTensor` or a
-  plain `Tensor` (TPUT only needs a readable local GM region on the source
-  side). The VEC staging tile that TPUT bounces through is materialised by
-  `ConvertTensorToTileOps` as an internal `pld.tile.put`, never on the DSL
-  surface. It is therefore a sibling of `pld.tensor.alloc_window_buffer` /
-  `pld.tensor.window`, **not** of the tile-producing `remote_load`.
-- **`pld.system.notify` / `pld.system.wait`** drive the per-rank signal slot —
-  pure control-plane synchronisation with no data operand — so they live in
-  `pld.system`.
+- **`pld.tensor.remote_store`** is the same op one IR level up — it consumes a
+  *tensor-level* value, so it lives in `pld.tensor` and `ConvertTensorToTileOps`
+  lowers it 1:1 to `pld.tile.remote_store`. This is the `tensor.aiv_shard` /
+  `tile.aiv_shard` shape (**one op, two levels, one identical argument
+  surface**), and it is why the tensor-level push is a separate entry point
+  rather than an overload of `pld.tensor.put`: dispatching `put` on the kind of
+  its `src` would make five of its arguments (`src_offsets`, `shape`, `atomic`,
+  `chunk_*`, `pipeline`) conditionally meaningless depending on how the value
+  was produced upstream — a property invisible at the call site.
+- **`pld.tensor.get` / `pld.tensor.put`** read and write *tensor* (GM) operands
+  on both sides. The window-bound side is the one the peer needs a slot for
+  (`get.src`, `put.dst`); the local side (`get.dst`, `put.src`) also accepts a
+  plain `Tensor`, so kernels can TGET into / TPUT from host-backed tensors
+  without staging through a window buffer. The VEC staging tile they bounce
+  through is materialised by `ConvertTensorToTileOps` as an internal
+  `pld.tile.get` / `pld.tile.put`, never on the DSL surface. Both are therefore
+  siblings of `pld.tensor.alloc_window_buffer` / `pld.tensor.window`, **not** of
+  the tile-producing `remote_load`.
+- **`pld.system.notify` / `pld.system.wait` / `pld.system.defer_wait`** drive
+  the per-rank signal slot — pure control-plane synchronisation with no data
+  operand — so they live in `pld.system`. `wait` blocks and later resumes its
+  kernel; `defer_wait` returns and transfers readiness to the scheduler TaskId.
+
+## Core placement in a mixed kernel
+
+`ExpandMixedKernel` splits a mixed InCore function into an AIC and an AIV
+function using `core_affinity::ClassifyCallAffinity`. Statements that classify
+`SHARED` are **duplicated onto both lanes**, so every distributed op has to be
+explicit about two independent questions: *which* core may run it, and *how many
+times* it may run.
+
+| Op | Affinity | Why |
+| -- | -------- | --- |
+| `pld.tile.put` / `pld.tensor.put`, `pld.tile.get` / `pld.tensor.get` | `VECTOR` (declared) | TPUT/TGET stream GM → UB → remote GM through a VEC staging tile; ptoas enforces it (`verifyCommStagingTileLike` requires `AddressSpace::VEC`). The tile forms would classify VECTOR incidentally via their staging-tile operand; the tensor forms have no tile operand and would otherwise be duplicated onto the cube lane |
+| `pld.tile.remote_store` | derived: VECTOR | Inherits VECTOR from its source tile operand via the first-tile-argument rule |
+| `pld.tile.remote_load` | `SHARED` (**known gap**) | Its tile is the *result*, not an argument, and it declares no memory spec — so both memory rules miss it and it reaches the `SHARED` fallback, which `ExpandMixedKernel` replicates onto both lanes. Benign today: the cube copy produces a `Vec` tile no cube statement consumes, so DCE removes it. Not fixed by declaring VECTOR (a false ISA claim — the destination could be a cube-side buffer) nor by classifying from the result tile: `LowerAutoVectorSplit` treats a VECTOR-affine leaf as "halve this", and the halving path has no rewrite for the op's `offsets` / `shape` tuples. A real fix teaches the halving path about the op |
+| `pld.system.notify` / `pld.system.wait` | `SHARED` (deliberately undeclared) | Their pto-isa implementations are pure scalar/GM (`st_atomic`, `dcci`, `dsb`) and ptoas imposes no core or section constraint — pto-isa's own cube-built `allgather_gemm_compute_kernel.cpp` calls TWAIT. Declaring VECTOR here would be a false claim about the ISA |
+
+`pld.system.notify` additionally carries the registry's `set_no_duplicate()`
+flag — for **both** `NotifyOp` forms. The hazard on the cube lane is not
+double-counting but **premature release from the wrong lane**: the AIC copy can
+publish the signal before the AIV lane's TPUT has landed the data that signal
+releases, so the peer reads stale bytes. A `NotifyOp::kSet` fires that race
+exactly as readily as an atomic-add.
+
+`pld.system.wait` is deliberately left unmarked, and not because TWAIT is
+idempotent: it *blocks*, and its presence on the cube lane is load-bearing —
+pinning it to the vector lane would let the matmul race past the peer data it
+waits on.
+
+The flag is orthogonal to affinity (it constrains replication, not placement).
+Its only consumer is `LowerAutoVectorSplit`'s `pl.split_aiv` region placement
+stamp, which pins a region's no-duplicate calls to the AIV lane; see
+`docs/en/dev/ir/05-operators.md` and
+`docs/en/dev/passes/20-lower_auto_vector_split.md`.
+
+**Comm ops written outside every region are still duplicated onto both lanes,
+and nothing diagnoses it.** Putting the comm phase in a `pl.split_aiv` region is
+the author's job; see `docs/en/user/language/04-scopes.md`.
 
 ## ABI enums (`include/pypto/ir/comm.h`)
 
 The four enums are an **append-only ABI**. Their underlying `int` values are
-serialised as the op's kwarg payload (`op` for notify, `cmp` for wait, `atomic`
+serialised as the op's kwarg payload (`op` for notify, `cmp` for wait/defer_wait, `atomic`
 for put) and cast back to the enum at codegen time. New variants may only be
 added **at the end** so existing IR and cached programs keep their meaning.
 
 ```cpp
 enum class NotifyOp : int { kAtomicAdd = 0, kSet = 1 };   // pld.system.notify
-enum class WaitCmp  : int { kEq = 0,        kGe = 1 };     // pld.system.wait
-enum class AtomicType : int { kNone = 0,    kAdd = 1 };    // pld.tensor.put
+enum class WaitCmp  : int { kEq = 0,        kGe = 1 };     // pld.system.wait / defer_wait
+enum class AtomicType : int { kNone = 0,    kAdd = 1 };    // pld.tensor.put, remote_store
 enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.tensor.allreduce
 ```
 
@@ -88,68 +126,160 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `NotifyOp` | `kAtomicAdd` | atomically add `value` into the peer's signal slot |
 | `NotifyOp` | `kSet` | non-atomic store of `value` into the peer's signal slot |
 | `WaitCmp` | `kEq` | block until `*signal_slot == expected` |
-| `WaitCmp` | `kGe` | block until `*signal_slot >= expected` |
+| `WaitCmp` | `kGe` | wait, or defer task completion, until `*signal_slot >= expected` |
 | `AtomicType` | `kNone` | plain remote store — overwrite the peer's dst slice |
 | `AtomicType` | `kAdd` | atomically add the source data into the peer's dst slice |
 | `ReduceOp` | `kSum` | sum-reduce every participating rank's window slice |
-| `ReduceOp` | `kMax` | reserved max-reduce variant; lowering pending |
-| `ReduceOp` | `kMin` | reserved min-reduce variant; lowering pending |
-| `ReduceOp` | `kProd` | reserved product-reduce variant; lowering pending |
+| `ReduceOp` | `kMax` | max-reduce every participating rank's window slice |
+| `ReduceOp` | `kMin` | min-reduce every participating rank's window slice |
+| `ReduceOp` | `kProd` | product-reduce every participating rank's window slice |
 
 Each enum is mirrored across three layers (C++ `enum class` → `nb::enum_` in the
 bindings → `.pyi` stub) and surfaced to the DSL as `pld.NotifyOp` /
 `pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp`. The deducer validates the packed `int`
 against the enum range so codegen can cast back without a second guard.
 
+## Barrier-signal protocol
+
+Every `pld.tensor.*` collective (`allreduce`, `barrier`, `broadcast`,
+`reduce_scatter`, `allgather`, `all_to_all`, `all_to_all_v`) synchronises through one shared,
+**self-clearing credit barrier** built from `pld.system.notify` /
+`pld.system.wait`:
+
+```text
+Body:      barrier(1); barrier(2); ...; barrier(N)   # g counted within this
+                                                      # call only
+  barrier(g):
+    for peer != my_rank: notify(signal, peer, <my cell>, 1, op=AtomicAdd)
+    for src  != my_rank: wait  (signal, <src cell>, g,   cmp=Ge)
+
+Epilogue:  for src != my_rank:
+               notify(signal, my_rank, <src cell>, -N, op=AtomicAdd)
+```
+
+`AtomicAdd` turns each cell into a credit counter: every notify is a
+producer's `+1`, and the epilogue is the sole consumer's `-N`. Because adds
+and subtracts are atomic and commutative, the signal is provably all-zero
+again once every rank has finished its epilogue for a call — **the signal
+carries no state that outlives one call**, so every call's generation `g`
+restarts at 1 and no cross-call bookkeeping is required. A slow rank can
+inflate a fast rank's own next-call credit by at most 1 while it finishes the
+current call (bounded skew), so the counter never overflows and a fast rank
+can never observe a spurious pass.
+
+`Ge` (not `Eq`) is load-bearing: a fast peer can advance a cell past the value
+the waiting rank is looking for before that rank ever polls it, so an
+equality wait would never unblock. For the same reason `Set` must never be
+mixed with `AtomicAdd` on the same cells — a set could clobber an already
+advanced counter.
+
+`N` (the credit total the epilogue subtracts) may be a **runtime scalar** —
+`pld.system.notify`'s `value` only requires `ScalarType` — so a mesh
+allreduce's per-chunk credit count does not need to be known at compile time.
+
+**Constraints:**
+
+| Constraint | Why |
+| ---------- | --- |
+| One signal must not be shared between mesh (`[NR, 1]`) and ring (`[2*(NR-1), NR]`) allreduce | Mesh addresses `[rank, 0]`; ring addresses `[row, rank]` — a shape mismatch, checked at lowering time |
+| A call aborted mid-flight (error / timeout) leaves the signal non-zero | Credits leak; recover via a host-side reset (`reset_persistent_windows`) before the next dispatch |
+
+Because the protocol is call-local and the signal always starts a call at
+all-zero, collectives are legal inside `for` / `while` / `if` — each call is a
+closed cycle, so the same compile-time `expected` values are reused every
+iteration. The only remaining requirement is rank-uniform execution (inherent
+to any barrier): rank-divergent control flow deadlocks, surfaced by `TWAIT`'s
+spin-count assert.
+
 ## Op reference
 
 ### `pld.tile.remote_load` (TLOAD)
 
 ```text
-pld.tile.remote_load(target, peer, offsets, shape) -> TileType(shape, target.dtype)
+pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])
+    -> TileType(shape, target.dtype)
 ```
 
 Reads a region of the `peer` rank's slice of a window-bound `DistributedTensor`
 into a local tile. Mirrors `tile.load` at the IR level (positional `offsets` /
 `shape` tuples, `TileType` result) but the source is a *remote* slice — the
-address translation is realised at codegen by
-`CommRemoteOffset(ctx, peer) + addptr + make_tensor_view`.
+address translation is realised at codegen by inline peer-offset arithmetic
+over the `CommContext` + `addptr` + `make_tensor_view`.
+
+`valid_shape` is optional. With or without it, type inference intersects the
+requested window with the source tensor's effective valid region and checks
+provable physical bounds. When present, `shape` remains the physical UB tile
+allocation while `valid_shape` additionally limits the remote partition and
+the tile's valid extent. This is the fixed-width ragged-tail form used by
+chunked collectives.
+
+Every symbolic source or requested valid extent that survives inference must
+be runtime-bound by a kernel scalar, loop variable, or physical tensor-shape
+parameter. A symbol that appears only in type metadata is rejected during PTO
+codegen.
 
 Verifier: `target` must be `DistributedTensorType`; `peer` must be a
-`ScalarType` rank index; `offsets` / `shape` must each be a `MakeTuple` whose
-rank equals `target.shape.size()`.
+`ScalarType` rank index; `offsets` / `shape` / optional `valid_shape` must each
+be a `MakeTuple` whose rank equals `target.shape.size()`.
 
-DSL (`python/pypto/language/distributed/op/tile_ops.py`) exposes `peer` /
-`offsets` / `shape` as keyword-only for readability; the IR op keeps them
-positional, matching `tile.load`.
+DSL (`python/pypto/language/distributed/op/tile_ops.py`) accepts positional or
+keyword arguments; the IR op keeps them positional, matching `tile.load`.
 
-### `pld.tile.remote_store` (TSTORE)
+### `pld.tile.remote_store` / `pld.tensor.remote_store` (TSTORE)
 
 ```text
-pld.tile.remote_store(src_tile, target, peer, offsets) -> Unknown
+pld.tile.remote_store(src_tile, target, peer, offsets, *, atomic: int = 0) -> Unknown
+pld.tensor.remote_store(src, target, peer, offsets, *, atomic: int = 0) -> Unknown
 ```
 
-Writes a local tile into a region of the `peer` rank's slice of a window-bound
+Writes a local value into a region of the `peer` rank's slice of a window-bound
 `DistributedTensor`. Mirrors `tile.store` at the IR level (positional `offsets`
-tuple + side-effect-only return) but the destination is a *remote* slice —
-address translation happens at codegen via `CommRemoteOffset(ctx, peer) +
-addptr + make_tensor_view`.
+tuple, optional `atomic` attr, side-effect-only return) but the destination is a
+*remote* slice — address translation happens at codegen via inline peer-offset
+arithmetic over the `CommContext` + `addptr` + `make_tensor_view`.
 
-Verifier: `src_tile` must be `TileType`; `target` must be
-`DistributedTensorType`; `peer` must be a `ScalarType` rank index; `offsets`
-must be a `MakeTuple` whose rank equals `target.shape.size()`; `src_tile.dtype`
-must match `target.dtype`.
+The two forms differ **only** in the IR level of `src`; `pld.remote_store`
+dispatches on the operand, so user code reads the same at either level.
 
-Codegen: the tile is 2-D (height × width) after the standard tile pipeline; the
-emitted `pto.partition_view` has the same rank as `target`, with the leading
-`(target.rank - 2)` dims set to size 1 (matching `notify`'s `one_dims(rank,
-"1")` pattern). This lets a 2-D tile push land on the inner two dims of any
-N-D peer slice (N ≥ 2) without forcing the caller to reshape — and it is the
-regression guard against the older codegen that emitted a fixed-2D
+Verifier (both forms):
+
+| Rule | Note |
+| ---- | ---- |
+| `target` is `DistributedTensorType`, `peer` a `ScalarType` rank index | |
+| `offsets` is a `MakeTuple` of rank `target.shape.size()` | |
+| `src.dtype == target.dtype`, `target` rank ≥ 2 | |
+| `src` is 2-D, or N-D with every leading dim 1 | the deducer runs *before* `FlattenTileNdTo2D` collapses N-D tiles; a leading extent > 1 would fold into the row count and overrun the target |
+| the pushed region fits inside `target` at `offsets` (static dims only) | `remote_store` has no transfer `shape` to clamp against — the extent comes from `src`, so without this an oversized push silently overwrote the peer's neighbouring region |
+| `src` is `TileType` (tile form) / `TensorType` (tensor form) | each diagnostic names the sibling entry point, so the author lands on the one for their level |
+
+Lowering (tensor form): `ConvertTensorToTileOps` rewrites it 1:1 to the tile
+form via `RegisterSimple`. Its `InputSpaceReq{Vec}` makes the op *total* on its
+argument surface — `BridgeInputSpaces` only rewrites `TensorType` operands, so a
+computed value (already a tile) passes straight through keeping its space, while
+a GM-resident `src` is auto-bridged with a natural `tile.load` into Vec.
+
+Codegen: the tile is 2-D (height × width) after the tile pipeline; the emitted
+`pto.partition_view` has `target`'s rank with the leading `(target.rank - 2)`
+dims set to size 1 (matching `notify`'s `one_dims(rank, "1")`). A 2-D push
+therefore lands on the inner two dims of any N-D peer slice (N ≥ 2) without the
+caller reshaping — and guards the older codegen that emitted a fixed-2D
 `partition_view` regardless of target rank.
 
-DSL (`python/pypto/language/distributed/op/tile_ops.py`) exposes `target` /
-`peer` / `offsets` as keyword-only for readability; the IR op keeps them
+`atomic = AtomicType.kAdd` appends `{atomicType = #pto<atomic_type atomic_add>}`
+to the `pto.tstore`, making the push a **combine** (`peer_region += src`) — the
+cross-rank twin of `tile.store`'s split-K accumulation, and what an all-to-all
+combine needs. Emitted only for `kAdd`, so plain pushes stay byte-identical.
+`kAdd` requires an fp32/bf16/fp16/int32/int16/int8 dtype -- the same hardware
+allow-list `tile.store` enforces -- and bf16 carries the same Ascend910B-only
+restriction on top.
+
+`pld.tensor.put` (TPUT) has **no** tile-source form — its staging tile is a
+bounce buffer, not a data source. Pushing a computed value is `remote_store`'s
+job; pushing a bulk GM region that need not fit on-core is `put`'s.
+
+DSL (`python/pypto/language/distributed/op/tile_ops.py`,
+`.../tensor_ops.py`) exposes `target` / `peer` / `offsets` as
+positional-or-keyword for readability and round-tripping; the IR ops keep them
 positional, matching `tile.store`.
 
 ### `pld.tensor.put` (TPUT)
@@ -216,7 +346,11 @@ allowed and bounded by the chunk). Full-slice `put` requires matching `dst` /
 `src` shape; subregion `put` allows different full slice extents as long as the
 explicit transfer region is in bounds (checked on static dims). Any dynamic
 transfer dim requires a matching static chunk (see above). `atomic` selects
-overwrite vs atomic-add (see `AtomicType`). The lowered `pld.tile.put` verifier
+overwrite vs atomic-add (see `AtomicType`). `atomic=Add` additionally requires a
+`FP32/BF16/FP16/INT32/INT16/INT8` destination (the hardware atomic-add dtypes,
+since TPUT lands its chunks through the same store pipe as `tile.store`); a
+`BF16` destination is further restricted to the Ascend910B (A2/A3) profile by the
+`AtomicAddDtypeValid` property verifier. The lowered `pld.tile.put` verifier
 requires the staging tile to **fit within** the flattened transfer in both
 **static** dims (it may be smaller — a chunk — but never larger; dynamic dims
 are bounded by the chunk at runtime).
@@ -261,47 +395,185 @@ region is in bounds (checked on static dims); any dynamic transfer dim requires
 a matching static chunk. Besides `chunk_rows` / `chunk_cols`, `get` accepts no
 keyword attributes.
 
+### `pld.tensor.all_to_all_v`
+
+```text
+pld.tensor.all_to_all_v(
+    input, target, signal, send_counts, recv_counts
+) -> DistributedTensorType(target)
+```
+
+Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
+
+- `input` — Tensor or DistributedTensor `[NR*MAX_RECV, SIZE]`
+- `target` — DistributedTensor `[NR*MAX_RECV, SIZE]` (window-as-result)
+- `signal` — DistributedTensor INT32 `[NR, 1]` (self-clearing credit barrier; reusable across calls)
+- `send_counts` — Tensor-like INT32 `[NR]` or `[NR, 1]` (runtime rows per dest)
+- `recv_counts` — DistributedTensor INT32 `[NR, 1]` (InOut recvcounts)
+
+`MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
+runtime, clamps to `MAX_RECV`, and publishes the **clamped** count into peer
+`recv_counts[my_rank, 0]` via `pld.system.notify` (Set). The push itself
+always transfers the full `MAX_RECV`-row capacity block per destination —
+independent of the runtime count — so rows beyond a sender's actual count
+still cross the wire; after the barrier the receiver uses `recv_counts[src, 0]`
+to skip those rows (MPI_Alltoallv semantics apply to the logical result, not
+the wire transfer). On the InCore path the transfer is a compile-time-sized
+`pld.tile.put` (PTOAS requires static partition-view dims); on the HOST path
+the kernel derives `MAX_RECV` at entry from the runtime rank count
+(`target.shape[0] / nranks`), so it is always consistent with the devices
+actually running.
+
+**InCore composite** (`LowerCompositeOps`): the primitive above, decomposed
+into `pld.tile.put` + `pld.system.notify`/`wait` inside a chip kernel.
+
+**HOST builtin** (`LowerHostTensorCollectives`): the same 5-arg call, made
+from a `host_orch` function, lowers per-device to `builtin.tensor.all_to_all_v`
+— an in-kernel-TPUT AIV builtin following the same pattern as
+`builtin.tensor.all_to_all`. `input` and `send_counts` must both be
+window-bound `DistributedTensor`s at this layer (narrower than the composite's
+`AsTensorTypeLike`, forced by the HOST dispatch codegen, which only supports
+window-bound or tile args) — all five operands (`input`, `target`, `signal`,
+`send_counts`, `recv_counts`) must resolve to pairwise-distinct window
+allocations (aliasing any pair is a cross-process race: data-vs-data is a TPUT
+overwrite, data-vs-control is a notify/count write racing a kernel read,
+control-vs-control is a notify racing a count publish). The kernel derives
+`MAX_RECV` at entry as `target.shape[0] / nranks` (the runtime comm-domain
+size), so the block layout is always consistent with the devices actually
+running — no exact `signal.shape[0]` == device-count requirement and no
+per-`MAX_RECV` variant mangling. Not supported inside a `for`/`while` loop in
+`host_orch` (single-use signal protocol) — the same restriction
+`LowerCompositeOps` enforces on the InCore path.
+
 ### `pld.tensor.allreduce`
 
 ```text
-pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
-pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
+pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh", core_num: int = 1) -> DistributedTensorType(src)
+pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh", core_num: int = 1) -> DistributedTensorType(src)
 ```
 
 Reduces every participating rank's window-bound `src` slice in place and returns
 the same type as `src`. The `mode` keyword selects the lowering algorithm:
 
+Fully-valid packed mesh targets are viewed as one logical `[1, N]` stream and
+processed in UB chunks of at most 16 KiB. A statically known `N` smaller than
+that budget shrinks the physical chunk to the smallest 32-byte-aligned width
+that covers `N`; larger or dynamic inputs retain the maximum width. The last
+chunk keeps its selected physical width
+but carries `valid_shape=[1, min(chunk, N-offset)]`, so arbitrary element counts
+neither read nor store past the end.
+
 For mesh lowering, a partial `TensorView.valid_shape` is preserved for packed ND
 targets when its valid box can be represented by collapsing the leading dimensions
-to one 2D rectangle; only that rectangle is reduced. Strided targets, DN partial
-views, and non-representable partial boxes are rejected explicitly.
+to one 2D rectangle and a statically bounded physical tile fits within one 16-KiB
+chunk. A symbolic valid extent falls back to the source's physical rectangle when
+that rectangle fits the budget. Oversized partial rectangles,
+strided targets, DN partial views, and non-representable partial boxes are rejected
+explicitly.
+
+Any symbolic target or partial-valid extent that survives lowering must be
+runtime-bound by a kernel scalar, loop variable, or physical tensor-shape
+parameter; a type-metadata-only symbol is rejected during PTO codegen. A fully
+dynamic physical target dimension is bound from that tensor parameter.
 
 - **`"mesh"` (default)** — direct all-to-all exchange with O(P) HCCL windows.
-  Signal shape `[NR, 1]` (one cell per rank).  4-phase decomposition: notify-all
-  (Set 1) / wait-all (Ge 1) / remote_load+accumulate / store-back with a
-  post-reduce WAR-guard barrier (AtomicAdd 1 → Ge 2).
+  Signal shape `[NR, 1]` (one cell per rank). A ready barrier (generation 1)
+  precedes the chunk loop. Each chunk performs `remote_load+accumulate`, then
+  a barrier on its own call-local generation before store-back, preventing
+  write-after-read races. A self-clearing epilogue then subtracts the call's
+  total credit count back out of every cell (see
+  [Barrier-signal protocol](#barrier-signal-protocol)), so the signal is
+  all-zero again once the call completes.
 - **`"ring"`** — NCCL-style chunked reduce-scatter + allgather schedule with
   O(1) HCCL windows.  Signal shape `[2 * (NR − 1), NR]` (one row per ring
-  round, one cell per rank).  2(P−1) ring steps with per-round barriers
-  (AtomicAdd 1 → Ge 1).  Chunk size = `SIZE // NR`, and `SIZE` must be an exact
-  multiple of `NR`; `LowerCompositeOps` constant-folds the chunk size when both
-  `SIZE` and `NR` are compile-time constants.
+  round, one cell per rank). A packed ND target is viewed as one logical
+  `[1, SIZE]` stream; a partial valid box must be a contiguous row-major
+  prefix. Lowering keeps the full physical
+  `[1, product(target.shape)]` view and records the logical prefix as
+  `TensorView.valid_shape=[1, product(target.valid_shape)]`. FP32 divides
+  `SIZE` with balanced `floor(i * SIZE / NR)` boundaries. FP16 rounds each
+  interior boundary up to 16 elements (32 bytes) and caps it at `SIZE`, so
+  every non-empty segment begins at an MTE-safe address without changing the
+  packed user-visible layout. Empty segments remain legal for very short
+  inputs. Each segment is processed in at most 16-KiB physical subchunks; an
+  FP16 ragged remote tail rounds only its physical read span to 32 bytes and
+  restores the logical `valid_shape` before reduction or store. Every
+  subchunk uses ready and read-complete barriers on its own call-local
+  generation before store-back, preventing write-after-read races. A
+  self-clearing epilogue subtracts the call's total credit count back out of
+  every row of the signal afterward.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
-the [`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md)
-pass inserts a private INT32 signal window with semantic shape `[world_size, 1]`
+the [`SynthesizeAllReduceSignals`](passes/40-synthesize_allreduce_signals.md)
+pass inserts a private INT32 signal window with semantic shape
+`[world_size, core_num]`
 for that call (mesh mode only — `mode="ring"` requires an explicit signal). The
 pass binds `world_size = pld.world_size()` as a standalone statement and uses
-that variable in the synthesized buffer size and window shape. All calls in
-loops are rejected because the current signal protocol is single-use. Explicit
+that variable in the synthesized buffer size and window shape. The
+self-clearing protocol (see [Barrier-signal protocol](#barrier-signal-protocol))
+makes every call a stateless cycle, so calls inside `for` / `while` loops are
+supported like any other collective. Explicit
 `signal` remains the internal form used by InCore lowering and by tests that
 intentionally construct the internal protocol. Comm-domain materialisation then
 keeps the signal buffer in the same domain as `src`, even when it is not passed
-to a user chip kernel. The public op currently accepts `ReduceOp.Sum` and
-rejects the reserved reduce variants (`Max`, `Min`, `Prod`) until their
-lowerings land. The host builtin lowering path currently supports the `Sum` +
-FP32 variant and accepts either a rank-1 `[world_size]` signal or the
-synthesized rank-2 `[world_size, 1]` signal.
+to a user chip kernel. Mesh, ring, and host-builtin paths support FP16 and FP32
+with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for arbitrary positive element
+counts. InCore lowering uses UB-bounded chunks; the host builtin uses
+256-element chunks. InCore mesh and ring round only the physical FP16 remote
+tail span to 32 bytes. The host builtin rounds ragged FP16 and FP32 load spans
+to 32 bytes. Both preserve the logical valid shape. The host builtin accepts
+either a rank-1 `[world_size]` signal or a rank-2
+`[world_size, signal_stride]` signal. Ring mode (`mode="ring"`) for the host
+orchestrator lowers to `builtin.tensor.allreduce_ring` and requires an explicit
+rank-2 `[2 * (NR - 1) + 1, NR]` INT32 signal (one extra row for the return
+barrier).
+
+#### Host multi-core AllReduce (`core_num`)
+
+`core_num` selects how many AIV blocks one HOST `pld.tensor.allreduce` dispatch
+uses **on each rank**. It does not change the task hierarchy: `device=r` still
+selects the card and the call still lowers to one builtin orchestration task per
+rank; that task now launches a synchronized SPMD grid of `core_num` blocks.
+
+```python
+data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, core_num=4)
+```
+
+| Constraint | Rule |
+| ---------- | ---- |
+| Range | Positive compile-time integer, default `1` (pre-existing behavior) |
+| Schedule | Mesh only — `mode="ring"` requires `core_num == 1` |
+| Capacity | At most the backend's AIV core count (submitted via `rt_submit_aiv_task`, so one block = one AIV core) |
+| InCore | Must stay `1`; use an enclosing `pl.spmd(...)` for multi-core work |
+
+**Signal layout.** The signal is a peer-major, lane-contiguous
+`[world_size, signal_stride]` matrix with `signal_stride >= core_num`. Block `b`
+waits on `signal_base + peer * signal_stride + b` and notifies peer `p` at
+`signal_base + my_rank * signal_stride + b`, so every `(peer, block)` pair owns
+an independent counter. A rank-1 `[world_size]` signal (stride 1) is valid only
+for `core_num == 1`. A synthesized signal is exactly `[world_size, core_num]`;
+an explicit signal may be wider.
+
+**Kernel partitioning.** Blocks own 256-element tiles block-cyclically — block
+`b` processes tiles `b, b + C, b + 2C, ...` for `C` launched blocks — so no two
+blocks touch the same chunk. Each block runs the ready barrier once, then a
+read-done barrier per chunk. That per-chunk barrier must stay **before** the
+store: without it a rank could overwrite its source chunk before the matching
+block on another rank has remote-loaded it. Blocks with no data still run the
+ready barrier, keeping ranks symmetric and letting `core_num` exceed the chunk
+count. Blocks at or beyond `signal_stride` have no lane to own, so they retire
+immediately without joining the barrier; `signal_stride` is equal on every rank,
+so all ranks retire the same blocks and the protocol stays symmetric.
+
+**Why one SPMD grid rather than `pl.parallel`.** `pl.parallel(N)` emits `N`
+independent tasks, each with its own TaskId and scheduling lifetime — unsafe for
+an in-place collective. Ranks may schedule chunk tasks in different orders, so a
+task waiting on another rank's matching chunk can deadlock, and conservative
+dependency tracking on the shared InOut window tends to serialize them anyway.
+One SPMD grid avoids both: `require_sync_start` admits all blocks together and
+`block_idx` gives deterministic, matching partitioning on every rank. That is a
+per-card admission guarantee, not a global simultaneous start across ranks — the
+ready barrier absorbs cross-rank launch skew.
 
 ### `pld.system.notify` (TNOTIFY)
 
@@ -328,35 +600,78 @@ predicate against `expected` (see `WaitCmp`).
 Verifier: `signal` must be `DistributedTensorType`; `expected` must be
 `ScalarType`; `offsets` must be a `MakeTuple` of rank equal to the signal rank.
 
+### `pld.system.defer_wait` (Simpler deferred completion)
+
+Signature: `pld.system.defer_wait(signal, offsets, expected, *, cmp: int) -> Unknown`.
+
+Registers a local counter condition without `pto.comm.twait`. The kernel can retire and
+release its AIV, but Simpler delays the ordinary TaskId's completion until every condition
+is ready; the kernel is never resumed.
+
+V1 accepts a direct window-bound INT32 `DistributedTensor` parameter with ND/DN
+addressing, integer/index offsets and threshold, and only `WaitCmp::kGe`.
+Slices/views/SSA aliases, NZ layout, and rank-zero signals are rejected. Counter
+storage is INT32 but polling is unsigned `>=`: thresholds and published values must
+remain monotonic in `[0, INT32_MAX]`; `-1` appears as `UINT32_MAX` and falsely
+satisfies. One task may register at most 64 conditions, independent of the scheduler's
+64-concurrent-deferred-task limit.
+
+The scope outliner requires a dedicated top-level single-block pure-AIV `pl.at(CORE_GROUP)`
+waiter with no predicate or `allow_early_resolve=True`.
+Pure scalar work may occur between registrations, but `tensor.read`,
+payload/cache operations, and other communication cannot. Scalars carried across
+a branch merge or a loop iteration are such bookkeeping — the SSA phi / iter_arg
+yields `ConvertToSSA` inserts for them are accepted, and a loop that registers no
+condition is allowed and needs no statically known trip count. A terminal waiter with no
+continuation may be submitted fire-and-forget and need not capture a TaskId. An
+unmarked direct `@pl.jit.incore` / AIV use is rejected because it bypasses the
+validated single-block task launch and runtime `AsyncCtx` contract. Programmatically
+constructed IR carrying the internal waiter marker is accepted only after the full
+body and orchestration call-site contract is revalidated.
+
+Continuation uses ordinary `deps=[wait_tid]`; there is no second dependency type.
+Simpler withholds the normal TaskId fanout until the counter is ready. Its standard
+task-start cache invalidation then runs on the normally dispatched consumer. The
+producer must still make payload writes visible before publishing the signal, and
+the waiter must remain ineligible for early resolve so consumer pickup cannot precede readiness.
+
+Codegen passes checked flattened offsets and raw dispatch arguments to an adapter that
+registers a counter `CompletionToken` in `AsyncCtx`. The legacy
+`pld.system.wait`/`pto.comm.twait` path is unchanged. See the
+[distributed primitives guide](../user/distributed/02-primitives.md#deferred-completion-release-the-core-keep-the-task-pending)
+for the complete programming contract and examples.
+
 ## Shared codegen infrastructure
 
-All five ops lower through PTO codegen helpers in
-`src/backend/common/pto_ops_common.cpp` and `src/codegen/pto/pto_codegen.cpp`.
+The low-level RMA and synchronization ops lower through PTO codegen helpers in
+`src/backend/common/pto_ops_distributed.cpp` and `src/codegen/pto/pto_codegen.cpp`.
 The reusable pieces — shared so each op's lowering carries no bespoke peer
 arithmetic — are:
 
 | Helper | Role |
 | ------ | ---- |
-| `CommRemoteOffset_<dtype>` | per-dtype MLIR helper (emitted once by `PTOCodegen::EmitCommRemoteOffsetHelpers`) that turns `(ctx, peer)` into the byte offset of the peer's window slice |
-| `EmitCommRemoteView` | emits `CommRemoteOffset + addptr + make_tensor_view` at the call site, yielding the peer-addressed view (used by `remote_load`, `get`'s `src`, and `put`'s `dst`) |
+| `PTOCodegen::EmitCommRemoteOffsetInline` | emits the `CommContext` reads + byte-to-element division **inline** in the caller's own `func.func`, turning `(ctx, peer)` into the element offset of the peer's window slice. No module-level helper is emitted: a mixed cube+vector group is one MLIR module holding both the AIC and the AIV function, and a helper carrying no `pto.kernel_kind` strands its value-returning `return` outside PTOAS's `__DAV_VEC__` section guard |
+| `EmitCommRemoteView` | emits the inline peer offset + `addptr` + `make_tensor_view` at the call site, yielding the peer-addressed view (used by `remote_load`, `get`'s `src`, and `put`'s `dst`) |
 | `EmitPartitionViewPTO` | wraps a tensor view in a full-slice `partition_view` with given offsets/sizes (used by every op for both local and peer operands) |
 | `ResolveDistTensorBinding` | resolves a `DistributedTensor` arg to its codegen binding (type + window var) |
 | `AsTensorTypeLike` | kind-trait downcast accepting both `TensorType` and `DistributedTensorType` where a view's element/shape info is read uniformly |
 
-The local-vs-remote split is intentional: a *local* operand (e.g. `get`'s
-`dst`, `put`'s `src`, `wait`'s `signal`) reuses the tensor view already created by
-`EmitMakeTensorViews` with no peer arithmetic, while a *remote* operand (e.g.
+The local-vs-remote split is intentional: a *local* PTO operand (e.g. `get`'s
+`dst`, `put`'s `src`, `wait`'s `signal`) reuses the tensor view already created
+by `EmitMakeTensorViews` with no peer arithmetic, while a *remote* operand (e.g.
 `remote_load`'s `target`, `get`'s `src`, `put`'s `dst`) goes through
-`EmitCommRemoteView`.
+`EmitCommRemoteView`. `defer_wait` is also local, but its adapter receives the
+direct parameter base plus a checked flattened logical element offset rather
+than a PTO tensor view.
 
 ## Pipeline integration
 
 Comm domains and their slot allocations are materialised by the
-[`MaterializeCommDomainScopes`](passes/38-materialize_comm_domain_scopes.md) pass, which wraps each
+[`MaterializeCommDomainScopes`](passes/41-materialize_comm_domain_scopes.md) pass, which wraps each
 host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
 per-window `WindowBuffer` records that the runtime binds physical buffers to.
 Host-level tensor collectives are then lowered by
-[`LowerHostTensorCollectives`](passes/39-lower_host_tensor_collectives.md) into internal builtin chip
+[`LowerHostTensorCollectives`](passes/42-lower_host_tensor_collectives.md) into internal builtin chip
 dispatches before the final `Simplify`.
 
 ## Testing
@@ -373,10 +688,17 @@ dispatches before the final `Simplify`.
   (each likewise dynamic-NR, P=2/P=4),
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_tensor_allreduce_ring_intrinsic.py`,
   `test_l3_allreduce_ring.py` (hand-rolled ring RS+AG), `test_l3_host_tensor_allreduce.py`,
-  `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
+  `test_l3_host_tensor_allreduce_ring.py`,
+  `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`,
+  `test_l3_tensor_all_to_all_v_intrinsic.py` (InCore composite),
+  `test_l3_host_tensor_all_to_all_v.py` (HOST builtin), and related L3 STs
   under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
   enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and
   chunked/pipelined transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅),
-  and `test_l3_remote_store.py` (tile-level subview push ✅). All tests use the
-  `pld.system.notify` / `pld.system.wait` handshake pattern established by
-  notify/wait and collective STs.
+  and `test_l3_remote_store.py` (tile-level subview push ✅, plus a
+  tensor-level push of a *computed* value ✅). Deferred completion is covered by
+  `test_l3_deferred_completion.py`: A2/A3 AIV-saturation/core-release,
+  already-ready registration reuse, A5 cross-rank correctness, persistent
+  monotonic epochs, and ordinary TaskId dependency gating. Other communication
+  STs use the `pld.system.notify` / `pld.system.wait` handshake pattern
+  established by notify/wait and collective STs.

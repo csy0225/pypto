@@ -28,8 +28,6 @@
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/program.h"
-#include "pypto/ir/reporter/report.h"
-#include "pypto/ir/reporter/report_generator_registry.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/verifier/diagnostic_check_registry.h"
@@ -48,7 +46,12 @@ VerificationInstrument::VerificationInstrument(VerificationMode mode) : mode_(mo
 namespace {
 
 /**
- * @brief Verify properties and throw ValueError on errors (used by VerificationInstrument)
+ * @brief Verify properties and throw VerificationError on errors (used by VerificationInstrument)
+ *
+ * Throws the same type as PropertyVerifierRegistry::VerifyPropertiesOrThrow. Both report a failure
+ * of the *same* properties from the *same* registry, so they must not surface as different Python
+ * types -- otherwise the exception a caller sees depends on whether a VerificationInstrument
+ * happens to be installed (i.e. on PYPTO_VERIFY_LEVEL), which is a test-harness detail.
  */
 void VerifyOrThrowWithContext(const IRPropertySet& properties, const ProgramPtr& program,
                               const std::string& context_msg) {
@@ -63,7 +66,7 @@ void VerifyOrThrowWithContext(const IRPropertySet& properties, const ProgramPtr&
                                 [](const Diagnostic& d) { return d.severity == DiagnosticSeverity::Error; });
   if (has_errors) {
     std::string report = PropertyVerifierRegistry::GenerateReport(diagnostics);
-    throw pypto::ValueError(context_msg + ":\n" + report);
+    throw VerificationError(context_msg + ":\n" + report, std::move(diagnostics));
   }
 }
 
@@ -106,39 +109,11 @@ std::string CallbackInstrument::GetName() const { return name_; }
 
 ReportInstrument::ReportInstrument(std::string output_dir) : output_dir_(std::move(output_dir)) {}
 
-void ReportInstrument::EnableReport(ReportType type, std::string trigger_pass) {
-  triggers_[std::move(trigger_pass)].insert(type);
-}
-
 void ReportInstrument::RunBeforePass(const Pass& /*pass*/, const ProgramPtr& /*program*/) {}
 
-void ReportInstrument::RunAfterPass(const Pass& pass, const ProgramPtr& program) {
-  auto it = triggers_.find(pass.GetName());
-  if (it == triggers_.end()) return;
-
-  auto& registry = ReportGeneratorRegistry::GetInstance();
-  auto reports = registry.GenerateReports(it->second, pass, program);
-
-  for (const auto& report : reports) {
-    std::string filename = report->GetTitle() + "_after_" + pass.GetName() + ".txt";
-    WriteReport(*report, filename);
-  }
-}
+void ReportInstrument::RunAfterPass(const Pass& /*pass*/, const ProgramPtr& /*program*/) {}
 
 std::string ReportInstrument::GetName() const { return "ReportInstrument"; }
-
-void ReportInstrument::WriteReport(const Report& report, const std::string& filename) {
-  std::string filepath = output_dir_ + "/" + filename;
-  std::ofstream file(filepath);
-  if (!file.is_open()) {
-    LOG_ERROR << "Failed to open report file: " << filepath;
-    return;
-  }
-  file << report.Format();
-  if (file.fail()) {
-    LOG_ERROR << "Failed to write report file: " << filepath;
-  }
-}
 
 // Diagnostic emission helpers ------------------------------------------------
 
@@ -302,20 +277,51 @@ std::string DiagnosticInstrument::GetName() const { return "DiagnosticInstrument
 
 // PassContext
 
+/// The wire name of each runtime kind, in enumerator order. Single table so a
+/// new runtime cannot be added to one direction and forgotten in the other.
+constexpr std::pair<RuntimeKind, const char*> kRuntimeNames[] = {
+    {RuntimeKind::TensorMapAndRingBuffer, "tensormap_and_ringbuffer"},
+    {RuntimeKind::HostBuildGraph, "host_build_graph"},
+};
+
+std::string RuntimeKindToName(RuntimeKind kind) {
+  for (const auto& [candidate, name] : kRuntimeNames) {
+    if (candidate == kind) return name;
+  }
+  INTERNAL_UNREACHABLE << "Internal error: unhandled RuntimeKind value " << static_cast<int>(kind);
+}
+
+RuntimeKind RuntimeKindFromName(const std::string& name) {
+  for (const auto& [kind, candidate] : kRuntimeNames) {
+    if (name == candidate) return kind;
+  }
+  std::ostringstream supported;
+  for (size_t i = 0; i < std::size(kRuntimeNames); ++i) {
+    if (i != 0) supported << ", ";
+    supported << kRuntimeNames[i].second;
+  }
+  CHECK(false) << "Unknown runtime '" << name << "': expected one of " << supported.str();
+  return kDefaultRuntimeKind;  // unreachable; CHECK throws
+}
+
 PassContext::PassContext(std::vector<PassInstrumentPtr> instruments, VerificationLevel verification_level,
                          DiagnosticPhase diagnostic_phase, DiagnosticCheckSet disabled_diagnostics,
-                         MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer)
+                         MemoryPlanner memory_planner, bool enable_pypto_l0c_double_buffer,
+                         RuntimeKind runtime)
     : instruments_(std::move(instruments)),
       verification_level_(verification_level),
       diagnostic_phase_(diagnostic_phase),
       disabled_diagnostics_(disabled_diagnostics),
       memory_planner_(memory_planner),
       enable_pypto_l0c_double_buffer_(enable_pypto_l0c_double_buffer),
+      runtime_(runtime),
       previous_(nullptr) {}
 
 VerificationLevel PassContext::GetVerificationLevel() const { return verification_level_; }
 
 MemoryPlanner PassContext::GetMemoryPlanner() const { return memory_planner_; }
+
+RuntimeKind PassContext::GetRuntime() const { return runtime_; }
 
 bool PassContext::GetEnablePyptoL0cDoubleBuffer() const { return enable_pypto_l0c_double_buffer_; }
 

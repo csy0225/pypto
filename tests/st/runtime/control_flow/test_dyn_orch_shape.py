@@ -21,9 +21,9 @@ Scenarios:
 - Scenario 1 — fully dynamic MxN orch: both InCore and orchestration use
   ``pl.Tensor[[M, N], pl.FP32]``; validates ``from_task_arg()`` for
   external tensors with no static shape information in the orch signature.
-- Scenario 2 — dynamic orch + valid_shapes scalars: orchestration uses MxN
+- Scenario 2 — dynamic orch + valid_shape scalars: orchestration uses MxN
   dims; m, n scalars are read from an INT64 tensor via ``pl.tensor.read`` and
-  forwarded to the InCore kernel as valid_shapes.
+  forwarded to the InCore kernel as valid_shape.
 - Scenario 3 — mixed dynamic M / static cols: orchestration uses
   ``pl.Tensor[[M, cols], pl.FP32]`` (M dynamic, cols=16 static); InCore reads
   M via ``pl.tensor.dim`` and iterates in pairs.
@@ -147,7 +147,7 @@ class DynOrchReshapeAddTestCase(PTOTestCase):
     """Test add kernel where the orchestration uses ``pl.reshape`` on dynamic 1D inputs.
 
     Validates that ``tensor.reshape`` is supported in Orchestration functions and lowers
-    to the runtime ``Tensor::reshape`` interface (issue #1068).  The orchestration takes
+    to the runtime ``ChipTensor::reshape`` interface (issue #1068).  The orchestration takes
     flat 1D tensors of length ``rows*cols`` and reshapes them to ``[rows, cols]`` before
     forwarding them to a 2D InCore add kernel.
     Expected result: c = a + b over the full rows×cols tile.
@@ -219,12 +219,12 @@ class DynOrchTransposeAddTestCase(PTOTestCase):
     """Test add kernel where the orchestration uses ``pl.transpose`` on dynamic 2D inputs.
 
     Validates that ``tensor.transpose`` is supported in Orchestration functions and lowers
-    to the runtime ``Tensor::transpose`` interface (issue #1071).  The orchestration takes
+    to the runtime ``ChipTensor::transpose`` interface (issue #1071).  The orchestration takes
     ``[rows, cols]`` tensors, swaps axes 0/1 via ``pl.transpose`` (zero-copy metadata
     swap of shape/raw_shape/offset), and forwards the resulting ``[cols, rows]`` views to
     a 2D InCore add kernel.
 
-    Because ``Tensor::transpose`` only swaps metadata and the kernel performs an
+    Because ``ChipTensor::transpose`` only swaps metadata and the kernel performs an
     element-wise add (which is layout-agnostic at the byte level), the bit pattern of
     ``c`` equals the bit pattern of ``a + b`` re-laid out to ``[cols, rows]``.
     """
@@ -291,7 +291,7 @@ class DynOrchTransposeAddTestCase(PTOTestCase):
 
 
 class DynOrchValidShapeAddTestCase(PTOTestCase):
-    """Test add with dynamic M×N orchestration and valid_shapes from a scalar tensor.
+    """Test add with dynamic M×N orchestration and valid_shape from a scalar tensor.
 
     Orchestration params a, b, c use dynamic M×N dims.  The scalars m, n are
     read at runtime from the INT64 tensor ``vs`` via ``pl.tensor.read``, which
@@ -346,9 +346,9 @@ class DynOrchValidShapeAddTestCase(PTOTestCase):
                 m: pl.Scalar[pl.INDEX],
                 n: pl.Scalar[pl.INDEX],
             ) -> pl.Tensor[[M, N], pl.FP32]:
-                """Add two tiles with dynamic valid_shapes [m, n]."""
-                a_tile = pl.load(a, [0, 0], [rows, cols], valid_shapes=[m, n])
-                b_tile = pl.load(b, [0, 0], [rows, cols], valid_shapes=[m, n])
+                """Add two tiles with dynamic valid_shape [m, n]."""
+                a_tile = pl.load(a, [0, 0], [rows, cols], valid_shape=[m, n])
+                b_tile = pl.load(b, [0, 0], [rows, cols], valid_shape=[m, n])
                 result = pl.add(a_tile, b_tile)
                 out = pl.store(result, [0, 0], c)
                 return out
@@ -371,7 +371,7 @@ class DynOrchValidShapeAddTestCase(PTOTestCase):
     def compute_expected(self, tensors, params=None):
         vr = int(tensors["vs"][0])
         vc = int(tensors["vs"][1])
-        # Only c[:vr, :vc] is written (valid_shapes-bounded store); outside that
+        # Only c[:vr, :vc] is written (valid_shape-bounded store); outside that
         # region is undefined-by-design -> mark NaN so validate_golden skips it.
         tensors["c"][:] = float("nan")
         tensors["c"][:vr, :vc] = tensors["a"][:vr, :vc] + tensors["b"][:vr, :vc]
@@ -772,7 +772,7 @@ class TestDynOrchShapeOperations:
         """Test add where the orchestration transposes dynamic 2D inputs before dispatch.
 
         Validates ``pl.transpose`` (issue #1071) inside an Orchestration function lowers
-        to the runtime ``Tensor::transpose`` zero-copy metadata swap.  Uses an asymmetric
+        to the runtime ``ChipTensor::transpose`` zero-copy metadata swap.  Uses an asymmetric
         shape (rows != cols) so the ``[rows, cols] -> [cols, rows]`` view transformation
         is actually exercised end-to-end (a buggy no-op transpose would not pass this).
         """
@@ -782,7 +782,7 @@ class TestDynOrchShapeOperations:
     @pytest.mark.parametrize("platform", PLATFORMS)
     @pytest.mark.parametrize("shape,valid_shape", [((32, 32), (16, 16))])
     def test_dyn_orch_valid_shape_add(self, test_runner, shape, valid_shape, platform):
-        """Test add with dynamic M x N orchestration and valid_shapes from INT64 tensor."""
+        """Test add with dynamic M x N orchestration and valid_shape from INT64 tensor."""
         result = test_runner.run(DynOrchValidShapeAddTestCase(shape, valid_shape, platform=platform))
         assert result.passed, f"Test failed for shape {shape}, valid_shape {valid_shape}: {result.error}"
 

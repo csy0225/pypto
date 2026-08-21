@@ -22,7 +22,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import DataType
+from pypto.language.parser.diagnostics import InvalidOperationError, ParserSyntaxError
 from pypto.pypto_core import ir
+
+_OP_PLD_SYSTEM_WORLD_SIZE = ir.get_op("pld.system.world_size").name
 
 
 def _get_func(program: ir.Program, name: str) -> ir.Function:
@@ -43,7 +46,7 @@ def _find_world_size_calls(func: ir.Function) -> list[ir.Call]:
     def visit_expr(expr: ir.Expr | None) -> None:
         if expr is None or not isinstance(expr, ir.Call):
             return
-        if expr.op.name == "pld.system.world_size":
+        if expr.op.name == _OP_PLD_SYSTEM_WORLD_SIZE:
             found.append(expr)
         for sub in expr.args:
             visit_expr(sub)
@@ -118,7 +121,7 @@ def test_world_size_can_drive_pl_range_bound():
 
 
 def test_world_size_rejects_positional_args():
-    with pytest.raises(Exception, match=r"no positional arguments|takes 0 positional"):
+    with pytest.raises(InvalidOperationError, match=r"no positional arguments|takes 0 positional"):
 
         @pl.program
         class P:  # noqa: F841
@@ -129,7 +132,9 @@ def test_world_size_rejects_positional_args():
 
 
 def test_world_size_rejects_kwargs():
-    with pytest.raises(Exception, match=r"does not accept keyword arguments|unexpected keyword argument"):
+    with pytest.raises(
+        InvalidOperationError, match=r"does not accept keyword arguments|unexpected keyword argument"
+    ):
 
         @pl.program
         class P:  # noqa: F841
@@ -142,7 +147,7 @@ def test_world_size_rejects_kwargs():
 def test_world_size_rejected_outside_host_function():
     """``pld.world_size()`` is host-only — calling it from a CORE_GROUP-level
     function body is a parse error."""
-    with pytest.raises(Exception, match="HOST"):
+    with pytest.raises(ParserSyntaxError, match="HOST"):
 
         @pl.program
         class P:  # noqa: F841
@@ -157,7 +162,7 @@ def test_world_size_rejected_in_nested_device_scope_within_host_function():
     """Even inside a HOST orchestrator, ``pld.world_size()`` must be rejected
     when nested inside a device-side scope (InCore / SPMD), since
     the call is not lowerable there."""
-    with pytest.raises(Exception, match="InCore"):
+    with pytest.raises(ParserSyntaxError, match="InCore"):
 
         @pl.program
         class P:  # noqa: F841
@@ -190,7 +195,7 @@ def test_world_size_call_used_as_size_in_alloc():
         for stmt in body.stmts
         if isinstance(stmt, ir.AssignStmt)
         and isinstance(stmt.value, ir.Call)
-        and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+        and stmt.value.op.name == ir.get_op("pld.tensor.alloc_window_buffer").name
         for c in [stmt.value]
     )
     assert alloc_call.args[0] is calls[0]
@@ -210,7 +215,7 @@ def test_long_form_world_size_call():
     func = _get_func(P, "host_orch")
     calls = _find_world_size_calls(func)
     assert len(calls) == 1
-    assert calls[0].op.name == "pld.system.world_size"
+    assert calls[0].op.name == _OP_PLD_SYSTEM_WORLD_SIZE
 
 
 if __name__ == "__main__":

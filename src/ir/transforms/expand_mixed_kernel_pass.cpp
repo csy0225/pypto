@@ -26,6 +26,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
@@ -38,19 +39,21 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/deferred_wait_contract.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
-#include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
 #include "pypto/ir/transforms/utils/tpop_tfree_finalizer.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -62,8 +65,6 @@ namespace pypto {
 namespace ir {
 
 namespace {
-
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
 
 using core_affinity::ClassifyCallAffinity;
 using core_affinity::ClassifyMoveDirection;
@@ -85,6 +86,62 @@ using tpop_tfree::FinalizeTpopTfrees;
 
 // Use the shared utility; local alias preserves call sites.
 const auto& FlattenBody = transform_utils::FlattenToStmts;
+
+/// Validate that a deferred waiter is reached only through the task-level
+/// orchestration dispatch shape produced by ScopeOutliner. The marker is
+/// printable and therefore cannot be treated as provenance by itself.
+class DeferredWaiterCallSiteValidator : public IRVisitor {
+ public:
+  DeferredWaiterCallSiteValidator(const std::unordered_set<std::string>& waiter_names, FunctionPtr caller)
+      : waiter_names_(waiter_names), caller_(std::move(caller)) {}
+
+  [[nodiscard]] const std::unordered_set<std::string>& called_waiters() const { return called_waiters_; }
+
+ protected:
+  void VisitExpr_(const CallPtr& call) override {
+    if (IsWaiter(call->op_)) {
+      RecordCall(call->op_, call->GetAttr<bool>("allow_early_resolve", false), call->HasAttr(kAttrPredicate),
+                 call->HasAttr(kAttrCoreNum) || call->GetAttr<bool>(kAttrSyncStart, false), call->span_);
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+
+  void VisitExpr_(const SubmitPtr& submit) override {
+    if (IsWaiter(submit->op_)) {
+      RecordCall(submit->op_, submit->allow_early_resolve_, submit->predicate_.has_value(),
+                 submit->core_num_.has_value() || submit->sync_start_, submit->span_);
+    }
+    IRVisitor::VisitExpr_(submit);
+  }
+
+ private:
+  [[nodiscard]] bool IsWaiter(const OpPtr& op) const {
+    auto global = As<GlobalVar>(op);
+    return global && waiter_names_.count(global->name_) != 0;
+  }
+
+  void RecordCall(const OpPtr& op, bool allow_early_resolve, bool predicate, bool has_launch_shape,
+                  const Span& span) {
+    auto global = As<GlobalVar>(op);
+    INTERNAL_CHECK_SPAN(global, span) << "Internal error: deferred waiter call target is not a GlobalVar";
+    CHECK_SPAN(caller_->func_type_ == FunctionType::Orchestration, span)
+        << "deferred waiter '" << global->name_
+        << "' must be dispatched directly from an Orchestration function via a task-level "
+           "pl.at(CORE_GROUP) scope";
+    CHECK_SPAN(!allow_early_resolve, span)
+        << "deferred waiter '" << global->name_ << "' cannot use allow_early_resolve=True";
+    CHECK_SPAN(!predicate, span) << "deferred waiter '" << global->name_
+                                 << "' cannot use a dispatch predicate";
+    CHECK_SPAN(!has_launch_shape, span)
+        << "deferred waiter '" << global->name_
+        << "' must be a single-block task and cannot use core_num or sync_start";
+    called_waiters_.insert(global->name_);
+  }
+
+  const std::unordered_set<std::string>& waiter_names_;
+  FunctionPtr caller_;
+  std::unordered_set<std::string> called_waiters_;
+};
 
 // ============================================================================
 // Explicit split-reshape op helpers (tile.aiv_shard / tile.aic_gather)
@@ -310,7 +367,8 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
                                                     call->args_[0],
                                                     call->GetType(),
                                                     /*op_driven=*/true,
-                                                    call->GetKwarg<int>("split", 0)};
+                                                    call->GetKwarg<int>("split", 0),
+                                                    call->GetKwarg<int>("lane_stride", 0)};
       } else if (call) {
         auto dir = ClassifyMoveDirection(call);
         if (dir != CVDirection::NONE) {
@@ -347,12 +405,44 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
 // TPUSH / TPOP creation helpers
 // ============================================================================
 
-std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0) {
-  return {{"split", std::any(split)}};
+std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int lane_stride = 0) {
+  std::vector<std::pair<std::string, std::any>> kwargs{{"split", std::any(split)}};
+  // The partition stride only rides along when a ragged boundary was rebalanced
+  // (see split_axis::ResolveLaneStride). PTO codegen ignores it — it prints only
+  // id and split — but the torch reference runtime needs it to cut the two lanes
+  // where the compiler did.
+  if (lane_stride > 0) {
+    kwargs.emplace_back("lane_stride", std::any(lane_stride));
+  }
+  return kwargs;
 }
 
-CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split), span);
+/// The pto-isa split code for an op-driven boundary's tpush / tpop pair.
+///
+/// ``CVBoundaryMove::split`` is the authored MODE (see cross_core.cpp); the code
+/// additionally encodes how the two lanes' runtime extents relate, which only
+/// the FULL-width tile can tell us: the shard's operand (Cube -> Vector) or the
+/// gather's result (Vector -> Cube). Both sides of the pipe run this on the same
+/// inputs, so the AIC and AIV bodies always agree on the code.
+int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
+  const SplitMode mode = SplitModeFromSplitCode(bm.split);
+  if (mode == SplitMode::None) return kSplitNone;
+  const int split_dim = split_axis::SplitDimension(mode);
+  if (bm.direction == CVDirection::CUBE_TO_VECTOR) {
+    // `lane_stride` is what LowerAutoVectorSplit actually partitioned by: absent
+    // (0) for the default box partition, the balanced stride when it rebalanced
+    // a ragged boundary across the lanes.
+    ExprPtr lane_stride =
+        bm.lane_stride > 0 ? std::make_shared<ConstInt>(bm.lane_stride, DataType::INDEX, span) : nullptr;
+    return split_axis::ShardSplitCode(mode, bm.source_tile->GetType(), split_dim, lane_stride,
+                                      "tile.aiv_shard", span);
+  }
+  return split_axis::GatherSplitCode(mode, bm.result_type, split_dim, "tile.aic_gather", span);
+}
+
+CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
+                    int lane_stride = 0) {
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
 }
 
 CallPtr CreateTpop(const std::string& op_name, const TypePtr& result_type, const Span& span,
@@ -375,13 +465,88 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
-// ============================================================================
-// Parameterized Core Body Builder (shared by AIC and AIV)
-// ============================================================================
-
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
+
+// ============================================================================
+// Hand-written cross-core pipe: V->C push layout adaptation
+// ============================================================================
+
+/// Give a hand-written `pl.tpush_to_aic` the same fractal adapter the compiler
+/// inserts for the pipes it builds itself.
+///
+/// The boundary-move path below adapts every V->C push on a backend whose
+/// cross-core boundary carries fractal layout (BackendHandler::
+/// RequiresVtoCFractalAdapt). A hand-written pipe -- pl.reserve_buffer +
+/// pl.{aic,aiv}_initialize_pipe + pl.tpush_to_aic, authored directly in an AIV
+/// function -- never reaches it, because this pass expands InCore functions and
+/// passes every other function through untouched. On Ascend950 that shipped a
+/// bare ND tile into a FIFO the cube reads as fractal, so every element of the
+/// popped tile landed somewhere else: tests/st/runtime/cross_core
+/// test_multiple_pipes_nosplit returns 256/256 wrong values on board while
+/// passing on a5sim (which does not model the on-chip FIFO layout) and on
+/// Ascend910B (which needs no adapter: push/pop goes ub -> gm -> mat and takes
+/// ND directly).
+///
+/// The target view does not depend on where the consumer pops to -- the handler
+/// maps Mat, Left and Right alike onto one fractal view -- so keying off Mat,
+/// the cube-side transfer memory the op-driven branch below already uses, is
+/// exact rather than a guess, and needs no cross-function analysis to find the
+/// matching tpop.
+class AdaptManualVtoCPush : public IRMutator {
+ protected:
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto call = As<Call>(op->expr_);
+    if (!call || !IsOp(call, "tile.tpush_to_aic") || call->args_.size() != 1) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const ExprPtr& source = call->args_[0];
+    auto src_type = As<TileType>(source->GetType());
+    INTERNAL_CHECK_SPAN(src_type, op->span_) << "Internal error: tile.tpush_to_aic source must be a TileType";
+
+    // Backend gate lives here, not around the caller's loop: a program with no
+    // hand-written push must not require a configured backend to walk this phase.
+    const auto* handler = PassContext::Current()->GetBackendHandler();
+    if (!handler->RequiresVtoCFractalAdapt()) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+    const TileView fractal_view =
+        handler->BuildCrossCoreTransferView(GetBoundaryTpopMemory(CoreSide::AIC), src_view);
+    // Already in the boundary layout: either a second run of this pass, or an
+    // author who staged the move by hand. Either way there is nothing to add.
+    if (fractal_view.blayout == src_view.blayout && fractal_view.slayout == src_view.slayout) {
+      return IRMutator::VisitStmt_(op);
+    }
+
+    auto adapted_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
+                                                   fractal_view, MemorySpace::Vec);
+    std::string src_name = "tile";
+    if (auto sv = AsVarLike(source)) {
+      src_name = sv->name_hint_;
+    }
+    const bool is_nz = (fractal_view.blayout == TileLayout::col_major);
+    auto adapted_var = std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), adapted_type, op->span_);
+    auto adapt_call = CreateMove(source, MemorySpace::Vec, adapted_type, op->span_);
+
+    // Rebuild rather than CreateTpush: a hand-written push carries its own
+    // kwargs (`split`, and `id` selecting one of several pipes), and dropping
+    // `id` would silently collapse a multi-pipe program onto one FIFO. attrs_
+    // rides along for the same reason -- this rewrite replaces the pushed tile
+    // and nothing else, so it must not quietly drop compiler metadata a caller
+    // or an earlier pass attached to the op.
+    auto adapted_push = std::make_shared<Call>(call->op_, std::vector<ExprPtr>{adapted_var}, call->kwargs_,
+                                               call->attrs_, call->GetType(), call->span_);
+    std::vector<StmtPtr> out{std::make_shared<AssignStmt>(adapted_var, adapt_call, op->span_),
+                             std::make_shared<EvalStmt>(adapted_push, op->span_)};
+    return SeqStmts::Flatten(std::move(out), op->span_);
+  }
+};
+
+// ============================================================================
+// Parameterized Core Body Builder (shared by AIC and AIV)
+// ============================================================================
 
 TypePtr BuildBoundaryTpopType(CoreSide side, const TypePtr& original_type) {
   auto tt = std::dynamic_pointer_cast<const TileType>(original_type);
@@ -706,12 +871,25 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // off this transfer memory rather than the op's result memory — which
         // names the other lane whenever this side is the producer.
         const MemorySpace xfer_ms = GetBoundaryTpopMemory(side);
-        const int op_split = bm.op_driven ? bm.split : 0;
+        // The transport carries the pto-isa split CODE, not the authored mode:
+        // when the two AIV lanes' extents differ by one — an odd physical box,
+        // or an odd valid extent inside an even one — the pair takes the ODD
+        // code, whose lane 1 band sits one cell past its own extent. Derived
+        // from the FULL (cube-side) tile: the shard's operand, the gather's
+        // result.
+        const int op_split = bm.op_driven ? BoundaryTransportSplitCode(bm, stmt->span_) : kSplitNone;
+        // Only the Cube -> Vector direction is ever rebalanced, so only its
+        // transport carries the stride.
+        const int op_lane_stride =
+            (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
           // the required fractal layout before tpush.
-          // On Ascend950: Left -> NZ, Right -> ZN.
+          // On Ascend950 both cross as NZ: Left -> NZ, and Right -> NZ too, because
+          // V2C inserts the Vec tile into the Mat FIFO via TINSERT_IMPL<TInsertMode::NZ>.
+          // A Right operand does end up ZN, but only after the cube side's own
+          // Mat -> Right tile.move, one step past this boundary.
           // On Ascend910B: don't need to adapt layout! push/pop will be ub -> gm -> mat, ub -> gm can
           // directly use nd
           if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
@@ -749,7 +927,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split), stmt->span_));
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride), stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
@@ -807,8 +985,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           tpop_var_remap[tpop_var.get()] = tpop_var;
           // tile.move boundary tpops carry no split kwarg here (assigned later by
           // SplitVectorKernel); op-driven tpops stamp the op's split now.
-          auto pop_kwargs =
-              bm.op_driven ? MakeSplitKwargs(op_split) : std::vector<std::pair<std::string, std::any>>{};
+          auto pop_kwargs = bm.op_driven ? MakeSplitKwargs(op_split, op_lane_stride)
+                                         : std::vector<std::pair<std::string, std::any>>{};
           result.push_back(std::make_shared<AssignStmt>(
               tpop_var, CreateTpop(pop_op, tpop_result_type, stmt->span_, pop_kwargs), stmt->span_));
           if (needs_post_move) {
@@ -1085,11 +1263,11 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // user controls this perf decision (drop the split, or remove the transpose).
   //
   // Explicit ``pl.split_aiv`` regions are validated per-region by
-  // LowerAutoVectorSplit (pass 21), where each region's mode is unambiguous; skip
+  // LowerAutoVectorSplit (pass 20), where each region's mode is unambiguous; skip
   // the single-func-mode check for them. A multi-mode function carries no single
   // ``func->GetSplitMode()`` and this whole-function check would mis-check the
   // other region's axis (critique #2).
-  if (!func->HasAttr("split_aiv_region_validated")) {
+  if (!func->HasAttr(kAttrSplitAivRegionValidated)) {
     if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
       int split_dim = (*mode == SplitMode::UpDown) ? 0 : 1;
       auto hazard = split_axis::FindTransposeSplitHazard(func->body_, split_dim);
@@ -1262,7 +1440,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // references to the fresh parameter corresponding to the store's output tensor.
   {
     // Collect all vars defined in the AIV body
-    outline_utils::VarDefUseCollector aiv_def_collector;
+    var_collectors::VarDefUseCollector aiv_def_collector;
     auto aiv_body_stmt = MakeBody(aiv_final, func->span_);
     aiv_def_collector.VisitStmt(aiv_body_stmt);
 
@@ -1306,9 +1484,9 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   auto aiv_attrs = func->attrs_;
   if (needs_dual_aiv_dispatch) {
     aiv_attrs.erase(std::remove_if(aiv_attrs.begin(), aiv_attrs.end(),
-                                   [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                                   [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
                     aiv_attrs.end());
-    aiv_attrs.emplace_back(kDualAivDispatchAttr, true);
+    aiv_attrs.emplace_back(kAttrDualAivDispatch, true);
   }
   auto aiv_func = std::make_shared<Function>(aiv_name, aiv_params, func->param_directions_,
                                              func->return_types_, aiv_cloned_body, func->span_,
@@ -1466,7 +1644,7 @@ bool FunctionCallsFunction(const FunctionPtr& func, const std::string& callee_na
 // Hand-written Group ABI normalization
 // ============================================================================
 
-/// Runtime MixedKernels subslots share one L0TaskArgs payload. Auto-expanded
+/// Runtime MixedKernels subslots share one CoreTaskArgs payload. Auto-expanded
 /// Groups already satisfy that contract because both member calls forward the
 /// complete Group signature. A hand-written Group may call AIC/AIV functions
 /// with different subsets, however, so normalize both members to the Group ABI
@@ -1529,7 +1707,7 @@ bool NeedsInferredNoSplitDualAivDispatch(const FunctionPtr& func) {
   const auto* backend_handler = pass_context ? pass_context->GetBackendHandler()
                                              : pypto::backend::BackendConfig::GetBackend()->GetHandler();
   if (!backend_handler->RequiresNoSplitDualAivDispatch() ||
-      func->GetAttr<bool>(kDualAivDispatchAttr, false) || func->HasAttr("external_source") ||
+      func->GetAttr<bool>(kAttrDualAivDispatch, false) || func->HasAttr(kAttrExternalSource) ||
       func->requires_runtime_binding_) {
     return false;
   }
@@ -1546,9 +1724,9 @@ FunctionPtr WithDualAivDispatch(const FunctionPtr& func) {
   auto result = MutableCopy(func);
   auto attrs = result->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
-                             [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                             [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
               attrs.end());
-  attrs.emplace_back(kDualAivDispatchAttr, true);
+  attrs.emplace_back(kAttrDualAivDispatch, true);
   result->attrs_ = std::move(attrs);
   return result;
 }
@@ -1763,10 +1941,11 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
     if (!needs_abi_normalization && !needs_dual_aiv_dispatch) continue;
 
     if (needs_abi_normalization) {
-      CHECK_SPAN(
-          !aic.inner_callee->HasAttr("external_source") && !aiv.inner_callee->HasAttr("external_source") &&
-              !aic.inner_callee->requires_runtime_binding_ && !aiv.inner_callee->requires_runtime_binding_,
-          group->span_)
+      CHECK_SPAN(!aic.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aiv.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aic.inner_callee->requires_runtime_binding_ &&
+                     !aiv.inner_callee->requires_runtime_binding_,
+                 group->span_)
           << "Mixed Group '" << group->name_
           << "' has AIC/AIV members with different argument layouts. External or runtime-bound members "
              "cannot be adapted; declare both members with the same signature and forward the Group's full "
@@ -1813,12 +1992,80 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
   return {std::move(result)};
 }
 
+// Removes the pl.split_aiv region placement stamp LowerAutoVectorSplit left on
+// each region call once this pass has consumed it (see the Phase 5 comment in
+// ExpandMixedKernel, and kCorePlacementAttr in attrs.h for the full lifecycle).
+//
+// Returns the input Call unchanged when the attr is absent, so a program with
+// no regions in it walks through at the cost of the traversal alone.
+class CorePlacementStripper : public IRMutator {
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto mutated = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(mutated);
+    if (!call || !call->HasAttr(kCorePlacementAttr)) return mutated;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
+                                  StripAttr(call->attrs_, kCorePlacementAttr), call->GetType(), call->span_);
+  }
+};
+
+FunctionPtr StripCorePlacement(const FunctionPtr& func) {
+  if (!func || !func->body_) return func;
+  auto new_body = CorePlacementStripper().VisitStmt(func->body_);
+  if (new_body.get() == func->body_.get()) return func;
+  auto stripped = MutableCopy(func);
+  stripped->body_ = new_body;
+  return stripped;
+}
+
 }  // namespace
 
 namespace pass {
 
 Pass ExpandMixedKernel() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    // Audit every function before filtering to InCore below. A hand-authored
+    // AIV/AIC function, or a user-stamped marker without a validated waiter
+    // body and task-level call site, must not bypass the deferred contract.
+    std::unordered_set<std::string> deferred_waiter_names;
+    for (const auto& [gvar, func] : program->functions_) {
+      // Detect the real op independently of the printable compiler marker.
+      if (!outline_utils::ContainsDeferredWait(func->body_)) continue;
+      CHECK_SPAN(func->GetAttr<bool>(kAttrDeferredCompletionWaiter, false), func->span_)
+          << "pld.system.defer_wait in function '" << func->name_
+          << "' bypasses the deferred-waiter task contract. Use a task-level "
+             "`with pl.at(level=pl.Level.CORE_GROUP)` scope; capture its TaskId and use "
+             "`deps=[wait_tid]` only when a later consumer must be gated.";
+      CHECK_SPAN(func->func_type_ == FunctionType::InCore || func->func_type_ == FunctionType::AIV,
+                 func->span_)
+          << "deferred waiter '" << func->name_
+          << "' must be an outlined InCore function or its pure-AIV expanded form";
+      CHECK_SPAN(
+          !func->GetAttr<ExprPtr>(kAttrCoreNum, nullptr) && !func->GetAttr<bool>(kAttrSyncStart, false),
+          func->span_)
+          << "deferred waiter '" << func->name_
+          << "' must be a single-block task and cannot carry core_num or sync_start";
+      auto contract = outline_utils::DeferredWaitContractValidator::Validate(func->body_, func->span_);
+      INTERNAL_CHECK_SPAN(contract.has_deferred_wait, func->span_)
+          << "Internal error: deferred-wait finder/contract-validator disagreement";
+      deferred_waiter_names.insert(func->name_);
+    }
+
+    if (!deferred_waiter_names.empty()) {
+      std::unordered_set<std::string> called_waiters;
+      for (const auto& [gvar, func] : program->functions_) {
+        DeferredWaiterCallSiteValidator validator(deferred_waiter_names, func);
+        validator.VisitStmt(func->body_);
+        called_waiters.insert(validator.called_waiters().begin(), validator.called_waiters().end());
+      }
+      for (const auto& waiter_name : deferred_waiter_names) {
+        CHECK_SPAN(called_waiters.count(waiter_name) != 0, program->span_)
+            << "deferred waiter '" << waiter_name
+            << "' has no task-level Orchestration call site; a printable function attr alone is not a "
+               "valid deferred-completion contract";
+      }
+    }
+
     // Phase 1: Pre-scan — find InCore functions that have existing callers.
     std::unordered_set<std::string> incore_names;
     for (const auto& [gvar, func] : program->functions_) {
@@ -1864,6 +2111,14 @@ Pass ExpandMixedKernel() {
       std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
       std::unordered_map<const Var*, CoreAffinity> var_affinity;
       auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+
+      const bool is_deferred_waiter = deferred_waiter_names.count(func->name_) != 0;
+
+      if (is_deferred_waiter) {
+        CHECK_SPAN(combined != CoreAffinity::CUBE && combined != CoreAffinity::MIXED, func->span_)
+            << "deferred waiter '" << func->name_
+            << "' must lower to a pure AIV kernel; AIC and mixed AIC/AIV waiters are not supported";
+      }
 
       // A function is mixed if combined affinity says so. Leaf boundary moves
       // (tile.move across the C/V divide) classify as MIXED via ClassifyCallAffinity,
@@ -1920,6 +2175,52 @@ Pass ExpandMixedKernel() {
     // callee scan sees the final AIC/AIV functions.
     auto rewritten_program = std::make_shared<Program>(new_functions, program->name_, program->span_);
     new_functions = NormalizeHandWrittenGroupAbis(rewritten_program, new_functions).functions;
+
+    // Phase 5: the region placement stamp is consumed — drop it.
+    //
+    // ``core_placement`` exists solely to carry pl.split_aiv region membership
+    // across the wrapper erasure in LowerAutoVectorSplit, and every reader of
+    // it (ClassifyCallAffinity, via the affinity roll-up above) has now run. It
+    // is stripped rather than left in place because Call::attrs_ is a
+    // reflection UsualField and the python printer serialises attrs open-world:
+    // an un-stripped stamp would show up in every downstream pass dump, in the
+    // print -> parse round-trip, and in every ir.assert_structural_equal a
+    // later pass's tests make — noise that describes a region that no longer
+    // exists. Same lifecycle as ``pipeline_stages`` (set by LowerPipelineLoops,
+    // stripped by CanonicalizeIOOrder).
+    //
+    // The sweep covers EVERY emitted function, not just the split pair: a
+    // region in a function that turned out not to be mixed (converted straight
+    // to AIV, or left alone because it was not InCore) carries the same stamp
+    // and must not keep it either.
+    for (auto& func : new_functions) func = StripCorePlacement(func);
+
+    // Phase 6: give every hand-written V->C push the boundary's fractal layout.
+    //
+    // The sweep covers EVERY emitted AIV function rather than only the ones
+    // that were already typed AIV on entry. `tile.tpush_to_aic` declares
+    // CoreAffinity::VECTOR, so it is legal to author one inside an InCore body:
+    // a pure-vector body reaches AIV through the conversion above, and a mixed
+    // body carries the statement into its expanded AIV half. Both produce their
+    // AIV function after the per-function loop, so a hook there would leave
+    // exactly the bare ND push this adapter exists to prevent.
+    //
+    // Running last also makes the boundary-move path's own adapters harmless:
+    // AdaptManualVtoCPush leaves a push whose source already carries the
+    // boundary view alone, so the pushes that path staged are not touched twice.
+    // The backend is consulted inside the mutator, on the first V->C push it
+    // meets, rather than as a guard around this loop: a program with no
+    // hand-written push must not require a configured backend just to walk past
+    // this phase.
+    for (auto& func : new_functions) {
+      if (func->func_type_ != FunctionType::AIV) continue;
+      AdaptManualVtoCPush adapter;
+      auto adapted_body = adapter.VisitStmt(func->body_);
+      if (adapted_body == func->body_) continue;
+      auto adapted = std::make_shared<Function>(*func);
+      adapted->body_ = adapted_body;
+      func = adapted;
+    }
 
     return std::make_shared<Program>(new_functions, program->name_, program->span_);
   };

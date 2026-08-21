@@ -14,6 +14,7 @@
  * @brief PTO codegen registration for cross-core (TPUSH/TPOP/TFREE/pipe) ops.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +35,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
@@ -75,12 +77,12 @@ static std::shared_ptr<const ir::TileType> GetTpushTileType(const ExprPtr& tile_
   return As<ir::TileType>(tile_expr->GetType());
 }
 
-static bool EmitSplitTpushTransportValidShape(const CallPtr& op, codegen::PTOCodegen& codegen,
-                                              const std::string& tile_buf, const std::string& tile_type,
-                                              int split) {
-  // split == 0 normally means no cross-core split: the single consumer reads
-  // exactly the producer's (possibly narrowed) valid_shape, so no full-box
-  // transport is needed. BUT the 910B no-split dual-AIV dispatch path
+static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, codegen::PTOCodegen& codegen,
+                                         const std::string& tile_buf, const std::string& tile_type,
+                                         int split) {
+  // split == 0 normally means no cross-core split. Two physical FIFO cases
+  // still require a box-normalized transport: partial Acc->Vec payloads and
+  // the 910B no-split dual-AIV dispatch path. The latter
   // (function attr `dual_aiv_dispatch`) runs the producer on TWO AIV subblocks
   // that share one FIFO slot while the single cube consumer pops the FULL
   // slot. If the producer narrowed its valid_shape (e.g. set_validshape on a
@@ -88,15 +90,17 @@ static bool EmitSplitTpushTransportValidShape(const CallPtr& op, codegen::PTOCod
   // and feed garbage into the consumer's matmul. So for that mode we must
   // still transport the full box, exactly as for split==1/2 — this extends
   // PR #1454's fix to the split==0 dual-dispatch case.
-  const bool dual_aiv_no_split = (split == 0) && codegen.IsDualAivDispatchFunction();
-  if ((split == 0 && !dual_aiv_no_split) || tile_buf.empty() || tile_type.empty()) {
-    return false;
-  }
-
   auto source_tile_type = GetTpushTileType(op->args_[0]);
   if (!source_tile_type || source_tile_type->shape_.size() < 2) {
     return false;
   }
+  const bool dual_aiv_no_split = (split == 0) && codegen.IsDualAivDispatchFunction();
+  const bool acc_to_vec_no_split = (split == 0) && std::string_view(target) == "aiv" &&
+                                   source_tile_type->GetMemorySpace() == ir::MemorySpace::Acc;
+  if ((split == 0 && !dual_aiv_no_split && !acc_to_vec_no_split) || tile_buf.empty() || tile_type.empty()) {
+    return false;
+  }
+
   const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*source_tile_type);
   if (tile_view.valid_shape.size() < 2) {
     return false;
@@ -113,6 +117,18 @@ static bool EmitSplitTpushTransportValidShape(const CallPtr& op, codegen::PTOCod
   const auto& valid_shape = tile_view.valid_shape;
   ExprPtr transport_row = shape[0];
   ExprPtr transport_col = shape[1];
+
+  // A no-split Acc->Vec FIFO slot is laid out using the source's physical box.
+  // Both dimensions therefore need to be full for TPUSH, even though later
+  // vector compute/store must continue to see the narrower logical shape. An
+  // empty tile remains an empty protocol operation and must not be widened.
+  if (acc_to_vec_no_split) {
+    for (const auto& valid_dim : valid_shape) {
+      if (auto dim_const = As<ir::ConstInt>(valid_dim); dim_const && dim_const->value_ == 0) {
+        return false;
+      }
+    }
+  }
 
   // For the 910B no-split dual-AIV path there is NO genuine cross-core row
   // split: subblock 0 runs the full computation while subblock 1 is a
@@ -202,18 +218,25 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpush_to_") + target;
 
-  CHECK(op->args_.size() == 1) << op_name << " requires 1 argument (tile), got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << op_name << " requires 1 argument (tile), got " << op->args_.size();
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK_SPAN(tile, op->span_) << op_name << " first argument must be a Var or IterArg";
 
   const int split = op->GetKwarg<int>("split", -1);
-  CHECK(split >= 0 && split <= 2) << op_name
-                                  << " requires 'split' attribute (0=none, 1=up-down, 2=left-right), got "
-                                  << split;
+  CHECK(ir::IsValidSplitCode(split))
+      << op_name
+      << " requires 'split' attribute (0=none, 1=up-down, 2=left-right, 3=up-down/odd, "
+         "4=left-right/odd), got "
+      << split;
+  CHECK(!(ir::IsOddSplitCode(split) && std::string_view(target) == "aic"))
+      << op_name << ": pto-isa has no odd split for the Vector -> Cube direction (split = " << split
+      << "). Only the Cube -> Vector shard splits an odd axis.";
 
   std::string tile_buf = codegen.GetExprAsCode(op->args_[0]);
   std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-  const bool restore_valid_shape = EmitSplitTpushTransportValidShape(op, codegen, tile_buf, tile_type, split);
+  const bool restore_valid_shape =
+      EmitTpushTransportValidShape(target, op, codegen, tile_buf, tile_type, split);
 
   std::ostringstream oss;
   oss << "pto.tpush_to_" << target << "(" << tile_buf;
@@ -236,30 +259,121 @@ static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tpop_from_") + target;
 
-  CHECK(op->args_.size() == 0) << op_name << " takes no arguments, got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+      << op_name << " takes no arguments, got " << op->args_.size();
 
   const int split = op->GetKwarg<int>("split", 0);
-  CHECK(split >= 0 && split <= 2) << op_name
-                                  << " requires 'split' attribute (0=none, 1=up-down, 2=left-right), got "
-                                  << split;
+  CHECK(ir::IsValidSplitCode(split))
+      << op_name
+      << " requires 'split' attribute (0=none, 1=up-down, 2=left-right, 3=up-down/odd, "
+         "4=left-right/odd), got "
+      << split;
+  CHECK(!(ir::IsOddSplitCode(split) && std::string_view(target) == "aiv"))
+      << op_name << ": pto-isa has no odd split for the Vector -> Cube direction (split = " << split
+      << "). Only the Cube -> Vector shard splits an odd axis.";
 
   std::string result_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!result_buf.empty(), op->span_) << op_name << " requires assignment target (tile_buf)";
   std::string result_type = codegen.GetCurrentResultTileBufTypeString();
-  auto [valid_row, valid_col] = codegen.GetCurrentResultTpopValidShapeOperands();
+  auto [logical_row, logical_col] = codegen.GetCurrentResultTpopValidShapeOperands();
 
+  // PTO's Cube->Vector FIFO copies the physical consumer box, at EVERY split.
+  // pto-isa builds the GM slot view from the popped tile's compile-time
+  // rows/cols and the producer's box row pitch (a2a3 TPush.hpp
+  // popVecTileFromGMFiFo: gmValidR/gmValidC = ConsM/ConsN, gmStrideR = ProdN),
+  // then strides that view with the tile's RUNTIME validCol (TLoadGm2ubNd2nd:
+  // lenBurst = validCol, but gmGap = gStride3 - gShape4). A narrowed validCol
+  // therefore collapses the GM gap to zero and the pop reads one contiguous
+  // run instead of one box row per burst -- silently, since the matching
+  // PTO_ASSERT(validCol == gShape4) is compiled out in release builds. Give
+  // TPOP the full-box extent, mirroring the producer-side widening in
+  // EmitTpushTransportValidShape, then restore the logical result shape before
+  // any vector consumer sees it. Keep a statically empty pop empty: the
+  // dual-AIV no-split path uses such a replay only to balance the pipe, and a
+  // split lane whose localized valid extent is statically 0 must likewise
+  // move nothing.
+  auto result_tile_type = codegen.GetCurrentResultTileType();
+  bool statically_empty = false;
+  bool has_static_logical_shape = false;
+  if (result_tile_type) {
+    const auto result_view = ir::tile_view_semantics::GetEffectiveTileView(*result_tile_type);
+    has_static_logical_shape = result_view.valid_shape.size() >= 2;
+    for (const auto& valid_dim : result_view.valid_shape) {
+      auto dim_const = As<ir::ConstInt>(valid_dim);
+      has_static_logical_shape = has_static_logical_shape && static_cast<bool>(dim_const);
+      if (dim_const && dim_const->value_ == 0) {
+        statically_empty = true;
+      }
+    }
+  }
+  // The physical box must be static too, not just the logical extent: the
+  // treshape below rebuilds the logical type from ConstInt dims, and a split
+  // tile CAN carry a dynamic physical extent (ReshapeSplitAxis lowers a dynamic
+  // split axis to floordiv(dim, 2)). Without this the pop would reach that
+  // INTERNAL_CHECK instead of falling back to the direct-TPOP path.
+  // An ODD split is the one case that must NOT take the full-box path: the two
+  // lanes pop different extents (ceil / floor), and pto-isa derives lane 1's
+  // slot offset from the popped tile's own RUNTIME valid extents
+  // (TILE_UP_DOWN_ODD: subAIVOffset = subBlockId * (validRow + subBlockId) *
+  // validCol). Widening either lane to the box would place lane 1 one cell past
+  // the producer's band. Such a tile carries a per-lane (non-static) valid
+  // extent anyway, so this only makes the requirement explicit.
+  const bool use_full_box =
+      std::string_view(target) == "aic" && !ir::IsOddSplitCode(split) && !logical_row.empty() &&
+      !logical_col.empty() && has_static_logical_shape && !statically_empty && result_tile_type &&
+      result_tile_type->GetMemorySpace() == ir::MemorySpace::Vec && result_tile_type->shape_.size() >= 2 &&
+      As<ir::ConstInt>(result_tile_type->shape_[0]) && As<ir::ConstInt>(result_tile_type->shape_[1]);
+  // PTOAS enforces the same contract from the other side ("expects odd C2V
+  // split tpop to provide per-sub-core valid_row and valid_col operands"), so
+  // fail here with the op's own span rather than in the assembler.
+  INTERNAL_CHECK_SPAN(!ir::IsOddSplitCode(split) || (!logical_row.empty() && !logical_col.empty()), op->span_)
+      << "Internal error: " << op_name
+      << " with an odd split must carry per-lane valid_row / valid_col operands; the split-axis "
+         "localization in LowerAutoVectorSplit produces them";
+  std::string transport_row = logical_row;
+  std::string transport_col = logical_col;
+  if (use_full_box) {
+    transport_row = EmitIndexOperand(codegen, result_tile_type->shape_[0], "tpop transport row");
+    transport_col = EmitIndexOperand(codegen, result_tile_type->shape_[1], "tpop transport col");
+  }
+
+  // A frontend tpop result is not itself a locally bound tile in PTOAS, so
+  // pto.set_validshape cannot mutate it directly. When transport uses the
+  // full physical box, pop into a temporary and expose the logical result via
+  // pto.treshape. PTOAS has a dedicated zero-copy treshape-over-tpop lowering
+  // that preserves the FIFO tile handle while rebuilding its static valid
+  // metadata. A full-box pto.subview is not equivalent here: PTOAS lowers that
+  // path through a disconnected tile handle on A2/A3.
+  //
+  // Treshape carries no valid-row/valid-col operands, so it can restore only
+  // static logical extents. Keep the existing direct TPOP behavior for dynamic
+  // valid shapes until PTO exposes a dynamic metadata rebind for pipe entries.
+  std::string transport_buf = use_full_box ? codegen.NewNamedTemp("tpop_transport") : result_buf;
   std::ostringstream oss;
-  oss << result_buf << " = pto.tpop_from_" << target;
-  if (!valid_row.empty() || !valid_col.empty()) {
-    INTERNAL_CHECK_SPAN(!valid_row.empty() && !valid_col.empty(), op->span_)
+  oss << transport_buf << " = pto.tpop_from_" << target;
+  if (!transport_row.empty() || !transport_col.empty()) {
+    INTERNAL_CHECK_SPAN(!transport_row.empty() && !transport_col.empty(), op->span_)
         << "Internal error: " << op_name << " dynamic valid_shape requires both valid_row and valid_col";
-    oss << "(" << valid_row << ", " << valid_col << ")";
+    oss << "(" << transport_row << ", " << transport_col << ")";
   }
   oss << " " << FormatFrontendPipeAttrs(op, split);
   if (!result_type.empty()) {
     oss << " -> " << result_type;
   }
   codegen.Emit(oss.str());
+  if (use_full_box) {
+    const auto& shape = result_tile_type->shape_;
+    INTERNAL_CHECK_SPAN(As<ir::ConstInt>(shape[0]) && As<ir::ConstInt>(shape[1]), op->span_)
+        << "Internal error: full-box tpop localization requires a compile-time constant physical shape";
+    std::string logical_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile_type);
+    INTERNAL_CHECK_SPAN(!logical_type.empty(), op->span_)
+        << "Internal error: full-box tpop localization requires a logical tile type";
+    std::string logical_buf = codegen.NewNamedTemp("tpop_logical");
+    codegen.Emit(logical_buf + " = pto.treshape " + transport_buf + " : " + result_type + " -> " +
+                 logical_type);
+    codegen.RegisterTileBufType(logical_buf, logical_type);
+    codegen.SetCurrentResultBuf(logical_buf);
+  }
 
   return "";
 }
@@ -270,8 +384,8 @@ static std::string MakeTfreeCodegenPTO(const char* target, const CallPtr& op,
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string("tfree_to_") + target;
 
-  CHECK(op->args_.size() == 1) << op_name << " requires 1 argument (tile from tpop), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << op_name << " requires 1 argument (tile from tpop), got " << op->args_.size();
   INTERNAL_CHECK_SPAN(op->HasKwarg("split"), op->span_)
       << "Internal error: system." << op_name
       << " is missing its 'split' kwarg; StampTfreeSplit must "
@@ -323,9 +437,8 @@ static std::string MakeInitializePipeCodegenPTO(const char* target, const CallPt
   auto& codegen = AsPto(codegen_base);
   const std::string op_name = std::string(target) + "_initialize_pipe";
 
-  CHECK(op->args_.size() == 2) << op_name
-                               << " requires 2 arguments (c2v_consumer_buf, v2c_consumer_buf), got "
-                               << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << op_name << " requires 2 arguments (c2v_consumer_buf, v2c_consumer_buf), got " << op->args_.size();
   const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
   const int slot_size = op->GetKwarg<int>("slot_size", -1);
   CHECK(dir_mask >= 0) << op_name << " requires 'dir_mask' attribute";
@@ -403,8 +516,7 @@ static std::string MakeSetFFTSCodegenPTO(const CallPtr& op, codegen::CodegenBase
   auto extent = As<ir::ConstInt>(tensor_type->shape_[0]);
   INTERNAL_CHECK_SPAN(extent && extent->value_ >= 256, op->span_)
       << "system.set_ffts workspace must have a static length of at least 256 INT64 elements";
-  codegen.Emit("pto.set_ffts " + codegen.GetVarName(workspace) + " : memref<" +
-               std::to_string(extent->value_) + "xi64>");
+  codegen.Emit("pto.set_ffts " + codegen.GetVarName(workspace) + " : !pto.ptr<i64>");
   return "";
 }
 
@@ -451,7 +563,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
 
   reg("system.reserve_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 0) << "reserve_buffer takes no arguments, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+        << "reserve_buffer takes no arguments, got " << op->args_.size();
 
     const auto name = op->GetKwarg<std::string>("name");
     const int size = op->GetKwarg<int>("size", -1);
@@ -494,7 +607,8 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
 
   reg("system.import_peer_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 0) << "import_peer_buffer takes no arguments, got " << op->args_.size();
+    INTERNAL_CHECK_SPAN(op->args_.size() == 0, op->span_)
+        << "import_peer_buffer takes no arguments, got " << op->args_.size();
 
     const auto name = op->GetKwarg<std::string>("name");
     const auto peer_func = op->GetKwarg<std::string>("peer_func");
@@ -526,79 +640,71 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
         << "system.syncall: core_type must be aiv_only|aic_only|mix, got " << core_type;
 
     if (mode == "hard") {
-      CHECK(op->args_.empty()) << "system.syncall (hard form) takes no arguments, got " << op->args_.size();
+      INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+          << "system.syncall (hard form) takes no arguments, got " << op->args_.size();
       codegen.Emit("pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<" +
                    core_type + ">");
       return std::string("");
     }
 
     CHECK(mode == "soft") << "system.syncall: mode must be hard|soft, got " << mode;
-    // Soft form operands (all validated below):
-    //   aiv_only: [gm_workspace, ub_scratch, used_cores]
-    //   aic_only: [gm_workspace, l1_scratch, used_cores]
-    //   mix:      [gm_workspace, ub_scratch, l1_scratch, used_cores]
-    // gm_workspace is a shared 1-D GM int32 buffer (used_cores*8 slots, zero-init);
-    // the scratch tiles are local int32 staging (UB=Vec on the vector lane, flat
-    // L1=Mat on the cube lane); used_cores is an i32 participant count. A mix
-    // barrier carries both scratch tiles and is emitted on both lanes (SHARED);
-    // pto-isa's soft-mix lowering uses the L1 tile on the cube path and the UB
-    // tile on the vector path (the other is dead on each lane).
-    const bool is_mix = core_type == "mix";
-    const size_t num_scratch = is_mix ? 2 : 1;
-    const size_t expected_args = num_scratch + 2;  // gm_workspace + scratch(es) + used_cores
-    CHECK(op->args_.size() == expected_args) << "system.syncall (soft " << core_type << ") requires "
-                                             << expected_args << " operands, got " << op->args_.size();
-    const size_t used_idx = op->args_.size() - 1;
+    // The current PTO-ISA uses one soft operand ABI for every participant set:
+    // [gm_workspace] or [gm_workspace, used_cores]. Omitting used_cores asks
+    // PTO-ISA to derive the participant count from the launch configuration.
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+        << "system.syncall (soft " << core_type << ") requires gm_workspace and optional used_cores, got "
+        << op->args_.size() << " operands";
 
-    // gm_workspace: shared 1-D GM int32 tensor -> pto.partition_view over the
-    // whole buffer.
+    // gm_workspace: shared GM int32 tensor -> pto.partition_view over the whole
+    // buffer. PTO-ISA uses one exclusive 64-byte cache line, so a statically
+    // shaped workspace must contain at least 16 int32 elements.
     auto gm_var = AsVarLike(op->args_[0]);
     CHECK_SPAN(gm_var, op->span_) << "system.syncall soft: gm_workspace must be a tensor variable";
     auto gm_tt = As<ir::TensorType>(gm_var->GetType());
-    CHECK_SPAN(gm_tt && gm_tt->shape_.size() == 1, op->span_)
-        << "system.syncall soft: gm_workspace must be a 1-D tensor";
+    CHECK_SPAN(gm_tt && !gm_tt->shape_.empty(), op->span_)
+        << "system.syncall soft: gm_workspace must be a tensor with rank >= 1";
     const std::string dtype_str = codegen.GetTypeString(gm_tt->dtype_);
-    // Workspace contract (user-facing): the soft barrier indexes int32 counter
-    // slots, so the GM buffer must be INT32 with >= used_cores * 8 elements.
     CHECK_SPAN(dtype_str == "i32", op->span_)
         << "system.syncall soft: gm_workspace must be an INT32 tensor, got " << dtype_str;
-    constexpr int64_t kSyncAllSoftSlotInt32 = 8;  // pto::SYNCALL soft: 8 int32 slots per core
-    if (auto used_const = As<ir::ConstInt>(op->args_[used_idx])) {
-      const int64_t required = used_const->value_ * kSyncAllSoftSlotInt32;
-      if (auto gm_dim = As<ir::ConstInt>(gm_tt->shape_[0])) {
-        CHECK_SPAN(gm_dim->value_ >= required, op->span_)
-            << "system.syncall soft: gm_workspace needs >= used_cores*8 (" << required
-            << ") int32 slots, got " << gm_dim->value_;
+
+    constexpr int64_t kSyncAllSoftWorkspaceInt32 = 16;
+    int64_t static_capacity = 1;
+    bool has_dynamic_dim = false;
+    for (const auto& dim_expr : gm_tt->shape_) {
+      auto dim = As<ir::ConstInt>(dim_expr);
+      if (!dim) {
+        has_dynamic_dim = true;
+        continue;
       }
+      CHECK_SPAN(dim->value_ > 0, op->span_)
+          << "system.syncall soft: gm_workspace dimensions must be positive, got " << dim->value_;
+      static_capacity = std::min(kSyncAllSoftWorkspaceInt32,
+                                 static_capacity * std::min(kSyncAllSoftWorkspaceInt32, dim->value_));
     }
-    // Each scratch tile must be an INT32 staging tile (it mirrors the int32 GM slots).
-    for (size_t i = 1; i <= num_scratch; ++i) {
-      if (auto scratch_tt = As<ir::TileType>(op->args_[i]->GetType())) {
-        CHECK_SPAN(codegen.GetTypeString(scratch_tt->dtype_) == "i32", op->span_)
-            << "system.syncall soft: scratch tile must be INT32";
-      }
+    if (!has_dynamic_dim) {
+      CHECK_SPAN(static_capacity >= kSyncAllSoftWorkspaceInt32, op->span_)
+          << "system.syncall soft: gm_workspace must contain at least " << kSyncAllSoftWorkspaceInt32
+          << " INT32 elements (64 bytes), got " << static_capacity;
     }
+
     const std::string gm_view = codegen.GetOrCreateTensorView(gm_var);
     const std::string gm_view_type = codegen.GetTensorViewTypeString(gm_tt.get());
     const std::string partition_type = MakePartitionTensorViewType(GetDimStrings(gm_tt->shape_), dtype_str);
-    const std::vector<std::string> offset_codes = {codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX)};
+    const std::vector<std::string> offset_codes(gm_tt->shape_.size(),
+                                                codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX));
     const std::vector<std::string> size_codes = GetSizeCodes(gm_tt->shape_, codegen);
     const std::string gm_pview = EmitPartitionViewPTO(gm_var->name_hint_ + "_syncgm", gm_view, gm_view_type,
                                                       partition_type, offset_codes, size_codes, codegen);
 
-    // Assemble the operand + type-annotation lists: gm_pview, scratch(es), used_cores.
+    // Assemble the operand and type lists: gm_pview[, used_cores].
     std::vector<std::string> operands = {gm_pview};
     std::vector<std::string> types = {partition_type};
-    for (size_t i = 1; i <= num_scratch; ++i) {
-      const std::string scratch = codegen.GetExprAsCode(op->args_[i]);
-      const std::string scratch_type = codegen.GetExprTypeAnnotation(op->args_[i]);
-      CHECK_SPAN(!scratch_type.empty(), op->span_)
-          << "system.syncall soft: scratch tile has no tile_buf type annotation";
-      operands.push_back(scratch);
-      types.push_back(scratch_type);
+    if (op->args_.size() == 2) {
+      CHECK_SPAN(ExprIsI32Scalar(op->args_[1]), op->span_)
+          << "system.syncall soft: used_cores must be an INT32 scalar";
+      operands.push_back(codegen.GetExprAsCode(op->args_[1]));
+      types.emplace_back("i32");
     }
-    operands.push_back(codegen.GetExprAsCode(op->args_[used_idx]));  // used_cores (i32)
-    types.emplace_back("i32");
 
     std::ostringstream oss;
     oss << "pto.syncall(";

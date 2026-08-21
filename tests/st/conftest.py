@@ -21,6 +21,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import warnings
 from collections import Counter
 from contextlib import nullcontext
 from datetime import datetime
@@ -51,8 +52,15 @@ from harness.core.test_runner import (  # noqa: E402
     shutdown_pipeline,
     start_pipeline,
 )
-from pypto import LogLevel, set_log_level  # noqa: E402
-from pypto.runtime.runner import RunConfig  # noqa: E402
+from pypto import LogLevel  # noqa: E402
+from pypto.pypto_core import _clear_thread_log_level, _set_thread_log_level  # noqa: E402
+from pypto.pypto_core.passes import MemoryPlanner  # noqa: E402
+from pypto.runtime.runner import (  # noqa: E402
+    _SWIMLANE_CLI_HELP,
+    _SWIMLANE_FULL_LEVEL,
+    _SWIMLANE_MAX_LEVEL,
+    RunConfig,
+)
 
 # Temp directories created for pre-compilation (when --save-kernels is not set).
 # Cleaned up in pytest_sessionfinish.
@@ -75,6 +83,28 @@ def setup_simpler_dependency(request):
     for path in [get_simpler_python_path(), get_simpler_scripts_path()]:
         if path.exists() and str(path) not in sys.path:
             sys.path.insert(0, str(path))
+
+
+def _resolve_swimlane_option(config: pytest.Config) -> int:
+    """Return the requested chip-swimlane collection level.
+
+    Precedence: an explicit ``--chip-swimlane-level N`` wins, then the bare
+    ``--enable-chip-swimlane`` (full level), then the deprecated bare
+    ``--enable-l2-swimlane`` (same level, with a warning). Absent means off.
+    """
+    level: int | None = config.getoption("--chip-swimlane-level")
+    if level is not None:
+        return level
+    if config.getoption("--enable-chip-swimlane"):
+        return _SWIMLANE_FULL_LEVEL
+    if config.getoption("enable_l2_swimlane_deprecated"):
+        warnings.warn(
+            "--enable-l2-swimlane is deprecated; use --enable-chip-swimlane (or --chip-swimlane-level N).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return _SWIMLANE_FULL_LEVEL
+    return 0
 
 
 def pytest_addoption(parser):
@@ -111,6 +141,17 @@ def pytest_addoption(parser):
         default="Default",
         choices=["Default"],
         help="Optimization strategy for PyPTO pass pipeline (default: Default)",
+    )
+    parser.addoption(
+        "--memory-planner",
+        action="store",
+        default="default",
+        choices=["default", "pypto", "dsa-rp", "ptoas"],
+        help=(
+            "Session-wide memory planner for test cases that do not select one explicitly: "
+            "default (defer to PyPTO), pypto, dsa-rp, or ptoas. An explicit planner on a "
+            "PTOTestCase takes precedence (default: default)."
+        ),
     )
     parser.addoption(
         "--kernels-dir",
@@ -195,8 +236,8 @@ def pytest_addoption(parser):
         "--runtime-log-level",
         action="store",
         default=None,
-        help="PyPTO runtime log level (debug, v0..v9, info, warn, error, null). "
-        "Default: leave the runtime logger at its V5/INFO default.",
+        help="PyPTO runtime log level (debug, info, timing, warn, error, null). "
+        "Default: leave the runtime logger at its TIMING default.",
     )
     parser.addoption(
         "--analyze-auto-scopes-for-deps",
@@ -207,18 +248,45 @@ def pytest_addoption(parser):
         ),
     )
     # ── DFX (Design For X) toggles ────────────────────────────────────────
-    # Each maps 1:1 to the same-named field on ``RunConfig`` and to the
-    # corresponding ``CallConfig`` member on the runtime side. Names match
-    # ``runtime/conftest.py`` so the two surfaces stay aligned.
+    # Each maps to the same-named field on ``RunConfig`` and to the corresponding
+    # runtime ``CallConfig`` member.
+    #
+    # The bare enable flag and the level-valued form are deliberately two
+    # options. An ``nargs="?"`` option greedily eats the next non-dash token, so
+    # a single option would turn the conventional
+    # ``pytest --enable-chip-swimlane tests/st/runtime/`` into
+    # "invalid int value: 'tests/st/runtime/'" — the flag used to be
+    # ``store_true`` and that ordering has always worked. Keeping the bare flag
+    # valueless makes it order-independent again.
     parser.addoption(
-        "--enable-l2-swimlane",
-        action="store_true",
-        default=False,
-        help="Capture per-task L2 perf records into <work_dir>/dfx_outputs/l2_swimlane_records.json. "
+        "--enable-chip-swimlane",
+        action="store_const",
+        const=_SWIMLANE_FULL_LEVEL,
+        default=0,
+        help=f"Enable chip swimlane capture at the full level ({_SWIMLANE_FULL_LEVEL}), matching the "
+        "runtime harness's bare --enable-chip-swimlane. Use --chip-swimlane-level N for a lower "
+        "level. Records are written into <work_dir>/dfx_outputs/chip_swimlane_records.json. "
         "On onboard platforms, also render merged_swimlane_*.json and run the kernel twice: a dep_gen "
         "pass to capture deps.json (the converter's task graph) then a clean swimlane pass, since "
         "dep_gen collection perturbs the timing. Simulator platforms emit only the records (the merged "
         "swimlane is skipped).",
+    )
+    parser.addoption(
+        "--chip-swimlane-level",
+        default=None,
+        type=int,
+        choices=range(_SWIMLANE_MAX_LEVEL + 1),
+        metavar="PERF_LEVEL",
+        help=_SWIMLANE_CLI_HELP + " Takes precedence over --enable-chip-swimlane.",
+    )
+    # Deprecated spelling, kept because CI and existing scripts still pass it.
+    # Valueless like the original ``store_true`` form it replaces.
+    parser.addoption(
+        "--enable-l2-swimlane",
+        dest="enable_l2_swimlane_deprecated",
+        action="store_true",
+        default=False,
+        help="Deprecated alias for --enable-chip-swimlane.",
     )
     parser.addoption(
         "--dump-args",
@@ -326,6 +394,16 @@ def _parse_platform_filter(raw: str) -> tuple[str, ...]:
     return valid
 
 
+def _parse_memory_planner(raw: str) -> MemoryPlanner | None:
+    """Translate the system-test CLI spelling into the public planner enum."""
+    return {
+        "default": None,
+        "pypto": MemoryPlanner.PYPTO,
+        "dsa-rp": MemoryPlanner.DSA_RP,
+        "ptoas": MemoryPlanner.PTOAS,
+    }[raw]
+
+
 @pytest.fixture(autouse=True)
 def _report_device(request) -> None:
     """Report which device executed each test at the end of the test body.
@@ -429,12 +507,13 @@ def test_config(request) -> RunConfig:
         save_kernels_dir=save_kernels_dir,
         dump_passes=request.config.getoption("--dump-passes"),
         codegen_only=request.config.getoption("--codegen-only"),
-        enable_l2_swimlane=request.config.getoption("--enable-l2-swimlane"),
+        enable_chip_swimlane=_resolve_swimlane_option(request.config),
         enable_dump_args=request.config.getoption("--dump-args"),
         enable_pmu=request.config.getoption("--enable-pmu"),
         enable_dep_gen=request.config.getoption("--enable-dep-gen"),
         enable_scope_stats=request.config.getoption("--enable-scope-stats"),
         analyze_auto_scopes_for_deps=request.config.getoption("--analyze-auto-scopes-for-deps"),
+        memory_planner=_parse_memory_planner(request.config.getoption("--memory-planner")),
     )
 
 
@@ -480,7 +559,7 @@ def tensor_shape(request):
 
 # Skip markers
 def pytest_configure(config):
-    """Register custom markers and apply early global settings."""
+    """Register custom markers and apply early runtime settings."""
     config.addinivalue_line(
         "markers",
         "platforms(*ids): restrict the test to the given platform ids "
@@ -498,15 +577,7 @@ def pytest_configure(config):
         "ci.yml change.",
     )
 
-    # Set C++ log level as early as possible so it applies to collection too.
-    # Forked child processes inherit this setting via os.fork().
-    try:
-        level_name: str = config.getoption("--pypto-log-level")
-        set_log_level(LogLevel[level_name])
-    except (ValueError, KeyError):
-        pass  # option not yet registered (e.g. during --co --help)
-
-    # Set PyPTO runtime log level (orthogonal to PyPTO C++ logger above).
+    # Set the PyPTO runtime log level independently of the per-ST-item C++ logger.
     try:
         runtime_level = config.getoption("--runtime-log-level")
     except KeyError:
@@ -516,6 +587,29 @@ def pytest_configure(config):
             from pypto.runtime import configure_log  # noqa: PLC0415
 
             configure_log(runtime_level)  # ValueError propagates: invalid CLI value must fail fast
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Apply the requested C++ log level only while an ST item is running.
+
+    ``tests/st/conftest.py`` can be loaded in a mixed ST/UT session.  Changing
+    the process-global C++ logger in ``pytest_configure`` therefore suppressed
+    diagnostics expected by later unit tests.  Surround the complete pytest
+    protocol (fixture setup, test call, and teardown) so forked runtime workers
+    still inherit the requested level, then clear the thread-local override.
+    """
+    del nextitem
+    if not item.path.is_relative_to(_ST_DIR):
+        yield
+        return
+
+    try:
+        level_name: str = item.config.getoption("--pypto-log-level")
+        _set_thread_log_level(LogLevel[level_name])
+        yield
+    finally:
+        _clear_thread_log_level()
 
 
 def pytest_itemcollected(item):
@@ -632,7 +726,11 @@ def _eval_arg_node(
     raise _Unresolvable(ast.dump(node))
 
 
-def _collect_test_case_from_item(item: pytest.Item, seen: dict[str, PTOTestCase]) -> None:
+def _collect_test_case_from_item(
+    item: pytest.Item,
+    seen: dict[str, PTOTestCase],
+    session_memory_planner: MemoryPlanner | None,
+) -> None:
     """Inspect *item* and add any discovered PTOTestCase instances to *seen*.
 
     Parses the test body and resolves every ``SomeCase(...)`` constructor call
@@ -640,7 +738,7 @@ def _collect_test_case_from_item(item: pytest.Item, seen: dict[str, PTOTestCase]
     params, locals assigned earlier in the body, and the test module globals,
     then instantiates it exactly as the body would.  This reconstructs the case
     regardless of parametrize→__init__ name renames (``valid`` →
-    ``valid_shapes``), hard-coded literal args (``dtype=DataType.FP16``),
+    ``valid_shape``), hard-coded literal args (``dtype=DataType.FP16``),
     positional args, the class-as-parameter pattern (``op_cls(...)``), or a
     locally-built config (``cfg = RunConfig(...); run(Case(config=cfg))``) — so
     the case is pre-compiled and batched instead of falling to the per-case
@@ -704,7 +802,7 @@ def _collect_test_case_from_item(item: pytest.Item, seen: dict[str, PTOTestCase]
         except Exception:
             # _Unresolvable arg, or a constructor mismatch — leave for inline.
             continue
-        seen.setdefault(_cache_key(instance), instance)
+        seen.setdefault(_cache_key(instance, session_memory_planner=session_memory_planner), instance)
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -726,10 +824,11 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         return
 
     # ── discover PTOTestCase instances ───────────────────────────────────────
-    seen: dict[str, PTOTestCase] = {}  # cache_key → instance (deduped)
+    session_memory_planner = _parse_memory_planner(session.config.getoption("--memory-planner"))
+    seen: dict[str, PTOTestCase] = {}  # effective cache_key → instance (deduped)
 
     for item in session.items:
-        _collect_test_case_from_item(item, seen)
+        _collect_test_case_from_item(item, seen, session_memory_planner)
 
     # Read the task-submit / pipeline options *before* the empty-discovery guard:
     # a suite that only creates PTOTestCases dynamically leaves ``seen`` empty yet
@@ -788,7 +887,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 
     dump_passes: bool = session.config.getoption("--dump-passes")
     codegen_only: bool = session.config.getoption("--codegen-only")
-    enable_l2_swimlane: bool = session.config.getoption("--enable-l2-swimlane")
+    enable_chip_swimlane: int = _resolve_swimlane_option(session.config)
     enable_dump_args: int = session.config.getoption("--dump-args")
     enable_pmu: int = session.config.getoption("--enable-pmu")
     enable_dep_gen: bool = session.config.getoption("--enable-dep-gen")
@@ -844,26 +943,33 @@ def pytest_collection_finish(session: pytest.Session) -> None:
         f"\n[PyPTO] Pipeline: {len(test_cases)} test case(s); "
         f"compile_workers={max_workers}, execute_mode={execute_mode}, {device_info}"
     )
-    start_pipeline(
-        test_cases=test_cases,
-        cache_dir=cache_dir,
-        session_platform=session_platform,
-        dump_passes=dump_passes,
-        codegen_only=codegen_only,
-        compile_workers=max_workers,
-        device_pool=device_pool,
-        enable_l2_swimlane=enable_l2_swimlane,
-        enable_dump_args=enable_dump_args,
-        enable_pmu=enable_pmu,
-        enable_dep_gen=enable_dep_gen,
-        enable_scope_stats=enable_scope_stats,
-        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
-        execute_mode=execute_mode,
-        task_max_time=task_max_time,
-        task_queue_timeout=task_queue_timeout,
-        task_submit_device=task_submit_device,
-        execute_batch_size=execute_batch_size,
-    )
+    pypto_log_level = LogLevel[session.config.getoption("--pypto-log-level")]
+    _set_thread_log_level(pypto_log_level)
+    try:
+        start_pipeline(
+            test_cases=test_cases,
+            cache_dir=cache_dir,
+            session_platform=session_platform,
+            dump_passes=dump_passes,
+            codegen_only=codegen_only,
+            pypto_log_level=pypto_log_level,
+            compile_workers=max_workers,
+            device_pool=device_pool,
+            enable_chip_swimlane=enable_chip_swimlane,
+            enable_dump_args=enable_dump_args,
+            enable_pmu=enable_pmu,
+            enable_dep_gen=enable_dep_gen,
+            enable_scope_stats=enable_scope_stats,
+            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+            execute_mode=execute_mode,
+            task_max_time=task_max_time,
+            task_queue_timeout=task_queue_timeout,
+            task_submit_device=task_submit_device,
+            execute_batch_size=execute_batch_size,
+            memory_planner=session_memory_planner,
+        )
+    finally:
+        _clear_thread_log_level()
     print("[PyPTO] Pipeline scheduled — pytest item loop starting\n")
 
 

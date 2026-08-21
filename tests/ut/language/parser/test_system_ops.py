@@ -219,6 +219,23 @@ class TestSystemOpsParsing:
         assert isinstance(reparsed, ir.Program)
         ir.assert_structural_equal(Before, reparsed)
 
+    def test_cacheinvalid_round_trip_whole_gm(self):
+        """Round-trip for the no-argument (whole-GM) form."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.system.cacheinvalid()
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.cacheinvalid()" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
     def test_cacheinvalid_rejects_float_offset(self):
         """A non-integer offset is rejected at the IR wrapper, not deep in codegen."""
         span = ir.Span.unknown()
@@ -234,6 +251,27 @@ class TestSystemOpsParsing:
         tensor = ir.Var("x", ir.TensorType([dim, dim], DataType.FP32), span)
         with pytest.raises(ValueError, match="offsets must match tensor rank 2"):
             system_ops.cacheinvalid(tensor, [1, 1], [0])
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"shapes": [1]},
+            {"offsets": [0]},
+            {"shapes": [1], "offsets": [0]},
+        ],
+        ids=["shapes-only", "offsets-only", "both"],
+    )
+    def test_cacheinvalid_rejects_region_args_without_tensor(self, kwargs):
+        """A missing tensor must not silently widen a region call to whole-GM.
+
+        Both the DSL wrapper (``pl.system.cacheinvalid``) and the IR wrapper
+        reject it — otherwise the region arguments are dropped and the call
+        invalidates the entire GM address space instead of surfacing the error.
+        """
+        with pytest.raises(ValueError, match="whole-GM form takes no shapes/offsets"):
+            pl.system.cacheinvalid(None, **kwargs)  # type: ignore[arg-type]  # intentionally missing tensor
+        with pytest.raises(ValueError, match="whole-GM form takes no shapes/offsets"):
+            system_ops.cacheinvalid(None, **kwargs)  # type: ignore[arg-type]  # intentionally missing tensor
 
     def test_syncall_round_trip(self):
         """Test round-trip for pl.system.syncall with an explicit core_type."""
@@ -284,7 +322,7 @@ class TestSystemOpsParsing:
                 self,
                 x: pl.Tensor[[512, 128], pl.FP32],
                 out: pl.Tensor[[512, 128], pl.FP32],
-                ws: pl.Tensor[[32], pl.INT32],
+                ws: pl.Tensor[[16], pl.INT32],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 off = pl.tile.get_block_idx() * 128
                 t = pl.load(x, [off, 0], [128, 128])
@@ -292,16 +330,76 @@ class TestSystemOpsParsing:
                 return pl.store(t, [off, 0], out)
 
         printed = Before.as_python()
-        # The high-level surface (mode/core_type/gm_workspace/used_cores) round-trips;
-        # the synthesized scratch is threaded back via the internal scratch= kwarg.
+        # The high-level surface has no compiler-internal scratch operands.
         assert 'pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=4' in printed
+        assert "scratch" not in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_syncall_soft_auto_participant_count_round_trip(self):
+        """Explicit used_cores=0 round-trips as the launch-derived soft form."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(self, ws: pl.Tensor[[16], pl.INT32]) -> pl.Tensor[[16], pl.INT32]:
+                pl.system.syncall(mode="soft", core_type="mix", gm_workspace=ws, used_cores=0)
+                return ws
+
+        printed = Before.as_python()
+        syncall_line = next(line for line in printed.splitlines() if "pl.system.syncall" in line)
+        assert 'mode="soft", core_type="mix", gm_workspace=ws, used_cores=0' in syncall_line
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_syncall_soft_ir_zero_count_is_canonicalized(self):
+        """The low-level helper also maps explicit i32 zero to the one-operand form."""
+        span = ir.Span.unknown()
+        workspace = ir.Var("ws", ir.TensorType([16], DataType.INT32), span)
+        zero = ir.ConstInt(0, DataType.INT32, span)
+
+        call = system_ops.syncall_soft("aiv_only", workspace, zero, span=span)
+
+        assert call.args == [workspace]
+
+    def test_syncall_soft_ir_rejects_out_of_range_count(self):
+        """The low-level helper rejects i32 constants that cannot represent a participant count."""
+        span = ir.Span.unknown()
+        workspace = ir.Var("ws", ir.TensorType([16], DataType.INT32), span)
+
+        for invalid_count in (-1, 1 << 31):
+            count = ir.ConstInt(invalid_count, DataType.INT32, span)
+            with pytest.raises(ValueError, match="INT32 range"):
+                system_ops.syncall_soft("aiv_only", workspace, count, span=span)
+
+    def test_syncall_soft_dynamic_participant_count_round_trip(self):
+        """An INT32 participant count remains an operand across print/parse."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                ws: pl.Tensor[[16], pl.INT32],
+                participants: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[16], pl.INT32]:
+                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=participants)
+                return ws
+
+        printed = Before.as_python()
+        syncall_line = next(line for line in printed.splitlines() if "pl.system.syncall" in line)
+        assert "used_cores=participants" in syncall_line
 
         reparsed = pl.parse_program(printed)
         assert isinstance(reparsed, ir.Program)
         ir.assert_structural_equal(Before, reparsed)
 
     def test_syncall_soft_validation(self):
-        """Soft syncall validates mode, core_type, gm_workspace, and used_cores."""
+        """Soft syncall validates mode, core type, workspace, and participant count."""
         with pytest.raises(ValueError, match="mode"):
             pl.system.syncall(mode="bogus")
         # An unknown core_type is rejected.
@@ -312,6 +410,16 @@ class TestSystemOpsParsing:
         for ct in ("aiv_only", "aic_only", "mix"):
             with pytest.raises(ValueError, match="gm_workspace"):
                 pl.system.syncall(mode="soft", core_type=ct, used_cores=4)
+
+        span = ir.Span.unknown()
+        workspace = pl.Tensor(expr=ir.Var("ws", ir.TensorType([16], DataType.INT32), span))
+        with pytest.raises(ValueError, match="explicit used_cores"):
+            pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=workspace)
+        for invalid_count in (-1, 1 << 31):
+            with pytest.raises(ValueError, match="INT32 range"):
+                pl.system.syncall(
+                    mode="soft", core_type="aiv_only", gm_workspace=workspace, used_cores=invalid_count
+                )
 
     def test_multiple_system_ops_round_trip(self):
         """Test round-trip with multiple system ops in a single function."""
@@ -626,6 +734,94 @@ class test_program:
         assert "@pl.function(type=pl.FunctionType.Group" in printed
         reparsed = pl.parse_program(printed)
         ir.assert_structural_equal(Before, reparsed)
+
+
+class TestLaunchShapeQueryParsing:
+    """Parsing / round-trip for the SPMD launch-shape queries.
+
+    ``pl.system.available_cluster_count()`` / ``available_aiv_count()`` read the
+    run's own device geometry, so an SPMD launch can size itself on the device
+    rather than on a literal baked at compile time.
+    """
+
+    def test_available_cluster_count_round_trip(self):
+        """pl.system.available_cluster_count() binds a Scalar[INT32] and round-trips."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                n = pl.system.available_cluster_count()  # noqa: F841 — the DSL parser binds it
+                pl.system.fence()
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.available_cluster_count()" in printed
+        assert "n: pl.Scalar[pl.INT32]" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_available_aiv_count_round_trip(self):
+        """pl.system.available_aiv_count() binds a Scalar[INT32] and round-trips."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                n = pl.system.available_aiv_count()  # noqa: F841 — the DSL parser binds it
+                pl.system.fence()
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.available_aiv_count()" in printed
+        assert "n: pl.Scalar[pl.INT32]" in printed
+
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_spmd_launch_width_attr_round_trips(self):
+        """As an SPMD width the query lands in the Spmd wrapper's ``attrs["core_num"]``.
+
+        The outliner moves the launch width onto a synthesized ``Spmd`` function,
+        where the printer emits the call itself. Recovering it needs the
+        decorator-level ``attrs={...}`` parser, not the statement parser the
+        tests above cover.
+        """
+        from pypto import passes  # noqa: PLC0415
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[64, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                t = pl.load(x, [0, 0], [64, 64])
+                out = pl.store(t, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[64, 64], pl.FP32], out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.spmd(pl.system.available_cluster_count(), sync_start=True):
+                    out = self.kernel(x, out)
+                return out
+
+        outlined = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+        printed = outlined.as_python()
+        assert 'attrs={"core_num": pl.system.available_cluster_count()' in printed, printed
+
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(outlined, reparsed)
+
+    def test_ir_level_result_type(self):
+        """The IR wrappers deduce Scalar[INT32] — the type pl.spmd's core_num accepts."""
+        for call in (system_ops.available_cluster_count(), system_ops.available_aiv_count()):
+            assert isinstance(call, ir.Call)
+            assert isinstance(call.type, ir.ScalarType)
+            assert call.type.dtype == DataType.INT32
 
 
 if __name__ == "__main__":

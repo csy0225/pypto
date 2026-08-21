@@ -99,7 +99,7 @@ def test_dfx_flags_parsed_into_dfx_opts(tmp_path):
         rc = main(
             _argv(
                 tmp_path,
-                "--enable-l2-swimlane",
+                "--enable-chip-swimlane",
                 "--dump-args",
                 "2",
                 "--enable-pmu",
@@ -111,7 +111,7 @@ def test_dfx_flags_parsed_into_dfx_opts(tmp_path):
     assert rc == 0
     _, kwargs = run.call_args
     assert kwargs["dfx"] == _DfxOpts(
-        enable_l2_swimlane=True,
+        enable_chip_swimlane=True,
         enable_dump_args=2,
         enable_pmu=5,
         enable_dep_gen=True,
@@ -139,11 +139,15 @@ def test_no_validate_flag_defers_validation(tmp_path):
 
 def test_execute_artifact_dir_wires_compile_then_execute(tmp_path, stub_compile_and_assemble):
     chip = object()
-    stub_compile_and_assemble.return_value = (chip, "tensormap_and_ringbuffer", {})
+    stub_compile_and_assemble.return_value = (
+        chip,
+        "tensormap_and_ringbuffer",
+        {"enable_sdma": True},
+    )
     with patch.object(execute_artifact, "_execute_on_device") as exec_on_dev:
         execute_artifact_dir(tmp_path, "a2a3", 1)
     stub_compile_and_assemble.assert_called_once_with(tmp_path, "a2a3")
-    args, _ = exec_on_dev.call_args
+    args, kwargs = exec_on_dev.call_args
     # work_dir, golden_path, chip_callable, runtime_name, platform, device_id
     assert args[0] == tmp_path
     assert args[1] == tmp_path / "golden.py"
@@ -151,6 +155,14 @@ def test_execute_artifact_dir_wires_compile_then_execute(tmp_path, stub_compile_
     assert args[3] == "tensormap_and_ringbuffer"
     assert args[4] == "a2a3"
     assert args[5] == 1
+    assert kwargs["enable_sdma"] is True
+
+
+def test_execute_artifact_dir_defaults_sdma_off(tmp_path, stub_compile_and_assemble):
+    with patch.object(execute_artifact, "_execute_on_device") as exec_on_dev:
+        execute_artifact_dir(tmp_path, "a2a3", 1)
+
+    assert exec_on_dev.call_args.kwargs["enable_sdma"] is False
 
 
 def test_work_dir_and_platform_are_required():
@@ -176,11 +188,135 @@ def test_execute_batch_runs_all_in_one_worker(tmp_path, capsys, stub_compile_and
         all_ok = execute_batch_manifest(manifest, 3, validate=False)
     assert all_ok is True
     cw.assert_called_once()  # ONE ChipWorker for the whole batch
+    assert cw.call_args.kwargs["enable_sdma"] is False
     chipworker.__enter__.assert_called_once()
     assert on_dev.call_count == 2  # one device run per artifact, reusing the worker
+    assert all(call.kwargs["enable_sdma"] is False for call in on_dev.call_args_list)
     out = capsys.readouterr().out
     assert f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=3" in out
     assert f"PYPTO_EXEC_RESULT=PASS work_dir={wd2} device=3" in out
+
+
+def test_execute_batch_enables_sdma_worker_for_prefetch_artifact(
+    tmp_path,
+    stub_compile_and_assemble,
+):
+    wd = tmp_path / "prefetch"
+    manifest = _manifest(tmp_path, wd)
+    stub_compile_and_assemble.return_value = (
+        object(),
+        "tensormap_and_ringbuffer",
+        {"enable_sdma": True},
+    )
+
+    with (
+        patch("pypto.runtime.ChipWorker", return_value=MagicMock()) as worker_cls,
+        patch.object(execute_artifact, "_execute_on_device") as on_dev,
+    ):
+        all_ok = execute_batch_manifest(manifest, 3, validate=False)
+
+    assert all_ok is True
+    assert worker_cls.call_args.kwargs["enable_sdma"] is True
+    assert on_dev.call_args.kwargs["enable_sdma"] is True
+
+
+@pytest.mark.parametrize(
+    "runtime_configs",
+    [
+        pytest.param(({}, {"enable_sdma": True}), id="ordinary-then-sdma"),
+        pytest.param(({"enable_sdma": True}, {}), id="sdma-then-ordinary"),
+    ],
+)
+def test_execute_batch_mixed_sdma_capability_is_order_independent(
+    tmp_path,
+    capsys,
+    stub_compile_and_assemble,
+    runtime_configs,
+):
+    """Any same-binding SDMA artifact enables the shared worker, independent of manifest order."""
+    wd1, wd2 = tmp_path / "a", tmp_path / "b"
+    manifest = _manifest(tmp_path, wd1, wd2)
+    configs_by_work_dir = dict(zip((wd1, wd2), runtime_configs, strict=True))
+
+    def reconstruct(work_dir, _platform):
+        return object(), "tensormap_and_ringbuffer", configs_by_work_dir[work_dir]
+
+    stub_compile_and_assemble.side_effect = reconstruct
+    with (
+        patch("pypto.runtime.ChipWorker", return_value=MagicMock()) as worker_cls,
+        patch.object(execute_artifact, "_execute_on_device") as on_dev,
+    ):
+        all_ok = execute_batch_manifest(manifest, 3, validate=False)
+
+    assert all_ok is True
+    assert worker_cls.call_args.kwargs["enable_sdma"] is True
+    assert [call.kwargs["enable_sdma"] for call in on_dev.call_args_list] == [
+        bool(config.get("enable_sdma", False)) for config in runtime_configs
+    ]
+    out = capsys.readouterr().out
+    markers = [line for line in out.splitlines() if line.startswith("PYPTO_EXEC_RESULT=")]
+    assert markers == [
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=3",
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd2} device=3",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("platforms", "runtimes"),
+    [
+        pytest.param(
+            ("a2a3sim", "a2a3"),
+            ("tensormap_and_ringbuffer", "tensormap_and_ringbuffer"),
+            id="different-platform",
+        ),
+        pytest.param(
+            ("a2a3", "a2a3"),
+            ("first_runtime", "second_runtime"),
+            id="different-runtime",
+        ),
+    ],
+)
+def test_execute_batch_ignores_fallback_artifact_for_shared_sdma_capability(
+    tmp_path,
+    capsys,
+    stub_compile_and_assemble,
+    platforms,
+    runtimes,
+):
+    """An SDMA artifact on another binding must not configure the shared worker."""
+    wd1, wd2 = tmp_path / "ordinary", tmp_path / "sdma"
+    manifest = tmp_path / "mixed-bindings.json"
+    manifest.write_text(
+        json.dumps(
+            [
+                {"work_dir": str(wd1), "platform": platforms[0]},
+                {"work_dir": str(wd2), "platform": platforms[1]},
+            ]
+        )
+    )
+    artifacts_by_work_dir = {
+        wd1: (object(), runtimes[0], {}),
+        wd2: (object(), runtimes[1], {"enable_sdma": True}),
+    }
+
+    def reconstruct(work_dir, _platform):
+        return artifacts_by_work_dir[work_dir]
+
+    stub_compile_and_assemble.side_effect = reconstruct
+    with (
+        patch("pypto.runtime.ChipWorker", return_value=MagicMock()) as worker_cls,
+        patch.object(execute_artifact, "_execute_on_device") as on_dev,
+    ):
+        all_ok = execute_batch_manifest(manifest, 3, validate=False)
+
+    assert all_ok is True
+    assert worker_cls.call_args.kwargs["enable_sdma"] is False
+    assert [call.kwargs["enable_sdma"] for call in on_dev.call_args_list] == [False, True]
+    markers = [line for line in capsys.readouterr().out.splitlines() if line.startswith("PYPTO_EXEC_RESULT=")]
+    assert markers == [
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=3",
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd2} device=3",
+    ]
 
 
 def test_execute_batch_one_failure_does_not_abort_rest(tmp_path, capsys, stub_compile_and_assemble):
@@ -209,12 +345,13 @@ def test_execute_batch_first_rebind_failure_marks_infra_and_continues(
     """
     wd1, wd2 = tmp_path / "a", tmp_path / "b"
     manifest = _manifest(tmp_path, wd1, wd2)
-    # 1st rebind (probe wd1) fails; 2nd (probe wd2) + 3rd (run wd2) succeed.
-    stub_compile_and_assemble.side_effect = [
-        RuntimeError("bad .so"),
-        (object(), "tensormap_and_ringbuffer", {}),
-        (object(), "tensormap_and_ringbuffer", {}),
-    ]
+
+    def reconstruct(work_dir, _platform):
+        if work_dir == wd1:
+            raise RuntimeError("bad .so")
+        return object(), "tensormap_and_ringbuffer", {}
+
+    stub_compile_and_assemble.side_effect = reconstruct
     with (
         patch("pypto.runtime.ChipWorker", return_value=MagicMock()),
         patch.object(execute_artifact, "_execute_on_device"),
@@ -222,17 +359,24 @@ def test_execute_batch_first_rebind_failure_marks_infra_and_continues(
         all_ok = execute_batch_manifest(manifest, 0, validate=False)
     assert all_ok is False
     out = capsys.readouterr().out
-    assert f"PYPTO_EXEC_RESULT=INFRA work_dir={wd1}" in out
-    assert f"PYPTO_EXEC_RESULT=PASS work_dir={wd2} device=0" in out
+    markers = [line for line in out.splitlines() if line.startswith("PYPTO_EXEC_RESULT=")]
+    assert markers == [
+        f"PYPTO_EXEC_RESULT=INFRA work_dir={wd1}",
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd2} device=0",
+    ]
 
 
 def test_execute_batch_setup_failure_marks_infra_not_fail(tmp_path, capsys, stub_compile_and_assemble):
     """A mid-batch rebind failure is INFRA (infra), a device-run failure is FAIL."""
     wd1, wd2 = tmp_path / "a", tmp_path / "b"
     manifest = _manifest(tmp_path, wd1, wd2)
-    # Probe wd1 ok (opens worker); run wd1 ok; rebind wd2 fails → INFRA for wd2.
-    good = (object(), "tensormap_and_ringbuffer", {})
-    stub_compile_and_assemble.side_effect = [good, good, RuntimeError("wd2 cache miss")]
+
+    def reconstruct(work_dir, _platform):
+        if work_dir == wd2:
+            raise RuntimeError("wd2 cache miss")
+        return object(), "tensormap_and_ringbuffer", {}
+
+    stub_compile_and_assemble.side_effect = reconstruct
     with (
         patch("pypto.runtime.ChipWorker", return_value=MagicMock()),
         patch.object(execute_artifact, "_execute_on_device"),
@@ -240,9 +384,11 @@ def test_execute_batch_setup_failure_marks_infra_not_fail(tmp_path, capsys, stub
         all_ok = execute_batch_manifest(manifest, 0, validate=False)
     assert all_ok is False
     out = capsys.readouterr().out
-    assert f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=0" in out
-    assert f"PYPTO_EXEC_RESULT=INFRA work_dir={wd2}" in out
-    assert f"PYPTO_EXEC_RESULT=FAIL work_dir={wd2}" not in out
+    markers = [line for line in out.splitlines() if line.startswith("PYPTO_EXEC_RESULT=")]
+    assert markers == [
+        f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=0",
+        f"PYPTO_EXEC_RESULT=INFRA work_dir={wd2}",
+    ]
 
 
 if __name__ == "__main__":

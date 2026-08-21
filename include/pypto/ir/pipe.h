@@ -30,7 +30,7 @@ enum PipeType : int {
   M,     ///< Matrix Unit
   V,     ///< Vector Unit
   S,     ///< Scalar Unit
-  FIX,   ///< Fix Pipe (L0C -> UB)
+  FIX,   ///< Fix Pipe (L0C writeback)
   ALL    ///< All Pipes
 };
 
@@ -78,13 +78,14 @@ enum CoreType : int {
  * - Right (L0B): right matrix input buffer
  * - Acc (L0C): accumulator/output buffer
  * - Mat (L1): staging buffer
+ * - LeftScale / RightScale: L0A/L0B MX block-scale sidecars (A5)
  *
  * @param space Memory space to check
  * @return true if the memory space is used by the CUBE core
  */
 inline bool IsCubeMemorySpace(MemorySpace space) {
   return space == MemorySpace::Left || space == MemorySpace::Right || space == MemorySpace::Acc ||
-         space == MemorySpace::Mat;
+         space == MemorySpace::Mat || space == MemorySpace::LeftScale || space == MemorySpace::RightScale;
 }
 
 }  // namespace ir

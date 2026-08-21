@@ -81,19 +81,6 @@ int64_t ComputeShapeProduct(const std::vector<ExprPtr>& shape) {
   return product;
 }
 
-TileLayout InferTileLayoutFromShape(const std::vector<ExprPtr>& shape) {
-  if (shape.size() != 2) {
-    return TileLayout::row_major;
-  }
-
-  auto rows_const = As<ConstInt>(shape[0]);
-  auto cols_const = As<ConstInt>(shape[1]);
-  if (!rows_const || !cols_const) {
-    return TileLayout::row_major;
-  }
-  return (cols_const->value_ == 1 && rows_const->value_ > 1) ? TileLayout::col_major : TileLayout::row_major;
-}
-
 /**
  * @brief Validate that all elements of a TupleType are ScalarType with an index-like dtype
  *
@@ -242,8 +229,8 @@ TypePtr DeduceTileSliceType(const std::vector<ExprPtr>& args,
   }
 
   // Slice produces a window over the source tile.  PTO's pto.subview semantics
-  // require the result tile_buf to share dtype, memory space, and the four
-  // tile-config fields (blayout, slayout, fractal, pad) with the source.
+  // require the result tile_buf to share dtype, memory space, and the five
+  // tile-config fields (blayout, slayout, fractal, pad, compact) with the source.
   // Inherit only those fields from the source TileView; recompute the
   // window-specific fields (valid_shape and physical stride/start_offset are
   // inherent to the slice itself, not the parent buffer).  Tiles without an
@@ -256,8 +243,9 @@ TypePtr DeduceTileSliceType(const std::vector<ExprPtr>& args,
     tile_view.slayout = src_v.slayout;
     tile_view.fractal = src_v.fractal;
     tile_view.pad = src_v.pad;
+    tile_view.compact = src_v.compact;
   } else {
-    tile_view.blayout = InferTileLayoutFromShape(new_shape);
+    tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(new_shape);
   }
   tile_view.valid_shape = valid_shape;
 
@@ -330,11 +318,18 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
                                       << " into shape with size " << new_product;
   }
 
-  // Return new TileType with reshaped dimensions and same dtype
+  // Return new TileType with reshaped dimensions and same dtype. Tensor and tile
+  // reshape share one no-widening mapping, so ConvertTensorToTileOps cannot
+  // rewrite a tensor.reshape into a tile.reshape that widens the region back.
   TileView tile_view;
-  tile_view.valid_shape = new_shape;
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  tile_view.valid_shape =
+      ComputeReshapeValidShape(GetValidShape(tile_type), tile_type->shape_, new_shape,
+                               source_view.blayout == TileLayout::row_major, args[0]->span_, "tile.reshape");
+  tile_view.pad = source_view.pad;
+  tile_view.compact = source_view.compact;
 
-  tile_view.blayout = InferTileLayoutFromShape(new_shape);
+  tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(new_shape);
 
   return std::make_shared<TileType>(new_shape, tile_type->dtype_, std::nullopt, tile_view);
 }
@@ -471,8 +466,8 @@ TypePtr DeduceTileTransposeViewType(const std::vector<ExprPtr>& args,
   // scatter axis) has no major-ness and is left unchanged. This maps each
   // layout to its transpose dual: NZ<->ZN, NN<->ZZ, ND<->DN. (A plain swap of
   // the two fields would be correct only for NZ/ZN, and would wrongly leave
-  // NN/ZZ fixed and produce an illegal none_box blayout for ND/DN.) fractal/pad
-  // are byte-level invariants and carry through unchanged.
+  // NN/ZZ fixed and produce an illegal none_box blayout for ND/DN.) fractal,
+  // pad, and compact mode are byte-level invariants and carry through unchanged.
   auto flip_major = [](TileLayout l) -> TileLayout {
     switch (l) {
       case TileLayout::row_major:
@@ -490,6 +485,7 @@ TypePtr DeduceTileTransposeViewType(const std::vector<ExprPtr>& args,
   tile_view.slayout = flip_major(src_v.slayout);
   tile_view.fractal = src_v.fractal;
   tile_view.pad = src_v.pad;
+  tile_view.compact = src_v.compact;
   std::vector<ExprPtr> valid_shape = src_v.valid_shape.empty() ? tile_type->shape_ : src_v.valid_shape;
   std::swap(valid_shape[ndim - 2], valid_shape[ndim - 1]);
   tile_view.valid_shape = valid_shape;
@@ -515,6 +511,7 @@ REGISTER_OP("tile.slice")
                   "Optional axes (MakeTuple of ConstInt) erased from the result type; the result is "
                   "clamped to 2D if reduction would take it below 2D")
     .set_output_memory_inherit_input()
+    .no_execution_memory_access()
     .set_attr<PadValue>("pad_value")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
@@ -527,6 +524,7 @@ REGISTER_OP("tile.reshape")
     .add_argument("input", "Input tile (TileType)")
     .add_argument("shape", "New shape dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
     .set_output_memory_inherit_input()
+    .no_execution_memory_access()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileReshapeType(args, kwargs);
@@ -539,6 +537,7 @@ REGISTER_OP("tile.reinterpret_view")
     .add_argument("shape", "Optional target shape; omitted to scale the physically contiguous dimension")
     .set_attr<DataType>("dtype")
     .set_output_memory_inherit_input()
+    .no_execution_memory_access()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileReinterpretViewType(args, kwargs);
@@ -574,6 +573,7 @@ REGISTER_OP("tile.transpose_view")
     // layout, so it inherits the input's memory space and InitMemRef shares the
     // input MemRef (same base_ -> same address). Codegen emits no data movement.
     .set_output_memory_inherit_input()
+    .no_execution_memory_access()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileTransposeViewType(args, kwargs);
@@ -614,17 +614,44 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
          "Acc->Mat FIXPIPE downcast to bf16/f16), but got "
       << target_type->dtype_.ToString() << " and " << source_type->dtype_.ToString();
 
-  // Inherit the target's TileView *and its optionality*.  When the target carries
-  // an implicit view (``tile_view_ == nullopt`` — e.g. a tile.create'd Mat scratch,
-  // whose effective layout is the Mat NZ implicit col_major/row_major), the result
-  // must stay implicit too, so its effective layout matches the target's rather than
-  // collapsing to the raw struct default (row_major/none_box — the VEC layout, not a
-  // Mat operand's).  An in-place Acc->Mat assemble chain then shares one consistent
-  // layout (see GetEffectiveTileView, which only honors an *explicit* view).
-  std::optional<TileView> tile_view = target_type->tile_view_;
-  if (tile_view.has_value()) {
-    tile_view->valid_shape = target_type->shape_;
+  // The result holds what the target already held plus what was just written.
+  // ``pto.tinsert`` copies the whole source subview rather than consulting its
+  // valid extent, so the *physical* source is what has to fit inside the target.
+  // As for tensor.assemble, the union is derivable only when the source, the
+  // offsets, and the target share one rank; a rank-mismatched write is a
+  // reinterpreting one whose axes do not correspond, and keeps its previous result.
+  std::vector<ExprPtr> offsets = ExtractTupleElements(args[2], offset_tuple_type->types_.size());
+  const size_t target_rank = target_type->shape_.size();
+  std::vector<ExprPtr> result_valid = target_type->shape_;
+  if (source_type->shape_.size() == target_rank && offsets.size() == target_rank) {
+    result_valid = InferWriteValidShapeUnion({
+        /*target_physical=*/target_type->shape_,
+        /*target_valid=*/GetValidShape(target_type),
+        /*source_physical=*/source_type->shape_,
+        /*source_valid=*/GetValidShape(source_type),
+        /*offsets=*/std::move(offsets),
+        /*kind=*/WriteBoundsKind::kExactSubview,
+        /*op_name=*/"tile.assemble",
+        /*bounds_remedy=*/
+        "tile.assemble lowers to pto.tinsert, which copies the whole source subview rather than only "
+        "its valid region, so the source allocation itself has to fit -- unlike tensor.assemble, "
+        "which transfers only the valid extent",
+        /*span=*/args[0]->span_,
+    });
   }
+
+  // Seed from the target's EFFECTIVE view so the result keeps the layout the
+  // target's shape and memory space imply.  When the target carries an implicit
+  // view (``tile_view_ == nullopt`` — e.g. a tile.create'd Mat scratch, whose
+  // effective layout is the Mat NZ implicit col_major/row_major), that layout must
+  // survive rather than collapsing to the raw struct default (row_major/none_box —
+  // the VEC layout, not a Mat operand's).  An in-place Acc->Mat assemble chain then
+  // shares one consistent layout (see GetEffectiveTileView, which only honors an
+  // *explicit* view).  A fully valid union canonicalizes straight back to an
+  // implicit view in the TileType constructor, so a target that was implicit before
+  // stays implicit unless the write genuinely leaves the result partially valid.
+  TileView tile_view = tile_view_semantics::GetEffectiveTileView(*target_type);
+  tile_view.valid_shape = std::move(result_valid);
   return std::make_shared<TileType>(target_type->shape_, target_type->dtype_, std::nullopt, tile_view,
                                     target_type->memory_space_);
 }
@@ -635,6 +662,9 @@ REGISTER_OP("tile.assemble")
     .add_argument("target", "Target tile (TileType)")
     .add_argument("source", "Source tile to write (TileType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
+    // Rewrites the offset sub-region of `target` and passes the rest through to
+    // the result, so the prior content is read. Tile-local, hence no channel.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .set_output_memory_inherit_input()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
@@ -718,27 +748,45 @@ TypePtr DeduceTileExtractType(const std::vector<ExprPtr>& args,
       "ISA TEXTRACT bounds are hard, so the window must fit inside the source tile",
       /*span=*/args[0]->span_,
   });
-  tile_view.blayout = InferTileLayoutFromShape(dst_shape);
+  // The destination memory dictates the layout, so seed from its implicit view.
+  // The default mirrors `set_output_memory_from_kwarg("target_memory", Vec)`
+  // registered below; since this deducer now always stamps the space itself,
+  // that registry fallback is unreachable for tile.extract and the two only have
+  // to agree on the default.
+  const MemorySpace target = GetKwargOr<MemorySpace>(kwargs, "target_memory", MemorySpace::Vec);
+
+  tile_view_semantics::SetTileLayout(tile_view,
+                                     tile_view_semantics::GetImplicitTileLayout(dst_shape, target));
 
   // Override blayout/slayout for L0-resident destinations to match the
   // architectural layouts the A2/A3 `pto.textract` codegen verifier
-  // expects.  Mat/other targets keep the inferred default.  These
+  // expects.  Mat/other targets keep the destination's implicit layout.  These
   // hardcoded layouts mirror the L0A/L0B formats the hardware imposes on
   // TEXTRACT outputs (and differ from `tile.move`'s TMOV-side L0 formats).
-  for (const auto& [k, v] : kwargs) {
-    if (k != "target_memory") continue;
-    auto target = AnyCast<MemorySpace>(v, "kwarg key: target_memory");
-    if (target == MemorySpace::Left) {
-      tile_view.blayout = TileLayout::row_major;
-      tile_view.slayout = TileLayout::row_major;
-    } else if (target == MemorySpace::Right) {
-      tile_view.blayout = TileLayout::row_major;
-      tile_view.slayout = TileLayout::col_major;
-    }
-    break;
+  if (target == MemorySpace::Left) {
+    tile_view.blayout = TileLayout::row_major;
+    tile_view.slayout = TileLayout::row_major;
+  } else if (target == MemorySpace::Right) {
+    tile_view.blayout = TileLayout::row_major;
+    tile_view.slayout = TileLayout::col_major;
   }
 
-  return std::make_shared<TileType>(dst_shape, src_type->dtype_, std::nullopt, tile_view);
+  // A partial Mat->L0A/L0B extract is a compact boundary transfer, not a
+  // physical-width copy. PTO-ISA's non-compact TEXTRACT path does not receive
+  // valid-row/valid-col operands; selecting it for a box-padded tail copies
+  // padding as data (issue #2232). Keep this inference at the operation/type
+  // boundary so every producer of a partial tile.extract gets the same legal
+  // tile config, while full extracts and non-L0 destinations remain byte-
+  // identical to their historical non-compact form.
+  if ((target == MemorySpace::Left || target == MemorySpace::Right) &&
+      !tile_view_semantics::ShapeExprListsEquivalent(tile_view.valid_shape, dst_shape)) {
+    tile_view.compact = CompactMode::normal;
+  }
+
+  // Canonicalize the view once, against the space it is actually a view of --
+  // not against nullopt, which would let OpRegistry::Create re-interpret a
+  // collapsed view under a different space's implicit layout.
+  return std::make_shared<TileType>(dst_shape, src_type->dtype_, std::nullopt, tile_view, target);
 }
 
 REGISTER_OP("tile.extract")
@@ -829,6 +877,8 @@ REGISTER_OP("tile.scatter_update")
     .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .set_output_reuses_input(0)
+    // DPS: the indexed rows are rewritten, every other row passes through.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileScatterUpdateType(args, kwargs);
@@ -869,6 +919,7 @@ TypePtr DeduceTileConcatType(const std::vector<ExprPtr>& args,
 
 REGISTER_OP("tile.concat")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Concatenate two tiles along column dimension")
     .add_argument("src0", "First source tile (TileType)")
     .add_argument("src1", "Second source tile (TileType)")
@@ -930,20 +981,28 @@ TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
   // row_major / fractal=1024, a [M, 1] Vec tile is col_major, ...). Default-
   // constructing a TileView here would pin the raw row_major / none_box /
   // fractal=512 defaults onto an alias of, e.g., an Acc accumulator.
+  // The inherited `compact` is deliberately kept as-is, including for an Acc
+  // alias. This op is metadata-only and may run *after* the buffer was written,
+  // so the stride its readers must use is the one the producing `mad` already
+  // laid the bytes out at — not one derived from the new valid rows. Narrowing
+  // a fully-written accumulator here must therefore leave its non-compact
+  // reading pitch alone.
   TileView tile_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
   tile_view.valid_shape = {args[1], args[2]};
 
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
-// NOTE: Internal op for compiler-generated code only; should not be exposed to end users in future releases.
+// Public: reachable from the DSL as `pl.set_validshape` / `pl.tile.set_validshape`, and used
+// directly by kernels to pin a valid extent the type deducer cannot infer.
 REGISTER_OP("tile.set_validshape")
     .set_op_category("TileOp")
-    .set_description("Update valid-shape metadata of a tile without data movement (internal)")
+    .set_description("Update valid-shape metadata of a tile without data movement")
     .add_argument("tile", "Input tile (TileType, 2D)")
     .add_argument("valid_rows", "Number of valid rows (ScalarType INDEX/INT64/UINT64)")
     .add_argument("valid_cols", "Number of valid columns (ScalarType INDEX/INT64/UINT64)")
     .set_output_memory_inherit_input()
+    .no_execution_memory_access()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileSetValidShapeType(args, kwargs);

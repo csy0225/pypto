@@ -31,6 +31,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -127,15 +128,16 @@ TypePtr DeduceTileBatchMatMulType(const std::vector<ExprPtr>& args,
   auto result_dtype =
       (lhs_type->dtype_.IsFloat() && rhs_type->dtype_.IsFloat()) ? DataType::FP32 : DataType::INT32;
 
-  // The matmul output tile uses the hardware's native accumulator layout:
-  // - blayout=col_major, slayout=row_major: hardware's column-major block / row-major sub-block
-  // - fractal=1024: 32x32 sub-tile fractal size (standard for this hardware's matrix unit)
+  // The matmul output tile uses the hardware's native accumulator layout
+  // (col_major block / row_major sub-block), which is exactly Acc's implicit
+  // layout — take it from there rather than restating the triple. fractal is the
+  // inner box size in *bytes* — 16 rows x (1024 / dtype_bytes / 16) cols, i.e. a
+  // 16x16 box for the 4-byte (FP32/INT32) accumulator.
   TileView tile_view;
-  tile_view.blayout = TileLayout::col_major;
-  tile_view.slayout = TileLayout::row_major;
-  tile_view.fractal = 1024;
+  tile_view_semantics::SetTileLayout(
+      tile_view, tile_view_semantics::GetImplicitTileLayout(output_shape, MemorySpace::Acc));
   tile_view.valid_shape = output_shape;
-  return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view);
+  return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view, MemorySpace::Acc);
 }
 
 /**
@@ -261,13 +263,13 @@ TypePtr DeduceTileBatchMatMulAccType(const std::vector<ExprPtr>& args,
   // Output shape = acc shape (in-place accumulation).
   std::vector<ExprPtr> output_shape = acc_shape;
 
-  // Acc layout (Nz) — same as 2D matmul_acc.
+  // Acc layout (Nz) — same as 2D matmul_acc; fractal is a byte size (see
+  // DeduceTileBatchMatMulType above).
   TileView tile_view;
-  tile_view.blayout = TileLayout::col_major;
-  tile_view.slayout = TileLayout::row_major;
-  tile_view.fractal = 1024;
+  tile_view_semantics::SetTileLayout(
+      tile_view, tile_view_semantics::GetImplicitTileLayout(output_shape, MemorySpace::Acc));
   tile_view.valid_shape = output_shape;
-  return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view);
+  return std::make_shared<TileType>(output_shape, result_dtype, std::nullopt, tile_view, MemorySpace::Acc);
 }
 
 // ============================================================================
@@ -276,6 +278,7 @@ TypePtr DeduceTileBatchMatMulAccType(const std::vector<ExprPtr>& args,
 
 REGISTER_OP("tile.batch_matmul")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Batch matrix multiplication of two tiles with broadcasting")
     .add_argument("lhs", "Left-hand side tile (TileType, at least 2D)")
     .add_argument("rhs", "Right-hand side tile (TileType, at least 2D)")
@@ -289,6 +292,7 @@ REGISTER_OP("tile.batch_matmul")
 
 REGISTER_OP("tile.batch_matmul_acc")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description(
         "Batch matrix multiplication with accumulation: acc = acc + lhs @ rhs (with batch broadcast)")
     .add_argument("acc", "Accumulator tile (TileType, at least 2D)")
@@ -299,6 +303,8 @@ REGISTER_OP("tile.batch_matmul_acc")
     .set_input_memory(2, MemorySpace::Right)
     .set_output_memory(MemorySpace::Acc)
     .set_output_reuses_input(0)
+    // Accumulates into `acc`, same as tile.matmul_acc.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileBatchMatMulAccType(args, kwargs, "tile.batch_matmul_acc");

@@ -103,9 +103,7 @@ def run_with_callback() -> None:
     compiled = ir.compile(
         InspectProgram,
         platform=PLATFORM,
-        distributed_config=DistributedConfig(
-            device_ids=[0], num_sub_workers=1, block_dim=3, aicpu_thread_num=4
-        ),
+        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1),
     )
 
     # Shared-memory IO, allocated BEFORE prepare() so the forked workers inherit
@@ -117,7 +115,7 @@ def run_with_callback() -> None:
 
     def inspect_result(args) -> None:
         # Real implementation: read the computed tensor and stash a summary.
-        f = _tensor_from_continuous(args.tensor(0))
+        f = _tensor_from_continuous(args[0])
         observed[0] = float(f.reshape(-1)[0].item())
 
     with compiled.prepare(callbacks={"inspect_result": inspect_result}) as rt:
@@ -134,9 +132,7 @@ def show_missing_binding_error() -> None:
     compiled = ir.compile(
         InspectProgram,
         platform=PLATFORM,
-        distributed_config=DistributedConfig(
-            device_ids=[0], num_sub_workers=1, block_dim=3, aicpu_thread_num=4
-        ),
+        distributed_config=DistributedConfig(device_ids=[0], num_sub_workers=1),
     )
     try:
         compiled.prepare()  # no callbacks → inspect_result is unbound

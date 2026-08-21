@@ -81,6 +81,30 @@ The build system uses scikit-build-core to automatically handle CMake configurat
   sudo apt-get install ccache  # Ubuntu/Debian
   ```
 
+### AI Assistant Plugins
+
+Shared PyPTO skills are published from
+[`hw-native-sys/pypto-skills`](https://github.com/hw-native-sys/pypto-skills)
+as two plugins: `pypto-developer` for repository development workflows and
+`pypto-user` for user-facing inspection and profiling workflows. Install either
+or both plugins as needed.
+
+Codex:
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-developer@pypto-skills
+codex plugin add pypto-user@pypto-skills
+```
+
+Claude Code:
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-developer@pypto-skills
+claude plugin install pypto-user@pypto-skills
+```
+
 ### Running Examples
 
 PyPTO includes examples organized by complexity:
@@ -88,13 +112,13 @@ PyPTO includes examples organized by complexity:
 #### 1. Hello World (simplest program)
 
 ```bash
-python examples/hello_world.py
+python examples/beginner/01_hello_world.py
 ```
 
-#### 2. Kernel Examples (element-wise, matmul, softmax, ...)
+#### 2. Beginner & Intermediate Examples (element-wise, matmul, softmax, ...)
 
 ```bash
-python examples/kernels/06_softmax.py
+python examples/intermediate/02_softmax.py
 ```
 
 #### 3. Model Examples (FFN, paged attention, LLaMA, ...)
@@ -120,6 +144,31 @@ python -m pytest tests/ut/core/test_error.py -n auto --maxprocesses 8 -v
 ```
 
 For system tests, see `tests/st/README.md`.
+
+## Documentation
+
+The documentation site is published at **<https://hw-native-sys.github.io/pypto/>**.
+Its source is the markdown under [`docs/`](docs/), readable directly on GitHub:
+
+| Section | Contents |
+| ------- | -------- |
+| [User Manual](docs/en/user/index.md) | Getting started, the language guide, the operation reference, debugging |
+| [Reference](docs/en/reference/index.md) | PTO ISA — cluster architecture, TPUSH/TPOP, buffer management |
+| [Developer](docs/en/dev/index.md) | IR, passes, code generation, backend dispatch |
+| [Runtime](https://hw-native-sys.github.io/simpler/) | The `simpler` runtime that executes compiled programs |
+
+Chinese translations live in [`docs/zh/`](docs/zh/) and are selectable from the
+site's language menu.
+
+To build the site locally:
+
+```bash
+# Only the docs toolchain is needed -- the site does not require a built pypto
+pip install -r docs/requirements.txt
+
+mkdocs serve            # live preview at http://127.0.0.1:8000
+mkdocs build --strict   # what CI runs; broken links fail the build
+```
 
 ## License
 

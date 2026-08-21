@@ -166,10 +166,30 @@ FunctionPtr IRMutator::VisitFunction(const FunctionPtr& func) {
   auto new_body = VisitStmt(func->body_);
   bool body_changed = (new_body.get() != func->body_.get());
 
-  if (!params_changed && !return_types_changed && !body_changed) return func;
+  // A reference-valued function attr names a param, so remapping a param must
+  // rewrite the attr too — otherwise it dangles to the pre-substitution Var,
+  // which is the failure mode that made the Function-carried SPMD launch spec
+  // untenable. Runs after the param walk has primed var_remap_.
+  std::vector<std::pair<std::string, std::any>> new_attrs;
+  bool attrs_changed = false;
+  new_attrs.reserve(func->attrs_.size());
+  for (const auto& [k, v] : func->attrs_) {
+    auto remapped = MapAttrExprs(v, [this](const ExprPtr& e) { return ExprFunctor<ExprPtr>::VisitExpr(e); });
+    if (remapped.has_value()) {
+      attrs_changed = true;
+      new_attrs.emplace_back(k, std::move(*remapped));
+    } else {
+      new_attrs.emplace_back(k, v);
+    }
+  }
+
+  if (!params_changed && !return_types_changed && !body_changed && !attrs_changed) return func;
+  // ``new_attrs`` carries every key — remapped entries and untouched copies
+  // alike — so it can be moved unconditionally. A ternary against
+  // ``func->attrs_`` would deduce a const reference and silently copy instead.
   return std::make_shared<const Function>(func->name_, std::move(new_params), func->param_directions_,
                                           std::move(new_return_types), std::move(new_body), func->span_,
-                                          func->func_type_, func->level_, func->role_, func->attrs_);
+                                          func->func_type_, func->level_, func->role_, std::move(new_attrs));
 }
 
 ExprPtr IRMutator::VisitExpr(const ExprPtr& expr) { return ExprFunctor<ExprPtr>::VisitExpr(expr); }
@@ -278,11 +298,26 @@ ExprPtr IRMutator::VisitExpr_(const MemRefPtr& op) {
   if (op->byte_offset_) {
     new_offset = ExprFunctor<ExprPtr>::VisitExpr(op->byte_offset_);
   }
-  if (new_base.get() == op->base_.get() && new_offset.get() == op->byte_offset_.get()) {
+  // A declared allocation's slot index is an ordinary expression over SSA values,
+  // so substitution has to follow it — otherwise a renamed loop variable leaves the
+  // index pointing at the old Var.
+  std::optional<ExprPtr> new_slot_index = op->slot_index_;
+  if (op->slot_index_.has_value() && *op->slot_index_) {
+    new_slot_index = ExprFunctor<ExprPtr>::VisitExpr(*op->slot_index_);
+  }
+  const bool slot_index_changed =
+      new_slot_index.has_value() != op->slot_index_.has_value() ||
+      (new_slot_index.has_value() && new_slot_index->get() != op->slot_index_->get());
+  if (new_base.get() == op->base_.get() && new_offset.get() == op->byte_offset_.get() &&
+      !slot_index_changed) {
     return op;
   }
-  auto fresh = std::make_shared<const MemRef>(op->name_hint_, std::move(new_base), std::move(new_offset),
-                                              op->size_, op->span_);
+  // Carry is_pinned_ / slot_count_ / slot_index_ through: a substituted MemRef
+  // denotes the same storage as its source, and dropping them would silently turn
+  // an author's declaration into a compiler allocation mid-pipeline.
+  auto fresh =
+      std::make_shared<const MemRef>(op->name_hint_, std::move(new_base), std::move(new_offset), op->size_,
+                                     op->span_, op->is_pinned_, op->slot_count_, std::move(new_slot_index));
   var_remap_[op.get()] = fresh;
   return fresh;
 }
@@ -350,62 +385,21 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
   std::vector<std::pair<std::string, std::any>> new_attrs;
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
+  // Remap by stored type, matching ``IRVisitor::VisitExpr_(CallPtr)``. The two
+  // must agree: anything the visitor reports as a live reference has to be
+  // rewritten here, or substitution leaves the attr pointing at the pre-mutation
+  // Var — e.g. the P==1 unroll folding ``r`` -> ``0`` rewrites the slice
+  // subscripts but leaves ``device=r`` dangling to the now-undefined loop var,
+  // and codegen emits an unbound index. A key-gated remap could not keep that
+  // promise for an attr key nobody thought to enumerate.
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrArgDirOverrideVars ||
-        k == kAttrDumpVars) {
-      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-      if (edges) {
-        std::vector<VarPtr> new_edges;
-        new_edges.reserve(edges->size());
-        bool any_changed = false;
-        for (const auto& e : *edges) {
-          if (!e) {
-            new_edges.push_back(e);
-            continue;
-          }
-          auto remapped = ExprFunctor<ExprPtr>::VisitExpr(e);
-          // Use AsVarLike so a remapped IterArg (loop-carried tensor) still
-          // matches — As<Var> is exact-kind only and would silently drop the
-          // remap, leaving a stale pointer in the attr.
-          auto remapped_var = AsVarLike(remapped);
-          if (!remapped_var) {
-            // Should not happen — Var/IterArg visits return Var-like. Fall
-            // back to original to avoid corrupting the attr.
-            new_edges.push_back(e);
-            continue;
-          }
-          if (remapped_var.get() != e.get()) {
-            any_changed = true;
-          }
-          new_edges.push_back(std::move(remapped_var));
-        }
-        if (any_changed) {
-          attrs_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(new_edges)));
-          continue;
-        }
-      }
-    } else if (k == kAttrDevice) {
-      // The distributed dispatch ``device=`` attr holds a single ExprPtr (a
-      // ConstInt rank or a Var loop index). It references a Var defined
-      // elsewhere (the host-orch ``for r in pl.range(P)`` loop var), so it must
-      // be remapped alongside the args — otherwise a loop-var substitution
-      // (e.g. the P==1 unroll folding ``r`` -> ``0``) rewrites the slice
-      // subscripts but leaves ``device=r`` dangling to the now-undefined loop
-      // var, and codegen emits an unbound index -> NameError. Mirrors the
-      // kAttrDevice handling in the SSA pass.
-      const auto* dev = std::any_cast<ExprPtr>(&v);
-      if (dev && *dev) {
-        auto new_dev = ExprFunctor<ExprPtr>::VisitExpr(*dev);
-        INTERNAL_CHECK_SPAN(new_dev, op->span_) << "Call device attribute mutated to null";
-        if (new_dev.get() != dev->get()) {
-          attrs_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(new_dev)));
-          continue;
-        }
-      }
+    auto remapped = MapAttrExprs(v, [this](const ExprPtr& e) { return ExprFunctor<ExprPtr>::VisitExpr(e); });
+    if (remapped.has_value()) {
+      attrs_changed = true;
+      new_attrs.emplace_back(k, std::move(*remapped));
+    } else {
+      new_attrs.emplace_back(k, v);
     }
-    new_attrs.emplace_back(k, v);
   }
 
   if (!args_changed && !type_changed && !attrs_changed) return op;
@@ -489,40 +483,16 @@ ExprPtr IRMutator::VisitExpr_(const SubmitPtr& op) {
   std::vector<std::pair<std::string, std::any>> new_attrs;
   bool attrs_changed = false;
   new_attrs.reserve(op->attrs_.size());
+  // Remapped by stored type, matching ``IRVisitor::VisitExpr_(SubmitPtr)``.
+  // Previously this arm listed three keys while the Call arm listed a different
+  // set plus ``IsExprValuedCallAttr``, so an Expr-valued attr such as
+  // ``kAttrDevice`` was rewritten on a Call but left stale on a Submit.
   for (const auto& [k, v] : op->attrs_) {
-    if (k == kAttrArgDirOverrideVars || k == kAttrCompilerManualDepEdges || k == kAttrDumpVars) {
-      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-      if (edges) {
-        std::vector<VarPtr> new_edges;
-        new_edges.reserve(edges->size());
-        bool any_changed = false;
-        for (const auto& e : *edges) {
-          if (!e) {
-            new_edges.push_back(e);
-            continue;
-          }
-          auto remapped = ExprFunctor<ExprPtr>::VisitExpr(e);
-          // Use AsVarLike so a remapped IterArg (loop-carried tensor) still
-          // matches — As<Var> is exact-kind only and would silently drop the
-          // remap, leaving a stale pointer in the attr.
-          auto remapped_var = AsVarLike(remapped);
-          if (!remapped_var) {
-            // Should not happen — Var/IterArg visits return Var-like. Fall
-            // back to original to avoid corrupting the attr.
-            new_edges.push_back(e);
-            continue;
-          }
-          if (remapped_var.get() != e.get()) {
-            any_changed = true;
-          }
-          new_edges.push_back(std::move(remapped_var));
-        }
-        if (any_changed) {
-          attrs_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(new_edges)));
-          continue;
-        }
-      }
+    auto remapped = MapAttrExprs(v, [this](const ExprPtr& e) { return ExprFunctor<ExprPtr>::VisitExpr(e); });
+    if (remapped.has_value()) {
+      attrs_changed = true;
+      new_attrs.emplace_back(k, std::move(*remapped));
+      continue;
     }
     new_attrs.emplace_back(k, v);
   }
@@ -927,68 +897,17 @@ std::pair<std::vector<std::pair<std::string, std::any>>, bool> IRMutator::Mutate
   std::vector<std::pair<std::string, std::any>> new_attrs;
   new_attrs.reserve(attrs.size());
   bool any_changed = false;
+  // Remapped by stored type, matching ``IRVisitor::VisitScopeAttrs``. The old
+  // key list covered manual_dep_edges / compiler_manual_dep_edges /
+  // arg_direction_overrides_vars / dump_vars / task_id_var / predicate; any
+  // other reference-valued scope attr was walked by the visitor but never
+  // rewritten here.
   for (const auto& [k, v] : attrs) {
-    if (k == kAttrManualDepEdges || k == kAttrCompilerManualDepEdges || k == kAttrArgDirOverrideVars ||
-        k == kAttrDumpVars) {
-      const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
-      if (edges) {
-        std::vector<VarPtr> new_edges;
-        new_edges.reserve(edges->size());
-        bool edges_changed = false;
-        for (const auto& e : *edges) {
-          if (!e) {
-            new_edges.push_back(e);
-            continue;
-          }
-          auto remapped = ExprFunctor<ExprPtr>::VisitExpr(e);
-          auto remapped_var = AsVarLike(remapped);
-          if (!remapped_var) {
-            new_edges.push_back(e);
-            continue;
-          }
-          if (remapped_var.get() != e.get()) edges_changed = true;
-          new_edges.push_back(std::move(remapped_var));
-        }
-        if (edges_changed) {
-          any_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(new_edges)));
-          continue;
-        }
-      }
-    } else if (k == kAttrTaskIdVar) {
-      const auto* var = std::any_cast<VarPtr>(&v);
-      if (var && *var) {
-        auto remapped = ExprFunctor<ExprPtr>::VisitExpr(*var);
-        auto remapped_var = AsVarLike(remapped);
-        if (remapped_var && remapped_var.get() != var->get()) {
-          any_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(remapped_var)));
-          continue;
-        }
-      }
-    } else if (k == kAttrPredicate) {
-      // ``with pl.spmd(..., predicate=(t[i] > 0)):`` — an Expr tree, not a
-      // Var, so mutate the whole subtree (the operand tensor Var and its
-      // index Vars must follow any remapping the mutator is performing).
-      //
-      // No pipeline pass currently reaches this: the passes that run while the
-      // attr still exists (before OutlineSpmdScopes) either do not remap Vars
-      // inside it, or — like FlattenCallExpr — override the Spmd handler and
-      // copy attrs_ verbatim. ConvertToSSA has its own SubstScopeAttrs. This
-      // branch is therefore untested-by-construction, and kept for the same
-      // reason the sibling Var attrs above are handled here: any future
-      // IRMutator-based pass that renames Vars must not silently skip the
-      // predicate. Deleting it would make the predicate the one scope attr the
-      // generic mutator ignores.
-      const auto* pred = std::any_cast<ExprPtr>(&v);
-      if (pred && *pred) {
-        auto remapped = ExprFunctor<ExprPtr>::VisitExpr(*pred);
-        if (remapped && remapped.get() != pred->get()) {
-          any_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(remapped)));
-          continue;
-        }
-      }
+    auto remapped = MapAttrExprs(v, [this](const ExprPtr& e) { return ExprFunctor<ExprPtr>::VisitExpr(e); });
+    if (remapped.has_value()) {
+      any_changed = true;
+      new_attrs.emplace_back(k, std::move(*remapped));
+      continue;
     }
     new_attrs.emplace_back(k, v);
   }

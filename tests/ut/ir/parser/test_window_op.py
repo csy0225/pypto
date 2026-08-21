@@ -25,6 +25,7 @@ from typing import cast
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
+from pypto.language.parser.diagnostics import InvalidOperationError, ParserSyntaxError
 from pypto.pypto_core import ir
 
 
@@ -59,7 +60,7 @@ def _find_alloc_var(func: ir.Function) -> ir.Var:
         if (
             isinstance(stmt, ir.AssignStmt)
             and isinstance(stmt.value, ir.Call)
-            and stmt.value.op.name == "pld.tensor.alloc_window_buffer"
+            and stmt.value.op.name == ir.get_op("pld.tensor.alloc_window_buffer").name
         ):
             return stmt.var
         if isinstance(stmt, ir.SeqStmts):
@@ -143,7 +144,7 @@ def test_window_propagates_multi_dim_shape():
 
 def test_window_rejects_non_ptr_arg():
     """A non-Ptr-typed Var cannot stand in for a Ptr handle."""
-    with pytest.raises(Exception, match="Ptr handle"):
+    with pytest.raises(InvalidOperationError, match="Ptr handle"):
 
         @pl.program
         class P:  # noqa: F841
@@ -154,7 +155,7 @@ def test_window_rejects_non_ptr_arg():
 
 
 def test_window_rejects_unknown_kwarg():
-    with pytest.raises(Exception, match=r"unexpected keyword argument|does not accept kwarg"):
+    with pytest.raises(InvalidOperationError, match=r"unexpected keyword argument|does not accept kwarg"):
 
         @pl.program
         class P:  # noqa: F841
@@ -166,7 +167,7 @@ def test_window_rejects_unknown_kwarg():
 
 
 def test_window_rejects_missing_shape_arg():
-    with pytest.raises(Exception, match=r"missing.*positional argument|2 positional"):
+    with pytest.raises(InvalidOperationError, match=r"missing.*positional argument|2 positional"):
 
         @pl.program
         class P:  # noqa: F841
@@ -178,7 +179,7 @@ def test_window_rejects_missing_shape_arg():
 
 
 def test_window_rejects_missing_dtype_kwarg():
-    with pytest.raises(Exception, match="dtype"):
+    with pytest.raises(InvalidOperationError, match="dtype"):
 
         @pl.program
         class P:  # noqa: F841
@@ -218,13 +219,13 @@ def test_window_long_form():
 
     func = _get_host_orch(P)
     call = _find_call(func, "pld.tensor.window")
-    assert call.op.name == "pld.tensor.window"
+    assert call.op.name == ir.get_op("pld.tensor.window").name
     assert isinstance(call.type, ir.DistributedTensorType)
 
 
 def test_alloc_names_globally_unique_across_functions():
     """A second function in the same @pl.program cannot reuse a buffer name."""
-    with pytest.raises(Exception, match="already declared"):
+    with pytest.raises(ParserSyntaxError, match="already declared"):
 
         @pl.program
         class P:  # noqa: F841

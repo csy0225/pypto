@@ -24,6 +24,43 @@ import pytest
 from pypto import DataType, ir
 from pypto.ir.op import tensor
 
+_OP_TENSOR_CREATE = ir.get_op("tensor.create").name
+_OP_TENSOR_DIM = ir.get_op("tensor.dim").name
+_OP_TENSOR_EXPAND_CLONE = ir.get_op("tensor.expand_clone").name
+_OP_TENSOR_FMODS = ir.get_op("tensor.fmods").name
+_OP_TENSOR_GATHER = ir.get_op("tensor.gather").name
+_OP_TENSOR_GATHER_MASK = ir.get_op("tensor.gather_mask").name
+_OP_TENSOR_MAXIMUM = ir.get_op("tensor.maximum").name
+_OP_TENSOR_MINIMUM = ir.get_op("tensor.minimum").name
+_OP_TENSOR_READ = ir.get_op("tensor.read").name
+_OP_TENSOR_RESHAPE = ir.get_op("tensor.reshape").name
+_OP_TENSOR_RSQRT = ir.get_op("tensor.rsqrt").name
+_OP_TENSOR_SCATTER = ir.get_op("tensor.scatter").name
+_OP_TENSOR_SCATTER_MASK = ir.get_op("tensor.scatter_mask").name
+_OP_TENSOR_SCATTER_UPDATE = ir.get_op("tensor.scatter_update").name
+_OP_TENSOR_SET_VALIDSHAPE = ir.get_op("tensor.set_validshape").name
+_OP_TENSOR_SLICE = ir.get_op("tensor.slice").name
+_OP_TENSOR_TRANSPOSE = ir.get_op("tensor.transpose").name
+_OP_TENSOR_WRITE = ir.get_op("tensor.write").name
+
+
+def _tensor_var(name: str, shape: list[int], dtype: DataType = DataType.FP16) -> ir.Var:
+    """Build a Var of TensorType with the given static shape."""
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(d, DataType.INT32, span) for d in shape]
+    return ir.Var(name, ir.TensorType(dims, dtype), span)
+
+
+def _const_shape(call: ir.Call) -> list[int]:
+    """Return the deduced output shape of a tensor op call, requiring every dim static."""
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    dims = []
+    for dim in result_type.shape:
+        assert isinstance(dim, ir.ConstInt)
+        dims.append(dim.value)
+    return dims
+
 
 def test_tensor_create():
     """Test tensor.create operation."""
@@ -31,7 +68,7 @@ def test_tensor_create():
     call = ir.op.tensor.create([4, 8], DataType.FP32)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.create"
+    assert call.op.name == _OP_TENSOR_CREATE
 
     # Check result type
     result_type = call.type
@@ -54,7 +91,7 @@ def test_tensor_slice():
     call = ir.op.tensor.slice(tensor_var, [8, 16], [0, 0])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.slice"
+    assert call.op.name == _OP_TENSOR_SLICE
 
     # Check result type
     result_type = call.type
@@ -81,7 +118,7 @@ def test_tensor_matmul():
     call = ir.op.tensor.matmul(lhs, rhs, out_dtype=DataType.FP32)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.matmul"
+    assert call.op.name == ir.get_op("tensor.matmul").name
 
     # Check result type - should be [4, 16]
     result_type = call.type
@@ -108,8 +145,63 @@ def test_tensor_matmul_with_transpose():
     call = ir.op.tensor.matmul(lhs, rhs, out_dtype=DataType.FP16, a_trans=True, b_trans=False)
 
     assert isinstance(call, ir.Call)
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
+    assert _const_shape(call) == [4, 4]
+
+
+def test_tensor_matmul_mat_vec_honors_a_trans():
+    """2D x 1D contracts over dim 0 of the lhs when a_trans is set."""
+    # lhs stored [K=128, M=64] with a_trans, rhs [K=128] -> [64]
+    call = ir.op.tensor.matmul(_tensor_var("a", [128, 64]), _tensor_var("b", [128]), a_trans=True)
+
+    assert _const_shape(call) == [64]
+
+
+def test_tensor_matmul_vec_mat_honors_b_trans():
+    """1D x 2D contracts over dim 1 of the rhs when b_trans is set."""
+    # lhs [K=64], rhs stored [N=128, K=64] with b_trans -> [128]
+    call = ir.op.tensor.matmul(_tensor_var("a", [64]), _tensor_var("b", [128, 64]), b_trans=True)
+
+    assert _const_shape(call) == [128]
+
+
+def test_tensor_matmul_mat_vec_a_trans_k_mismatch_fails():
+    """A transposed mat-vec whose K disagrees is rejected, not silently reshaped."""
+    # Real K is lhs dim 0 (128) under a_trans; rhs K is 64.
+    with pytest.raises(ValueError, match="lhs K=128 and rhs K=64"):
+        ir.op.tensor.matmul(_tensor_var("a", [128, 64]), _tensor_var("b", [64]), a_trans=True)
+
+
+def test_tensor_matmul_vec_mat_b_trans_k_mismatch_fails():
+    """A transposed vec-mat whose K disagrees is rejected, not silently reshaped."""
+    # Real K is rhs dim 1 (64) under b_trans; lhs K is 128.
+    with pytest.raises(ValueError, match="lhs K=128 and rhs K=64"):
+        ir.op.tensor.matmul(_tensor_var("a", [128]), _tensor_var("b", [128, 64]), b_trans=True)
+
+
+@pytest.mark.parametrize(
+    "lhs_shape, rhs_shape, kwargs, message",
+    [
+        ([64, 128], [128], {"b_trans": True}, "b_trans does not apply to a 1D rhs"),
+        ([64], [64, 128], {"a_trans": True}, "a_trans does not apply to a 1D lhs"),
+        ([64], [64], {"a_trans": True}, "a_trans does not apply to a 1D lhs"),
+        ([64], [64], {"b_trans": True}, "b_trans does not apply to a 1D rhs"),
+    ],
+)
+def test_tensor_matmul_rejects_transpose_on_1d_operand(lhs_shape, rhs_shape, kwargs, message):
+    """A vector has no axes to swap, so a transpose flag on it is a user error."""
+    with pytest.raises(ValueError, match=message):
+        ir.op.tensor.matmul(_tensor_var("a", lhs_shape), _tensor_var("b", rhs_shape), **kwargs)
+
+
+def test_tensor_matmul_mixed_1d_without_transpose_unchanged():
+    """The untransposed mat-vec / vec-mat / dot-product shapes are unaffected."""
+    mat_vec = ir.op.tensor.matmul(_tensor_var("a", [64, 128]), _tensor_var("b", [128]))
+    vec_mat = ir.op.tensor.matmul(_tensor_var("a", [128]), _tensor_var("b", [128, 64]))
+    dot = ir.op.tensor.matmul(_tensor_var("a", [64]), _tensor_var("b", [64]))
+
+    assert _const_shape(mat_vec) == [64]
+    assert _const_shape(vec_mat) == [64]
+    assert _const_shape(dot) == []
 
 
 def test_tensor_matmul_acc():
@@ -132,7 +224,7 @@ def test_tensor_matmul_acc():
     call = ir.op.tensor.matmul_acc(acc, lhs, rhs)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.matmul_acc"
+    assert call.op.name == ir.get_op("tensor.matmul_acc").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -225,7 +317,7 @@ def test_tensor_row_max():
     call = ir.op.tensor.row_max(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_max"
+    assert call.op.name == ir.get_op("tensor.row_max").name
 
     # Check result type - should be [64, 1]
     result_type = call.type
@@ -248,7 +340,7 @@ def test_tensor_row_sum():
     call = ir.op.tensor.row_sum(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_sum"
+    assert call.op.name == ir.get_op("tensor.row_sum").name
 
     # Check result type - should be [64, 1]
     result_type = call.type
@@ -268,7 +360,7 @@ def test_tensor_col_sum():
     call = ir.op.tensor.col_sum(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_sum"
+    assert call.op.name == ir.get_op("tensor.col_sum").name
 
     # Output shape should be [1, 128] — the second-to-last dim collapses to 1.
     result_type = call.type
@@ -289,7 +381,7 @@ def test_tensor_row_prod():
     call = ir.op.tensor.row_prod(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_prod"
+    assert call.op.name == ir.get_op("tensor.row_prod").name
 
     # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1].
     result_type = call.type
@@ -312,7 +404,7 @@ def test_tensor_col_prod():
     call = ir.op.tensor.col_prod(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_prod"
+    assert call.op.name == ir.get_op("tensor.col_prod").name
 
     # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128].
     result_type = call.type
@@ -367,6 +459,129 @@ def test_tensor_unary_preserves_symbolic_valid_shape():
     valid = result_type.tensor_view.valid_shape
     assert isinstance(valid[0], ir.ConstInt) and valid[0].value == 64
     assert valid[1] == vlen  # the symbolic extent is carried through unchanged
+
+
+@pytest.mark.parametrize("op_name", ["adds", "subs", "muls", "divs", "maximum", "minimum"])
+def test_tensor_scalar_elementwise_preserves_partial_valid_shape(op_name):
+    """Fresh scalar-elementwise results keep content validity, not source alias metadata."""
+    partial = _partial_tensor_var([32, 256], [28, 250])
+
+    result_type = getattr(ir.op.tensor, op_name)(partial, 1.0).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [28, 250]
+    assert result_type.tensor_view.stride == []
+    assert result_type.tensor_view.layout == ir.TensorLayout.ND
+    assert result_type.tensor_view.pad == ir.PadValue.null
+
+
+@pytest.mark.parametrize("op_name", ["add", "sub", "mul", "div", "fmod", "maximum", "minimum"])
+def test_tensor_binary_elementwise_preserves_matching_partial_valid_shape(op_name):
+    """Identically shaped operands with the same real data region keep that region."""
+    lhs = _partial_tensor_var([32, 256], [28, 250], name="lhs")
+    rhs = _partial_tensor_var([32, 256], [28, 250], name="rhs")
+
+    result_type = getattr(ir.op.tensor, op_name)(lhs, rhs).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [28, 250]
+    assert result_type.tensor_view.stride == []
+    assert result_type.tensor_view.layout == ir.TensorLayout.ND
+    assert result_type.tensor_view.pad == ir.PadValue.null
+
+
+def test_tensor_binary_elementwise_preserves_matching_symbolic_valid_shape():
+    """A shared runtime tail extent remains attached to a binary result."""
+    span = ir.Span.unknown()
+    valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+    shape = [ir.ConstInt(32, DataType.INDEX, span), ir.ConstInt(256, DataType.INDEX, span)]
+
+    def partial(name: str) -> ir.Var:
+        view = ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[valid_rows, shape[1]])
+        return ir.Var(name, ir.TensorType(shape, DataType.FP32, tensor_view=view), span)
+
+    result_type = ir.op.tensor.add(partial("lhs"), partial("rhs")).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert result_type.tensor_view.valid_shape[0] is valid_rows
+    assert isinstance(result_type.tensor_view.valid_shape[1], ir.ConstInt)
+    assert result_type.tensor_view.valid_shape[1].value == 256
+
+
+@pytest.mark.parametrize("case", ["broadcast", "different_valid", "unproven_symbolic"])
+def test_tensor_binary_elementwise_does_not_infer_unproven_valid_shape(case):
+    """Only an exact, provably equal effective region may be propagated."""
+    span = ir.Span.unknown()
+    lhs = _partial_tensor_var([32, 256], [28, 250], name="lhs")
+    if case == "broadcast":
+        rhs = _partial_tensor_var([32, 1], [28, 1], name="rhs")
+    elif case == "different_valid":
+        rhs = _partial_tensor_var([32, 256], [27, 250], name="rhs")
+    else:
+        lhs_rows = ir.Var("lhs_rows", ir.ScalarType(DataType.INDEX), span)
+        rhs_rows = ir.Var("rhs_rows", ir.ScalarType(DataType.INDEX), span)
+        lhs = _partial_tensor_var([32, 256], [lhs_rows, 250], name="lhs")
+        rhs = _partial_tensor_var([32, 256], [rhs_rows, 250], name="rhs")
+
+    result_type = ir.op.tensor.add(lhs, rhs).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize("op_name", ["part_add", "part_mul", "part_max", "part_min"])
+def test_tensor_part_ops_keep_their_existing_valid_shape_contract(op_name):
+    """Partial-combine operators need a separate dominance/union rule."""
+    lhs = _partial_tensor_var([32, 256], [28, 250], name="lhs")
+    rhs = _partial_tensor_var([32, 256], [28, 250], name="rhs")
+
+    result_type = getattr(ir.op.tensor, op_name)(lhs, rhs).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize("rhs_kind", ["tensor", "scalar"])
+def test_tensor_cmp_does_not_claim_partial_valid_shape_before_lowering_support(rhs_kind):
+    """Comparison lowering currently materializes full one/zero value tiles."""
+    lhs = _partial_tensor_var([32, 256], [28, 250], name="lhs")
+    rhs = _partial_tensor_var([32, 256], [28, 250], name="rhs") if rhs_kind == "tensor" else 0.0
+
+    result_type = ir.op.tensor.cmp(lhs, rhs, cmp_type=0).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize("op_name", ["adds", "ands", "shls"])
+def test_tensor_scalar_elementwise_does_not_preserve_distributed_valid_shape(op_name):
+    """Direct distributed windows need a separate valid-shape lowering contract."""
+    window = _partial_distributed_tensor_var([32, 256], [28, 250], dtype=DataType.INT32)
+
+    result_type = getattr(ir.op.tensor, op_name)(window, 1).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert not isinstance(result_type, ir.DistributedTensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize("op_name", ["add", "and_", "shl"])
+@pytest.mark.parametrize("distributed_side", ["lhs", "rhs"])
+def test_tensor_binary_elementwise_does_not_preserve_distributed_valid_shape(op_name, distributed_side):
+    """Matching distributed windows remain excluded for arithmetic, bitwise, and shift ops."""
+    make_lhs = _partial_distributed_tensor_var if distributed_side == "lhs" else _partial_tensor_var
+    make_rhs = _partial_distributed_tensor_var if distributed_side == "rhs" else _partial_tensor_var
+    lhs = make_lhs([32, 256], [28, 250], name="lhs", dtype=DataType.INT32)
+    rhs = make_rhs([32, 256], [28, 250], name="rhs", dtype=DataType.INT32)
+
+    result_type = getattr(ir.op.tensor, op_name)(lhs, rhs).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert not isinstance(result_type, ir.DistributedTensorType)
+    assert result_type.tensor_view is None
 
 
 def test_tensor_cast_preserves_valid_shape_and_changes_dtype():
@@ -499,7 +714,7 @@ def test_tensor_row_argmax():
     call = ir.op.tensor.row_argmax(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_argmax"
+    assert call.op.name == ir.get_op("tensor.row_argmax").name
 
     # Row reduction collapses the last axis (keepdim): [64, 128] -> [64, 1]; dtype -> int32.
     result_type = call.type
@@ -522,7 +737,7 @@ def test_tensor_row_argmin():
     call = ir.op.tensor.row_argmin(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_argmin"
+    assert call.op.name == ir.get_op("tensor.row_argmin").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.INT32
@@ -544,7 +759,7 @@ def test_tensor_col_argmax():
     call = ir.op.tensor.col_argmax(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_argmax"
+    assert call.op.name == ir.get_op("tensor.col_argmax").name
 
     # Column reduction collapses axis=-2 (keepdim): [64, 128] -> [1, 128]; dtype -> int32.
     result_type = call.type
@@ -567,7 +782,7 @@ def test_tensor_col_argmin():
     call = ir.op.tensor.col_argmin(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_argmin"
+    assert call.op.name == ir.get_op("tensor.col_argmin").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.INT32
@@ -590,7 +805,7 @@ def test_tensor_col_max():
     call = ir.op.tensor.col_max(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_max"
+    assert call.op.name == ir.get_op("tensor.col_max").name
 
     # Output shape should be [1, 128] — the second-to-last dim collapses to 1.
     result_type = call.type
@@ -612,7 +827,7 @@ def test_tensor_col_min():
     call = ir.op.tensor.col_min(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_min"
+    assert call.op.name == ir.get_op("tensor.col_min").name
 
     # Output shape should be [1, 128] — the second-to-last dim collapses to 1.
     result_type = call.type
@@ -635,7 +850,7 @@ def test_tensor_exp():
     call = ir.op.tensor.exp(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.exp"
+    assert call.op.name == ir.get_op("tensor.exp").name
 
     # Check result type - should preserve shape and dtype
     result_type = call.type
@@ -644,28 +859,37 @@ def test_tensor_exp():
     assert len(result_type.shape) == 2
 
 
-def test_tensor_log():
-    """Test tensor.log operation preserves float dtype and shape."""
+@pytest.mark.parametrize(
+    "dtype,high_precision",
+    [
+        pytest.param(DataType.FP16, False, id="f16-default"),
+        pytest.param(DataType.FP32, True, id="f32-high-precision"),
+    ],
+)
+def test_tensor_log_contract_and_precision(dtype, high_precision):
+    """tensor.log preserves float shape/dtype and its optional precision request."""
     span = ir.Span.unknown()
 
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_type = ir.TensorType([dim64, dim128], dtype)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    call = ir.op.tensor.log(tensor_var)
+    call = ir.op.tensor.log(tensor_var, high_precision=high_precision)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.log"
-
+    assert call.op.name == ir.get_op("tensor.log").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
+    expected_kwargs = {"high_precision": True} if high_precision else {}
+    assert dict(call.kwargs) == expected_kwargs
 
 
-def test_tensor_log_int_promotes_to_fp32():
-    """tensor.log on integer input promotes the result dtype to FP32."""
+@pytest.mark.parametrize("high_precision", [False, True])
+def test_tensor_log_rejects_integer_contract(high_precision):
+    """PTOAS does not define either logarithm precision mode for integer tensors."""
     span = ir.Span.unknown()
 
     dim64 = ir.ConstInt(64, DataType.INT32, span)
@@ -673,10 +897,8 @@ def test_tensor_log_int_promotes_to_fp32():
     tensor_type = ir.TensorType([dim64, dim128], DataType.INT32)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    call = ir.op.tensor.log(tensor_var)
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP32
+    with pytest.raises(ValueError, match=r"requires an FP16 or FP32"):
+        ir.op.tensor.log(tensor_var, high_precision=high_precision)
 
 
 # =============================================================================
@@ -695,7 +917,7 @@ def test_tensor_sin_creates_call():
     call = ir.op.tensor.sin(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.sin"
+    assert call.op.name == ir.get_op("tensor.sin").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -714,7 +936,7 @@ def test_tensor_cos_creates_call():
     call = ir.op.tensor.cos(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.cos"
+    assert call.op.name == ir.get_op("tensor.cos").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -774,7 +996,7 @@ def test_tensor_neg():
     call = ir.op.tensor.neg(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.neg"
+    assert call.op.name == ir.get_op("tensor.neg").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -811,7 +1033,7 @@ def test_tensor_abs():
     call = ir.op.tensor.abs(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.abs"
+    assert call.op.name == ir.get_op("tensor.abs").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.BF16
@@ -836,22 +1058,26 @@ def test_tensor_abs_int_dtype():
 # =============================================================================
 
 
-def test_tensor_recip():
-    """Test tensor.recip operation."""
+@pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32])
+@pytest.mark.parametrize("high_precision", [False, True])
+def test_tensor_recip_contract_and_precision(dtype, high_precision):
+    """Both reciprocal precision modes preserve each supported float dtype."""
     span = ir.Span.unknown()
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_type = ir.TensorType([dim64, dim128], dtype)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    call = ir.op.tensor.recip(tensor_var)
+    call = ir.op.tensor.recip(tensor_var, high_precision=high_precision)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.recip"
+    assert call.op.name == ir.get_op("tensor.recip").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
+    expected_kwargs = {"high_precision": True} if high_precision else {}
+    assert dict(call.kwargs) == expected_kwargs
 
 
 def test_tensor_recip_int_promotes_to_fp32():
@@ -868,6 +1094,16 @@ def test_tensor_recip_int_promotes_to_fp32():
     assert result_type.dtype == DataType.FP32
 
 
+@pytest.mark.parametrize("dtype", [DataType.INT32, DataType.BF16])
+def test_tensor_recip_rejects_unsupported_high_precision_dtype(dtype):
+    """The PTOAS high-precision reciprocal template only supports FP16 and FP32 inputs."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], dtype), span)
+
+    with pytest.raises(ValueError, match=r"high_precision only for FP16 or FP32"):
+        ir.op.tensor.recip(tensor_var, high_precision=True)
+
+
 def test_tensor_sqrt():
     """Test tensor.sqrt operation."""
     span = ir.Span.unknown()
@@ -879,7 +1115,7 @@ def test_tensor_sqrt():
     call = ir.op.tensor.sqrt(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.sqrt"
+    assert call.op.name == ir.get_op("tensor.sqrt").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -921,7 +1157,7 @@ def test_tensor_rsqrt():
     call = ir.op.tensor.rsqrt(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.rsqrt"
+    assert call.op.name == _OP_TENSOR_RSQRT
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -962,7 +1198,7 @@ def test_tensor_rsqrt_high_precision_kwarg():
 
     call = ir.op.tensor.rsqrt(tensor_var, high_precision=True)
 
-    assert call.op.name == "tensor.rsqrt"
+    assert call.op.name == _OP_TENSOR_RSQRT
     kwargs = dict(call.kwargs)
     assert kwargs.get("high_precision") is True
 
@@ -981,7 +1217,7 @@ def test_tensor_cast():
     call = ir.op.tensor.cast(tensor_var, DataType.FP32)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.cast"
+    assert call.op.name == ir.get_op("tensor.cast").name
 
     # Check result type - should preserve shape but change dtype
     result_type = call.type
@@ -1024,7 +1260,7 @@ def test_tensor_assemble():
     call = ir.op.tensor.assemble(target, source, [0, 0])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.assemble"
+    assert call.op.name == ir.get_op("tensor.assemble").name
 
     # Check result type - should be target type
     result_type = call.type
@@ -1046,7 +1282,7 @@ def test_tensor_row_expand_mul():
     call = ir.op.tensor.row_expand_mul(tensor_var, row_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_mul"
+    assert call.op.name == ir.get_op("tensor.row_expand_mul").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -1078,7 +1314,7 @@ def test_tensor_row_expand_max():
     tensor_var, row_var = _row_expand_pair()
     call = ir.op.tensor.row_expand_max(tensor_var, row_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_max"
+    assert call.op.name == ir.get_op("tensor.row_expand_max").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1088,7 +1324,7 @@ def test_tensor_row_expand_min():
     tensor_var, row_var = _row_expand_pair()
     call = ir.op.tensor.row_expand_min(tensor_var, row_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_min"
+    assert call.op.name == ir.get_op("tensor.row_expand_min").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1098,7 +1334,7 @@ def test_tensor_row_expand_expdif():
     tensor_var, row_var = _row_expand_pair()
     call = ir.op.tensor.row_expand_expdif(tensor_var, row_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_expdif"
+    assert call.op.name == ir.get_op("tensor.row_expand_expdif").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1108,7 +1344,7 @@ def test_tensor_col_expand_max():
     tensor_var, col_var = _col_expand_pair()
     call = ir.op.tensor.col_expand_max(tensor_var, col_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_max"
+    assert call.op.name == ir.get_op("tensor.col_expand_max").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1118,7 +1354,7 @@ def test_tensor_col_expand_min():
     tensor_var, col_var = _col_expand_pair()
     call = ir.op.tensor.col_expand_min(tensor_var, col_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_min"
+    assert call.op.name == ir.get_op("tensor.col_expand_min").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1128,7 +1364,7 @@ def test_tensor_col_expand_expdif():
     tensor_var, col_var = _col_expand_pair()
     call = ir.op.tensor.col_expand_expdif(tensor_var, col_var)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_expdif"
+    assert call.op.name == ir.get_op("tensor.col_expand_expdif").name
     assert isinstance(call.type, ir.TensorType)
     assert len(call.type.shape) == 2
 
@@ -1182,7 +1418,7 @@ def test_tensor_row_expand_div():
     call = ir.op.tensor.row_expand_div(tensor_var, row_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_div"
+    assert call.op.name == ir.get_op("tensor.row_expand_div").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -1238,7 +1474,7 @@ def test_tensor_col_expand_mul():
     call = ir.op.tensor.col_expand_mul(tensor_var, col_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_mul"
+    assert call.op.name == ir.get_op("tensor.col_expand_mul").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -1297,7 +1533,7 @@ def test_tensor_maximum():
     call = ir.op.tensor.maximum(var_a, var_b)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.maximum"
+    assert call.op.name == _OP_TENSOR_MAXIMUM
 
 
 def test_tensor_maximum_scalar():
@@ -1308,7 +1544,7 @@ def test_tensor_maximum_scalar():
     var_a = ir.Var("a", type_a, span)
 
     call = ir.op.tensor.maximum(var_a, 0.5)
-    assert call.op.name == "tensor.maximum"
+    assert call.op.name == _OP_TENSOR_MAXIMUM
 
 
 def test_tensor_minimum():
@@ -1320,10 +1556,10 @@ def test_tensor_minimum():
     var_b = ir.Var("b", type_a, span)
 
     call_tt = ir.op.tensor.minimum(var_a, var_b)
-    assert call_tt.op.name == "tensor.minimum"
+    assert call_tt.op.name == _OP_TENSOR_MINIMUM
 
     call_ts = ir.op.tensor.minimum(var_a, 1.0)
-    assert call_ts.op.name == "tensor.minimum"
+    assert call_ts.op.name == _OP_TENSOR_MINIMUM
 
 
 def test_tensor_mul():
@@ -1342,7 +1578,7 @@ def test_tensor_mul():
     call = ir.op.tensor.mul(tensor_var, scalar_tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.mul"
+    assert call.op.name == ir.get_op("tensor.mul").name
 
 
 def test_tensor_add():
@@ -1359,7 +1595,7 @@ def test_tensor_add():
     call = ir.op.tensor.add(var_a, var_b)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.add"
+    assert call.op.name == ir.get_op("tensor.add").name
 
 
 def test_tensor_sub():
@@ -1376,24 +1612,120 @@ def test_tensor_sub():
     call = ir.op.tensor.sub(var_a, var_b)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.sub"
+    assert call.op.name == ir.get_op("tensor.sub").name
 
 
-def test_tensor_div():
-    """Test tensor.div operation."""
+def test_tensor_div_precision_kwarg_and_scalar_dispatch():
+    """Only tensor-tensor division carries the tdiv precision attribute."""
     span = ir.Span.unknown()
+    tensor_type = ir.TensorType([8], DataType.FP32)
+    lhs = ir.Var("lhs", tensor_type, span)
+    rhs = ir.Var("rhs", tensor_type, span)
 
-    # Create two tensors
-    dim8 = ir.ConstInt(8, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim8], DataType.FP32)
-    var_a = ir.Var("a", tensor_type, span)
-    var_b = ir.Var("b", tensor_type, span)
+    default_call = ir.op.tensor.div(lhs, rhs)
+    high_precision_call = ir.op.tensor.div(lhs, rhs, high_precision=True)
+    scalar_call = ir.op.tensor.div(lhs, 2.0)
 
-    # Divide
-    call = ir.op.tensor.div(var_a, var_b)
+    assert dict(default_call.kwargs) == {}
+    assert dict(high_precision_call.kwargs) == {"high_precision": True}
+    assert scalar_call.op.name == ir.get_op("tensor.divs").name
+    assert dict(scalar_call.kwargs) == {}
+    with pytest.raises(TypeError, match=r"requires a Tensor rhs"):
+        ir.op.tensor.div(lhs, 2.0, high_precision=True)
+
+
+def test_tensor_div_rejects_integer_high_precision_template_gap():
+    """Do not expose the integer path that the PTOAS high-precision template cannot implement."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8], DataType.INT32), span)
+    rhs = ir.Var("rhs", ir.TensorType([8], DataType.INT32), span)
+
+    with pytest.raises(ValueError, match=r"high_precision only for FP16 or FP32"):
+        ir.op.tensor.div(lhs, rhs, high_precision=True)
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+def test_tensor_div_accepts_ptoas_dtype_union(dtype):
+    """tensor.div accepts the union that can lower to pto.tdiv."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], dtype), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], dtype), span)
+
+    call = tensor.div(lhs, rhs)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.div"
+    assert call.op.name == ir.get_op("tensor.div").name
+    assert isinstance(call.type, ir.TensorType)
+    assert call.type.dtype == dtype
+
+
+def test_tensor_div_rejects_unsupported_dtype():
+    """INT8 cannot lower to the current pto.tdiv contract."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT8), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], DataType.INT8), span)
+
+    with pytest.raises(ValueError, match=r"INT16, INT32, FP16, FP32"):
+        tensor.div(lhs, rhs)
+
+
+def test_tensor_precision_apis_keep_positional_span_compatibility():
+    """The legacy positional span slots remain ahead of high_precision."""
+    span = ir.Span("tensor_precision_compat.py", 9, 4, 9, 23)
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.FP32), span)
+    rhs = ir.Var("rhs", ir.TensorType([8, 16], DataType.FP32), span)
+
+    calls = (
+        tensor.div(lhs, rhs, span),
+        tensor.log(lhs, span),
+        tensor.recip(lhs, span),
+    )
+
+    assert all(call.span.filename == "tensor_precision_compat.py" for call in calls)
+    assert all(call.span.begin_line == 9 for call in calls)
+    assert all(dict(call.kwargs) == {} for call in calls)
+
+
+def test_tensor_subs_mixed_scalar_dtype_preserves_lhs_dtype():
+    """The tsubs scalar dtype does not retype the tensor result."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT16), span)
+    scalar = ir.ConstFloat(2.5, DataType.FP32, span)
+
+    calls = (
+        tensor.subs(lhs, scalar),
+        tensor.subs(lhs, 2.5),
+    )
+
+    for call in calls:
+        assert isinstance(call.type, ir.TensorType)
+        assert call.type.dtype == DataType.INT16
+        scalar_type = call.args[1].type
+        assert isinstance(scalar_type, ir.ScalarType)
+        assert scalar_type.dtype == DataType.FP32
+
+
+def test_tensor_subs_rejects_unsupported_tensor_dtype():
+    """INT64 is outside the current pto.tsubs tensor dtype union."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT64), span)
+
+    with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32, BF16"):
+        tensor.subs(lhs, 1)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [DataType.UINT32, DataType.BOOL, DataType.INDEX, DataType.INT64, DataType.FP8E4M3FN],
+)
+def test_tensor_subs_rejects_unsupported_scalar_dtype(dtype):
+    """Only scalar dtypes exercised by the executable PTOAS paths are exposed."""
+    span = ir.Span.unknown()
+    lhs = ir.Var("lhs", ir.TensorType([8, 16], DataType.INT16), span)
+    scalar = ir.Var("scalar", ir.ScalarType(dtype), span)
+
+    with pytest.raises(ValueError, match=r"requires scalar dtype in"):
+        ir.create_op_call("tensor.subs", [lhs, scalar], span)
 
 
 @pytest.mark.parametrize("op_name", ["part_add", "part_mul", "part_max", "part_min"])
@@ -1423,17 +1755,17 @@ def test_tensor_fmod():
     # tensor-tensor -> tensor.fmod
     call = ir.op.tensor.fmod(var_a, var_b)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.fmod"
+    assert call.op.name == ir.get_op("tensor.fmod").name
 
     # tensor-scalar via fmod auto-dispatch -> tensor.fmods
     call_scalar = ir.op.tensor.fmod(var_a, 3.0)
     assert isinstance(call_scalar, ir.Call)
-    assert call_scalar.op.name == "tensor.fmods"
+    assert call_scalar.op.name == _OP_TENSOR_FMODS
 
     # explicit fmods -> tensor.fmods
     call_fmods = ir.op.tensor.fmods(var_a, 3.0)
     assert isinstance(call_fmods, ir.Call)
-    assert call_fmods.op.name == "tensor.fmods"
+    assert call_fmods.op.name == _OP_TENSOR_FMODS
 
 
 def test_const_float():
@@ -1475,7 +1807,7 @@ def test_tensor_read():
     call = ir.op.tensor.read(tensor_var, [2, 3])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.read"
+    assert call.op.name == _OP_TENSOR_READ
 
     # Result should be ScalarType with tensor's element dtype
     result_type = call.type
@@ -1497,7 +1829,7 @@ def test_tensor_read_with_expr_indices():
     call = ir.op.tensor.read(tensor_var, [idx_var])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.read"
+    assert call.op.name == _OP_TENSOR_READ
     result_type = call.type
     assert isinstance(result_type, ir.ScalarType)
     assert result_type.dtype == DataType.FP16
@@ -1518,7 +1850,7 @@ def test_tensor_dim():
     call = ir.op.tensor.dim(tensor_var, 1)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.dim"
+    assert call.op.name == _OP_TENSOR_DIM
 
     # Result should be ScalarType(INDEX) — tensor.dim returns machine-word index type
     result_type = call.type
@@ -1540,7 +1872,7 @@ def test_tensor_dim_negative_axis():
     call = ir.op.tensor.dim(tensor_var, -1)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.dim"
+    assert call.op.name == _OP_TENSOR_DIM
     result_type = call.type
     assert isinstance(result_type, ir.ScalarType)
     assert result_type.dtype == DataType.INDEX
@@ -1555,7 +1887,7 @@ def test_tensor_create_dynamic_shape():
     call = ir.op.tensor.create([dim_n, 128], DataType.FP32)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.create"
+    assert call.op.name == _OP_TENSOR_CREATE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -1607,7 +1939,7 @@ def test_tensor_reshape():
     call = ir.op.tensor.reshape(tensor_var, [32])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.reshape"
+    assert call.op.name == _OP_TENSOR_RESHAPE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -1635,7 +1967,7 @@ def test_tensor_reshape_dynamic():
     call = ir.op.tensor.reshape(tensor_var, [dim_k])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.reshape"
+    assert call.op.name == _OP_TENSOR_RESHAPE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
 
@@ -1824,7 +2156,7 @@ def test_tensor_transpose():
     call = ir.op.tensor.transpose(tensor_var, 0, 2)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.transpose"
+    assert call.op.name == _OP_TENSOR_TRANSPOSE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -1846,7 +2178,7 @@ def test_tensor_transpose_negative_axis():
     call = ir.op.tensor.transpose(tensor_var, -2, -1)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.transpose"
+    assert call.op.name == _OP_TENSOR_TRANSPOSE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
 
@@ -2014,7 +2346,7 @@ def test_tensor_transpose_valid_shape_rank_mismatch_rejected():
     dim16 = ir.ConstInt(16, DataType.INT32, span)
     tensor_var = ir.Var("t", ir.TensorType([dim8, dim16], DataType.FP32), span)
 
-    with pytest.raises(Exception, match="valid_shape rank"):
+    with pytest.raises(ValueError, match="valid_shape rank"):
         tensor.transpose(tensor_var, 0, 1, valid_shape=[16])
 
 
@@ -2062,7 +2394,7 @@ def test_tensor_slice_with_valid_shape():
     call = ir.op.tensor.slice(tensor_var, [8, 16], [0, 0], valid_shape=[4, 8])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.slice"
+    assert call.op.name == _OP_TENSOR_SLICE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -2079,7 +2411,7 @@ def test_tensor_slice_drop_dims_rank_reduces():
 
     call = ir.op.tensor.slice(tensor_var, [1, 1, 64, 64], [3, 5, 0, 0], drop_dims=[0, 1])
 
-    assert call.op.name == "tensor.slice"
+    assert call.op.name == _OP_TENSOR_SLICE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [64, 64]
@@ -2114,6 +2446,14 @@ def test_tensor_slice_drop_dims_rejects_out_of_range():
     tensor_var = ir.Var("t", ir.TensorType([64, 64], DataType.FP32), span)
     with pytest.raises(ValueError, match="out of range"):
         ir.op.tensor.slice(tensor_var, [1, 64], [0, 0], drop_dims=[2])
+
+
+def test_tensor_slice_drop_dims_rejects_rank_zero_result():
+    """drop_dims cannot create a rank-zero runtime tensor."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([1, 1], DataType.FP32), span)
+    with pytest.raises(ValueError, match="cannot erase every dimension"):
+        ir.op.tensor.slice(tensor_var, [1, 1], [0, 0], drop_dims=[0, 1])
 
 
 def test_tensor_slice_empty_drop_dims_is_backward_compatible():
@@ -2162,7 +2502,7 @@ def test_tensor_slice_with_pad_value():
     call = tensor.slice(tensor_var, [8, 16], [0, 0], valid_shape=[8, 4], pad_value=ir.PadValue.zero)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.slice"
+    assert call.op.name == _OP_TENSOR_SLICE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.tensor_view is not None
@@ -2254,11 +2594,18 @@ def test_tensor_slice_pad_without_valid_shape_warns():
 # ---------------------------------------------------------------------------
 
 
-def _partial_tensor_var(shape, valid_shape, pad=ir.PadValue.null, name="t"):
+def _partial_tensor_var(shape, valid_shape, pad=ir.PadValue.null, name="t", dtype=DataType.FP32):
     """Build a tensor Var whose tensor_view narrows it to `valid_shape`."""
     span = ir.Span.unknown()
     view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=valid_shape, pad=pad)
-    return ir.Var(name, ir.TensorType(shape, DataType.FP32, tensor_view=view), span)
+    return ir.Var(name, ir.TensorType(shape, dtype, tensor_view=view), span)
+
+
+def _partial_distributed_tensor_var(shape, valid_shape, name="t", dtype=DataType.FP32):
+    """Build a direct distributed-window Var with a partial valid region."""
+    span = ir.Span.unknown()
+    view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=valid_shape)
+    return ir.Var(name, ir.DistributedTensorType(shape, dtype, None, view), span)
 
 
 def _valid_of(result_type):
@@ -2557,7 +2904,7 @@ def test_tensor_fillpad_clears_valid_shape():
     call = ir.op.tensor.fillpad(tensor_var, pad_value=ir.PadValue.min)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.fillpad"
+    assert call.op.name == ir.get_op("tensor.fillpad").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -2580,7 +2927,7 @@ def test_tensor_fillpad_expand():
     call = ir.op.tensor.fillpad_expand(tensor_var, [64, 128], pad_value=ir.PadValue.zero)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.fillpad_expand"
+    assert call.op.name == ir.get_op("tensor.fillpad_expand").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -2616,7 +2963,7 @@ def test_tensor_set_validshape():
     call = ir.op.tensor.set_validshape(tensor_var, 16, 24)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.set_validshape"
+    assert call.op.name == _OP_TENSOR_SET_VALIDSHAPE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -2636,7 +2983,7 @@ def test_tensor_set_validshape_dynamic():
     call = ir.op.tensor.set_validshape(tensor_var, vr, vc)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.set_validshape"
+    assert call.op.name == _OP_TENSOR_SET_VALIDSHAPE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.tensor_view is not None
@@ -2650,7 +2997,7 @@ def test_tensor_set_validshape_rejects_negative():
     tensor_type = ir.TensorType([dim32, dim32], DataType.FP32)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    with pytest.raises(Exception, match="must be >= 0"):
+    with pytest.raises(ValueError, match="must be >= 0"):
         ir.op.tensor.set_validshape(tensor_var, -1, 16)
 
 
@@ -2661,7 +3008,7 @@ def test_tensor_set_validshape_rejects_exceeding_bound():
     tensor_type = ir.TensorType([dim32, dim32], DataType.FP32)
     tensor_var = ir.Var("t", tensor_type, span)
 
-    with pytest.raises(Exception, match="exceeds tensor bound"):
+    with pytest.raises(ValueError, match="exceeds tensor bound"):
         ir.op.tensor.set_validshape(tensor_var, 16, 64)
 
 
@@ -2731,13 +3078,178 @@ def test_tensor_reshape_with_valid_shape():
     call = ir.op.tensor.reshape(tensor_var, [32], valid_shape=[16])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.reshape"
+    assert call.op.name == _OP_TENSOR_RESHAPE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
     assert len(call.args) == 3
     assert result_type.tensor_view is not None
     assert len(result_type.tensor_view.valid_shape) == 1
+
+
+# ---- valid_shape mapping through reshape ---------------------------------------------------
+#
+# A reshape is a zero-copy view, so it cannot invent data: the result's valid region is the
+# source's, expressed in the target shape. `valid_shape` can only describe an origin-anchored
+# box, so a region the target shape cannot spell is rejected rather than rounded up to fully
+# valid. `tile.reshape` is held to the same rule — see test_tile_ops.py.
+
+
+def test_tensor_reshape_fully_valid_input_yields_no_explicit_view():
+    """A fully valid source stays fully valid, canonicalized to no view at all."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([8, 16], DataType.FP32), span)
+
+    result_type = ir.op.tensor.reshape(tensor_var, [16, 8]).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+def test_tensor_reshape_maps_row_prefix_to_target_rectangle():
+    """Valid rows are a contiguous flat prefix: 5*16 = 80 cells = 10 rows of 8."""
+    result_type = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [16, 8]).type
+
+    assert _valid_of(result_type) == [10, 8]
+
+
+def test_tensor_reshape_maps_prefix_through_flatten():
+    """Flattening keeps the prefix as a single extent."""
+    result_type = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [128]).type
+
+    assert _valid_of(result_type) == [80]
+
+
+def test_tensor_reshape_drops_full_unit_axis_exactly():
+    """Erasing a provably full unit axis is a coordinate-only rank change.
+
+    Rows stay rows and columns stay columns, so an arbitrary rectangle survives —
+    including a column-partial region, which is not a contiguous flat prefix.
+    """
+
+    def dropped(valid):
+        return _valid_of(ir.op.tensor.reshape(_partial_tensor_var([1, 8, 16], valid), [8, 16]).type)
+
+    assert dropped([1, 5, 16]) == [5, 16]  # also reachable as a flat prefix
+    assert dropped([1, 8, 5]) == [8, 5]  # column-partial — unit-axis rule only
+    assert dropped([1, 5, 5]) == [5, 5]  # partial on both axes — unit-axis rule only
+
+
+def test_tensor_reshape_lifts_unit_axis_exactly():
+    """The inverse rank change — inserting a unit axis — is equally exact."""
+    result_type = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [8, 5]), [1, 8, 16]).type
+
+    assert _valid_of(result_type) == [1, 8, 5]
+
+
+def test_tensor_reshape_empty_region_stays_empty():
+    """The empty set has an exact representation in every target shape."""
+    result_type = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [0, 16]), [16, 8]).type
+
+    assert _valid_of(result_type) == [0, 0]
+
+
+def test_tensor_reshape_preserves_symbolic_row_prefix():
+    """A dynamic row count survives onto a target axis whose step is the trailing volume.
+
+    The target is repartitioned ([8, 16] -> [8, 4, 4]) so the unit-axis rule cannot
+    apply — 16 != 4 and neither axis is a unit — which pins the dynamic-prefix
+    branch specifically. An identity reshape would be answered by the unit-axis
+    rule first and prove nothing about this one.
+    """
+    span = ir.Span.unknown()
+    vrow = ir.Var("vrow", ir.ScalarType(DataType.INDEX), span)
+    view = ir.TensorView([], ir.TensorLayout.ND, valid_shape=[vrow, ir.ConstInt(16, DataType.INDEX, span)])
+    tensor_var = ir.Var("t", ir.TensorType([8, 16], DataType.FP32, None, view), span)
+
+    result_type = ir.op.tensor.reshape(tensor_var, [8, 4, 4]).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    valid = result_type.tensor_view.valid_shape
+    assert valid[0] == vrow  # the dynamic prefix carries over unchanged
+    assert _const_int_values(valid[1:]) == [4, 4]
+
+
+def test_tensor_reshape_rejects_symbolic_prefix_without_a_target_axis():
+    """No target axis preserves the trailing volume, so the dynamic prefix is rejected."""
+    span = ir.Span.unknown()
+    vrow = ir.Var("vrow", ir.ScalarType(DataType.INDEX), span)
+    view = ir.TensorView([], ir.TensorLayout.ND, valid_shape=[vrow, ir.ConstInt(16, DataType.INDEX, span)])
+    tensor_var = ir.Var("t", ir.TensorType([8, 16], DataType.FP32, None, view), span)
+
+    with pytest.raises(ValueError, match="has the matching row size"):
+        ir.op.tensor.reshape(tensor_var, [32, 4])
+
+
+def test_tensor_reshape_carries_pad_alongside_the_mapped_region():
+    """Padding describes the invalid cells, so it travels with the region it describes.
+
+    A view of the same buffer keeps its fill convention; dropping it would leave
+    downstream unable to tell zero-filled padding from unknown bytes.
+    """
+    src = _partial_tensor_var([8, 16], [5, 16], pad=ir.PadValue.zero)
+
+    result_type = ir.op.tensor.reshape(src, [16, 8]).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert result_type.tensor_view.pad == ir.PadValue.zero
+    assert _valid_of(result_type) == [10, 8]
+
+
+def test_tensor_reshape_rejects_region_that_is_not_a_flat_prefix():
+    """Valid columns leave gaps between real rows, so no target rectangle spans them."""
+    with pytest.raises(ValueError, match="real data is scattered across the buffer"):
+        ir.op.tensor.reshape(_partial_tensor_var([8, 16], [8, 5]), [16, 8])
+
+
+def test_tensor_reshape_rejects_prefix_without_a_target_rectangle():
+    """80 cells is not a whole number of 32-wide rows, so [4, 32] cannot spell it."""
+    with pytest.raises(ValueError, match="do not fill a whole number of rows"):
+        ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [4, 32])
+
+
+def test_tensor_reshape_explicit_valid_shape_may_narrow_the_mapped_region():
+    """The 3rd argument narrows what the source supplies."""
+    call = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [16, 8], valid_shape=[4, 8])
+
+    assert len(call.args) == 3
+    assert _valid_of(call.type) == [4, 8]
+
+
+def test_tensor_reshape_explicit_valid_shape_may_not_widen_the_mapped_region():
+    """The 3rd argument cannot claim data the source does not have."""
+    with pytest.raises(ValueError, match="not provably within the source-derived extent"):
+        ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [16, 8], valid_shape=[12, 8])
+
+
+def test_tensor_reshape_explicit_valid_shape_rejects_a_negative_extent():
+    """An upper bound alone would admit a negative extent: -1 <= 5 proves true."""
+    with pytest.raises(ValueError, match="must be provably >= 0"):
+        ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [16, 8], valid_shape=[-1, 8])
+
+
+def test_tensor_reshape_explicit_valid_shape_allows_a_zero_extent():
+    """Zero is how an empty region is spelled, so it must survive the bound check."""
+    call = ir.op.tensor.reshape(_partial_tensor_var([8, 16], [5, 16]), [16, 8], valid_shape=[0, 8])
+
+    assert _valid_of(call.type) == [0, 8]
+
+
+def test_tensor_reshape_rejects_a_partial_source_with_reordered_strides():
+    """An ND layout does not by itself mean the elements are stored row-major.
+
+    ``tensor.transpose`` of a non-trailing axis pair keeps the ND layout while
+    permuting the strides ([2, 4, 8] -> [4, 2, 8] with stride [8, 32, 1]), so the
+    flat-prefix mapping would walk the wrong offsets and could widen the region.
+    """
+    span = ir.Span.unknown()
+    view = ir.TensorView([8, 32, 1], ir.TensorLayout.ND, valid_shape=[2, 2, 8])
+    strided = ir.Var("t", ir.TensorType([4, 2, 8], DataType.FP32, None, view), span)
+
+    with pytest.raises(ValueError, match="not stored row-major"):
+        ir.op.tensor.reshape(strided, [8, 8])
 
 
 def test_tensor_transpose_with_valid_shape():
@@ -2751,7 +3263,7 @@ def test_tensor_transpose_with_valid_shape():
     call = ir.op.tensor.transpose(tensor_var, 0, 1, valid_shape=[16, 8])
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.transpose"
+    assert call.op.name == _OP_TENSOR_TRANSPOSE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -2779,7 +3291,7 @@ class TestTensorScalarMemoryOps:
         call = tensor.read(tensor_var, [idx])
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tensor.read"
+        assert call.op.name == _OP_TENSOR_READ
         assert isinstance(call.type, ir.ScalarType)
         assert call.type.dtype == DataType.FP32
 
@@ -2795,7 +3307,7 @@ class TestTensorScalarMemoryOps:
 
         call = tensor.read(tensor_var, [i, j])
 
-        assert call.op.name == "tensor.read"
+        assert call.op.name == _OP_TENSOR_READ
         assert isinstance(call.type, ir.ScalarType)
         assert call.type.dtype == DataType.FP32
 
@@ -2811,7 +3323,7 @@ class TestTensorScalarMemoryOps:
         call = tensor.write(tensor_var, [idx], value)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tensor.write"
+        assert call.op.name == _OP_TENSOR_WRITE
 
     def test_write_2d(self):
         """Test tensor.write with 2D indices."""
@@ -2826,7 +3338,7 @@ class TestTensorScalarMemoryOps:
 
         call = tensor.write(tensor_var, [i, j], value)
 
-        assert call.op.name == "tensor.write"
+        assert call.op.name == _OP_TENSOR_WRITE
 
     def test_read_type_mismatch(self):
         """Test tensor.read with wrong argument types raises error."""
@@ -2845,22 +3357,33 @@ class TestTensorScalarMemoryOps:
 # =============================================================================
 
 
-def test_tensor_row_min():
-    """Test tensor.row_min reduction."""
+@pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
+def test_tensor_row_min(dtype):
+    """tensor.row_min accepts every dtype in the PTO TROWMIN contract."""
     span = ir.Span.unknown()
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
+    tensor_type = ir.TensorType([dim64, dim128], dtype)
     tensor_var = ir.Var("t", tensor_type, span)
 
     call = ir.op.tensor.row_min(tensor_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_min"
+    assert call.op.name == ir.get_op("tensor.row_min").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT8, DataType.BF16])
+def test_tensor_row_min_rejects_unsupported_dtype(dtype):
+    """tensor.row_min rejects dtypes that cannot lower to PTO TROWMIN."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], dtype), span)
+
+    with pytest.raises(ValueError, match=r"requires input dtype in \{INT16, INT32, FP16, FP32\}"):
+        ir.op.tensor.row_min(tensor_var)
 
 
 # =============================================================================
@@ -2882,7 +3405,7 @@ def test_tensor_row_expand():
     call = ir.op.tensor.row_expand(tensor_var, row_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand"
+    assert call.op.name == ir.get_op("tensor.row_expand").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -2894,30 +3417,8 @@ def test_tensor_row_expand():
 # =============================================================================
 
 
-def test_tensor_row_expand_add():
-    """Test tensor.row_expand_add operation."""
-    span = ir.Span.unknown()
-    dim64 = ir.ConstInt(64, DataType.INT32, span)
-    dim128 = ir.ConstInt(128, DataType.INT32, span)
-    dim1 = ir.ConstInt(1, DataType.INT32, span)
-
-    tensor_type = ir.TensorType([dim64, dim128], DataType.FP16)
-    row_type = ir.TensorType([dim64, dim1], DataType.FP16)
-    tensor_var = ir.Var("t", tensor_type, span)
-    row_var = ir.Var("rv", row_type, span)
-
-    call = ir.op.tensor.row_expand_add(tensor_var, row_var)
-
-    assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_add"
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP16
-    assert len(result_type.shape) == 2
-
-
-def test_tensor_row_expand_add_dtype_promotion():
-    """Test tensor.row_expand_add promotes data types."""
+def test_tensor_row_expand_add_rejects_mixed_dtypes():
+    """PTOAS requires src0, src1, and dst to have one exact dtype."""
     span = ir.Span.unknown()
     dim64 = ir.ConstInt(64, DataType.INT32, span)
     dim128 = ir.ConstInt(128, DataType.INT32, span)
@@ -2928,11 +3429,37 @@ def test_tensor_row_expand_add_dtype_promotion():
     tensor_var = ir.Var("t", tensor_type, span)
     row_var = ir.Var("rv", row_type, span)
 
-    call = ir.op.tensor.row_expand_add(tensor_var, row_var)
+    with pytest.raises(ValueError, match=r"src0 and src1 to have the same dtype"):
+        ir.op.tensor.row_expand_add(tensor_var, row_var)
 
-    result_type = call.type
-    assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP32
+
+@pytest.mark.parametrize(
+    "dtype",
+    [DataType.INT8, DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32],
+)
+def test_tensor_row_expand_add_accepts_ptoas_dtype_union(dtype):
+    """The tensor contract exposes the union of supported PTOAS architectures."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], dtype), span)
+    row_var = ir.Var("rv", ir.TensorType([64, 1], dtype), span)
+
+    call = tensor.row_expand_add(tensor_var, row_var)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == ir.get_op("tensor.row_expand_add").name
+    assert isinstance(call.type, ir.TensorType)
+    assert call.type.dtype == dtype
+    assert [dim.value for dim in call.type.shape if isinstance(dim, ir.ConstInt)] == [64, 128]
+
+
+def test_tensor_row_expand_add_rejects_unsupported_dtype():
+    """BF16 is outside the current pto.trowexpandadd dtype union."""
+    span = ir.Span.unknown()
+    tensor_var = ir.Var("t", ir.TensorType([64, 128], DataType.BF16), span)
+    row_var = ir.Var("rv", ir.TensorType([64, 1], DataType.BF16), span)
+
+    with pytest.raises(ValueError, match=r"INT8, INT16, INT32, FP16, FP32"):
+        tensor.row_expand_add(tensor_var, row_var)
 
 
 def test_tensor_row_expand_add_wrong_type():
@@ -2970,7 +3497,7 @@ def test_tensor_row_expand_sub():
     call = ir.op.tensor.row_expand_sub(tensor_var, row_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.row_expand_sub"
+    assert call.op.name == ir.get_op("tensor.row_expand_sub").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3031,7 +3558,7 @@ def test_tensor_col_expand():
     call = ir.op.tensor.col_expand(tensor_var, col_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand"
+    assert call.op.name == ir.get_op("tensor.col_expand").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3092,7 +3619,7 @@ def test_tensor_col_expand_div():
     call = ir.op.tensor.col_expand_div(tensor_var, col_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_div"
+    assert call.op.name == ir.get_op("tensor.col_expand_div").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3138,7 +3665,7 @@ def test_tensor_col_expand_sub():
     call = ir.op.tensor.col_expand_sub(tensor_var, col_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_sub"
+    assert call.op.name == ir.get_op("tensor.col_expand_sub").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3184,7 +3711,7 @@ def test_tensor_col_expand_add():
     call = ir.op.tensor.col_expand_add(tensor_var, col_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.col_expand_add"
+    assert call.op.name == ir.get_op("tensor.col_expand_add").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3244,7 +3771,7 @@ def test_tensor_expands():
     call = ir.op.tensor.expands(tensor_var, scalar_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.expands"
+    assert call.op.name == ir.get_op("tensor.expands").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3273,7 +3800,7 @@ def test_tensor_expand_clone_dim0():
     call = ir.op.tensor.expand_clone(input_var, target_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.expand_clone"
+    assert call.op.name == _OP_TENSOR_EXPAND_CLONE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3300,7 +3827,7 @@ def test_tensor_expand_clone_dim1():
     call = ir.op.tensor.expand_clone(input_var, target_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.expand_clone"
+    assert call.op.name == _OP_TENSOR_EXPAND_CLONE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3327,7 +3854,7 @@ def test_tensor_expand_clone_dim2():
     call = ir.op.tensor.expand_clone(input_var, target_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.expand_clone"
+    assert call.op.name == _OP_TENSOR_EXPAND_CLONE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3350,7 +3877,7 @@ def test_tensor_concat():
     call = tensor.concat(t0_var, t1_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.concat"
+    assert call.op.name == ir.get_op("tensor.concat").name
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3409,7 +3936,7 @@ def test_tensor_scatter_update_2d():
     call = ir.op.tensor.scatter_update(input_var, -2, index_var, src_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.scatter_update"
+    assert call.op.name == _OP_TENSOR_SCATTER_UPDATE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP16
@@ -3438,7 +3965,7 @@ def test_tensor_scatter_update_4d():
     call = ir.op.tensor.scatter_update(input_var, -2, index_var, src_var)
 
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.scatter_update"
+    assert call.op.name == _OP_TENSOR_SCATTER_UPDATE
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.BF16
@@ -3489,6 +4016,131 @@ def test_tensor_scatter_update_invalid_dim():
         ir.op.tensor.scatter_update(input_var, 0, index_var, src_var)
 
 
+def _operand_dtype(expr: ir.Expr) -> DataType:
+    """Return a constant operand's dtype, narrowing ``Expr`` for the type checker."""
+    assert isinstance(expr, (ir.ConstInt, ir.ConstFloat)), f"expected a constant, got {type(expr).__name__}"
+    return expr.dtype
+
+
+def _tensor_result_dtype(call: ir.Call) -> DataType:
+    """Return a tensor call's result element dtype, narrowing ``Type``."""
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    return result_type.dtype
+
+
+class TestTensorScalarOperandDtype:
+    """A constant scalar operand of a tensor x scalar op adopts the tensor dtype.
+
+    The tensor path is stricter than the tile path: ``DeduceTensorOpElementwiseScalarType``
+    runs the scalar dtype through ``PromoteDataTypes``, so an ``index`` placeholder
+    does not just break codegen -- it silently retypes the *result* tensor. The
+    wrappers must re-stamp the placeholder to the tensor element dtype, reject
+    non-constant ``index`` values, and preserve genuine promotion (int tensor +
+    float literal -> float result).
+    """
+
+    _TENSOR_SCALAR_WRAPPERS = [
+        ("add", tensor.add),
+        ("sub", tensor.sub),
+        ("mul", tensor.mul),
+        ("div", tensor.div),
+        ("adds", tensor.adds),
+        ("subs", tensor.subs),
+        ("muls", tensor.muls),
+        ("divs", tensor.divs),
+        ("maximum", tensor.maximum),
+        ("minimum", tensor.minimum),
+        ("cmp", tensor.cmp),
+    ]
+
+    @staticmethod
+    def _tensor(dtype=DataType.INT32, shape=(64, 64)):
+        return ir.Var("x", ir.TensorType(list(shape), dtype), ir.Span.unknown())
+
+    def test_dsl_int_literal_adopts_tensor_dtype(self):
+        """`pl.add(x, 5)` yields a scalar operand at the tensor dtype, not index."""
+        for dtype in (DataType.INT32, DataType.INT16, DataType.FP16, DataType.FP32):
+            call = tensor.add(self._tensor(dtype), 5)
+            assert _operand_dtype(call.args[1]) == dtype
+
+    def test_result_tensor_dtype_preserved(self):
+        """The tensor-specific severity: an int literal must not retype the result.
+
+        Before the fix, `tensor.adds(x_i32, 5)` had an index scalar that promoted
+        the whole result tensor to `index`.
+        """
+        for dtype in (DataType.INT32, DataType.INT16, DataType.FP16):
+            call = tensor.adds(self._tensor(dtype), 5)
+            assert _tensor_result_dtype(call) == dtype
+
+    def test_no_index_survives_any_tensor_scalar_op(self):
+        """No wrapper leaves an index-typed constant operand."""
+        for name, fn in self._TENSOR_SCALAR_WRAPPERS:
+            call = fn(self._tensor(DataType.INT32), 5)
+            assert _operand_dtype(call.args[1]) != DataType.INDEX, f"{name} left an index operand"
+
+    def test_int_literal_on_float_tensor_is_const_float(self):
+        """An int literal on a float tensor becomes a ConstFloat at the tensor dtype."""
+        for dtype in (DataType.FP16, DataType.FP32):
+            call = tensor.adds(self._tensor(dtype), 5)
+            rhs = call.args[1]
+            assert isinstance(rhs, ir.ConstFloat)
+            assert rhs.dtype == dtype
+
+    def test_float_literal_on_int_tensor_still_promotes(self):
+        """A float literal keeps FP32 and promotion still lifts the result to float."""
+        call = tensor.muls(self._tensor(DataType.INT32), 2.5)
+        rhs = call.args[1]
+        assert isinstance(rhs, ir.ConstFloat)
+        assert rhs.dtype == DataType.FP32
+        assert _tensor_result_dtype(call) == DataType.FP32
+
+    def test_ir_level_restamps_index_const(self):
+        """A hand-built ConstInt(INDEX) operand (parser output) is re-stamped."""
+        span = ir.Span.unknown()
+        call = tensor.adds(self._tensor(DataType.INT16), ir.ConstInt(5, DataType.INDEX, span))
+        assert _operand_dtype(call.args[1]) == DataType.INT16
+        assert _tensor_result_dtype(call) == DataType.INT16
+
+    def test_explicitly_typed_const_is_not_restamped(self):
+        """An explicit pl.const(v, dtype) is a user annotation, left untouched."""
+        span = ir.Span.unknown()
+        typed = ir.ConstInt(5, DataType.INT32, span)
+        call = tensor.adds(self._tensor(DataType.INT16), typed)
+        assert _operand_dtype(call.args[1]) == DataType.INT32
+
+    def test_typed_scalar_param_passes_through(self):
+        """A typed pl.Scalar operand is not re-stamped."""
+        span = ir.Span.unknown()
+        k = ir.Var("k", ir.ScalarType(DataType.INT32), span)
+        call = tensor.adds(self._tensor(DataType.INT16), k)
+        assert call.args[1] is k
+
+    def test_tensor_rhs_untouched(self):
+        """A tensor rhs dispatches to the tensor-tensor op, operand unchanged."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("a", ir.TensorType([64, 64], DataType.INT32), span)
+        rhs = ir.Var("b", ir.TensorType([64, 64], DataType.INT32), span)
+        call = tensor.add(lhs, rhs)
+        assert call.op.name == ir.get_op("tensor.add").name
+        assert call.args[1] is rhs
+
+    def test_expands_adopts_target_dtype(self):
+        """tensor.expands re-stamps its scalar to the target tensor dtype (not FP32)."""
+        call = tensor.expands(self._tensor(DataType.INT32), 5)
+        assert _operand_dtype(call.args[1]) == DataType.INT32
+
+    def test_index_scalar_value_is_rejected(self):
+        """A non-constant index scalar operand is rejected, pointing at pl.cast."""
+        span = ir.Span.unknown()
+        idx = ir.Var("i", ir.ScalarType(DataType.INDEX), span)
+        with pytest.raises((ValueError, TypeError), match="index"):
+            tensor.adds(self._tensor(DataType.INT32), idx)
+        with pytest.raises((ValueError, TypeError), match="pl.cast"):
+            tensor.adds(self._tensor(DataType.INT32), idx)
+
+
 class TestTensorFormatShapeError:
     """Regression tests for issue #824: FormatShape prints readable shapes, not pointer addresses."""
 
@@ -3537,7 +4189,7 @@ def test_tensor_sort32():
 
     call = ir.op.tensor.sort32(src, idx)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.sort32"
+    assert call.op.name == ir.get_op("tensor.sort32").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -3555,7 +4207,7 @@ def test_tensor_sort32_wrong_dtype():
     src = ir.Var("src", ir.TensorType([d8, d32], DataType.INT32), span)
     idx = ir.Var("idx", ir.TensorType([d8, d32], DataType.INT32), span)
 
-    with pytest.raises(Exception, match=r"FP16 or FP32"):
+    with pytest.raises(ValueError, match=r"FP16 or FP32"):
         ir.op.tensor.sort32(src, idx)
 
 
@@ -3568,7 +4220,7 @@ def test_tensor_mrgsort_format1():
 
     call = ir.op.tensor.mrgsort(src, block_len=64)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.mrgsort_format1"
+    assert call.op.name == ir.get_op("tensor.mrgsort_format1").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -3584,7 +4236,7 @@ def test_tensor_mrgsort_format1_invalid_block_len():
     d128 = ir.ConstInt(128, DataType.INT32, span)
     src = ir.Var("src", ir.TensorType([d1, d128], DataType.FP32), span)
 
-    with pytest.raises(Exception, match=r"multiple of 64"):
+    with pytest.raises(ValueError, match=r"multiple of 64"):
         ir.op.tensor.mrgsort(src, block_len=63)
 
 
@@ -3599,7 +4251,7 @@ def test_tensor_mrgsort_format2():
 
     call = ir.op.tensor.mrgsort(*srcs)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.mrgsort_format2"
+    assert call.op.name == ir.get_op("tensor.mrgsort_format2").name
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
@@ -3622,7 +4274,7 @@ def test_tensor_mrgsort_format2_dtype_mismatch():
     s2 = ir.Var("s2", src_fp32, span)
     s3 = ir.Var("s3", src_fp32, span)
 
-    with pytest.raises(Exception, match=r"matching dtype"):
+    with pytest.raises(ValueError, match=r"matching dtype"):
         ir.op.tensor.mrgsort(s0, s1, s2, s3)
 
 
@@ -3656,7 +4308,7 @@ def test_tensor_gather_basic():
     inp, idx = _make_gather_inputs()
     call = ir.op.tensor.gather(inp, dim=-1, index=idx)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.gather"
+    assert call.op.name == _OP_TENSOR_GATHER
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3669,13 +4321,13 @@ def test_tensor_gather_dim_last_axis_positive():
     """dim=rank-1 is accepted as an alias for dim=-1."""
     inp, idx = _make_gather_inputs()
     call = ir.op.tensor.gather(inp, dim=1, index=idx)
-    assert call.op.name == "tensor.gather"
+    assert call.op.name == _OP_TENSOR_GATHER
 
 
 def test_tensor_gather_rejects_bad_dim():
     inp, idx = _make_gather_inputs()
     # rank=2, valid dims are -2..1. dim=2 is out of range.
-    with pytest.raises(Exception, match=r"dim"):
+    with pytest.raises(ValueError, match=r"dim"):
         ir.op.tensor.gather(inp, dim=2, index=idx)
 
 
@@ -3683,7 +4335,7 @@ def test_tensor_gather_accepts_int16_index_with_16bit_input():
     """INT16 index is accepted when the input is a 16-bit dtype (FP16/INT16)."""
     inp, idx = _make_gather_inputs(src_dtype=DataType.FP16, idx_dtype=DataType.INT16)
     call = ir.op.tensor.gather(inp, dim=-1, index=idx)
-    assert call.op.name == "tensor.gather"
+    assert call.op.name == _OP_TENSOR_GATHER
     assert isinstance(call.type, ir.TensorType)
     assert call.type.dtype == DataType.FP16
 
@@ -3691,20 +4343,20 @@ def test_tensor_gather_accepts_int16_index_with_16bit_input():
 def test_tensor_gather_rejects_int16_index_with_32bit_input():
     """INT16 index with a 32-bit input is unsafe (tgather b32 reads it as u32)."""
     inp, idx = _make_gather_inputs(src_dtype=DataType.FP32, idx_dtype=DataType.INT16)
-    with pytest.raises(Exception, match=r"16-bit input"):
+    with pytest.raises(ValueError, match=r"16-bit input"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 
 def test_tensor_gather_rejects_non_int_index_dtype():
     """A non-integer index dtype (FP32) is rejected outright."""
     inp, idx = _make_gather_inputs(idx_dtype=DataType.FP32)
-    with pytest.raises(Exception, match=r"index dtype INT32"):
+    with pytest.raises(ValueError, match=r"index dtype INT32"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 
 def test_tensor_gather_rejects_unsupported_input_dtype():
     inp, idx = _make_gather_inputs(src_dtype=DataType.UINT32)
-    with pytest.raises(Exception, match=r"FP16, FP32, INT16, or INT32"):
+    with pytest.raises(ValueError, match=r"FP16, FP32, INT16, or INT32"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 
@@ -3715,7 +4367,7 @@ def test_tensor_gather_rejects_rank_mismatch():
     K = ir.ConstInt(3, DataType.INT32, span)
     inp = ir.Var("inp", ir.TensorType([B, N], DataType.FP32), span)
     idx = ir.Var("idx", ir.TensorType([K], DataType.INT32), span)
-    with pytest.raises(Exception, match=r"rank"):
+    with pytest.raises(ValueError, match=r"rank"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 
@@ -3727,7 +4379,7 @@ def test_tensor_gather_rejects_non_matching_outer_dim():
     K = ir.ConstInt(3, DataType.INT32, span)
     inp = ir.Var("inp", ir.TensorType([B, N], DataType.FP32), span)
     idx = ir.Var("idx", ir.TensorType([B2, K], DataType.INT32), span)
-    with pytest.raises(Exception, match=r"non-gather axes"):
+    with pytest.raises(ValueError, match=r"non-gather axes"):
         ir.op.tensor.gather(inp, dim=-1, index=idx)
 
 
@@ -3746,7 +4398,7 @@ def test_tensor_gather_mask_p0101_halves_last_dim():
     inp = _make_gather_mask_input(rows=8, cols=64)
     call = ir.op.tensor.gather(inp, mask_pattern=1)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.gather_mask"
+    assert call.op.name == _OP_TENSOR_GATHER_MASK
     rt = call.type
     assert isinstance(rt, ir.TensorType)
     assert rt.dtype == DataType.FP32
@@ -3777,7 +4429,7 @@ def test_tensor_gather_mask_output_dtype_reinterpret():
     """output_dtype reinterprets bits to a same-bit-width dtype."""
     inp = _make_gather_mask_input(rows=2, cols=32, dtype=DataType.FP32)
     call = ir.op.tensor.gather(inp, mask_pattern=2, output_dtype=DataType.UINT32)
-    assert call.op.name == "tensor.gather_mask"
+    assert call.op.name == _OP_TENSOR_GATHER_MASK
     rt = call.type
     assert isinstance(rt, ir.TensorType)
     assert rt.dtype == DataType.UINT32
@@ -3785,19 +4437,19 @@ def test_tensor_gather_mask_output_dtype_reinterpret():
 
 def test_tensor_gather_mask_rejects_bad_pattern():
     inp = _make_gather_mask_input()
-    with pytest.raises(Exception, match=r"mask_pattern in range"):
+    with pytest.raises(ValueError, match=r"mask_pattern in range"):
         ir.op.tensor.gather(inp, mask_pattern=0)
 
 
 def test_tensor_gather_mask_rejects_indivisible_cols():
     inp = _make_gather_mask_input(rows=2, cols=33)
-    with pytest.raises(Exception, match=r"divisible by 2"):
+    with pytest.raises(ValueError, match=r"divisible by 2"):
         ir.op.tensor.gather(inp, mask_pattern=1)
 
 
 def test_tensor_gather_mask_rejects_dtype_width_mismatch():
     inp = _make_gather_mask_input(rows=2, cols=32, dtype=DataType.FP16)
-    with pytest.raises(Exception, match=r"same bit width"):
+    with pytest.raises(ValueError, match=r"same bit width"):
         ir.op.tensor.gather(inp, mask_pattern=1, output_dtype=DataType.FP32)
 
 
@@ -3835,7 +4487,7 @@ def test_tensor_scatter_basic():
     inp, idx, src = _make_scatter_inputs()
     call = ir.op.tensor.scatter(inp, dim=-1, index=idx, src=src)
     assert isinstance(call, ir.Call)
-    assert call.op.name == "tensor.scatter"
+    assert call.op.name == _OP_TENSOR_SCATTER
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
     assert result_type.dtype == DataType.FP32
@@ -3857,13 +4509,13 @@ def test_tensor_scatter_positive_dim():
     """dim=1 is accepted as an alias for dim=-1 (rank-2 last axis)."""
     inp, idx, src = _make_scatter_inputs()
     call = ir.op.tensor.scatter(inp, dim=1, index=idx, src=src)
-    assert call.op.name == "tensor.scatter"
+    assert call.op.name == _OP_TENSOR_SCATTER
 
 
 def test_tensor_scatter_rejects_unsupported_dim():
     """MVP only supports dim=-1 (last axis)."""
     inp, idx, src = _make_scatter_inputs()
-    with pytest.raises(Exception, match=r"dim=-1"):
+    with pytest.raises(ValueError, match=r"dim=-1"):
         ir.op.tensor.scatter(inp, dim=0, index=idx, src=src)
 
 
@@ -3874,7 +4526,7 @@ def test_tensor_scatter_rejects_dtype_mismatch():
     K = ir.ConstInt(4, DataType.INT32, span)
     N = ir.ConstInt(8, DataType.INT32, span)
     src_wrong = ir.Var("src_bad", ir.TensorType([K, N], DataType.FP16), span)
-    with pytest.raises(Exception, match=r"src dtype"):
+    with pytest.raises(ValueError, match=r"src dtype"):
         ir.op.tensor.scatter(inp, dim=-1, index=idx, src=src_wrong)
 
 
@@ -3894,7 +4546,7 @@ def test_tensor_scatter_rejects_index_size_mismatch(dtype, wrong_idx_dtype):
     K = ir.ConstInt(4, DataType.INT32, span)
     N = ir.ConstInt(8, DataType.INT32, span)
     idx_wrong = ir.Var("idx_bad", ir.TensorType([K, N], wrong_idx_dtype), span)
-    with pytest.raises(Exception, match=r"index dtype"):
+    with pytest.raises(ValueError, match=r"index dtype"):
         ir.op.tensor.scatter(inp, dim=-1, index=idx_wrong, src=src)
 
 
@@ -3907,7 +4559,7 @@ def test_tensor_scatter_mask_p0101_doubles_last_dim():
     inp = ir.Var("inp", ir.TensorType([R, C], DataType.FP32), span)
     dst = ir.Var("dst", ir.TensorType([R, C2], DataType.FP32), span)
     call = ir.op.tensor.scatter(inp, mask_pattern=1, dst=dst)
-    assert call.op.name == "tensor.scatter_mask"
+    assert call.op.name == _OP_TENSOR_SCATTER_MASK
     rt = call.type
     assert isinstance(rt, ir.TensorType)
     assert rt.dtype == DataType.FP32
@@ -3921,7 +4573,7 @@ def test_tensor_scatter_mask_p1111_keeps_last_dim():
     inp = ir.Var("inp", ir.TensorType([R, C], DataType.FP32), span)
     dst = ir.Var("dst", ir.TensorType([R, C], DataType.FP32), span)
     call = ir.op.tensor.scatter(inp, mask_pattern=7, dst=dst)
-    assert call.op.name == "tensor.scatter_mask"
+    assert call.op.name == _OP_TENSOR_SCATTER_MASK
 
 
 def test_tensor_scatter_mask_rejects_bad_pattern():
@@ -3930,7 +4582,7 @@ def test_tensor_scatter_mask_rejects_bad_pattern():
     C = ir.ConstInt(8, DataType.INT32, span)
     inp = ir.Var("inp", ir.TensorType([R, C], DataType.FP32), span)
     dst = ir.Var("dst", ir.TensorType([R, C], DataType.FP32), span)
-    with pytest.raises(Exception, match=r"mask_pattern in \[1, 7\]"):
+    with pytest.raises(ValueError, match=r"mask_pattern in \[1, 7\]"):
         ir.op.tensor.scatter(inp, mask_pattern=42, dst=dst)
 
 
@@ -3942,7 +4594,7 @@ def test_tensor_scatter_mask_rejects_col_expansion_mismatch():
     Cwrong = ir.ConstInt(24, DataType.INT32, span)
     inp = ir.Var("inp", ir.TensorType([R, C], DataType.FP32), span)
     dst = ir.Var("dst_bad", ir.TensorType([R, Cwrong], DataType.FP32), span)
-    with pytest.raises(Exception, match=r"mask_pattern=1"):
+    with pytest.raises(ValueError, match=r"mask_pattern=1"):
         ir.op.tensor.scatter(inp, mask_pattern=1, dst=dst)
 
 
@@ -3958,7 +4610,7 @@ def test_tensor_scatter_mask_rejects_dtype_mismatch():
     C2 = ir.ConstInt(16, DataType.INT32, span)
     inp = ir.Var("inp", ir.TensorType([R, C], DataType.FP16), span)
     dst = ir.Var("dst", ir.TensorType([R, C2], DataType.INT16), span)
-    with pytest.raises(Exception, match=r"same dtype"):
+    with pytest.raises(ValueError, match=r"same dtype"):
         ir.op.tensor.scatter(inp, mask_pattern=1, dst=dst)
 
 
@@ -4009,13 +4661,75 @@ class TestTensorCiOp:
     def test_top_level_arange_is_tensor_ci(self):
         assert pl.arange is pl.tensor.ci
 
-    def test_top_level_sort32_is_tensor_sort32(self):
-        assert pl.sort32 is pl.tensor.sort32
+    def test_top_level_sort32_dispatches_on_operand_level(self):
+        """``pl.sort32`` dispatches; it is not ``pl.tensor.sort32`` under a shorter name."""
+        assert pl.sort32 is not pl.tensor.sort32
 
-    def test_top_level_mrgsort_is_tensor_mrgsort(self):
-        assert pl.mrgsort is pl.tensor.mrgsort
+        @pl.program
+        class TensorProgram:
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[8, 32], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.UINT32],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                return pl.sort32(src, idx)
+
+        @pl.program
+        class TileProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[8, 32], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.UINT32],
+                output: pl.Tensor[[8, 64], pl.FP32],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                src_tile: pl.Tile[[8, 32], pl.FP32] = pl.load(src, [0, 0], [8, 32])
+                idx_tile: pl.Tile[[8, 32], pl.UINT32] = pl.load(idx, [0, 0], [8, 32])
+                out_tile: pl.Tile[[8, 64], pl.FP32] = pl.sort32(src_tile, idx_tile)
+                return pl.store(out_tile, [0, 0], output)
+
+        assert "tensor.sort32" in str(TensorProgram)
+        assert "tile.sort32" in str(TileProgram)
+
+    def test_top_level_mrgsort_dispatches_on_operand_level(self):
+        """``pl.mrgsort`` dispatches; it is not ``pl.tensor.mrgsort`` under a shorter name."""
+        assert pl.mrgsort is not pl.tensor.mrgsort
+
+        @pl.program
+        class TensorProgram:
+            @pl.function
+            def main(self, src: pl.Tensor[[1, 128], pl.FP32]) -> pl.Tensor[[1, 128], pl.FP32]:
+                return pl.mrgsort(src, block_len=64)
+
+        @pl.program
+        class TileProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                src: pl.Tensor[[1, 128], pl.FP32],
+                output: pl.Tensor[[1, 128], pl.FP32],
+            ) -> pl.Tensor[[1, 128], pl.FP32]:
+                src_tile: pl.Tile[[1, 128], pl.FP32] = pl.load(src, [0, 0], [1, 128])
+                out_tile: pl.Tile[[1, 128], pl.FP32] = pl.mrgsort(src_tile, block_len=64)
+                return pl.store(out_tile, [0, 0], output)
+
+        assert "tensor.mrgsort" in str(TensorProgram)
+        assert "tile.mrgsort" in str(TileProgram)
+
+    def test_top_level_mrgsort_rejects_tmp_on_tensor_path(self):
+        """The Tile-only scratch operand raises rather than being silently dropped."""
+        span = ir.Span.unknown()
+        shape = [ir.ConstInt(1, DataType.INT32, span), ir.ConstInt(128, DataType.INT32, span)]
+        src0 = pl.Tensor(expr=ir.Var("src0", ir.TensorType(shape, DataType.FP32), span))
+        src1 = pl.Tensor(expr=ir.Var("src1", ir.TensorType(shape, DataType.FP32), span))
+        tmp = pl.Tensor(expr=ir.Var("tmp", ir.TensorType(shape, DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="must not pass tmp"):
+            pl.mrgsort(src0, src1, tmp=tmp)
 
     def test_top_level_gather_is_tensor_gather(self):
+        """``gather``'s tile and tensor signatures diverge, so it stays tensor-bound."""
         assert pl.gather is pl.tensor.gather
 
 
@@ -4049,6 +4763,596 @@ class TestTensorRandomOp:
 
     def test_top_level_random_is_tensor_random(self):
         assert pl.random is pl.tensor.random
+
+
+class TestTensorAssembleValidRegionUnion:
+    """The valid region left behind by ``tensor.assemble``.
+
+    A valid shape names one origin-anchored rectangle, so the union of what the
+    target already held with what was just written is representable only in the
+    cases proven below; everything else rejects rather than widening padding into
+    real data or narrowing real data away.
+    """
+
+    @staticmethod
+    def _symbol(name):
+        return ir.Var(name, ir.ScalarType(DataType.INDEX), ir.Span.unknown())
+
+    def test_fully_valid_target_stays_fully_valid(self):
+        """A write inside a fully valid target leaves nothing to narrow."""
+        span = ir.Span.unknown()
+        target = ir.Var("dst", ir.TensorType([64, 128], DataType.FP32), span)
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [8, 0]).type
+
+        # Full validity is the redundant encoding, so the view collapses away.
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.tensor_view is None
+
+    def test_empty_source_is_a_no_op(self):
+        """Writing an empty region leaves the target exactly as it was."""
+        target = _partial_tensor_var([64, 128], [20, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [0, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [20, 0]).type
+
+        assert _valid_of(result_type) == [20, 128]
+
+    def test_empty_target_is_initialized_by_an_origin_anchored_source(self):
+        """An empty accumulator takes the written region as its whole valid region."""
+        target = _partial_tensor_var([64, 128], [0, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [0, 0]).type
+
+        assert _valid_of(result_type) == [12, 128]
+
+    def test_empty_target_written_off_origin_rejects(self):
+        """A region that does not start at the origin is not a valid shape."""
+        target = _partial_tensor_var([64, 128], [0, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+
+        with pytest.raises(ValueError, match="does not start at the origin"):
+            ir.op.tensor.assemble(target, source, [8, 0])
+
+    def test_source_contained_in_target_preserves_target_validity(self):
+        """Overwriting real data that is already there adds nothing."""
+        target = _partial_tensor_var([64, 128], [40, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [8, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [0, 0]).type
+
+        assert _valid_of(result_type) == [40, 128]
+
+    def test_contiguous_growth_extends_one_dimension(self):
+        """An append that abuts the target grows exactly that axis."""
+        target = _partial_tensor_var([64, 128], [20, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [20, 0]).type
+
+        assert _valid_of(result_type) == [32, 128]
+
+    def test_overlapping_growth_is_still_contiguous(self):
+        """A write that starts inside the target and runs past it leaves no gap."""
+        target = _partial_tensor_var([64, 128], [20, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [16, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [12, 0]).type
+
+        assert _valid_of(result_type) == [28, 128]
+
+    def test_gap_between_target_and_write_rejects(self):
+        """A write starting past the target's edge leaves an unrepresentable hole."""
+        target = _partial_tensor_var([64, 128], [20, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+
+        with pytest.raises(ValueError, match="leaves a gap in dimension 0"):
+            ir.op.tensor.assemble(target, source, [24, 0])
+
+    def test_growth_in_two_dimensions_rejects(self):
+        """Growing two axes at once makes the union an L-shape."""
+        target = _partial_tensor_var([64, 256], [20, 64], name="dst")
+        source = _partial_tensor_var([32, 128], [12, 80], name="src")
+
+        with pytest.raises(ValueError, match="dimensions 0 and 1 at once"):
+            ir.op.tensor.assemble(target, source, [20, 0])
+
+    def test_passenger_dimension_must_match_the_target_exactly(self):
+        """A narrower slab than the region it extends is an L-shape."""
+        target = _partial_tensor_var([64, 256], [20, 128], name="dst")
+        source = _partial_tensor_var([32, 128], [12, 64], name="src")
+
+        with pytest.raises(ValueError, match="must provably equal the target valid extent"):
+            ir.op.tensor.assemble(target, source, [20, 0])
+
+    def test_passenger_dimension_must_start_at_the_origin(self):
+        """An offset slab does not line up with the region it extends.
+
+        Dimension 1 stays inside the target (8 + 64 <= 128), so this reaches the
+        passenger rule rather than the two-dimensional growth rule above.
+        """
+        target = _partial_tensor_var([64, 256], [20, 128], name="dst")
+        source = _partial_tensor_var([32, 128], [12, 64], name="src")
+
+        with pytest.raises(ValueError, match="must span dimension 1 from the origin"):
+            ir.op.tensor.assemble(target, source, [20, 8])
+
+    def test_target_swallowed_by_an_origin_anchored_write(self):
+        """A write covering the target on every axis stands alone."""
+        target = _partial_tensor_var([64, 128], [4, 8], name="dst")
+        source = _partial_tensor_var([32, 128], [32, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [0, 0]).type
+
+        assert _valid_of(result_type) == [32, 128]
+
+    def test_negative_offset_rejects(self):
+        """A write must start inside its target."""
+        span = ir.Span.unknown()
+        target = _partial_tensor_var([64, 128], [20, 128], name="dst")
+        source = _partial_tensor_var([16, 128], [12, 128], name="src")
+        neg = ir.ConstInt(-4, DataType.INDEX, span)
+
+        with pytest.raises(ValueError, match="provably negative"):
+            ir.op.tensor.assemble(target, source, [neg, 0])
+
+    def test_write_past_the_target_end_rejects(self):
+        """The written region must fit inside the target allocation."""
+        span = ir.Span.unknown()
+        target = ir.Var("dst", ir.TensorType([64, 128], DataType.FP32), span)
+        source = _partial_tensor_var([32, 128], [32, 128], name="src")
+
+        with pytest.raises(ValueError, match="writes past the end of dimension 0"):
+            ir.op.tensor.assemble(target, source, [56, 0])
+
+    def test_only_the_source_valid_region_has_to_fit(self):
+        """A padded source transfers its real extent, not its whole allocation.
+
+        The counterpart tile.assemble rejects this same write, because
+        ``pto.tinsert`` copies the physical subview rather than the valid one.
+        """
+        span = ir.Span.unknown()
+        target = ir.Var("dst", ir.TensorType([64, 128], DataType.FP32), span)
+        # 48 rows allocated, only 8 of them real, landing on the last 8 target rows.
+        source = _partial_tensor_var([48, 128], [8, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [56, 0]).type
+
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.tensor_view is None
+
+    def test_symbolic_contiguous_append_is_proven_by_structural_equality(self):
+        """``t = [k, 128]`` appended at ``[k, 0]`` grows to ``k + m``."""
+        k = self._symbol("k")
+        m = self._symbol("m")
+        target = _partial_tensor_var([64, 128], [k, 128], name="dst")
+        source = _partial_tensor_var([32, 128], [m, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [k, 0]).type
+
+        # Capped at the physical extent, which no proof settles for symbolic k + m.
+        assert isinstance(result_type, ir.TensorType)
+        view = result_type.tensor_view
+        assert view is not None
+        assert ir.python_print(view.valid_shape[0]) == "pl.min(k + m, 64)"
+        assert _valid_of(result_type)[1] == 128
+
+    def test_unprovable_symbolic_offset_rejects(self):
+        """An offset unrelated to the target's extent cannot be shown to abut it."""
+        k = self._symbol("k")
+        m = self._symbol("m")
+        j = self._symbol("j")
+        target = _partial_tensor_var([64, 128], [k, 128], name="dst")
+        source = _partial_tensor_var([32, 128], [m, 128], name="src")
+
+        with pytest.raises(ValueError, match="leaves a gap in dimension 0"):
+            ir.op.tensor.assemble(target, source, [j, 0])
+
+    def test_monotonic_multi_step_accumulation(self):
+        """Repeated appends stay one rectangle and never narrow."""
+        span = ir.Span.unknown()
+        target = _partial_tensor_var([64, 128], [0, 128], name="acc")
+        source = _partial_tensor_var([8, 128], [8, 128], name="src")
+
+        for step, expected in enumerate([8, 16, 24]):
+            result_type = ir.op.tensor.assemble(target, source, [step * 8, 0]).type
+            assert _valid_of(result_type) == [expected, 128]
+            target = ir.Var(f"acc{step}", result_type, span)
+
+    def test_rank_mismatched_write_keeps_its_previous_result(self):
+        """A reinterpreting write is not a rectangle on these axes, so it is left alone.
+
+        ``OptimizeOrchTensors`` materializes the dimension correspondence of a
+        lower-rank source as strides, exactly as for a lower-rank window read.
+        """
+        span = ir.Span.unknown()
+        target = ir.Var("dst", ir.TensorType([2, 4, 8], DataType.FP32), span)
+        source = _partial_tensor_var([2, 4], [1, 4], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [0, 0, 0]).type
+
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.tensor_view is None
+
+
+# ---------------------------------------------------------------------------
+# Bitwise / shift ops (issue #2216)
+# ---------------------------------------------------------------------------
+
+
+def _bitwise_tensor_var(shape: list[int], dtype: DataType = DataType.INT32, name: str = "t") -> ir.Var:
+    """Tensor Var for the bitwise op tests (int32 unless a dtype is given)."""
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(d, DataType.INT32, span) for d in shape]
+    return ir.Var(name, ir.TensorType(dims, dtype), span)
+
+
+# (DSL/builder name, expected op name) for the tensor-tensor forms.
+_BITWISE_BINARY_OPS = [
+    ("and_", "tensor.and"),
+    ("or_", "tensor.or"),
+    ("xor", "tensor.xor"),
+    ("shl", "tensor.shl"),
+    ("shr", "tensor.shr"),
+]
+
+# (DSL/builder name, expected op name) for the explicit tensor-scalar forms.
+_BITWISE_SCALAR_OPS = [
+    ("ands", "tensor.ands"),
+    ("ors", "tensor.ors"),
+    ("xors", "tensor.xors"),
+    ("shls", "tensor.shls"),
+    ("shrs", "tensor.shrs"),
+]
+
+# (tensor-tensor entry point, op name it auto-dispatches to on a scalar rhs).
+_BITWISE_SCALAR_DISPATCH = [
+    ("and_", "tensor.ands"),
+    ("or_", "tensor.ors"),
+    ("xor", "tensor.xors"),
+    ("shl", "tensor.shls"),
+    ("shr", "tensor.shrs"),
+]
+
+_BITWISE_BINARY_VALID_SHAPE_OPS = [
+    ("and_", "tensor.and"),
+    ("or_", "tensor.or"),
+    ("shl", "tensor.shl"),
+    ("shr", "tensor.shr"),
+]
+
+_BITWISE_SCALAR_VALID_SHAPE_OPS = [
+    ("ands", "tensor.ands"),
+    ("ors", "tensor.ors"),
+    ("shls", "tensor.shls"),
+    ("shrs", "tensor.shrs"),
+]
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_OPS)
+def test_tensor_bitwise_binary(builder_name, op_name):
+    """Tensor-tensor bitwise/shift ops keep shape and integer dtype."""
+    lhs = _bitwise_tensor_var([64, 128], name="lhs")
+    rhs = _bitwise_tensor_var([64, 128], name="rhs")
+
+    call = getattr(ir.op.tensor, builder_name)(lhs, rhs)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == op_name
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+    assert _const_int_values(result_type.shape) == [64, 128]
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_VALID_SHAPE_OPS)
+def test_tensor_bitwise_binary_preserves_matching_partial_valid_shape(builder_name, op_name):
+    """Exact-shape integer operands keep their shared partial region."""
+    lhs = _partial_tensor_var([64, 128], [60, 120], name="lhs", dtype=DataType.INT32)
+    rhs = _partial_tensor_var([64, 128], [60, 120], name="rhs", dtype=DataType.INT32)
+
+    call = getattr(tensor, builder_name)(lhs, rhs)
+    assert call.op.name == op_name
+    result_type = call.type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [60, 120]
+
+
+def test_tensor_xor_does_not_claim_partial_valid_shape_before_scratch_support():
+    """XOR lowering creates a full-valid scratch tile on current backends."""
+    lhs = _partial_tensor_var([64, 128], [60, 120], name="lhs", dtype=DataType.INT32)
+    rhs = _partial_tensor_var([64, 128], [60, 120], name="rhs", dtype=DataType.INT32)
+
+    result_type = tensor.xor(lhs, rhs).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_SCALAR_OPS)
+def test_tensor_bitwise_scalar(builder_name, op_name):
+    """Tensor-scalar bitwise/shift ops preserve the tensor's shape and dtype."""
+    lhs = _bitwise_tensor_var([64, 128], dtype=DataType.INT16, name="lhs")
+
+    call = getattr(ir.op.tensor, builder_name)(lhs, 4)
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == op_name
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    # A bitwise op never changes the element type, and the untyped literal is
+    # re-stamped to the tensor's dtype rather than promoting the result.
+    assert result_type.dtype == DataType.INT16
+    assert _const_int_values(result_type.shape) == [64, 128]
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_SCALAR_VALID_SHAPE_OPS)
+def test_tensor_bitwise_scalar_preserves_partial_valid_shape(builder_name, op_name):
+    """The dtype-preserving scalar path must also keep content validity."""
+    span = ir.Span.unknown()
+    view = ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[60, 120])
+    lhs = ir.Var("lhs", ir.TensorType([64, 128], DataType.INT16, tensor_view=view), span)
+
+    call = getattr(ir.op.tensor, builder_name)(lhs, 4)
+
+    assert call.op.name == op_name
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT16
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [60, 120]
+
+
+def test_tensor_xors_does_not_claim_partial_valid_shape_before_scratch_support():
+    """Scalar XOR shares the full-valid automatic scratch limitation."""
+    lhs = _partial_tensor_var([64, 128], [60, 120], name="lhs", dtype=DataType.INT16)
+
+    result_type = ir.op.tensor.xors(lhs, 4).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is None
+
+
+@pytest.mark.parametrize(("builder_name", "expected_op"), _BITWISE_SCALAR_DISPATCH)
+def test_tensor_bitwise_auto_dispatches_scalar_rhs(builder_name, expected_op):
+    """A scalar rhs routes the tensor-tensor entry point to its `*s` variant."""
+    lhs = _bitwise_tensor_var([64], name="lhs")
+
+    call = getattr(ir.op.tensor, builder_name)(lhs, 0xFF)
+
+    assert call.op.name == expected_op
+
+
+def test_tensor_not():
+    """tensor.not preserves the int16 shape and dtype."""
+    call = ir.op.tensor.not_(_bitwise_tensor_var([64, 128], dtype=DataType.INT16))
+
+    assert isinstance(call, ir.Call)
+    assert call.op.name == ir.get_op("tensor.not").name
+    result_type = call.type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT16
+    assert _const_int_values(result_type.shape) == [64, 128]
+
+
+def test_tensor_not_accepts_uint16():
+    """UINT16 is the other dtype pto.tnot is defined for."""
+    result_type = ir.op.tensor.not_(_bitwise_tensor_var([32], dtype=DataType.UINT16)).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.UINT16
+
+
+def test_tensor_not_preserves_partial_valid_shape():
+    """tensor.not is a unary op, so it carries the input's valid region like tensor.neg."""
+    span = ir.Span.unknown()
+    view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=[64, 40], pad=ir.PadValue.null)
+    partial = ir.Var("t", ir.TensorType([64, 128], DataType.INT16, tensor_view=view), span)
+
+    result_type = ir.op.tensor.not_(partial).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.tensor_view is not None
+    assert _const_int_values(result_type.tensor_view.valid_shape) == [64, 40]
+
+
+@pytest.mark.parametrize("dtype", [DataType.INT32, DataType.FP32])
+def test_tensor_not_rejects_non_16bit_dtype(dtype):
+    """tensor.not matches tile.not: TNOT is a 16-bit-integer-element instruction."""
+    with pytest.raises(ValueError, match=r"tensor\.not requires an int16 or uint16"):
+        ir.op.tensor.not_(_bitwise_tensor_var([64], dtype=dtype))
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_OPS)
+def test_tensor_bitwise_rejects_float_operand(builder_name, op_name):
+    """Bitwise/shift ops are integer-only — a float operand is rejected up front."""
+    float_var = _bitwise_tensor_var([64], dtype=DataType.FP32, name="f")
+
+    with pytest.raises(ValueError, match=rf"{op_name} requires an integer tensor dtype"):
+        getattr(ir.op.tensor, builder_name)(float_var, float_var)
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_OPS)
+def test_tensor_bitwise_rejects_float_rhs(builder_name, op_name):
+    """The rhs tensor must be integer too, not just the lhs."""
+    float_var = _bitwise_tensor_var([64], dtype=DataType.FP32, name="f")
+
+    with pytest.raises(ValueError, match=rf"{op_name} requires an integer tensor dtype"):
+        getattr(ir.op.tensor, builder_name)(_bitwise_tensor_var([64]), float_var)
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_OPS)
+def test_tensor_bitwise_rejects_broadcast(builder_name, op_name):
+    """There is no tile.row_expand_and, so a broadcasting pair cannot lower."""
+    lhs = _bitwise_tensor_var([64, 128], name="lhs")
+    col_vec = _bitwise_tensor_var([64, 1], name="col")
+
+    with pytest.raises(ValueError, match=rf"{op_name} requires both operands to have the same shape"):
+        getattr(ir.op.tensor, builder_name)(lhs, col_vec)
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_BINARY_OPS)
+def test_tensor_bitwise_rejects_rank_mismatch(builder_name, op_name):
+    """A rank mismatch is the other shape the hardware cannot broadcast."""
+    with pytest.raises(ValueError, match=rf"{op_name} requires both operands to have the same shape"):
+        getattr(ir.op.tensor, builder_name)(
+            _bitwise_tensor_var([64, 128]), _bitwise_tensor_var([128], name="rhs")
+        )
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), [("shls", "tensor.shls"), ("shrs", "tensor.shrs")])
+def test_tensor_shift_rejects_negative_constant(builder_name, op_name):
+    """Nothing downstream range-checks the shift count, so catch a constant here."""
+    with pytest.raises(ValueError, match=rf"{op_name} requires a non-negative shift count"):
+        getattr(ir.op.tensor, builder_name)(_bitwise_tensor_var([64]), -1)
+
+
+@pytest.mark.parametrize("builder_name", ["ands", "ors", "xors"])
+def test_tensor_bitwise_scalar_allows_negative_mask(builder_name):
+    """A negative mask is meaningful (-1 sets every bit) — only shifts are guarded."""
+    result_type = getattr(ir.op.tensor, builder_name)(_bitwise_tensor_var([64]), -1).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_SCALAR_OPS)
+def test_tensor_bitwise_scalar_rejects_float_scalar(builder_name, op_name):
+    """A float mask or shift count is meaningless; the ISA form takes an integer."""
+    span = ir.Span.unknown()
+    float_scalar = ir.ConstFloat(1.5, DataType.FP32, span)
+
+    with pytest.raises(ValueError, match=rf"{op_name} requires the shift/bitwise scalar"):
+        getattr(ir.op.tensor, builder_name)(_bitwise_tensor_var([64]), float_scalar)
+
+
+@pytest.mark.parametrize(("builder_name", "op_name"), _BITWISE_SCALAR_OPS)
+def test_tensor_bitwise_scalar_rejects_float_tensor(builder_name, op_name):
+    """The tensor operand of a `*s` form must be integer as well."""
+    float_var = _bitwise_tensor_var([64], dtype=DataType.FP32, name="f")
+
+    with pytest.raises(ValueError, match=rf"{op_name} requires an integer tensor dtype"):
+        getattr(ir.op.tensor, builder_name)(float_var, 4)
+
+
+@pytest.mark.parametrize("op_name", ["and_", "or_"])
+def test_tensor_bitwise_promotes_mixed_integer_widths(op_name):
+    """and/or promote across integer widths, matching tile.and / tile.or."""
+    lhs = _bitwise_tensor_var([64], dtype=DataType.INT16, name="lhs")
+    rhs = _bitwise_tensor_var([64], dtype=DataType.INT32, name="rhs")
+
+    result_type = getattr(ir.op.tensor, op_name)(lhs, rhs).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT32
+
+
+@pytest.mark.parametrize("op_name", ["shl", "shr"])
+def test_tensor_shift_keeps_lhs_dtype(op_name):
+    """The shift count never widens the result — mirrors DeduceTileOpShiftBinaryType."""
+    lhs = _bitwise_tensor_var([64], dtype=DataType.INT16, name="lhs")
+    shift = _bitwise_tensor_var([64], dtype=DataType.INT32, name="shift")
+
+    result_type = getattr(ir.op.tensor, op_name)(lhs, shift).type
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.dtype == DataType.INT16
+
+
+def test_tensor_bitwise_dsl_surface_is_complete():
+    """All 11 bitwise ops are reachable from pl.tensor (the gap issue #2216 reports)."""
+    names = ["and_", "ands", "or_", "ors", "xor", "xors", "not_", "shl", "shls", "shr", "shrs"]
+    assert [n for n in names if not hasattr(pl.tensor, n)] == []
+
+
+def test_tensor_bitwise_unified_dispatch_by_operand_kind():
+    """pl.and_ routes a Tensor operand to the tensor op and a Tile operand to the tile op."""
+
+    @pl.program
+    class Program:
+        @pl.function
+        def main(
+            self,
+            x: pl.Tensor[[128, 128], pl.INT32],
+            mask: pl.Tensor[[128, 128], pl.INT32],
+        ) -> pl.Tensor[[128, 128], pl.INT32]:
+            return pl.and_(x, mask)
+
+    assert "tensor.and_(" in str(Program)
+
+
+def test_tile_bitwise_unified_dispatch_still_reaches_tile_ops():
+    """Promoting pl.and_ to unified dispatch must not change the Tile path."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            a: pl.Tensor[[128, 128], pl.INT32],
+            b: pl.Tensor[[128, 128], pl.INT32],
+            output: pl.Tensor[[128, 128], pl.INT32],
+        ) -> pl.Tensor[[128, 128], pl.INT32]:
+            tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+            tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+            tile_c: pl.Tile[[32, 32], pl.INT32] = pl.and_(tile_a, tile_b)
+            tile_d: pl.Tile[[32, 32], pl.INT32] = pl.shls(tile_c, 2)
+            return pl.store(tile_d, [0, 0], output)
+
+    ir_str = str(Program)
+    assert "tile.and_(" in ir_str
+    assert "tile.shls(" in ir_str
+
+
+def _int_tile(shape: list[int], name: str = "t") -> pl.Tile:
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(d, DataType.INT32, span) for d in shape]
+    return pl.Tile(expr=ir.Var(name, ir.TileType(dims, DataType.INT32), span))
+
+
+def test_unified_xor_requires_tmp_for_tile_input():
+    """The tile path owns its scratch buffer, so omitting tmp must say so.
+
+    The overloads already reject this statically; the ignore is what lets the test
+    confirm the runtime guard behind them.
+    """
+    tile = _int_tile([32])
+
+    with pytest.raises(TypeError, match=r"Tile inputs require an explicit scratch tile"):
+        pl.xor(tile, tile)  # type: ignore[arg-type]
+
+
+def test_unified_xor_rejects_tmp_for_tensor_input():
+    """Passing tmp on the tensor path is a mistake: the conversion allocates it."""
+    span = ir.Span.unknown()
+    dims = [ir.ConstInt(32, DataType.INT32, span)]
+    tensor = pl.Tensor(expr=ir.Var("x", ir.TensorType(dims, DataType.INT32), span))
+
+    with pytest.raises(TypeError, match=r"must not pass tmp"):
+        pl.xor(tensor, tensor, _int_tile([32], name="tmp"))  # type: ignore[arg-type]
+
+
+def test_unified_xor_keeps_three_arg_tile_form():
+    """pl.xor(lhs, rhs, tmp) is pre-existing API — unified dispatch must preserve it."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            a: pl.Tensor[[128, 128], pl.INT32],
+            b: pl.Tensor[[128, 128], pl.INT32],
+            output: pl.Tensor[[128, 128], pl.INT32],
+        ) -> pl.Tensor[[128, 128], pl.INT32]:
+            tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+            tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+            tmp: pl.Tile[[32, 32], pl.INT32] = pl.tile.create(
+                [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+            )
+            tile_c: pl.Tile[[32, 32], pl.INT32] = pl.xor(tile_a, tile_b, tmp)
+            return pl.store(tile_c, [0, 0], output)
+
+    assert "tile.xor(" in str(Program)
 
 
 if __name__ == "__main__":

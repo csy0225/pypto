@@ -16,10 +16,9 @@ through simpler's distributed runtime (Worker level=3)::
     compiled(a, b, c)   # executes via simpler Worker(level=3)
 """
 
-import json
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,24 +29,27 @@ from pypto.pypto_core.ir import ParamDirection, Program, Role, level_to_linqu_le
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
 from .compiled_program import (
+    _DISTRIBUTED_META_FILENAME,
     CallArg,
     _default_platform,
+    _drop_foreign_build_markers,
     _extract_func_param_infos,
     _extract_param_infos,
-    _param_info_from_dict,
+    _load_meta,
+    _meta_error,
     _param_info_to_dict,
     _ParamInfo,
+    _remove_meta,
     _to_torch_dtype,
-    _validate_device_tensor,
-    _validate_stacked_tensor,
     _write_debug_runner,
+    _write_meta_atomically,
 )
 
-# Filename of the small JSON sidecar persisted alongside the build artifacts so
-# the program can be reconstructed (``from_dir``) without the live post-pass IR.
-# Bump ``_META_SCHEMA`` on any incompatible format change.
-_DISTRIBUTED_META_FILENAME = "distributed_meta.json"
-_META_SCHEMA = 1
+# The sidecar filename itself lives beside its L2 counterpart in
+# ``compiled_program`` (both feed the build-kind marker table there) and is
+# re-exported here, where the rest of the L3 metadata contract lives. Bump
+# ``_META_SCHEMA`` on any incompatible format change.
+_META_SCHEMA = 2
 
 if TYPE_CHECKING:
     from pypto.runtime.distributed_runner import DistributedWorker
@@ -58,16 +60,104 @@ if TYPE_CHECKING:
 class DistributedConfig:
     """Configuration for L3 distributed execution.
 
-    ``aicpu_thread_num=4`` matches the ``tensormap_and_ringbuffer`` runtime's
-    3-scheduler-plus-1-dispatcher layout; ``block_dim=None`` lets the L2
-    simpler runtime pick its own default.
+    Attributes:
+        device_ids: List of NPU device indices to use. Defaults to ``[0]``
+            (single-card). Pass ``[0, 1, 2, 3]`` for a 4-card ring. Must be
+            a non-empty list of distinct ints.
+        num_sub_workers: Number of sub-workers to request per chip process.
+            ``0`` (default) does not force a specific count — the runtime
+            instead uses ``max(num_sub_workers, len(sub_worker_fns))``, i.e.
+            exactly as many sub-workers as the program's declared sub-worker
+            functions. Set this explicitly only when requesting more
+            sub-workers than are declared, e.g. for multi-slice or internal
+            pipelining scenarios.
+        runtime: Simpler runtime flavour. ``"tensormap_and_ringbuffer"`` (default)
+            enables the tensor-map helpers and the ring-buffer DMA driver.
+        aicpu_thread_num: Number of AICPU threads allocated to the simpler
+            runtime. ``0`` (default) selects the architecture default (a2a3: 4;
+            a5: 5). Explicit normal-run values must be at least 2 and are
+            validated against the selected platform's limit by the runtime.
     """
 
     device_ids: list[int] = field(default_factory=lambda: [0])
     num_sub_workers: int = 0
     runtime: str = "tensormap_and_ringbuffer"
-    block_dim: int | None = None
-    aicpu_thread_num: int = 4
+    aicpu_thread_num: int = 0
+
+    def __post_init__(self) -> None:
+        """Enforce the value constraints the fields above document.
+
+        Placed on the dataclass rather than on either caller so the live
+        construction path and the ``distributed_meta.json`` reload cannot drift:
+        a hand-edited sidecar must not be able to smuggle in a config the API
+        itself rejects -- a duplicated device id would put two ranks on one card,
+        and an empty list would reach worker startup with nothing to run on.
+
+        Raises:
+            ValueError: a field violates its documented constraint.
+        """
+        if not self.device_ids:
+            raise ValueError("DistributedConfig.device_ids must not be empty")
+        if any(d < 0 for d in self.device_ids):
+            raise ValueError(
+                f"DistributedConfig.device_ids must be non-negative device indices, got {self.device_ids}"
+            )
+        if len(set(self.device_ids)) != len(self.device_ids):
+            raise ValueError(f"DistributedConfig.device_ids must be distinct, got {self.device_ids}")
+        if self.num_sub_workers < 0:
+            raise ValueError(
+                f"DistributedConfig.num_sub_workers must be non-negative, got {self.num_sub_workers}"
+            )
+        # 0 selects the architecture default; 1 is below the runtime's floor.
+        if self.aicpu_thread_num < 0 or self.aicpu_thread_num == 1:
+            raise ValueError(
+                "DistributedConfig.aicpu_thread_num must be 0 (architecture default) or at least 2, "
+                f"got {self.aicpu_thread_num}"
+            )
+
+
+def _distributed_config_from_dict(meta: dict[str, Any], meta_path: Path) -> DistributedConfig:
+    """Rebuild the :class:`DistributedConfig` a sidecar recorded.
+
+    Validated like every other sidecar field (see
+    :func:`~pypto.ir.compiled_program._load_meta`): the block must be an object
+    keyed only by ``DistributedConfig`` fields, each correctly typed. A
+    hand-edited ``device_ids`` therefore fails here, naming the file, instead of
+    reaching ``DistributedConfig(**raw)`` as a raw ``TypeError`` or surfacing
+    much later inside worker startup.
+    """
+
+    def _bad(detail: str) -> ValueError:
+        return _meta_error(_DISTRIBUTED_META_FILENAME, meta_path, detail)
+
+    # ``bool`` is an ``int`` subclass; a JSON ``true`` is never a count or index.
+    def _is_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    raw = meta.get("distributed_config", {})
+    if not isinstance(raw, dict):
+        raise _bad(f"'distributed_config' must be an object, got {type(raw).__name__}")
+    known = {f.name for f in fields(DistributedConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise _bad(f"'distributed_config' has unknown key(s) {unknown}; known: {sorted(known)}")
+
+    if "device_ids" in raw and not (
+        isinstance(raw["device_ids"], list) and all(_is_int(d) for d in raw["device_ids"])
+    ):
+        raise _bad(f"'distributed_config.device_ids' must be a list of ints, got {raw['device_ids']!r}")
+    for key in ("num_sub_workers", "aicpu_thread_num"):
+        if key in raw and not _is_int(raw[key]):
+            raise _bad(f"'distributed_config.{key}' must be an int, got {raw[key]!r}")
+    if "runtime" in raw and not isinstance(raw["runtime"], str):
+        raise _bad(f"'distributed_config.runtime' must be a string, got {raw['runtime']!r}")
+    # Value constraints (non-empty / distinct device ids, thread-count floors)
+    # live on the dataclass, so the reload is held to exactly the same bar as a
+    # live DistributedConfig; only the JSON *shape* is checked above.
+    try:
+        return DistributedConfig(**raw)
+    except ValueError as exc:
+        raise _bad(f"'distributed_config' is invalid ({exc})") from exc
 
 
 class DistributedCompiledProgram:
@@ -85,6 +175,18 @@ class DistributedCompiledProgram:
     **Return** (program has a return value)::
 
         c = compiled(a, b)
+
+    **One-shot dispatch**::
+
+        compiled = ir.compile(MyProgram, platform="a2a3", distributed_config=dc)
+        compiled(host_inputs, host_outputs)   # blocks until all ranks finish
+
+    **Persistent dispatch** (repeated launches without re-registering)::
+
+        with compiled.prepare() as rt:
+            for step in steps:
+                rt(host_x, host_out)
+        # rt.close() on exit — releases buffers and shuts down workers
     """
 
     __test__ = False
@@ -124,6 +226,13 @@ class DistributedCompiledProgram:
         # path must not clobber a user's hand-edited debug/run.py or the
         # already-present metadata file.
         if program is not None:
+            # An L3 build writes no top-level ``kernel_config.py`` (per-rank
+            # configs live under ``next_levels/``), so one found here is an L2
+            # leftover -- and ``replay()`` keys off exactly that file, which
+            # would make this build replay as the previous single-chip one.
+            _drop_foreign_build_markers(
+                self._output_dir, keep=(_DISTRIBUTED_META_FILENAME, "orchestration/host_orch.py")
+            )
             self._persist_metadata()
             _write_debug_runner(self._output_dir, self._platform, self._get_metadata)
 
@@ -139,12 +248,17 @@ class DistributedCompiledProgram:
         layout and needs no persistence.
 
         Best-effort: a program without a resolvable orchestrator signature
-        skips emission (mirrors :func:`_write_debug_runner`); :meth:`from_dir`
-        then reports the missing file with a recompile hint.
+        emits nothing (mirrors :func:`_write_debug_runner`) *and* deletes any
+        sidecar a previous compile into this directory left behind, so
+        :meth:`from_dir` reports the missing file with a recompile hint instead
+        of handing out a signature that no longer describes these artifacts --
+        ``ir.compile`` never clears ``output_dir``, and the mismatch is one
+        :meth:`from_dir` cannot detect.
         """
         try:
             param_infos, _, return_types = self._get_metadata()
         except (ValueError, TypeError):
+            _remove_meta(self._output_dir, _DISTRIBUTED_META_FILENAME)
             return
         dc = self._distributed_config
         meta = {
@@ -157,11 +271,10 @@ class DistributedCompiledProgram:
                 "device_ids": list(dc.device_ids),
                 "num_sub_workers": dc.num_sub_workers,
                 "runtime": dc.runtime,
-                "block_dim": dc.block_dim,
                 "aicpu_thread_num": dc.aicpu_thread_num,
             },
         }
-        (self._output_dir / _DISTRIBUTED_META_FILENAME).write_text(json.dumps(meta, indent=2))
+        _write_meta_atomically(self._output_dir / _DISTRIBUTED_META_FILENAME, meta)
 
     @classmethod
     def from_dir(
@@ -200,8 +313,8 @@ class DistributedCompiledProgram:
         Raises:
             FileNotFoundError: ``distributed_meta.json`` is absent (the directory
                 predates this feature or is not a distributed build).
-            ValueError: ``distributed_meta.json`` records a ``schema`` version
-                incompatible with this pypto build (the metadata format changed).
+            ValueError: ``distributed_meta.json`` is unreadable, malformed, or
+                records a ``schema`` version incompatible with this pypto build.
         """
         meta_path = Path(output_dir).resolve() / _DISTRIBUTED_META_FILENAME
         if not meta_path.exists():
@@ -210,26 +323,22 @@ class DistributedCompiledProgram:
                 f"directory. It predates the L3 replay feature or is not a distributed (L3+) "
                 f"build. Recompile via ir.compile() to refresh."
             )
-        meta = json.loads(meta_path.read_text())
-        schema = meta.get("schema")
-        if schema != _META_SCHEMA:
-            raise ValueError(
-                f"Incompatible {_DISTRIBUTED_META_FILENAME} schema {schema!r} (expected "
-                f"{_META_SCHEMA}) in {meta_path}. The metadata was written by a different "
-                f"pypto version — recompile via ir.compile() to refresh."
-            )
-        param_infos = [_param_info_from_dict(p) for p in meta["params"]]
+        # Shares the L2 loader, so every malformed field -- unreadable file, bad
+        # JSON, bad params, a ``backend_type`` naming a class attribute instead
+        # of an enum member -- surfaces as one ValueError naming the file and
+        # the recompile fix, rather than whichever internal exception it raised.
+        meta = _load_meta(meta_path, filename=_DISTRIBUTED_META_FILENAME, schema=_META_SCHEMA)
+        param_infos = meta["param_infos"]
         output_indices = [i for i, p in enumerate(param_infos) if p.direction == ParamDirection.Out]
         # ``return_types`` contents are never inspected at runtime — only the
         # count matters (has_return = len(...) > 0), so placeholders suffice.
-        return_types: list[Any] = [None] * int(meta.get("num_return_types", 0))
-        dc = distributed_config or DistributedConfig(**meta.get("distributed_config", {}))
-        bt = backend_type or getattr(BackendType, meta.get("backend_type", "Ascend910B"))
+        return_types: list[Any] = [None] * meta["num_return_types"]
+        dc = distributed_config or _distributed_config_from_dict(meta["raw"], meta_path)
         return cls(
             None,
             str(output_dir),
-            backend_type=bt,
-            platform=platform or meta.get("platform"),
+            backend_type=backend_type or meta["backend_type"],
+            platform=platform or meta["platform"],
             distributed_config=dc,
             _param_infos=param_infos,
             _output_indices=output_indices,
@@ -295,26 +404,26 @@ class DistributedCompiledProgram:
         self,
         *args: CallArg,
         config: "RunConfig | None" = None,
-    ) -> (
-        torch.Tensor
-        | DeviceTensor
-        | StackedDeviceTensor
-        | tuple[torch.Tensor | DeviceTensor | StackedDeviceTensor, ...]
-        | None
-    ):
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """Execute the distributed program via simpler Worker(level=3).
 
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
         ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
         ``ring_dep_pool``) size this dispatch's runtime ring buffers, and its
         runtime-diagnostic DFX flags (``enable_dump_args`` / ``enable_pmu`` /
-        ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
+        ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_chip_swimlane``) are
         written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
-        (``rank_local/d{k}`` for a comm-less dispatch, which has no real rank;
-        ``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
-        keep separate artifacts; swimlane co-enables dep_gen and emits
-        ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
+        (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
+        keep separate artifacts). Onboard swimlane runs a dep-gen-only graph
+        pass followed by a dep-gen-disabled timing pass and emits
+        ``merged_swimlane_*.json`` per dispatch. Both passes execute the program
+        and do not restore mutable arguments between them. Other compile-side
         fields are not consumed on the dispatch path.
+
+        One-shot calls accept host ``torch.Tensor`` arguments only. A resident
+        ``DeviceTensor`` needs the owner ``Buffer`` and provenance of the same
+        live Worker; use :meth:`prepare`, allocate it through the returned
+        ``DistributedWorker``, then call ``worker.run(...)``.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
 
@@ -323,6 +432,14 @@ class DistributedCompiledProgram:
         n_inputs = n_params - len(output_indices)
         has_return = len(return_types) > 0
         return_style = has_return and len(args) == n_inputs
+
+        if any(isinstance(arg, (DeviceTensor, StackedDeviceTensor)) for arg in args):
+            raise TypeError(
+                "One-shot DistributedCompiledProgram calls cannot accept DeviceTensor or "
+                "StackedDeviceTensor: their Buffer/provenance must belong to the same prepared "
+                "DistributedWorker. Use `with compiled.prepare() as worker:`, allocate with "
+                "`worker.alloc_tensor()` / `worker.alloc_stacked_tensor()`, then call `worker.run(...)`."
+            )
 
         if len(args) == n_params:
             all_args: list[CallArg] = list(args)
@@ -337,25 +454,13 @@ class DistributedCompiledProgram:
                 f"Parameters: {[p.name for p in param_infos]}"
             )
 
-        # Validate and coerce args. Tensor params accept a host ``torch.Tensor``,
-        # a worker-resident ``DeviceTensor``, or a ``StackedDeviceTensor`` whose
-        # per-rank shards are resident (both skip H2D/D2H) — matching the L2
-        # ``CompiledProgram`` and the ``DistributedWorker.run`` calling
-        # conventions.
-        coerced: list[torch.Tensor | DeviceTensor | StackedDeviceTensor] = []
+        # Validate and coerce one-shot host tensor args. Resident tensors are a
+        # prepared-DistributedWorker-only calling convention (guarded above).
+        coerced: list[torch.Tensor] = []
         for info, arg in zip(param_infos, all_args, strict=True):
-            if isinstance(arg, StackedDeviceTensor):
-                _validate_stacked_tensor(arg, info)
-                coerced.append(arg)
-                continue
-            if isinstance(arg, DeviceTensor):
-                _validate_device_tensor(arg, info)
-                coerced.append(arg)
-                continue
             if not isinstance(arg, torch.Tensor):
                 raise TypeError(
-                    f"Distributed programs only support tensor parameters "
-                    f"(torch.Tensor host, DeviceTensor, or StackedDeviceTensor worker-resident). "
+                    f"One-shot distributed programs only support host torch.Tensor parameters. "
                     f"Parameter {info.name!r} got {type(arg).__name__}"
                 )
             coerced.append(arg)
@@ -373,8 +478,10 @@ class DistributedCompiledProgram:
         *,
         extra_compiled: Sequence["DistributedCompiledProgram"] = (),
         persistent: bool = False,
+        reset_persistent_windows: bool | None = None,
         callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
+        startup_timeout_s: float | None = None,
     ) -> "DistributedWorker":
         """Prepare a reusable L3 execution handle (setup once, dispatch many).
 
@@ -388,11 +495,12 @@ class DistributedCompiledProgram:
 
         Per-call inputs and outputs are reused-in-place **shared-memory** host
         ``torch.Tensor`` buffers (allocated before ``prepare()``) and/or
-        worker-resident ``DeviceTensor`` / simpler ``Tensor`` arguments.
-        Non-shared host tensors are rejected (the forked chip worker cannot see
-        a buffer allocated after the fork). The convenience host-to-device
-        upload of arbitrary host ``torch.Tensor`` inputs is only available on
-        the one-shot ``compile(...)(*args)`` / ``execute_distributed`` path.
+        worker-resident ``DeviceTensor`` arguments. Non-shared host tensors are
+        rejected as direct dispatch arguments because the forked chip worker
+        cannot see a buffer allocated after the fork. Explicit
+        ``alloc_tensor(init=...)``, ``copy_to`` and ``copy_from`` operations may
+        still use ordinary contiguous CPU tensors: the runtime stages them
+        through an owned POSIX shared-memory ``Buffer``.
 
         Args:
             config: Optional :class:`~pypto.runtime.RunConfig` used **only** to
@@ -409,12 +517,17 @@ class DistributedCompiledProgram:
                 program dispatched by ``rt(*args)``; the rest are dispatched via
                 ``rt.run(other, *args)``. All must agree on platform, runtime,
                 and device ids. Defaults to none (single-program).
-            persistent: Keep one L3 ``Worker.run`` active for the lifetime of
-                the prepared worker and retain each compiled program's
-                CommDomains across dispatches. Retained windows are zeroed
-                before reuse so every call preserves the normal fresh-domain
-                semantics. Requires artifacts generated by a PyPTO version
-                that supports the internal domain-provider hook.
+            persistent: Retain each compiled program's CommDomains across
+                dispatches. Every request still runs through its own
+                ``Worker.run`` completion fence. Retained windows are restored
+                to zero before reuse by default. Requires artifacts generated
+                by a PyPTO version that supports the internal domain-provider
+                hook.
+            reset_persistent_windows: Whether to restore retained CommDomain
+                windows to zero before every reuse. ``None`` (the default)
+                enables reset in persistent mode. Set to ``False`` only when
+                the caller manually clears or otherwise manages all reused
+                communication-buffer state.
             callbacks: Bind a callable to a SubWorker by name — e.g. a real
                 sampling closure. Abstract SubWorkers (declared with a ``...``
                 body) are runtime-bound callback points and MUST be supplied
@@ -424,6 +537,9 @@ class DistributedCompiledProgram:
                 raises ``ValueError``. In multi-program mode the callbacks apply
                 to every prepared program.
             sub_worker_overrides: Deprecated alias for ``callbacks``.
+            startup_timeout_s: Optional positive finite bound, in seconds, for
+                the forked worker hierarchy to report startup readiness. ``None``
+                keeps Simpler's default timeout.
 
         Returns:
             A :class:`DistributedWorker`; use it as a context manager or call
@@ -435,8 +551,10 @@ class DistributedCompiledProgram:
             [self, *extra_compiled],
             config,
             persistent=persistent,
+            reset_persistent_windows=reset_persistent_windows,
             callbacks=callbacks,
             sub_worker_overrides=sub_worker_overrides,
+            startup_timeout_s=startup_timeout_s,
         )
 
     @staticmethod

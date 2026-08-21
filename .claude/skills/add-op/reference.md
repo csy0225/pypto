@@ -13,6 +13,35 @@ Complete file paths, code templates, and conventions for adding operators.
 #include "pypto/ir/expr.h"            // ExprPtr, CallPtr
 ```
 
+### REGISTER_OP Template
+
+```cpp
+#include "pypto/ir/op_registry.h"
+
+REGISTER_OP("tile.<op_name>")
+    .set_op_category("TileOp")
+    .set_description("<human-readable description>")
+    .add_argument("<arg1>", "<arg1 description>")
+    .add_argument("<arg2>", "<arg2 description>")
+    // kwargs if needed:
+    .set_attr<bool>("some_flag")
+    // memory spaces (required for all TileOps):
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    // physical execution-memory contract (required for executable TileOps):
+    .functional_execution_memory_access()
+    // type deduction:
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      // Validate args, compute output shape/dtype, return TypePtr
+      return std::make_shared<TileType>(output_shape, output_dtype);
+    });
+```
+
+Tensor ops use the same fluent chain with `.set_op_category("TensorOp")`, no
+memory-space calls, and a `TensorType` result from `f_deduce_type`.
+
 ### Tile Op — Memory Space Reference
 
 | MemorySpace | Usage |
@@ -119,9 +148,33 @@ Pattern: unwrap `Tile` → call IR function → wrap result:
 
 ```python
 def <op_name>(lhs: Tile, rhs: Tile) -> Tile:
+    """<One-line summary.>
+
+    <The explanation from the §2 IR wrapper, adapted to the DSL surface.>
+
+    Args:
+        lhs: Left-hand side tile
+        rhs: Right-hand side tile
+
+    Returns:
+        Tile wrapping the <op_name> operation
+    """
     call_expr = _ir_ops.<op_name>(lhs.unwrap(), rhs.unwrap())
     return Tile(expr=call_expr)
 ```
+
+**The docstring is not optional and not a shortened copy.** `pypto.language.tile` and
+`pypto.language.tensor` are rendered into `docs/en/user/api/`, so this docstring is the
+published manual while the §2 IR wrapper is internal. Whatever the IR copy says about shape
+rules, broadcasting, dtype restrictions or operand aliasing has to be said here too.
+
+Adapt rather than paste: drop the `span` argument and codegen internals, write `pl.tile.foo`
+where the IR copy writes `foo`, and say `Tile` where it says `TileType`. Being *longer* than the
+IR copy is fine and common. Write it as a **source literal** — do not assign `__doc__` from
+`_ir_ops.<op_name>` at import time, since mkdocstrings reads the source statically through griffe
+(see `docs/requirements.txt`) and a runtime-assigned `__doc__` renders empty on the API page.
+`tests/lint/check_op_docstring_parity.py` fails when the IR docstring explains something past its
+summary and the DSL twin does not.
 
 ### File: `python/pypto/language/op/tensor_ops.py`
 
@@ -360,14 +413,14 @@ def test_<op_name>_pto_codegen(self):
 ### Operator Docs
 
 - English: `docs/en/dev/ir/05-operators.md`
-- Chinese: `docs/zh-cn/dev/ir/05-operators.md`
+- Chinese: `docs/zh/dev/ir/05-operators.md`
 
 Add to the appropriate category table (TensorOp or TileOp section).
 
 ### Codegen Docs
 
 - PTO: `docs/en/dev/codegen/00-pto_codegen.md`
-- Orchestration: `docs/en/dev/codegen/02-orchestration_codegen.md`
+- Orchestration: `docs/en/dev/codegen/01-orchestration_codegen.md`
 
 ### Pass Docs (if conversion changes are significant)
 
@@ -399,8 +452,11 @@ Add to the appropriate category table (TensorOp or TileOp section).
 ## 10. Build & Test Commands
 
 ```bash
+# Load machine-local resource limits
+source .claude/skills/testing/load-env.sh
+
 # Build after C++ changes
-cmake --build build --parallel
+cmake --build build --parallel "$PYPTO_BUILD_JOBS"
 
 # Run specific op tests
 export PYTHONPATH=$(pwd)/python:$PYTHONPATH
@@ -410,8 +466,30 @@ python3 -m pytest tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py -v -
 python3 -m pytest tests/ut/codegen/test_pto_codegen_ops.py -v -k "<op_name>"
 
 # Full test suite
-python3 -m pytest tests/ut/ -n auto --maxprocesses 8 -v
+python3 -m pytest tests/ut/ -n "$PYPTO_TEST_JOBS" -v
 
 # Pre-commit checks
 pre-commit run --all-files
 ```
+
+---
+
+## 11. File Locations by Layer
+
+| Layer | Tile Op | Tensor Op |
+| ----- | ------- | --------- |
+| C++ registration | `src/ir/op/tile_ops/*.cpp` | `src/ir/op/tensor_ops/*.cpp` |
+| Python IR | `python/pypto/ir/op/tile_ops.py` | `python/pypto/ir/op/tensor_ops.py` |
+| Python DSL | `python/pypto/language/op/tile_ops.py` | `python/pypto/language/op/tensor_ops.py` |
+| Conversion | — | `src/ir/transforms/op_conversion_registry.cpp` |
+| PTO codegen | `src/backend/common/pto_ops_common.cpp` | — |
+| Orchestration codegen | — | `src/codegen/tensor_op_codegen.cpp` |
+| Tile op UT | `tests/ut/ir/operators/test_tile_ops.py` | — |
+| Tensor op UT | — | `tests/ut/ir/operators/test_tensor_ops.py` |
+| Conversion UT | — | `tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py` |
+| Codegen UT | `tests/ut/codegen/test_pto_codegen_ops.py` | `tests/ut/codegen/test_orchestration_codegen.py` |
+| ST | `tests/st/codegen/` | `tests/st/codegen/` |
+| Docs (en) | `docs/en/dev/ir/05-operators.md` | `docs/en/dev/ir/05-operators.md` |
+| Docs (zh) | `docs/zh/dev/ir/05-operators.md` | `docs/zh/dev/ir/05-operators.md` |
+| Codegen docs | `docs/en/dev/codegen/00-pto_codegen.md` | `docs/en/dev/codegen/01-orchestration_codegen.md` |
+| CMake | `CMakeLists.txt` (line ~98–116) | `CMakeLists.txt` (line ~109–116) |

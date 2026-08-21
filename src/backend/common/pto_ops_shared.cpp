@@ -75,8 +75,9 @@ codegen::PTOCodegen& AsPto(codegen::CodegenBase& codegen_base) {
 // Validate a call's arity with the canonical "Operation:[<pto_op>] requires N
 // argument(s), but got M" message shared by the simple-op handlers.
 void CheckArity(const CallPtr& op, std::string_view pto_op_name, size_t arity) {
-  CHECK(op->args_.size() == arity) << "Operation:[" << pto_op_name << "] requires " << arity << " argument"
-                                   << (arity != 1 ? "s" : "") << ", but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == arity, op->span_)
+      << "Operation:[" << pto_op_name << "] requires " << arity << " argument" << (arity != 1 ? "s" : "")
+      << ", but got " << op->args_.size();
 }
 
 const std::vector<std::string> cmp_modes = {"eq", "ne", "lt", "le", "gt", "ge"};
@@ -105,16 +106,34 @@ std::string MakePartitionTensorViewType(const std::vector<std::string>& dims, co
 // emitted as index constants; loop vars are already index (EmitCastToIndex is
 // a no-op). Used for every pto.partition_view offset (load/store/remote_store/
 // notify/wait/put), so all paths coerce offsets identically.
+//
+// After coercion, every runtime offset is clamped to non-negative via
+// arith.maxsi(offset, 0). A negative offset (e.g. a ring-neighbour computation
+// that passes through -1 before a conditional adjust) would otherwise reach
+// PTOAS as a signed index value that partition_view does not handle, silently
+// dropping or misdirecting the access. ConstInt offsets are clamped at emit
+// time so compile-time provably-negative offsets also become safe codegen
+// (the verifier rejects those independently).
 std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exprs,
                                              codegen::PTOCodegen& codegen) {
   std::vector<std::string> codes;
   codes.reserve(exprs.size());
   for (const auto& expr : exprs) {
+    std::string offset_idx;
     if (auto ci = As<ir::ConstInt>(expr)) {
-      codes.push_back(codegen.GetOrEmitConstant(ci->value_, DataType::INDEX));
+      // Clamp compile-time negative constants to zero at codegen time.
+      offset_idx = codegen.GetOrEmitConstant(std::max(ci->value_, static_cast<int64_t>(0)), DataType::INDEX);
     } else {
-      codes.push_back(codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr)));
+      // For runtime expressions, insert an arith.maxsi(offset, 0) clamp so
+      // that a negative dynamic value cannot reach pto.partition_view, where
+      // it would silently misbehave.
+      auto raw_idx = codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr));
+      auto zero_idx = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+      auto clamped = codegen.NewTemp();
+      codegen.Emit(clamped + " = arith.maxsi " + raw_idx + ", " + zero_idx + " : index");
+      offset_idx = clamped;
     }
+    codes.push_back(std::move(offset_idx));
   }
   return codes;
 }
@@ -134,8 +153,8 @@ std::vector<std::string> GetDimStrings(const std::vector<ir::ExprPtr>& exprs) {
   return dims;
 }
 
-// Convert expressions to MLIR size codes, using constants when available and
-// GetExprAsCode for dynamic values.
+// Convert expressions to MLIR size codes. partition_view sizes are index-typed,
+// so dynamic integer scalars need the same coercion as offsets.
 std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, codegen::PTOCodegen& codegen) {
   std::vector<std::string> codes;
   codes.reserve(exprs.size());
@@ -143,7 +162,7 @@ std::vector<std::string> GetSizeCodes(const std::vector<ir::ExprPtr>& exprs, cod
     if (auto c = As<ir::ConstInt>(expr)) {
       codes.push_back(codegen.GetOrEmitConstant(c->value_, DataType::INDEX));
     } else {
-      codes.push_back(codegen.GetExprAsCode(expr));
+      codes.push_back(codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr)));
     }
   }
   return codes;
@@ -174,6 +193,7 @@ codegen::TileTypeComponents InferSubviewTileTypeComponents(const ir::TileType& s
   c.slayout = tv.slayout;
   c.fractal = tv.fractal;
   c.pad = tv.pad;
+  c.compact = tv.compact;
 
   c.v_row = c.rows;
   c.v_col = c.cols;
@@ -450,7 +470,7 @@ std::string MaterializeSubviewOperandIfNeeded(const ir::ExprPtr& expr, codegen::
 
 // Verify that two TileTypes share the strict "same tile config" required by
 // pto.subview: identical dtype, identical TileView (blayout, slayout, fractal,
-// pad), and pad must be null since pto.subview is a pure view and does not
+// pad, compact), and pad must be null since pto.subview is a pure view and does not
 // pad.  Memory-space equality is enforced separately (via memory_inherit
 // rules on the op definition); this helper checks the tile_view fields that
 // must be byte-for-byte compatible for a subview to be legal.
@@ -471,6 +491,21 @@ void CheckSubviewTileCompat(const ir::TileType& source, const ir::TileType& resu
                                         << res_v.fractal << "); pto.subview requires identical fractal";
   CHECK(src_v.pad == res_v.pad)
       << op_name << ": pad mismatch between source and result; pto.subview requires identical pad mode";
+  // An Acc compact mismatch is reachable from ordinary DSL: a matmul whose lhs carries a
+  // narrowed valid row count produces a compact L0C tile (stride ceil(validRow/16)*16), while a
+  // plain `tile.create(target_memory=Acc)` window stays non-compact (stride = physical rows).
+  // The two really do address L0C at different pitches, so the copy is not expressible as a
+  // subview — say so in the user's terms rather than in `pto.subview`'s (#2470).
+  const bool acc_windows =
+      source.GetMemorySpace() == ir::MemorySpace::Acc && result.GetMemorySpace() == ir::MemorySpace::Acc;
+  CHECK(src_v.compact == res_v.compact)
+      << op_name << ": compact mismatch between source and result; pto.subview requires identical "
+      << "compact mode"
+      << (acc_windows ? "; the two accumulator windows disagree on their L0C fractal stride. A matmul "
+                        "whose lhs carries narrowed valid rows writes L0C at ceil(validRow/16)*16, "
+                        "and no wider full-height accumulator window can view that layout. Drop the "
+                        "narrowing from the matmul operand and compute the full tile."
+                      : "");
   CHECK(src_v.pad == ir::PadValue::null)
       << op_name << ": pto.subview does not support pad_value (" << static_cast<int>(src_v.pad)
       << "); apply tile.fillpad on the result tile instead of carrying a pad on the slice/assemble window";

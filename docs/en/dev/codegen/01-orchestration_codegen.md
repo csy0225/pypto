@@ -4,16 +4,16 @@
 
 Orchestration codegen follows the same principle as [PTO codegen](00-pto_codegen.md#design-principle-strict-1-to-1-mapping): a **strict 1-to-1 translation** from IR to generated C++ code. The codegen should not perform optimization, analysis, or indirection — such work belongs in earlier passes.
 
-For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
+For example, return-to-parameter tracing (mapping callee return values back to `Out` parameters) is analysis that should be resolved by a pass before codegen sees the IR. The [`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass now canonicalizes this before codegen, so orchestration codegen maps `return[i]` directly to `out_indices[i]` without tracing through `tile.store`/yield chains.
 
-Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/42-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
+Likewise, deciding whether a `ForStmt` iter_arg needs a materialised carry variable used to require an alias-equivalence fixpoint over the loop body. The [`ClassifyIterArgCarry`](../passes/45-classify_iter_arg_carry.md) pass now stamps that decision (and the TaskId fence-array extent) onto `ForStmt::attrs_`, so codegen reads `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>` instead of deriving them.
 
 ## Overview
 
 The orchestration codegen generates PTO2 runtime C++ code that manages task-graph execution on Ascend hardware. While [PTO codegen](00-pto_codegen.md) produces InCore kernel code (tile-level compute), orchestration codegen produces the host-side code that:
 
-- Wraps device memory pointers (via `ChipStorageTaskArgs`) into `Tensor` objects
-- Builds `Arg` objects and calls `add_input`/`add_output`/`add_inout`/`add_scalar` to classify parameters (manual-scope dep edges are emitted separately via a `set_dependencies` stack array — see [Manual Scope and TaskId Lowering](#manual-scope-and-taskid-lowering))
+- Borrows device-memory descriptors from `ChipTaskArgs` as `ChipTensor` references
+- Builds `CoreTaskArgs` objects and calls `add_input`/`add_output`/`add_inout`/`add_scalar` to classify parameters (manual-scope dep edges are emitted separately via a `set_dependencies` stack array — see [Manual Scope and TaskId Lowering](#manual-scope-and-taskid-lowering))
 - Submits tasks to AIC (CUBE) or AIV (VECTOR) cores via `rt_submit_*_task`
 - Handles control flow (loops, conditionals) with `PTO2_SCOPE`
 
@@ -80,46 +80,46 @@ This allows extensible operation codegen without modifying the core visitor.
 
 ```cpp
 // Phase 2: Config function — returns expected argument count
-PTO2OrchestrationConfig aicpu_orchestration_config(const ChipStorageTaskArgs& orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{ .expected_arg_count = 3 };
 }
 
 // Phase 3: Entry function signature
-void aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args) {
+void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {
 ```
 
 ### Phase 4–5: Tensor Setup
 
 ```cpp
-// Phase 4: External tensors — all layouts via from_tensor_arg()
-Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
-Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
-Tensor ext_dn = from_tensor_arg(orch_args.tensor(2));
+// Phase 4: External tensors — borrow the chip-resident descriptors
+const ChipTensor& ext_a = orch_args.tensor(0).ref();
+const ChipTensor& ext_b = orch_args.tensor(1).ref();
+const ChipTensor& ext_dn = orch_args.tensor(2).ref();
 
 // Phase 5: Internal tensors (from pl.create_tensor — intermediates only)
 // All tensor.create in the same scope are batched into a single alloc_tensors call.
 uint32_t tmp_ci_shapes[2] = {16, 16};
 TensorCreateInfo tmp_ci(tmp_ci_shapes, 2, DataType::FLOAT32);
 TaskOutputTensors alloc_0 = alloc_tensors(tmp_ci);
-const Tensor& tmp = alloc_0.get_ref(0);
+const ChipTensor& tmp = alloc_0.get_ref(0);
 ```
 
 ### Phase 6–8: Task Submission and Control Flow
 
 All task submission is wrapped in a top-level `PTO2_SCOPE()`. Codegen no longer
 decides scope placement from the `for` / `if` structure: the
-[MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) pass
+[MaterializeRuntimeScopes](../passes/44-materialize_runtime_scopes.md) pass
 inserts explicit AUTO `RuntimeScopeStmt` nodes (the function body and each
 `for` / `if` body) into the IR, and codegen emits `PTO2_SCOPE` 1:1 from those
 nodes (manual scopes lower to `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`):
 
 ```cpp
 PTO2_SCOPE() {
-    Arg params_t0;
+    CoreTaskArgs params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
-    params_t0.add_output(tmp);               // pre-allocated tensor uses add_output(const Tensor&)
+    params_t0.add_output(tmp);               // pre-allocated tensor uses add_output(const ChipTensor&)
     rt_submit_aiv_task(0, params_t0);
 
     // ForStmt example — plain for loop, no nested PTO2_SCOPE
@@ -135,10 +135,10 @@ PTO2_SCOPE() {
 
 | Type | Source | C++ Construction | Naming |
 | ---- | ------ | ---------------- | ------ |
-| External (ND/DN) | Function parameters | `from_tensor_arg(orch_args.tensor(N))` | `ext_<name>` |
+| External (ND/DN) | Function parameters | `orch_args.tensor(N).ref()` | `ext_<name>` |
 | Internal | `pl.create_tensor(...)` in function body | `TensorCreateInfo var_ci(...)` + `alloc_tensors(...)` at scope entry | `<name>` (no prefix) |
 
-External tensors wrap device memory pointers passed from the host via `ChipStorageTaskArgs`. Internal tensors are pre-allocated at scope entry via `alloc_tensors()` — all `tensor.create` calls within the same scope (function body, for body, if body) are batched into a single `alloc_tensors` invocation. Pre-allocated tensors are then passed to kernels via `add_output(const Tensor&)` (OUTPUT_EXISTING overload).
+External tensors borrow chip-resident descriptors passed through `ChipTaskArgs`. Internal tensors are pre-allocated at scope entry via `alloc_tensors()` — all `tensor.create` calls within the same scope (function body, for body, if body) are batched into a single `alloc_tensors` invocation. Pre-allocated tensors are then passed to kernels via `add_output(const ChipTensor&)` (OUTPUT_EXISTING overload).
 
 ### Parameter Direction
 
@@ -152,11 +152,11 @@ The `ParamDirection` of each function parameter determines how it appears in tas
 | `InOut` | `pl.InOut[pl.Tensor[...]]` | `params.add_inout(ext_x)` | Read-write |
 | Scalar | `pl.Scalar[...]` | `params.add_scalar(value)` | Scalar constant (separate scalar slot) |
 
-Internal tensors from `tensor.create` are pre-allocated at scope entry via `alloc_tensors()`. When passed to kernels, they use `add_output(const Tensor&)` which triggers the OUTPUT_EXISTING overload — the runtime reuses the pre-allocated buffer instead of allocating a new one.
+Internal tensors from `tensor.create` are pre-allocated at scope entry via `alloc_tensors()`. When passed to kernels, they use `add_output(const ChipTensor&)` which triggers the OUTPUT_EXISTING overload — the runtime reuses the pre-allocated buffer instead of allocating a new one.
 
 ### Scalar Parameter Encoding
 
-Scalar params occupy `ChipStorageTaskArgs` scalar slots (0-indexed, separate from tensor slots).
+Scalar params occupy `ChipTaskArgs` scalar slots (0-indexed, separate from tensor slots).
 Float scalars use `to_u64(f)` (bit-cast). Other integer/bool scalars are cast to `(uint64_t)`.
 At the receiving end, union-based type punning is used to reinterpret the `uint64_t` as the target C type:
 
@@ -170,7 +170,7 @@ float scale = scale_conv.val;
 
 A kernel/submit output is the in-place `Out`/`InOut` arg it writes — the *same
 physical tensor*. So when the result Var has a different name than that arg, the
-codegen does **not** mint a `const Tensor& result = ext_output;` rename; it
+codegen does **not** mint a `const ChipTensor& result = ext_output;` rename; it
 remaps the result Var's emit name to the source, and every downstream reference
 resolves directly to the source name. (This is the same strategy
 `tensor.assemble` uses, applied uniformly.)
@@ -183,17 +183,17 @@ consumer = self.kernel_use(result)
 
 ```cpp
 // Generated C++ — `result` is remapped to ext_output; the consumer reads it directly
-Arg params_t0;
+CoreTaskArgs params_t0;
 params_t0.add_output(ext_output);
 rt_submit_aiv_task(0, params_t0);
 
-Arg params_t1;
+CoreTaskArgs params_t1;
 params_t1.add_input(ext_output);  // `result` -> ext_output (no alias decl)
 ```
 
 Which `Out`/`InOut` param a result aliases is a lookup, not a heuristic — and
 not an analysis either. `ReturnParamsExplicit`
-([`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)) guarantees
+([`NormalizeReturnOrder`](../passes/25-normalize_return_order.md)) guarantees
 that every tensor param-writeback return value *is* the param, by pointer
 identity. Codegen therefore reads the return-position → param-index map straight
 off the callee's `ReturnStmt` via `ir::return_lineage::ExplicitReturnedParamIndices`;
@@ -211,7 +211,7 @@ enclosing `if`/loop owns) keeps its `<name> = <src>;` form; and a tensor whose
 source is not valid in the reader's C++ scope (a manual-scope-local source —
 see *Cross-scope tensors and `manual_scope`* below) keeps the decl path. A
 runtime-allocated output bound to `task_<n>_outs.get_ref(k)` likewise keeps its
-`const Tensor&` binding.
+`const ChipTensor&` binding.
 
 ### Core Type Inference
 
@@ -221,6 +221,22 @@ The codegen determines whether to submit to AIC (CUBE) or AIV (VECTOR) based on 
 | ----------- | --------- | --------------- |
 | `Left`, `Right`, `Acc`, `Mat` | CUBE (AIC) | `rt_submit_aic_task` |
 | `Vec` (default) | VECTOR (AIV) | `rt_submit_aiv_task` |
+
+**Exception — dual-AIV kernels.** An AIV kernel stamped `dual_aiv_dispatch` (any
+`split_aiv` kernel; see [`SplitVectorKernel`](../passes/23-split_vector_kernel.md))
+must run on **both** vector lanes of a cluster — a `pl.split_aiv` region hands each
+lane disjoint work selected by `aiv_id`. `rt_submit_aiv_task` fills only the AIV0
+slot, so the runtime schedules an *AIV-shape* task — one AIV core per block: the second
+lane never launches, and the lone lane that does reads a `get_sub_block_id()` that the
+runtime documents as **meaningless** for a single-AIV task. The scheduler seeds that value
+per core from the core's fixed position in its cluster, so `aiv_id` becomes that position
+rather than a per-block lane id. Such a kernel is therefore submitted as a two-lane
+`MixedKernels` + `rt_submit_task` instead (see [Group Functions (Mixed Kernels)](#group-functions-mixed-kernels)),
+whatever the dispatch path (direct call, `Spmd` wrapper, or AIV-only `Group`). Two active
+AIV slots make it a MIX-shape task, so the scheduler places both lanes of one cluster under
+the same `block_idx` and gives them `sub_block_id` 0 and 1; the cluster's AIC core is simply
+unused. A plain (non-`dual_aiv_dispatch`) vector kernel keeps `rt_submit_aiv_task`, which
+dispatches across independent AIV cores.
 
 ### Tuple Handling
 
@@ -233,7 +249,7 @@ pij, mij, lij = self.kernel_softmax(sij, scale, pij, mij, lij)
 
 ```cpp
 // Generated C++ — tensors first, then scalars
-Arg params_t0;
+CoreTaskArgs params_t0;
 params_t0.add_input(ext_sij);
 params_t0.add_inout(ext_pij);
 params_t0.add_inout(ext_mij);
@@ -248,22 +264,32 @@ When a kernel uses both AIC and AIV cores (mixed kernel), the codegen generates 
 
 ```cpp
 // Group: mixed_kernel (AIC + AIV)
-Arg params_t0;
+CoreTaskArgs params_t0;
 // ... add_input / add_inout / add_scalar calls ...
 MixedKernels mixed_0 = {aic_id, aiv_id, INVALID_KERNEL_ID};
 rt_submit_task(mixed_0, params_t0);
 ```
 
+The three slots are `{aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id}`; `INVALID_KERNEL_ID`
+marks a slot inactive. The AIV1 slot repeats the AIV kernel id when the AIV function
+carries `dual_aiv_dispatch` — so both vector lanes run:
+
+| Kernel | `MixedKernels` |
+| ------ | -------------- |
+| Mixed, single AIV lane | `{aic_id, aiv_id, INVALID_KERNEL_ID}` |
+| Mixed, `dual_aiv_dispatch` | `{aic_id, aiv_id, aiv_id}` |
+| Vector-only, `dual_aiv_dispatch` | `{INVALID_KERNEL_ID, aiv_id, aiv_id}` |
+
 ## Operation Mappings
 
 | IR Operation | C++ Codegen | Description |
 | ------------ | ----------- | ----------- |
-| `tensor.create` | `TensorCreateInfo var_ci(...)` + `alloc_tensors(...)` | Scope-level batched alloc; `const Tensor& var = alloc_N.get_ref(i)` |
+| `tensor.create` | `TensorCreateInfo var_ci(...)` + `alloc_tensors(...)` | Scope-level batched alloc; `const ChipTensor& var = alloc_N.get_ref(i)` |
 | `tensor.read` | `*reinterpret_cast<T*>(arg_ptr + offset)` | Read scalar from host tensor |
-| `tensor.slice` | `make_tensor_external(ptr + byte_offset, ...)` | Create view into existing tensor |
-| `tensor.transpose` | `Tensor xt = ext_x.transpose(axis1, axis2)` | Zero-copy metadata swap of two axes (lowers to runtime `Tensor::transpose`) |
+| `tensor.slice` | `ChipTensor xs = ext_x.view(shapes, offsets)` | Create a metadata view into an existing tensor |
+| `tensor.transpose` | `ChipTensor xt = ext_x.transpose(axis1, axis2)` | Zero-copy metadata swap of two axes (lowers to runtime `ChipTensor::transpose`) |
 | `tensor.dim` (static) | `int64_t d0 = 16` | Constant dimension value |
-| `tensor.dim` (dynamic) | `int64_t d0 = (int64_t)orch_args.tensor(N).ref().shapes[axis]` | Runtime dimension from ChipStorageTaskArgs. In an Orchestration body the parser folds it onto the declared extent instead — see below |
+| `tensor.dim` (dynamic) | `int64_t d0 = (int64_t)orch_args.tensor(N).ref().shapes[axis]` | Runtime dimension from ChipTaskArgs. In an Orchestration body the parser folds it onto the declared extent instead — see below |
 
 ### Dynamic-dim symbols
 
@@ -318,33 +344,33 @@ def orch_basic(
 
 extern "C" {
 
-PTO2OrchestrationConfig aicpu_orchestration_config(const ChipStorageTaskArgs& orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs& orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{ .expected_arg_count = 3 };
 }
 
-void aicpu_orchestration_entry(const ChipStorageTaskArgs& orch_args) {
-    // External tensors (from ChipStorageTaskArgs)
-    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
-    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
-    Tensor ext_d = from_tensor_arg(orch_args.tensor(2));
+void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {
+    // External tensors (from ChipTaskArgs)
+    const ChipTensor& ext_a = orch_args.tensor(0).ref();
+    const ChipTensor& ext_b = orch_args.tensor(1).ref();
+    const ChipTensor& ext_d = orch_args.tensor(2).ref();
 
     PTO2_SCOPE() {
         // Internal tensor — pre-allocated via alloc_tensors at scope entry
         uint32_t c_ci_shapes[2] = {16, 16};
         TensorCreateInfo c_ci(c_ci_shapes, 2, DataType::FLOAT32);
         TaskOutputTensors alloc_0 = alloc_tensors(c_ci);
-        const Tensor& c = alloc_0.get_ref(0);
+        const ChipTensor& c = alloc_0.get_ref(0);
 
         // Task 0: kernel_add (a + b → c)
-        Arg params_t0;
+        CoreTaskArgs params_t0;
         params_t0.add_input(ext_a);
         params_t0.add_input(ext_b);
         params_t0.add_output(c);
         rt_submit_aiv_task(0, params_t0);
 
         // Task 1: kernel_add (c + b → d)
-        Arg params_t1;
+        CoreTaskArgs params_t1;
         params_t1.add_input(c);
         params_t1.add_input(ext_b);
         params_t1.add_output(ext_d);
@@ -393,15 +419,24 @@ for i in pl.range(0, 4):
 
 ```cpp
 // Generated C++ (inside top-level PTO2_SCOPE)
-Tensor acc = ext_acc;  // iter_arg initialization
+ChipTensor acc = ext_acc;  // iter_arg initialization
 for (int64_t i = 0; i < 4; i += 1) {
-    Arg params_t0;
+    CoreTaskArgs params_t0;
     // ... add_input / add_inout calls ...
     rt_submit_aiv_task(0, params_t0);
 }
 ```
 
 Iter_args are initialized before the loop. `YieldStmt` updates are emitted at the end of each iteration.
+
+An `IterArg::initValue_` is usually an SSA `Var`, but any expression is legal —
+a scalar carry seeded by a constant (`acc: pl.Scalar[pl.INT64] = 0` before the
+loop, which `Simplify` propagates into the loop, or an explicit
+`pl.range(..., init_values=(0,))`) arrives as a `ConstInt`. Codegen emits the
+init expression directly (`int64_t acc__rv_v1 = 0;`); a trivial carry — one the
+body never rebinds — aliases both names straight to that expression instead. The
+one path that still requires the init to *name* something is the `ArrayType`
+carry copy-in, which indexes it slot-by-slot.
 
 ### IfStmt
 
@@ -417,13 +452,13 @@ else:
 // Generated C++
 if (condition) {
     PTO2_SCOPE() {
-        Arg params_t0;
+        CoreTaskArgs params_t0;
         // ... add_input / add_inout calls ...
         rt_submit_aiv_task(0, params_t0);
     }
 } else {
     PTO2_SCOPE() {
-        Arg params_t1;
+        CoreTaskArgs params_t1;
         // ... add_input / add_inout calls ...
         rt_submit_aiv_task(1, params_t1);
     }
@@ -449,12 +484,12 @@ The orchestration file is named `orchestration/<func_name>.cpp` in the generated
 
 `with pl.manual_scope():` regions lower to a `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
 block where the runtime's auto OverlapMap is disabled. Per-task params are
-always declared as a plain `Arg <task_var>;`. The orchestration codegen
+always declared as a plain `CoreTaskArgs <task_var>;`. The orchestration codegen
 materialises the required dependency edges as a fixed-size stack array plus
 a single `set_dependencies` call:
 
 ```cpp
-Arg params_t1;
+CoreTaskArgs params_t1;
 params_t1.add_input(...);
 // ...
 PTO2TaskId params_t1_deps[K];          // K = exact dep-edge count
@@ -464,38 +499,44 @@ if (carry.is_valid()) params_t1_deps[params_t1_deps_count++] = carry;  // loop c
 params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
 ```
 
-A dep slot is wrapped in `if (task_id.is_valid())` only when the TaskId may
-legitimately hold the `PTO2TaskId::invalid()` sentinel — a `None` loop-carry
-seed, an early loop iteration's iter_arg carry, or an unwritten array slot —
-because an invalid id must never reach `set_dependencies`. A **fresh
-direct-producer** TaskId (the output of a `pl.submit(...)` earlier in the same
-straight-line scope) is statically always-valid, so its insert is emitted
-unguarded (issue #1966), dropping the redundant always-true branch from the
-orchestration hot path.
+A dep slot is guarded with `if (task_id.is_valid())` only when the TaskId may
+legitimately hold the `PTO2TaskId::invalid()` sentinel, because an invalid id
+must never reach `set_dependencies`; a **fresh direct-producer** TaskId is
+statically always-valid and is emitted unguarded (issue #1966). See
+[TaskId sourcing](#taskid-sourcing) for the full case list.
 
-There is no `params.add_dep(...)` call any more, and there is no 16-dep cap
-— the runtime `Arg::set_dependencies` primitive has no upper bound, and the
-stack array is sized to the exact count. User edges come from the parser:
-it writes the user's `pl.submit(..., deps=[tid1, tid2])` kwarg into the typed
-`Submit::deps_` field; codegen reads them through the transient
-`SubmitToCallView`, which surfaces `deps_` as a synthesised
-`attrs["manual_dep_edges"]` entry (a `vector<VarPtr>` of `Scalar[TASK_ID]`
-variables). Plain `Call` carriers of `manual_dep_edges` no longer exist — the
+There is no `params.add_dep(...)` call and no 16-dep cap — the runtime
+`CoreTaskArgs::set_dependencies` primitive has no upper bound, and the stack array is
+sized to the exact count. User edges come from the parser: it writes the user's
+`pl.submit(..., deps=[tid1, tid2])` kwarg into the typed `Submit::deps_` field;
+codegen reads them through the transient `SubmitToCallView`, which surfaces
+`deps_` as a synthesised `attrs["manual_dep_edges"]` entry. Plain `Call`
+carriers of `manual_dep_edges` no longer exist — the
 ManualDepsOnSubmitOnly structural property verifies that no cross-function
 `Call` carries it; only the `system.task_dummy` barrier op keeps the attr as
-its fanin contract. Compiler-derived manual-scope edges come from
-[`AutoDeriveTaskDependencies`](../passes/35-auto_derive_task_dependencies.md)
+its fanin contract. Compiler-derived edges come from
+[`AutoDeriveTaskDependencies`](../passes/38-auto_derive_task_dependencies.md)
 in `Call.attrs["compiler_manual_dep_edges"]` (a separate key, allowed on plain
-calls). Codegen merges the two lists in that order and deduplicates by Var
-identity before emitting the stack array.
+calls). That pass never analyzes a user-written MANUAL scope — inside
+`pl.manual_scope()` the explicit `deps=[...]` list stays the only source of
+dependency edges. It analyzes AUTO regions only, and only under the compile-time
+`analyze_auto_scopes_for_deps` switch. A default-mode (`auto_scope=True`) region
+becomes a *compiler-owned* MANUAL scope when fully covered, and otherwise stays
+AUTO with its representable edges emitted on top of runtime auto-tracking. A
+hand-placed `pl.scope()` always keeps `manual=false`, and has its partial edges
+stripped if analysis falls back. Codegen merges the two lists in that order and
+deduplicates by Var identity before emitting the stack array, tagging each entry
+with its provenance (`DepEdge::user_written`).
+
+The provenance decides what happens when an edge fails to resolve to a live
+TaskId binding — see [Unresolvable dep edges](#unresolvable-dep-edges).
 
 ### TaskId sourcing
 
-Every kernel task launch inside a manual scope is a `Submit`; the
-`SubmitToCallView` adapter presents its `deps_` to codegen as
-`manual_dep_edges` — a `vector<VarPtr>` of `Scalar[TASK_ID]` variables.
-Compiler-derived edges arrive as `attrs["compiler_manual_dep_edges"]` on
-plain calls. Each entry resolves at codegen time through
+Every kernel task launch inside a manual scope is a `Submit`. Each dep entry —
+`manual_dep_edges` synthesised from `deps_` by `SubmitToCallView`, or
+`compiler_manual_dep_edges` on a plain call — is a TaskId `VarPtr`
+(`Scalar[TASK_ID]` or `Array[N, TASK_ID]`) and resolves at codegen time through
 `manual_task_id_map_` to one of the following forms:
 
 | Producer kind | C++ source emitted by codegen |
@@ -523,6 +564,38 @@ produced inside a scope does not leak to an enclosing scope where its identifier
 would be out of C++ scope. Loop / branch carries are declared *before* their
 body's `PTO2_SCOPE`, so they correctly survive the block.
 
+### Unresolvable dep edges
+
+A consequence of that lifetime rule: a dep edge naming a TaskId produced in a
+scope that has **already closed** cannot resolve — the binding was restored away
+on scope exit. Codegen's response depends on the edge's provenance:
+
+| Edge provenance | Behavior when unresolvable |
+| --------------- | -------------------------- |
+| Compiler-derived (`compiler_manual_dep_edges`) | Silently skipped. These are a best-effort hazard patch; `PrepareCrossScopeTaskIdHoists` already LCA-hoists the ones it can, and dropping the rest is safe because the pass only ever *adds* ordering |
+| User-written (`deps=[...]`) | **Hard error** — `CHECK_SPAN` raises a `pypto::ValueError` naming the TaskId and the DSL source line |
+
+Provenance is the attr key. Note that `attrs["dummy_task"]` is *not* an
+authorship marker: the parser stamps it on a user-written
+`pl.system.task_dummy(deps=[...])` exactly as
+[`ExpandManualPhaseFence`](../passes/39-expand_manual_phase_fence.md) does on the
+barriers it synthesises, so every `manual_dep_edges` carrier is enforced. The
+synthesised barrier only ever names a TaskId live in the manual scope it
+rewrites, so its fanin always resolves.
+
+Dropping a user edge would leave the consumer unordered against its producer and
+surface at runtime as a silent stale read, so codegen refuses to emit rather than
+emit wrong code. `ResolveDepEdgeBinding` is the single resolve-and-validate site
+both `CountManualDeps` (array sizing) and `EmitManualDeps` (array fill) route
+through, so the two can never disagree on which edges survive.
+
+The scope that closed need not be user-written. `MaterializeRuntimeScopes` wraps
+every `ForStmt` body and every `IfStmt` branch body in its own AUTO scope, so
+this fires on ordinary orchestration code with no `pl.scope()` / `pl.manual_scope()`
+in sight — e.g. a TaskId captured inside a `pl.range` body and depended on after
+the loop. The fix is to keep the consumer in the producer's scope, or hoist the
+producer outward.
+
 One exception applies to the `array_carry_vars_` restore on a `MANUAL` scope: an
 array carry registered *inside* the scope whose backing array was declared in
 the *enclosing* scope must survive the restore. This is the loop-carry of a
@@ -546,7 +619,7 @@ mechanisms enforce this, both gated on whether a name is *enclosing-scope-valid*
 (reserved before the block, or a hoisted in-scope buffer — i.e. not scope-local):
 
 - **Output remap.** A caller-allocated kernel/submit output that aliases an
-  enclosing-scope source is *not* given its own `const Tensor&` decl — its emit
+  enclosing-scope source is *not* given its own `const ChipTensor&` decl — its emit
   name is remapped to the source, so every reference (in-scope and after-scope)
   resolves to the enclosing name directly. This is the strategy `tensor.assemble`
   already uses, and since the output is the same physical tensor as its source
@@ -562,7 +635,7 @@ mechanisms enforce this, both gated on whether a name is *enclosing-scope-valid*
   excluded and stays put).
 
 Together these make a tensor created before *or* inside the scope and read after
-it resolve to a single enclosing-scope `const Tensor& buf = ...;` — the
+it resolve to a single enclosing-scope `const ChipTensor& buf = ...;` — the
 after-scope task simply does `add_input(buf)`, with no per-SSA-version alias.
 
 ### Array carry for `pl.parallel` TaskId iter_args
@@ -642,7 +715,7 @@ support an ordinary `AssignStmt` on `ArrayType`.
 
 The dep stack array is sized to the exact dep count (for an array carry,
 `N` slots), so trip counts larger than 16 are not capped — the runtime
-primitive `Arg::set_dependencies(ptr, count)` has no upper bound either.
+primitive `CoreTaskArgs::set_dependencies(ptr, count)` has no upper bound either.
 
 ### Example
 
@@ -670,7 +743,7 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
             out__rv_v4__tid[i] = out__rv_v2__tid[i];           // copy slot-by-slot
         for (int64_t branch = 0; branch < N_BRANCHES; branch += 1) {
             int64_t row = ...;
-            Arg params_t0; /* ... */
+            CoreTaskArgs params_t0; /* ... */
             PTO2TaskId params_t0_deps[N_BRANCHES];             // sized to array-carry N
             uint32_t params_t0_deps_count = 0;
             for (int64_t k = 0; k < N_BRANCHES; ++k) {         // multi-deps fanout
@@ -694,4 +767,4 @@ Every task in phase `N+1` waits for **all** `N_BRANCHES` tasks of phase `N`.
 
 - [PTO Codegen](00-pto_codegen.md) — MLIR generation for PTO backend
 - [Pass Manager](../passes/00-pass_manager.md) — IR optimization passes applied before codegen
-- [Python syntax: manual dependency primitives](../language/00-python_syntax.md#manual-dependency-primitives) — the user-facing surface form
+- [Python syntax: manual dependency primitives](../language/02-manual_dependencies.md#manual-dependency-primitives) — the user-facing surface form

@@ -21,6 +21,7 @@ from _orchestration_codegen_common import (
 from pypto import backend, passes
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
+from pypto.pypto_core import ir
 
 
 class TestManualScopeCodegen:
@@ -107,7 +108,7 @@ class TestManualScopeCodegen:
         code = _generate_orch_code(transformed)
 
         assert code.count("params_t0.add_scalar(signal_ctx);") == 1, code
-        assert "const Tensor& y = task_0_outs.get_ref(0);" in code, code
+        assert "const ChipTensor& y = task_0_outs.get_ref(0);" in code, code
         assert "params_t1.add_input(y);" in code, code
         assert "signal_ctx.get_ref" not in code, code
 
@@ -186,7 +187,7 @@ class TestManualScopeCodegen:
         # attached with a single ``set_dependencies(arr, count)`` call. Both
         # entries are unconditionally filled (plain TaskId bindings, not
         # iter-arg carries, so no is_valid() guard).
-        assert "L0TaskArgs params_t2;" in code
+        assert "CoreTaskArgs params_t2;" in code
         assert "PTO2TaskId params_t2_deps[2];" in code
         assert "params_t2_deps[params_t2_deps_count++] = a_tid;" in code
         assert "params_t2_deps[params_t2_deps_count++] = b_tid;" in code
@@ -1109,7 +1110,7 @@ class TestManualScopeCodegen:
                 return out
 
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
-        with pytest.raises(Exception, match="statically-known trip count"):
+        with pytest.raises(ValueError, match="statically-known trip count"):
             _generate_orch_code(pm.run_passes(Prog))
 
     def test_manual_scope_double_buffered_array_carry_above_legacy_16_cap(self):
@@ -1316,7 +1317,7 @@ class TestManualScopeCodegen:
             out, _       = pl.submit(self.stage2, scratch, out, row, col, deps=[tid])
 
         Expected codegen for the dep chain:
-            L0TaskArgs params_t1;
+            CoreTaskArgs params_t1;
             PTO2TaskId params_t1_deps[1];
             uint32_t params_t1_deps_count = 0;
             params_t1_deps[params_t1_deps_count++] = <producer TaskId>;
@@ -1510,7 +1511,7 @@ class TestManualScopeCodegen:
         # this is what the bug used to silently drop. Without these lines the
         # inner ``rt_submit_*_task`` would have no explicit fence on the outer
         # task and the regression would re-emerge.
-        assert "L0TaskArgs params_t1;" in code, code
+        assert "CoreTaskArgs params_t1;" in code, code
         assert "PTO2TaskId params_t1_deps[1];" in code, code
         # ``outer_tid`` is a fresh direct-producer TaskId declared in the outer
         # C++ scope (issue #1966): its cross-scope dep insert is unguarded.
@@ -1547,6 +1548,95 @@ class TestManualScopeCodegen:
         dump_lines = [ln for ln in code.split("\n") if ".dump(" in ln]
         assert dump_lines, code
         assert any("ext_x" in ln for ln in dump_lines), code
+
+    def test_submit_runtime_allocated_out_synths_add_output_and_get_ref_alias(self):
+        """A ``pl.submit`` that omits a trailing ``pl.Out`` param exercises all
+        three ``Submit::args_`` coverage regions in one program.
+
+        ``Submit::args_.size() <= callee->params_.size()`` (see the canonical
+        statement on ``Submit::args_`` in ``include/pypto/ir/expr.h``): the
+        callee param the call site does not supply is *runtime-allocated*, so
+        orchestration codegen must synthesise a ``TensorCreateInfo`` +
+        ``add_output`` for it and alias the matching return-tuple element to
+        ``task_<n>_outs.get_ref(...)`` rather than to an arg.
+
+        The gap is written directly in DSL source here — no pass produces it,
+        because both signature-extending passes (``ConvertTensorToTileOps``,
+        ``InjectGMPipeBuffer``) forward the arg they append. Task 1 pins the
+        contrasting *caller-allocated* branch in the same program: ``out`` is
+        passed positionally, so it aliases to ``ext_out`` and must NOT go
+        through ``get_ref`` — ``TaskOutputTensors`` holds only runtime-created
+        outputs (``runtime/.../pto_types.h``), so a ``get_ref`` there would
+        index past it.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class GapProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def producer(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                xt = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                yt = pl.tile.add(xt, xt)
+                return pl.store(yt, [0], ret0__out)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def consumer(
+                self,
+                a: pl.Tensor[[64], pl.FP32],
+                o: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ):
+                at = pl.load(a, [0], [64], [64], target_memory=pl.Mem.Vec)
+                pl.store(pl.tile.add(at, at), [0], o)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ):
+                with pl.manual_scope():
+                    # ``ret0__out`` deliberately not supplied: args=1, params=2.
+                    a, a_tid = pl.submit(self.producer, x)
+                    _tid = pl.submit(self.consumer, a, out, deps=[a_tid])
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(GapProgram)
+
+        # The gap survives the whole pipeline — this is what codegen must handle.
+        funcs = {gv.name: f for gv, f in transformed.functions.items()}
+
+        class _SubmitCoverage(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.coverage = []
+
+            def visit_submit(self, op):
+                callee = funcs[op.op.name]
+                self.coverage.append((op.op.name, len(op.args), len(callee.params)))
+                return super().visit_submit(op)
+
+        collector = _SubmitCoverage()
+        collector.visit_stmt(funcs["main"].body)
+        assert ("producer", 1, 2) in collector.coverage, collector.coverage
+        assert ("consumer", 2, 2) in collector.coverage, collector.coverage
+
+        code = _generate_orch_code(transformed)
+
+        # Task 0, region 2 (runtime-allocated): synthesised TensorCreateInfo,
+        # consumed by add_output, and the result aliased through get_ref.
+        assert "TensorCreateInfo params_t0_synth_out_1(" in code, code
+        assert "params_t0.add_output(params_t0_synth_out_1);" in code, code
+        assert "task_0_outs.get_ref(0)" in code, code
+
+        # Task 1, region 1 (caller-allocated): ``out`` was passed positionally,
+        # so it aliases to the arg, never through TaskOutputTensors.
+        assert "params_t1.add_output(ext_out);" in code, code
+        assert "task_1_outs.get_ref(" not in code, code
 
 
 if __name__ == "__main__":

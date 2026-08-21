@@ -38,6 +38,8 @@ from typing import Any
 
 import pytest
 from pypto.backend import BackendType, reset_for_testing, set_backend_type
+from pypto.pypto_core import LogLevel, _set_thread_log_level
+from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import compile_program
 from pypto.runtime.golden_writer import (
     _data_dir_has_files,
@@ -141,8 +143,12 @@ _BACKEND_TO_ARCH: dict[BackendType, str] = {
 }
 
 
-def _cache_key(tc: PTOTestCase, resolved_platform: str | None = None) -> str:
-    """Return a unique cache key combining test name and target platform.
+def _cache_key(
+    tc: PTOTestCase,
+    resolved_platform: str | None = None,
+    session_memory_planner: MemoryPlanner | None = None,
+) -> str:
+    """Return a unique cache key combining test name, platform, and planner.
 
     The cache key is anchored to the *resolved* platform so that the
     pre-compilation cache, the binary cache and the executor all agree on
@@ -164,7 +170,9 @@ def _cache_key(tc: PTOTestCase, resolved_platform: str | None = None) -> str:
             resolved_platform = None
     if not resolved_platform:
         resolved_platform = _BACKEND_TO_ARCH.get(tc.get_backend_type(), "unknown")
-    return f"{tc.get_name()}@{resolved_platform}"
+    planner = _resolve_case_memory_planner(tc, session_memory_planner)
+    planner_tag = planner.name.lower() if planner is not None else "default"
+    return f"{tc.get_name()}@{resolved_platform}@{planner_tag}"
 
 
 def _resolve_platform(config_platform: str, test_case: PTOTestCase | None = None) -> str:
@@ -184,6 +192,27 @@ def _resolve_platform(config_platform: str, test_case: PTOTestCase | None = None
         if tc_platform:
             return tc_platform
     return config_platform
+
+
+def _resolve_case_memory_planner(
+    test_case: PTOTestCase,
+    session_memory_planner: MemoryPlanner | None,
+) -> MemoryPlanner | None:
+    """Resolve planner precedence for a system-test compilation.
+
+    A test case that deliberately selects a planner remains authoritative.
+    Otherwise a planner carried by the case's own ``RunConfig`` wins, followed
+    by the session-wide ``--memory-planner`` override. Returning ``None`` keeps
+    the normal compiler default.
+    """
+    planner = test_case.get_memory_planner()
+    if planner is not None:
+        return planner
+    case_config = getattr(test_case, "config", None)
+    planner = getattr(case_config, "memory_planner", None)
+    if planner is not None:
+        return planner
+    return session_memory_planner
 
 
 def _default_work_dir(test_name: str) -> Path:
@@ -287,6 +316,7 @@ def _compile_for_cache(
     work_dir: Path,
     dump_passes: bool,
     analyze_auto_scopes_for_deps: bool,
+    session_memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Compile one test case into *work_dir* (called from thread pool).
 
@@ -310,7 +340,7 @@ def _compile_for_cache(
         backend_type=backend_type,
         dump_passes=dump_passes,
         analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
-        memory_planner=test_case.get_memory_planner(),
+        memory_planner=_resolve_case_memory_planner(test_case, session_memory_planner),
         enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
     )
     # External kernels are referenced in the manifest at their original path
@@ -342,6 +372,7 @@ class CompileArtifact:
     error: str | None = None
     runtime_name: str | None = None
     chip_callable: Any | None = None
+    enable_sdma: bool = False
 
 
 def _fused_compile_task(
@@ -350,6 +381,7 @@ def _fused_compile_task(
     session_platform: str,
     dump_passes: bool,
     analyze_auto_scopes_for_deps: bool,
+    session_memory_planner: MemoryPlanner | None = None,
 ) -> CompileArtifact:
     """Compile IR → kernels/orch C++ → golden.py → .so for one test case.
 
@@ -359,14 +391,20 @@ def _fused_compile_task(
     already be set on the main thread before this task is submitted.
     """
     resolved = _resolve_platform(session_platform, tc)
-    work_dir = cache_dir / _cache_key(tc, resolved)
+    work_dir = cache_dir / _cache_key(tc, resolved, session_memory_planner)
     work_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _compile_for_cache(tc, work_dir, dump_passes, analyze_auto_scopes_for_deps)
+        _compile_for_cache(
+            tc,
+            work_dir,
+            dump_passes,
+            analyze_auto_scopes_for_deps,
+            session_memory_planner,
+        )
         # Codegen-only runs skip assembly: the .so is never loaded by the
         # execute task (see _fused_execute_task) and assembling here would
-        # both waste work and race on PTO_ISA_ROOT (start_pipeline skips
-        # the pre-resolve under codegen_only).
+        # both waste work and force a pto-isa checkout the run never needs
+        # (start_pipeline skips the pre-resolve under codegen_only).
         if _pipeline_ctx.get("codegen_only"):
             return CompileArtifact(
                 work_dir=work_dir,
@@ -375,13 +413,15 @@ def _fused_compile_task(
             )
         from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
-        chip_callable, runtime_name, _ = compile_and_assemble(work_dir, resolved)
+        chip_callable, runtime_name, runtime_config = compile_and_assemble(work_dir, resolved)
+        enable_sdma = bool(runtime_config.get("enable_sdma", False))
         return CompileArtifact(
             work_dir=work_dir,
             resolved_platform=resolved,
             error=None,
             runtime_name=runtime_name,
             chip_callable=chip_callable,
+            enable_sdma=enable_sdma,
         )
     except Exception as exc:
         return CompileArtifact(
@@ -417,8 +457,10 @@ def _dfx_to_cli(dfx: "_DfxOpts") -> list[str]:
     ``pypto.runtime.execute_artifact._build_parser``.
     """
     argv: list[str] = []
-    if dfx.enable_l2_swimlane:
-        argv.append("--enable-l2-swimlane")
+    if dfx.enable_chip_swimlane:
+        # Levelled, not a toggle — pass the level explicitly so a level 1-3
+        # capture is not silently promoted to the bare flag's level 4.
+        argv += ["--enable-chip-swimlane", str(dfx.enable_chip_swimlane)]
     if dfx.enable_dump_args:
         argv += ["--dump-args", str(dfx.enable_dump_args)]
     if dfx.enable_pmu:
@@ -791,6 +833,7 @@ def _fused_execute_task(
             artifact.resolved_platform,
             device_id,
             dfx=_pipeline_ctx.get("dfx", _DfxOpts()),
+            enable_sdma=artifact.enable_sdma,
         )
         return RunResult(
             passed=True,
@@ -899,15 +942,13 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
         key_by_fut = {cfut: key for key, cfut in _compile_futures.items()}
         batch_idx = 0
         # A batch child opens ONE ChipWorker from its first entry, so a batch must
-        # never mix the (platform, runtime) that the worker is keyed on. ChipWorker
-        # reuse matches on (level, platform, device_id, runtime); level/device_id
-        # are fixed per batch child, so a differing platform OR runtime inside the
-        # batch would miss ChipWorker.current() and open a SECOND Worker.init() on
-        # the same card while the batch worker still holds it — the 2-inits-on-a-
-        # busy-card halMemCtl EACCES hazard. Bucket by (resolved_platform,
-        # runtime_name) to align with that reuse key and chunk within each bucket.
-        # (platform, runtime) → list of (key, wd, platform)
-        pending: dict[tuple[str, str | None], list[tuple[str, Path, str]]] = {}
+        # never mix the (platform, runtime, enable_sdma) that determines whether
+        # that worker can run every artifact. ChipWorker reuse matches on (level,
+        # platform, device_id, runtime), then rejects an SDMA-required dispatch
+        # when the matching worker lacks that capability. level/device_id are fixed
+        # per batch child, so bucket by the remaining binding and capability fields.
+        # (platform, runtime, enable_sdma) → list of (key, wd, platform)
+        pending: dict[tuple[str, str | None, bool], list[tuple[str, Path, str]]] = {}
 
         # Consume in completion order: fill a batch as cases finish compiling and
         # submit it immediately, so execution and compilation overlap.
@@ -920,7 +961,11 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
                 continue
             if artifact.resolved_platform.endswith("sim"):
                 continue
-            bucket_key = (artifact.resolved_platform, artifact.runtime_name)
+            bucket_key = (
+                artifact.resolved_platform,
+                artifact.runtime_name,
+                artifact.enable_sdma,
+            )
             bucket = pending.setdefault(bucket_key, [])
             bucket.append((key_by_fut[cfut], artifact.work_dir, artifact.resolved_platform))
             if len(bucket) >= batch_size:
@@ -928,7 +973,7 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
                 batch_idx += 1
                 pending[bucket_key] = bucket[batch_size:]
 
-        for leftover in pending.values():  # final short batch per (platform, runtime)
+        for leftover in pending.values():  # final short batch per worker capability
             if leftover:
                 _submit(leftover, batch_idx)
                 batch_idx += 1
@@ -943,10 +988,11 @@ def start_pipeline(  # noqa: PLR0913
     session_platform: str,
     dump_passes: bool,
     codegen_only: bool,
+    pypto_log_level: LogLevel,
     compile_workers: int,
     device_pool: "queue.Queue[int]",
     analyze_auto_scopes_for_deps: bool = False,
-    enable_l2_swimlane: bool = False,
+    enable_chip_swimlane: int = 0,
     enable_dump_args: int = 0,
     enable_pmu: int = 0,
     enable_dep_gen: bool = False,
@@ -956,6 +1002,7 @@ def start_pipeline(  # noqa: PLR0913
     task_queue_timeout: int = 1800,
     task_submit_device: str = "auto",
     execute_batch_size: int = 64,
+    memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Spin up the compile pipeline and populate :data:`_compile_futures`.
 
@@ -975,16 +1022,16 @@ def start_pipeline(  # noqa: PLR0913
 
     _batch_stats.clear()  # fresh per session; read by pytest_terminal_summary
 
-    # Resolve PTO_ISA_ROOT once on the main thread before any compile workers
-    # start.  Otherwise concurrent workers race on `git clone` into the same
-    # path — the first wins, the rest fail with "destination already exists"
-    # and propagate "PTO_ISA_ROOT could not be resolved" as a pre-compilation
-    # error.  Once the env var is set, workers short-circuit via the env-var
-    # branch in ensure_pto_isa_root().
+    # Resolve the pinned pto-isa checkout once on the main thread, before any
+    # compile worker starts.  Correctness no longer depends on this — the
+    # resolver serializes concurrent callers with a file lock — but doing it
+    # here keeps the one-time clone off the critical path and surfaces a
+    # missing/unobtainable pin as a clean session error rather than as N
+    # identical per-test compile failures.
     if not codegen_only:
-        from pypto.runtime.device_runner import ensure_pto_isa_root  # noqa: PLC0415
+        from pypto.runtime import ensure_pto_isa_root  # noqa: PLC0415
 
-        ensure_pto_isa_root(clone_protocol="https")
+        ensure_pto_isa_root()
 
     _device_pool = device_pool
     _pipeline_ctx = {
@@ -993,8 +1040,9 @@ def start_pipeline(  # noqa: PLR0913
         "dump_passes": dump_passes,
         "codegen_only": codegen_only,
         "analyze_auto_scopes_for_deps": analyze_auto_scopes_for_deps,
+        "memory_planner": memory_planner,
         "dfx": _DfxOpts(
-            enable_l2_swimlane=enable_l2_swimlane,
+            enable_chip_swimlane=enable_chip_swimlane,
             enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
@@ -1021,7 +1069,12 @@ def start_pipeline(  # noqa: PLR0913
         n_exec = min(n_batches, _MAX_TASK_SUBMIT_INFLIGHT)
     else:
         n_exec = max(1, device_pool.qsize())
-    _execute_pool = ThreadPoolExecutor(max_workers=n_exec, thread_name_prefix="pypto-exec")
+    _execute_pool = ThreadPoolExecutor(
+        max_workers=n_exec,
+        thread_name_prefix="pypto-exec",
+        initializer=_set_thread_log_level,
+        initargs=(pypto_log_level,),
+    )
 
     groups: dict[BackendType, list[PTOTestCase]] = {}
     for tc in test_cases:
@@ -1031,11 +1084,16 @@ def start_pipeline(  # noqa: PLR0913
     for i, (backend_type, group) in enumerate(group_items):
         is_last = i == len(group_items) - 1
         set_backend_type(backend_type)
-        compile_pool = ThreadPoolExecutor(max_workers=compile_workers, thread_name_prefix="pypto-compile")
+        compile_pool = ThreadPoolExecutor(
+            max_workers=compile_workers,
+            thread_name_prefix="pypto-compile",
+            initializer=_set_thread_log_level,
+            initargs=(pypto_log_level,),
+        )
         _compile_pools.append(compile_pool)
         group_futs: list[Future] = []
         for tc in group:
-            key = _cache_key(tc, _resolve_platform(session_platform, tc))
+            key = _cache_key(tc, _resolve_platform(session_platform, tc), memory_planner)
             cfut = compile_pool.submit(
                 _fused_compile_task,
                 tc,
@@ -1043,6 +1101,7 @@ def start_pipeline(  # noqa: PLR0913
                 session_platform,
                 dump_passes,
                 analyze_auto_scopes_for_deps,
+                memory_planner,
             )
             _compile_futures[key] = cfut
             group_futs.append(cfut)
@@ -1181,7 +1240,7 @@ class TestRunner:
             RunResult with pass/fail status and details.
         """
         resolved_platform = _resolve_platform(self.config.platform, test_case)
-        cache_k = _cache_key(test_case, resolved_platform)
+        cache_k = _cache_key(test_case, resolved_platform, self.config.memory_planner)
         cfut = _compile_futures.get(cache_k)
         if cfut is not None:
             try:
@@ -1307,7 +1366,7 @@ class TestRunner:
                 backend_type=backend_type,
                 dump_passes=self.config.dump_passes,
                 analyze_auto_scopes_for_deps=self.config.analyze_auto_scopes_for_deps,
-                memory_planner=test_case.get_memory_planner(),
+                memory_planner=_resolve_case_memory_planner(test_case, self.config.memory_planner),
                 enable_pypto_l0c_double_buffer=test_case.get_enable_pypto_l0c_double_buffer(),
             )
 
@@ -1337,7 +1396,11 @@ class TestRunner:
 
             from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
-            chip_callable, runtime_name, _ = compile_and_assemble(work_dir, resolved_platform)
+            chip_callable, runtime_name, runtime_config = compile_and_assemble(
+                work_dir,
+                resolved_platform,
+            )
+            enable_sdma = bool(runtime_config.get("enable_sdma", False))
             # Undiscovered cases (the minority the collection scan can't see)
             # borrow a card via task-submit too, so EVERY device run goes through
             # task-submit's per-card lock. Running these in-process would bypass
@@ -1382,6 +1445,7 @@ class TestRunner:
                 resolved_platform,
                 self.config.device_id,
                 dfx=_DfxOpts.from_run_config(self.config),
+                enable_sdma=enable_sdma,
             )
 
             return RunResult(

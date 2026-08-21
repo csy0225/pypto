@@ -9,7 +9,10 @@ This pass transforms `InCoreScopeStmt` nodes into separate `Function(InCore)` de
 **Requirements**:
 
 - Input IR must be in SSA form (run ConvertToSSA first); SSAForm is preserved (produced) by this pass
-- Only processes Opaque functions (InCore functions are left unchanged)
+- Processes Opaque and Orchestration functions (InCore functions are left
+  unchanged). An Orchestration function carries InCore scopes when the parser
+  desugars a high-level construct such as `for i in pl.spmd(...)`; an Opaque
+  parent that outlines at least one scope is promoted to Orchestration
 
 **When to use**: Run after ConvertToSSA when you need to extract InCore computation regions into separate callable functions.
 
@@ -36,8 +39,10 @@ program_outlined = outline_pass(program)
 
 ## Algorithm
 
-1. **Scan for InCore Scopes**: Find all `InCoreScopeStmt` nodes in Opaque functions
-2. **Analyze Inputs**: Determine external variable references (variables defined outside scope, used inside)
+1. **Scan for InCore Scopes**: Find all `InCoreScopeStmt` nodes in Opaque and
+   Orchestration functions
+2. **Analyze Inputs**: Collect the scope's *live-in* set — variables the body reads
+   before it (re)defines them, so their incoming value comes from the caller
 3. **Analyze Outputs**: Determine internal definitions used after scope (variables defined inside, used outside)
 4. **Create Function**: Extract scope body into new `Function(scope_type=InCore)` with:
    - Parameters = input variables
@@ -47,6 +52,104 @@ program_outlined = outline_pass(program)
    - Call to outlined function with input arguments
    - AssignStmt for each output variable
 6. **Add to Program**: Add outlined function to program's function list
+7. **Promote the parent**: an Opaque parent that outlined at least one scope becomes
+   `Orchestration` — and its param dyn-dim reads are folded first (below)
+
+**Param dyn-dim reads fold on promotion**: a tensor's declared extent *is* its
+runtime extent, so `pl.tensor.dim(a, 0)` on a param whose axis is a `pl.dynamic`
+symbol mints a *second* IR name for one quantity, and shapes built from the copy
+no longer compare equal to shapes built from the symbol. The DSL parser folds
+that read onto the symbol (`ASTParser._fold_tensor_dim`), but only in an
+Orchestration body — that is where Orchestration codegen defines the symbol from
+the param's task-arg descriptor, and where the fold is therefore sound. A body
+written as `Opaque` keeps the read, so this pass folds it at the moment it
+promotes the function, *before* outlining:
+
+```python
+# Opaque parent, as written                # after promotion
+m = pl.tensor.dim(a, 0)                    # (binding folded away)
+with pl.spmd(m // 16):                     with pl.spmd(M_DYN // 16):
+    ...                                        ...
+```
+
+Folding before the outliner runs means the promoted body reaches it in the same
+shape the parser hands an already-Orchestration function, so both paths produce
+identical IR. Without it the pass emits IR that no longer parses back to itself
+(the printed `tensor.dim` binding vanishes on reparse), breaking print→parse
+round-trip verification. Reads the parser would not fold are left alone: a
+constant extent, a runtime axis, or a symbol the signature does not declare.
+
+**Live-in, not `uses \ defs`**: the input set is computed flow-sensitively
+(`UpwardExposedUseCollector`). A plain set difference is wrong for a captured
+tensor that the body reads *and* rebinds under the same name — the shape the
+parser emits for a `pl.Out` param before `ConvertToSSA` splits it:
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP):
+    c = pl.store(t, [0, 0], c)   # one Var: read as the store target, then rebound
+```
+
+`c` is in both `var_uses` and `var_defs`, so the difference drops it from the
+parameter list and leaves the use dangling in the outlined body. Treating it as
+live-in makes it a write parameter, and the `tile.store` result binds a
+distinct Var (`c__store`) so the outlined body never rebinds its own parameter:
+
+```python
+def main_incore_0(a: Tensor[[128, 128], FP32], c: Out[Tensor[[128, 128], FP32]]):
+    c__store = pl.tile.store(..., c)
+    return c                       # the param — store writes through it in place
+```
+
+On SSA input — the pass's declared `IRProperty::SSAForm` precondition — live-in
+and `uses \ defs` are identical, so this only changes behaviour for IR that
+reaches the pass without that precondition holding. A captured variable rebound
+by anything *other* than a `tile.store` cannot be expressed without real SSA
+construction and is rejected with an internal error naming `ConvertToSSA`.
+
+The distinct result Var is the InCore/Cluster/Spmd outcome. Hierarchy scopes
+skip the store-target export entirely (the buffer is already visible to the
+caller through its write parameter), so their body keeps the original rebind —
+the capture still becomes a parameter, which is the part that was broken.
+
+**Write direction: `Out` unless the body reads**: a captured tensor the scope
+writes — a `tile.store` target or a `tensor.assemble` destination — is lifted
+off `In` by `InferParamDirections`. Which write direction it earns is decided by
+whether the body also *reads* it. Both write ops update a sub-region of the
+destination **in place**: the untouched region is neither loaded nor re-stored,
+so appearing in that destination slot moves no data into the scope and is not a
+read. A parameter whose only uses are destination slots is therefore `Out`;
+anything else — feeding a `tensor.slice`, a compute op, or a callee's `In`/`InOut`
+param — makes it `InOut`. Under SSA the post-write state binds to a fresh Var, so
+reading *that* alias counts too: the alias names the same buffer, and a read over
+a region the scope never wrote does need the incoming contents. Unrecognised uses
+count as reads, so the inference can only err towards `InOut`.
+
+Two keys are excluded: `dump_vars` and `arg_direction_overrides_vars` name a
+tensor as bookkeeping (dump marking, `NoDep` opt-out) rather than accessing it.
+
+Each source of evidence — the read scan, the store-target set, the assemble scan,
+and each inner callee's declared slot — is a *lower* bound on the accesses, so
+they are merged along `In < Out < InOut` rather than overwriting one another. A
+plain assignment would let a callee that declares its slot `Out` erase a read the
+body really performs.
+
+**Hierarchy scopes are an exception.** `OutlineScope` deliberately leaves
+`store_output_set` empty for `ScopeKind::Hierarchy` (the buffer is already
+visible to the caller without an explicit returned output), so a `tile.store`
+target captured by a Hierarchy scope never reaches the rule above and its
+parameter stays `In`. That predates the write-direction rule and is unchanged
+here.
+
+Claiming `InOut` for a parameter the body never reads is not a safe
+approximation. The direction propagates into
+`DistributedCodegen::EmitCallToWorker`, which tags each per-rank chip dispatch
+argument from the *callee's* direction, so a false `InOut` turns disjoint
+per-rank slices of one `pl.Out` tensor into a cross-rank write dependency
+(issue #2415). Ordering a write-only parameter genuinely needs is not lost:
+[`DeriveCallDirections`](37-derive_call_directions.md) re-derives the
+*call-site* direction and promotes a callee `Out` back to `InOut` under a
+sequential ancestor, behind a prior writer of the same root, or when the root is
+an enclosing `InOut` parameter.
 
 **Param-explicit returns**: the outlined function returns its
 own parameters, not SSA result vars, whenever a tensor output writes through
@@ -107,7 +210,7 @@ class Before:
 ```python
 @pl.program
 class After:
-    @pl.function  # Opaque function
+    @pl.function(type=pl.FunctionType.Orchestration)  # promoted from Opaque
     def main(self, x: Tensor[[64], FP32]) -> Tensor[[64], FP32]:
         y = x + 1
 
@@ -200,8 +303,64 @@ passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes, "Outline InCore 
 **Mutually exclusive AIV-split mechanisms**: a function-level AUTO split
 (`optimizations=[pl.split(mode)]`, carried as the scope's own `split_`) and
 explicit `pl.split_aiv` regions (`SplitAivScopeStmt`) cannot coexist on one
-scope. This pass rejects the combination (it bridges a single region's mode into
-a function-level representative `split`, which would silently collide with the
-user's `pl.split`). See
-[`LowerAutoVectorSplit`](18-lower_auto_vector_split.md) for how the surviving
-mechanism is lowered.
+scope (the outliner bridges a single region's mode into a function-level
+representative `split`, which would silently collide with the user's
+`pl.split`). See [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) for how
+the surviving mechanism is lowered.
+
+**Any** `pl.split(...)` is rejected, `SplitMode.NONE` included (RFC #1820). NONE
+carries no split of its own, but writing it on a scope that also holds regions
+still reads as "auto and manual split mixed on one scope". The exemption that
+used to allow it existed only because the cross-core slot count had no carrier
+other than `pl.split(..., slot_num=N)`; it now has one —
+`optimizations=[pl.cross_core_slot(slot_num=N)]`, which is orthogonal to
+splitting and coexists with regions freely.
+
+**Where the rejection fires.** `InCoreScopeStmt::split_` has a single encoding of
+"no split" (`SplitMode::None`), so a literal `pl.split(pl.SplitMode.NONE)` is
+invisible to this pass — it looks identical to writing no `pl.split` at all. The
+**parser** therefore owns the rejection: it is the only layer that sees the
+literal the user wrote, and it rejects every mode, NONE included. This pass keeps
+the check for `split_ != SplitMode::None` as the backstop for IR that never went
+through the parser (deserialized `.pto`, programmatically built scopes).
+
+The three states read distinctly:
+
+| Annotation | Meaning |
+| ---------- | ------- |
+| `optimizations=[pl.split(MODE)]` | AUTO split — the compiler partitions the vector work |
+| `for aiv_id in pl.split_aiv(2, mode=...)` | Manual split — the author partitions it per region |
+| `optimizations=[pl.cross_core_slot(slot_num=N)]` | Neither — just sizes the cross-core pipe |
+
+**The function-level `split` attr has one encoding of "no split": an absent key.**
+When the outlined body holds `pl.split_aiv` regions, this pass bridges their mode
+onto the function only when all regions agree *and* that mode is a real split:
+
+| Regions in the body | Attrs stamped on the outlined function |
+| ------------------- | -------------------------------------- |
+| All `mode=UP_DOWN` (or all `LEFT_RIGHT`) | `{"split_aiv": True, "split": pl.SplitMode.UP_DOWN}` |
+| All `mode=NONE` | `{"split_aiv": True}` — no `split` key |
+| Differing modes | `{"split_aiv": True}` — no representative mode |
+
+`Function::GetSplitMode()` maps a stored `0` to `nullopt` exactly as it does an
+absent key, so a `split=SplitMode.NONE` entry was invisible to every consumer —
+and the parser drops it, which made print → parse lossy (`Kwargs size mismatch`).
+The authoritative per-region mode always rides `SplitAivScopeStmt::split_`, which
+[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) consumes. The printer
+applies the same rule as a backstop: it omits a `split` attr of `SplitMode.NONE`
+so IR that bypassed this pass (a pre-existing `.pto` blob, a programmatically
+built `Function`) still prints in the canonical, re-parsable form.
+
+## Pass Properties
+
+| Property | Value |
+| -------- | ----- |
+| Required | SSAForm |
+| Produced | SSAForm, SplitIncoreOrch, AivSplitValid |
+| Invalidated | — |
+
+`AivSplitValid` opens here. The pass preserves the first-class `SplitAivScopeStmt` regions inside
+each outlined InCore function, so the structural region verifier can run from this point until
+[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) erases the node and invalidates the
+property. `ConvertTensorToTileOps` and `InferTileMemorySpace` re-verify it in between, once the
+boundary's memory side becomes observable.

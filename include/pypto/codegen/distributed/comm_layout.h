@@ -25,7 +25,7 @@ namespace comm_layout {
 // Field offsets and size of the runtime CommContext struct. The values come
 // from `offsetof(::CommContext, ...)` on the runtime header, then the
 // static_asserts below pin them to the literal numbers that distributed
-// codegen embeds into the emitted CommRemoteOffset() helper function.
+// codegen embeds inline into the peer-offset arithmetic of emitted kernels.
 //
 // If the runtime CommContext layout ever shifts (field reorder, insert, type
 // change), pypto's `cmake --build` fails here — codegen would otherwise
@@ -39,6 +39,10 @@ inline constexpr std::size_t kWindowsInOffset = offsetof(::CommContext, windowsI
 inline constexpr std::size_t kWindowsOutOffset = offsetof(::CommContext, windowsOut);
 inline constexpr std::size_t kWindowSlotStride = sizeof(std::uint64_t);
 inline constexpr std::size_t kCommCtxSize = sizeof(::CommContext);
+// Simpler carves communication buffers sequentially from one device window.
+// Keep every buffer start MTE/CCU-safe, and leave enough physical tail room
+// for an FP16 remote TLOAD rounded to the 32-byte transfer granularity.
+inline constexpr std::size_t kCommBufferAlignmentBytes = 32;
 
 static_assert(kRankIdOffset == 16, "CommContext.rankId offset drift");
 static_assert(kRankNumOffset == 20, "CommContext.rankNum offset drift");

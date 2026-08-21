@@ -43,8 +43,23 @@ const char* TileLayoutToStr(ir::TileLayout layout);
 /// v_row/v_col are the valid shape dimensions (may differ from rows/cols).
 std::string FormatTileBufTypeString(const std::string& loc, const std::string& dtype_str, int64_t rows,
                                     int64_t cols, ir::TileLayout blayout, ir::TileLayout slayout,
-                                    uint64_t fractal, ir::PadValue pad, int64_t v_row, int64_t v_col,
-                                    bool v_row_dynamic = false, bool v_col_dynamic = false);
+                                    uint64_t fractal, ir::PadValue pad, ir::CompactMode compact,
+                                    int64_t v_row, int64_t v_col, bool v_row_dynamic = false,
+                                    bool v_col_dynamic = false);
+
+/// The slot-count bounds ptoas's `!pto.multi_tile_buf` verifier enforces
+/// (`MAX_MULTI_BUFFER_NUM = 16`). Under the PTOAS memory planner a declaration
+/// outside them is rejected — falling back to one alloc per slot would let ptoas
+/// plan the slots on top of each other. The ordinary one-alloc-per-slot lowering
+/// is the PyPTO planner's path, where the baked addresses keep them apart.
+inline constexpr uint64_t kMinMultiTileBufSlots = 2;
+inline constexpr uint64_t kMaxMultiTileBufSlots = 16;
+
+/// Wrap a single-slot `!pto.tile_buf<...>` into ptoas's N-slot container type,
+/// `!pto.multi_tile_buf<<slot>, count=N>` — the result of `pto.alloc_multi_tile`
+/// and the operand of `pto.multi_tile_get`. `count` must be within ptoas's
+/// `[2, 16]`; callers gate on that before reaching here.
+std::string FormatMultiTileBufTypeString(const std::string& slot_type_str, uint64_t count);
 
 /// Intermediate result holder for ExtractTileTypeInfo.
 struct TileTypeComponents {
@@ -55,6 +70,7 @@ struct TileTypeComponents {
   ir::TileLayout slayout = ir::TileLayout::none_box;
   uint64_t fractal = 512;
   ir::PadValue pad = ir::PadValue::null;
+  ir::CompactMode compact = ir::CompactMode::null;
   int64_t v_row = 32;
   int64_t v_col = 32;
   bool v_row_dynamic = false;

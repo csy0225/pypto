@@ -50,6 +50,25 @@ std::optional<MemorySpace> ValidateTileMemorySpaceConsistency(const std::optiona
   return memory_space;
 }
 
+void ValidatePackedFp4Shape(const DataType& dtype, const std::vector<ExprPtr>& shape) {
+  if (dtype != DataType::FP4) return;
+  CHECK(!shape.empty()) << "Packed FP4 shaped types must have rank >= 1";
+  auto packed_extent = As<ConstInt>(shape.back());
+  if (!packed_extent) return;
+  CHECK(packed_extent->value_ > 0 && packed_extent->value_ % 2 == 0)
+      << "Packed FP4 shaped types require a positive even logical last dimension, but got "
+      << packed_extent->value_;
+}
+
+std::vector<ExprPtr> MakeShapeExprs(const std::vector<int64_t>& shape) {
+  std::vector<ExprPtr> result;
+  result.reserve(shape.size());
+  for (int64_t dim : shape) {
+    result.push_back(std::make_shared<ConstInt>(dim, DataType::INDEX, Span::unknown()));
+  }
+  return result;
+}
+
 void ClearRedundantFullValidShape(std::vector<ExprPtr>& valid_shape, const std::vector<ExprPtr>& shape) {
   if (!valid_shape.empty() && AreExprVectorsEqual(valid_shape, shape)) {
     valid_shape.clear();
@@ -87,7 +106,7 @@ bool operator==(const TileView& lhs, const TileView& rhs) {
   return AreExprVectorsEqual(lhs.valid_shape, rhs.valid_shape) &&
          AreExprVectorsEqual(lhs.stride, rhs.stride) && AreExprsEqual(lhs.start_offset, rhs.start_offset) &&
          lhs.blayout == rhs.blayout && lhs.slayout == rhs.slayout && lhs.fractal == rhs.fractal &&
-         lhs.pad == rhs.pad;
+         lhs.pad == rhs.pad && lhs.compact == rhs.compact;
 }
 
 bool operator!=(const TileView& lhs, const TileView& rhs) { return !(lhs == rhs); }
@@ -139,11 +158,12 @@ size_t Hash(const TileView& tv) {
   h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.slayout)));
   h = hash_combine(h, std::hash<uint64_t>{}(tv.fractal));
   h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.pad)));
+  h = hash_combine(h, std::hash<int>{}(static_cast<int>(tv.compact)));
   return static_cast<size_t>(h);
 }
 
 ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape)
-    : dtype_(dtype), shape_(std::move(shape)), memref_(std::nullopt) {}
+    : ShapedType(dtype, std::move(shape), std::optional<MemRefPtr>{}) {}
 
 std::string TensorLayoutToString(TensorLayout layout) {
   switch (layout) {
@@ -153,6 +173,10 @@ std::string TensorLayoutToString(TensorLayout layout) {
       return "DN";
     case TensorLayout::NZ:
       return "NZ";
+    case TensorLayout::MX_A_ZZ:
+      return "MX_A_ZZ";
+    case TensorLayout::MX_B_NN:
+      return "MX_B_NN";
     default:
       throw TypeError("Unknown TensorLayout value: " + std::to_string(static_cast<int>(layout)));
   }
@@ -165,6 +189,10 @@ TensorLayout StringToTensorLayout(const std::string& str) {
     return TensorLayout::DN;
   } else if (str == "NZ") {
     return TensorLayout::NZ;
+  } else if (str == "MX_A_ZZ") {
+    return TensorLayout::MX_A_ZZ;
+  } else if (str == "MX_B_NN") {
+    return TensorLayout::MX_B_NN;
   }
   throw TypeError("Unknown TensorLayout string: " + str);
 }
@@ -193,12 +221,28 @@ TileLayout StringToTileLayout(const std::string& str) {
   throw TypeError("Unknown TileLayout string: " + str);
 }
 
-ShapedType::ShapedType(DataType dtype, const std::vector<int64_t>& shape, std::optional<MemRefPtr> memref)
-    : dtype_(dtype), memref_(std::move(memref)) {
-  for (int64_t dim : shape) {
-    shape_.push_back(std::make_shared<ConstInt>(dim, DataType::INDEX, Span::unknown()));
+std::string CompactModeToString(CompactMode mode) {
+  switch (mode) {
+    case CompactMode::null:
+      return "null";
+    case CompactMode::normal:
+      return "normal";
+    default:
+      throw TypeError("Unknown CompactMode value: " + std::to_string(static_cast<int>(mode)));
   }
 }
+
+CompactMode StringToCompactMode(const std::string& str) {
+  if (str == "null") {
+    return CompactMode::null;
+  } else if (str == "normal") {
+    return CompactMode::normal;
+  }
+  throw TypeError("Unknown CompactMode string: " + str);
+}
+
+ShapedType::ShapedType(DataType dtype, const std::vector<int64_t>& shape, std::optional<MemRefPtr> memref)
+    : ShapedType(dtype, MakeShapeExprs(shape), std::move(memref)) {}
 
 TensorView::TensorView(const std::vector<int64_t>& stride_ints, TensorLayout layout_,
                        const std::vector<int64_t>& valid_shape_ints, PadValue pad_)
@@ -213,12 +257,13 @@ TensorView::TensorView(const std::vector<int64_t>& stride_ints, TensorLayout lay
 
 TileView::TileView(const std::vector<int64_t>& valid_shape_ints, const std::vector<int64_t>& stride_ints,
                    ExprPtr start_offset_, TileLayout blayout_, TileLayout slayout_, uint64_t fractal_,
-                   PadValue pad_)
+                   PadValue pad_, CompactMode compact_)
     : start_offset(std::move(start_offset_)),
       blayout(blayout_),
       slayout(slayout_),
       fractal(fractal_),
-      pad(pad_) {
+      pad(pad_),
+      compact(compact_) {
   for (int64_t v : valid_shape_ints) {
     valid_shape.push_back(std::make_shared<ConstInt>(v, DataType::INDEX, Span::unknown()));
   }
@@ -228,10 +273,12 @@ TileView::TileView(const std::vector<int64_t>& valid_shape_ints, const std::vect
 }
 
 ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, MemRefPtr memref)
-    : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {}
+    : ShapedType(dtype, std::move(shape), std::optional<MemRefPtr>{std::move(memref)}) {}
 
 ShapedType::ShapedType(DataType dtype, std::vector<ExprPtr> shape, std::optional<MemRefPtr> memref)
-    : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {}
+    : dtype_(dtype), shape_(std::move(shape)), memref_(std::move(memref)) {
+  ValidatePackedFp4Shape(dtype_, shape_);
+}
 
 TensorType::TensorType(std::vector<ExprPtr> shape, DataType dtype, std::optional<MemRefPtr> memref,
                        std::optional<TensorView> tensor_view)

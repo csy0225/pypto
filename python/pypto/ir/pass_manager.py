@@ -12,7 +12,7 @@
 import os
 import re
 from collections.abc import Callable
-from enum import Enum
+from enum import Enum, unique
 
 from pypto.compile_profiling import CompileProfiler
 from pypto.pypto_core import ir as core_ir
@@ -85,11 +85,11 @@ def _format_warnings(
 PassFactory = Callable[[], passes.Pass]
 
 
+@unique
 class OptimizationStrategy(Enum):
     """Enumeration of optimization strategies."""
 
     Default = "Default"  # Full tensor-oriented PTO pipeline
-    DebugTileOptimization = "DebugTileOptimization"  # Debug-only PTO tile pipeline
 
 
 class PassDumpLevel(Enum):
@@ -149,6 +149,8 @@ class PassManager:
         analyze_auto_scopes_for_deps: bool,
     ) -> tuple[PassFactory, ...]:
         """Build the immutable pass-factory recipe for an optimization strategy."""
+        if strategy != OptimizationStrategy.Default:
+            raise ValueError(f"Unsupported optimization strategy: {strategy!r}")
         tensor_prefix_passes: tuple[PassFactory, ...] = (
             # Eliminate FunctionType.Inline functions by splicing their bodies at
             # every call site. Runs FIRST so no downstream pass observes Inline
@@ -175,9 +177,14 @@ class PassManager:
         tile_pto_passes: tuple[PassFactory, ...] = (
             passes.lower_composite_ops,
             passes.flatten_tile_nd_to_2d,
+            # Expand non-native tile.cast (src,dst) pairs into shortest native
+            # cast chains (e.g. A5 INT32→FP16 → INT32→FP32→FP16) before
+            # AutoTileMatmulL0 may FIXPIPE-fold already-native f32→bf16/f16.
+            passes.legalize_tile_cast,
             passes.auto_tile_matmul_l0,
             passes.canonicalize_tile_slice,
             passes.infer_tile_memory_space,
+            passes.insert_mx_scale_addr,
             passes.resolve_backend_op_layouts,
             # RFC #1300: convert AUTO pl.split mixed InCore functions into the explicit
             # split_aiv form (aiv_shard/aic_gather + halved vector sub-region) so
@@ -196,6 +203,12 @@ class PassManager:
             passes.stamp_tfree_split,
             passes.normalize_return_order,
             passes.skew_cross_core_pipeline,
+            # LowerPipelineToSlots multi-buffers what it can via MemRef slots (one
+            # body, one N-slot allocation) and demotes those loops; every loop it
+            # declines stays ForKind.Pipeline for LowerPipelineLoops to replicate.
+            # It is self-gated on memory_planner=PTOAS, so the default path is
+            # unchanged — hence both passes run, rather than one replacing the other.
+            passes.lower_pipeline_to_slots,
             passes.lower_pipeline_loops,
             passes.canonicalize_io_order,
             # MaterializeTensorStrides fills empty stride slots on every
@@ -204,8 +217,8 @@ class PassManager:
             passes.init_mem_ref,
             # MaterializeSemanticAliases forces loop-carried / in-place buffers to
             # share one MemRef (semantics-required aliasing). It always runs; only
-            # the opportunistic lifetime coalescing (MemoryReuse) is skippable when
-            # ptoas owns reuse (memory_planner=PTOAS).
+            # legacy opportunistic coalescing is skipped when DSA_RP or PTOAS owns
+            # lifetime reuse.
             passes.materialize_semantic_aliases,
             # MemoryReuse coalesces independent tile buffers by lifetime; on
             # Ascend910B split-AIV it also avoids the load + tpop_from_aic in-place
@@ -234,8 +247,9 @@ class PassManager:
             passes.simplify,
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
-            # 1:1 from the IR. Runs dead last, after the final Simplify, so no
-            # other transform has to reason about the inserted scope wrappers.
+            # 1:1 from the IR. Runs after the final Simplify and after every
+            # rewriting transform, so none of them has to reason about the
+            # inserted scope wrappers.
             passes.materialize_runtime_scopes,
             # Classify each Orchestration ForStmt iter_arg as a trivial alias or a
             # materialised rebind carry (and size manual-scope TaskId array
@@ -243,12 +257,22 @@ class PassManager:
             # MaterializeRuntimeScopes so the classified IR is exactly the IR
             # orchestration codegen lowers.
             passes.classify_iter_arg_carry,
+            # Insert a whole-tensor system.cacheinvalid + GM system.fence between
+            # each publishing write and the pld.system.notify that releases it
+            # (data-before-signal, required by the latest PTOAS). Runs dead last,
+            # after every statement-reordering pass, so the inserted ops stay
+            # adjacent to their notify through codegen; additive InCore-only
+            # insertion that touches no property.
+            passes.insert_comm_fence,
+            # Give every device-kernel valid_shape symbol that the kernel cannot
+            # bind (not a physical tensor dim, not a scalar param) a leading
+            # Scalar[INDEX] parameter, fed from the caller's actual valid extent.
+            # Runs dead last: it only extends signatures and call arg lists, and
+            # by here both are final, so no later pass has to account for the
+            # appended parameter.
+            passes.materialize_valid_shape_symbols,
         )
-        if strategy == OptimizationStrategy.Default:
-            return tensor_prefix_passes + tensor_only_passes + tile_pto_passes
-        if strategy == OptimizationStrategy.DebugTileOptimization:
-            return tensor_prefix_passes + tile_pto_passes
-        raise ValueError(f"Unsupported optimization strategy: {strategy!r}")
+        return tensor_prefix_passes + tensor_only_passes + tile_pto_passes
 
     @classmethod
     def get_strategy(
@@ -292,26 +316,32 @@ class PassManager:
         self.strategy = strategy
         self.analyze_auto_scopes_for_deps = analyze_auto_scopes_for_deps
 
-        # When the active PassContext selects ptoas as the memory planner, skip
-        # the opportunistic lifetime reuse (MemoryReuse) and address assignment
-        # (AllocateMemoryAddr) so ptoas PlanMemory owns them (codegen emits no
-        # `pto.alloc_tile addr` and ptoas runs at --pto-level=level2).
+        # DSA_RP consumes the allocation identities produced by
+        # MaterializeSemanticAliases and performs lifetime reuse itself in
+        # AllocateMemoryAddr, so it skips only the legacy MemoryReuse pass.
+        # PTOAS skips both legacy reuse and address assignment.
         # MaterializeSemanticAliases still runs, so semantics-required aliasing
         # (loop-carried accumulators, in-place ops) is preserved as a shared
         # MemRef that codegen renders as one tile_buf handle — ptoas cannot
         # recover that from independent addr-less allocs. Read here because
         # __init__ runs inside the compile() PassContext (see compile.py).
         ctx = passes.PassContext.current()
-        # The construction-time planner fixes the pass LIST (MemoryReuse +
-        # AllocateMemoryAddr are dropped only for PTOAS). PTOAS-gated pass *behaviour*
+        # The construction-time planner fixes the pass list: DSA_RP drops
+        # MemoryReuse, while PTOAS drops MemoryReuse + AllocateMemoryAddr.
+        # Planner-gated pass behaviour
         # (AutoTileMatmulL0's dbC=2) reads the planner again at execution time, so
         # run_passes re-asserts the run-time planner still matches this one — otherwise a
         # PassManager built outside PTOAS but run inside a PTOAS context would keep
         # MemoryReuse yet still select dbC=2, coalescing the two co-live L0C accumulators
         # into one shrunk single-buffer tile (see _check_planner_consistency).
         self._construction_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
-        skip_mem_planning = self._construction_planner == passes.MemoryPlanner.PTOAS
-        _mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
+        skipped_mem_planning_passes: tuple[str, ...]
+        if self._construction_planner == passes.MemoryPlanner.PTOAS:
+            skipped_mem_planning_passes = ("MemoryReuse", "AllocateMemoryAddr")
+        elif self._construction_planner == passes.MemoryPlanner.DSA_RP:
+            skipped_mem_planning_passes = ("MemoryReuse",)
+        else:
+            skipped_mem_planning_passes = ()
 
         # The C++ pipeline is the single source of truth for both pass objects
         # and names. Strategy recipes contain factories only; names always come
@@ -323,7 +353,7 @@ class PassManager:
         )
         for pass_factory in pass_factories:
             pass_obj = pass_factory()
-            if skip_mem_planning and pass_obj.get_name() in _mem_planning_passes:
+            if pass_obj.get_name() in skipped_mem_planning_passes:
                 continue
             self._pipeline.add_pass(pass_obj)
 
@@ -340,15 +370,13 @@ class PassManager:
     def _check_planner_consistency(self) -> None:
         """Fail loud if the run-time memory planner differs from the construction-time one.
 
-        The pass LIST is fixed at construction: ``MemoryReuse`` / ``AllocateMemoryAddr``
-        are dropped iff the construction-time ``PassContext`` selected PTOAS. But
-        PTOAS-gated pass *behaviour* — ``AutoTileMatmulL0``'s dbC=2 selection — reads
-        ``GetMemoryPlanner()`` at *execution* time. If a PassManager built outside PTOAS
-        is then run inside a PTOAS context, the pipeline still contains ``MemoryReuse``
-        yet the chooser selects dbC=2, so ``MemoryReuse`` coalesces the two co-live L0C
-        accumulators into one — a shrunk single-buffer tile, the exact regression dbC=2
-        exists to avoid. ``compile()`` builds and runs under the same context, so this
-        never fires there; it guards misuse (build under one planner, run under another).
+        The pass list is fixed at construction: DSA_RP drops ``MemoryReuse`` and
+        PTOAS also drops ``AllocateMemoryAddr``. Planner-gated pass behaviour,
+        including ``AutoTileMatmulL0``'s dbC=2 selection, reads
+        ``GetMemoryPlanner()`` at execution time. Constructing under one planner
+        and running under another would therefore combine the wrong pass list
+        with the chosen lowering. ``compile()`` builds and runs under one
+        context, so this guard only catches direct PassManager misuse.
         """
         ctx = passes.PassContext.current()
         run_planner = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
@@ -489,7 +517,7 @@ class PassManager:
         # so callers' diagnostic intent isn't reset.
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
-        # Propagate the outer memory planner AND the PyPTO dbC=2 opt-in: a nested
+        # Propagate the outer memory planner AND the legacy-PYPTO dbC=2 opt-in: a nested
         # PassContext otherwise resets them to the binding defaults, which silently
         # disables planner-gated pass behaviour (AutoTileMatmulL0's dbC=2 tile
         # selection reads GetMemoryPlanner() + GetEnablePyptoL0cDoubleBuffer()
@@ -535,7 +563,7 @@ class PassManager:
         ctx = passes.PassContext.current()
         outer_instruments = list(ctx.get_instruments()) if ctx else []
         level = ctx.get_verification_level() if ctx else passes.get_default_verification_level()
-        # Propagate the outer memory planner + PyPTO dbC=2 opt-in (see run_passes)
+        # Propagate the outer memory planner + legacy-PYPTO dbC=2 opt-in (see run_passes)
         # so profiling doesn't silently reset them and disable planner-gated behaviour.
         mplan = ctx.get_memory_planner() if ctx else passes.MemoryPlanner.PYPTO
         dbc_flag = ctx.get_enable_pypto_l0c_double_buffer() if ctx else False

@@ -17,11 +17,14 @@
  * :class:`DistributedTensorType` across every rank of its comm group, using a
  * window-bound INT32 ``signal`` matrix for the cross-rank barrier. Sibling of
  * ``pld.system.notify`` / ``pld.system.wait`` / ``pld.tile.remote_load``.
- * Explicit-signal InCore allreduce uses the 4-phase decomposition in
+ * Explicit-signal InCore mesh allreduce uses a ready barrier followed by
+ * UB-sized reduce/barrier/store chunks in
  * ``src/ir/transforms/lower_composite_ops_pass.cpp``; host-level allreduce is
  * lowered later by ``LowerHostTensorCollectives``.
- * Explicit signal buffers are single-shot: callers issuing multiple allreduces
- * must provide a fresh signal for each call.
+ * The ``signal`` buffer is self-clearing: each lowering restores the barrier
+ * cells to zero before the call returns (the InCore credit-barrier protocol;
+ * the host builtins carry the matching epilogue), so one signal is reusable
+ * across back-to-back calls and, on the InCore rail, inside for/while loops.
  *
  * IR signature:
  *
@@ -29,9 +32,8 @@
  *     pld.tensor.allreduce(target, signal, *, op: int)  -> DistributedTensorType
  *
  * The ``op`` integer is the underlying value of :enum:`ReduceOp` (see
- * ``include/pypto/ir/comm.h``); the deducer rejects unsupported variants so
- * the lowering rule can dispatch without a separate guard. First-version
- * lowering implements only ``ReduceOp::kSum``.
+ * ``include/pypto/ir/comm.h``). Sum, maximum, minimum, and product are
+ * supported by both mesh and ring lowering.
  *
  * Result type: same as ``target`` (the call is in-place — semantically the
  * returned :class:`DistributedTensor` *is* ``target``, post-reduce). User code
@@ -46,12 +48,12 @@
  *   orchestrator's ``pld.window(...)`` call and may be ``nullopt`` on
  *   InCore parameters that flow through; matching the sibling
  *   ``pld.system.notify`` / ``pld.tile.remote_load`` deducers, this op
- *   relies on the kind check alone here.
+ *   relies on the kind check alone here. Its element type must be FP16 or
+ *   FP32.
  * * ``signal`` must have :class:`DistributedTensorType` with element type
  *   INT32 — the lowering uses ``pld.system.notify`` / ``pld.system.wait``
  *   against this slot.
- * * ``op`` kwarg must be a known :enum:`ReduceOp` value; first-version
- *   lowering accepts only ``ReduceOp::kSum``.
+ * * ``op`` kwarg must be a known :enum:`ReduceOp` value.
  */
 
 #include <any>
@@ -86,6 +88,8 @@ TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
   CHECK(target_type) << "pld.tensor.allreduce target must be a DistributedTensor (window-bound), "
                         "got "
                      << args[0]->GetType()->TypeName();
+  CHECK(target_type->dtype_ == DataType::FP16 || target_type->dtype_ == DataType::FP32)
+      << "pld.tensor.allreduce target dtype must be FP16 or FP32, got " << target_type->dtype_.ToString();
 
   if (args.size() == 2) {
     auto signal_type = As<DistributedTensorType>(args[1]->GetType());
@@ -98,14 +102,13 @@ TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
         << signal_type->dtype_.ToString();
   }
 
-  // Validate `op` kwarg falls in the ReduceOp range — first version supports
-  // kSum only; the other enum values are accepted by the parser binding but
-  // rejected here so users get a clear error rather than silently wrong
-  // codegen.
+  // Validate `op` kwarg falls in the ReduceOp range.
   auto op_value = GetRequiredKwarg<int>(kwargs, "op", "pld.tensor.allreduce");
-  CHECK(op_value == static_cast<int>(ReduceOp::kSum))
-      << "pld.tensor.allreduce op must be ReduceOp.Sum (got int " << op_value
-      << "); Max / Min / Prod lowerings are not yet implemented";
+  CHECK(op_value >= static_cast<int>(ReduceOp::kSum) && op_value <= static_cast<int>(ReduceOp::kProd))
+      << "pld.tensor.allreduce op must be ReduceOp.Sum, Max, Min, or Prod (got int " << op_value << ")";
+
+  auto core_num = GetRequiredKwarg<int>(kwargs, "core_num", "pld.tensor.allreduce");
+  CHECK(core_num > 0) << "pld.tensor.allreduce core_num must be positive, got " << core_num;
 
   // Result type: same DistributedTensorType as the input target (in-place
   // reduce — the same view holds the reduced value on every rank). Preserve
@@ -126,8 +129,8 @@ REGISTER_OP("pld.tensor.allreduce")
         "group. After the call, every rank's slice of `target` holds the reduced value. "
         "`signal`, when present, is a window-bound INT32 matrix used as the cross-rank barrier "
         "(one slot per rank). Host one-argument calls synthesize a private signal before lowering. "
-        "`op` selects the reduction operator. Explicit-signal InCore calls are lowered to a 4-phase "
-        "decomposition (notify / wait / remote_load + accumulate / store) by LowerCompositeOps; "
+        "`op` selects the reduction operator. Explicit-signal InCore calls are lowered to a ready "
+        "barrier plus UB-sized remote_load + accumulate + guarded store chunks by LowerCompositeOps; "
         "host-level calls are lowered later by LowerHostTensorCollectives.")
     .set_op_category("DistributedOp")
     .add_argument("target", "Window-bound DistributedTensor (InOut)")
@@ -135,7 +138,12 @@ REGISTER_OP("pld.tensor.allreduce")
                   "Optional window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .set_attr<int>("op")
     .set_attr<std::string>("mode")
+    .set_attr<int>("core_num")
     .no_memory_spec()
+    // Composite collective — target is reduced in place per chunk; signal is written by notify and read by
+    // wait.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorAllReduceType);
 
 }  // namespace ir

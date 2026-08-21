@@ -12,7 +12,7 @@
 import pypto.language as pl
 import pytest
 from pypto import ir
-from pypto.language.parser.diagnostics import InvalidOperationError
+from pypto.language.parser.diagnostics import InvalidOperationError, ParserSyntaxError
 
 
 class TestForLoops:
@@ -26,7 +26,8 @@ class TestForLoops:
             init: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
             for i, (sum_val,) in pl.range(10, init_values=(init,)):
-                new_sum: pl.Tensor[[1], pl.INT32] = pl.add(sum_val, i)
+                # ``i`` is an INDEX loop var; cast before use as a scalar operand.
+                new_sum: pl.Tensor[[1], pl.INT32] = pl.add(sum_val, pl.cast(i, pl.INT32))
                 result = pl.yield_(new_sum)
 
             return result
@@ -43,13 +44,17 @@ class TestForLoops:
             init2: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
             for i, (val1, val2) in pl.range(5, init_values=(init1, init2)):
-                new1: pl.Tensor[[1], pl.INT32] = pl.add(val1, i)
+                new1: pl.Tensor[[1], pl.INT32] = pl.add(val1, pl.cast(i, pl.INT32))
                 new2: pl.Tensor[[1], pl.INT32] = pl.mul(val2, 2)
                 out1, out2 = pl.yield_(new1, new2)
 
             return out1
 
-        assert isinstance(multi_iter, ir.Function)
+        for_stmt = _find_for_stmt(multi_iter)
+        _assert_range(for_stmt, start=0, stop=5, step=1)
+        assert len(for_stmt.iter_args) == 2
+        assert len(for_stmt.return_vars) == 2
+        _assert_body_kinds(for_stmt.body, ir.AssignStmt, ir.AssignStmt, ir.YieldStmt)
 
     def test_for_loop_with_range_params(self):
         """Test for loop with start, stop, step parameters."""
@@ -59,12 +64,14 @@ class TestForLoops:
             init: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
             for i, (acc,) in pl.range(0, 10, 2, init_values=(init,)):
-                new_acc: pl.Tensor[[1], pl.INT32] = pl.add(acc, i)
+                new_acc: pl.Tensor[[1], pl.INT32] = pl.add(acc, pl.cast(i, pl.INT32))
                 result = pl.yield_(new_acc)
 
             return result
 
-        assert isinstance(range_params, ir.Function)
+        for_stmt = _find_for_stmt(range_params)
+        _assert_range(for_stmt, start=0, stop=10, step=2)
+        assert len(for_stmt.iter_args) == 1
 
     def test_nested_for_loops(self):
         """Test nested for loops."""
@@ -82,7 +89,14 @@ class TestForLoops:
 
             return outer_out
 
-        assert isinstance(nested_loops, ir.Function)
+        outer = _find_for_stmt(nested_loops)
+        _assert_range(outer, start=0, stop=3, step=1)
+        _assert_body_kinds(outer.body, ir.ForStmt, ir.YieldStmt)
+
+        inner = _top_level_stmts(outer.body)[0]
+        assert isinstance(inner, ir.ForStmt), "outer loop body must open with the nested loop"
+        _assert_range(inner, start=0, stop=2, step=1)
+        assert len(inner.iter_args) == 1
 
     def test_for_loop_with_operations(self):
         """Test for loop with tensor operations."""
@@ -97,7 +111,10 @@ class TestForLoops:
 
             return result
 
-        assert isinstance(loop_ops, ir.Function)
+        for_stmt = _find_for_stmt(loop_ops)
+        _assert_range(for_stmt, start=0, stop=4, step=1)
+        assert len(for_stmt.iter_args) == 1
+        _assert_body_kinds(for_stmt.body, ir.AssignStmt, ir.YieldStmt)
 
 
 class TestIfStatements:
@@ -125,7 +142,15 @@ class TestIfStatements:
 
             return result
 
-        assert isinstance(if_in_loop, ir.Function)
+        for_stmt = _find_for_stmt(if_in_loop)
+        _assert_range(for_stmt, start=0, stop=5, step=1)
+        _assert_body_kinds(for_stmt.body, ir.IfStmt, ir.YieldStmt)
+
+        if_stmt = _top_level_stmts(for_stmt.body)[0]
+        assert isinstance(if_stmt, ir.IfStmt)
+        assert isinstance(if_stmt.condition, ir.Eq), "condition `i == 0` must parse to Eq"
+        assert if_stmt.else_body is not None, "else branch must be preserved"
+        assert len(if_stmt.return_vars) == 1
 
     def test_if_yield_type_annotation_preserved(self):
         """Test that type annotations on yield assignments are preserved in IR (issue #185)."""
@@ -198,7 +223,16 @@ class TestComplexControlFlow:
 
             return out1
 
-        assert isinstance(complex_flow, ir.Function)
+        for_stmt = _find_for_stmt(complex_flow)
+        _assert_range(for_stmt, start=0, stop=10, step=1)
+        assert len(for_stmt.iter_args) == 2
+        assert len(for_stmt.return_vars) == 2
+        _assert_body_kinds(for_stmt.body, ir.IfStmt, ir.YieldStmt)
+
+        if_stmt = _top_level_stmts(for_stmt.body)[0]
+        assert isinstance(if_stmt, ir.IfStmt)
+        assert if_stmt.else_body is not None
+        assert len(if_stmt.return_vars) == 2, "both branches yield two values"
 
     def test_sequential_loops(self):
         """Test sequential (not nested) for loops."""
@@ -219,7 +253,14 @@ class TestComplexControlFlow:
 
             return result2
 
-        assert isinstance(sequential_loops, ir.Function)
+        loops = _find_all_for_stmts(sequential_loops)
+        assert len(loops) == 2, "the two loops must stay siblings, not nest"
+        _assert_range(loops[0], start=0, stop=5, step=1)
+        _assert_range(loops[1], start=0, stop=3, step=1)
+        # Second loop consumes the first loop's result as its init value -- check the
+        # data-flow edge itself, since the iter-arg's name alone would also accept
+        # `init` or any other same-typed value.
+        assert loops[1].iter_args[0].initValue is loops[0].return_vars[0]
 
     def test_loop_without_iter_args(self):
         """Test loop without iter_args."""
@@ -236,7 +277,11 @@ class TestComplexControlFlow:
                     result = temp
             return result
 
-        assert isinstance(loop_without_iter_args, ir.Function)
+        for_stmt = _find_for_stmt(loop_without_iter_args)
+        _assert_range(for_stmt, start=0, stop=3, step=1)
+        assert len(for_stmt.iter_args) == 0
+        assert len(for_stmt.return_vars) == 0
+        _assert_body_kinds(for_stmt.body, ir.IfStmt)
 
 
 class TestParallelForLoops:
@@ -250,7 +295,7 @@ class TestParallelForLoops:
             init: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
             for i, (sum_val,) in pl.parallel(10, init_values=(init,)):
-                new_sum: pl.Tensor[[1], pl.INT32] = pl.add(sum_val, i)
+                new_sum: pl.Tensor[[1], pl.INT32] = pl.add(sum_val, pl.cast(i, pl.INT32))
                 result = pl.yield_(new_sum)
 
             return result
@@ -269,7 +314,11 @@ class TestParallelForLoops:
                 result = temp
             return result
 
-        assert isinstance(parallel_no_iter, ir.Function)
+        for_stmt = _find_for_stmt(parallel_no_iter)
+        assert for_stmt.kind == ir.ForKind.Parallel
+        _assert_range(for_stmt, start=0, stop=3, step=1)
+        assert len(for_stmt.iter_args) == 0
+        assert len(for_stmt.return_vars) == 0
 
     def test_parallel_for_loop_with_range_params(self):
         """Test parallel for loop with start, stop, step parameters."""
@@ -279,12 +328,15 @@ class TestParallelForLoops:
             init: pl.Tensor[[1], pl.INT32] = pl.create_tensor([1], dtype=pl.INT32)
 
             for i, (acc,) in pl.parallel(0, 10, 2, init_values=(init,)):
-                new_acc: pl.Tensor[[1], pl.INT32] = pl.add(acc, i)
+                new_acc: pl.Tensor[[1], pl.INT32] = pl.add(acc, pl.cast(i, pl.INT32))
                 result = pl.yield_(new_acc)
 
             return result
 
-        assert isinstance(parallel_range, ir.Function)
+        for_stmt = _find_for_stmt(parallel_range)
+        assert for_stmt.kind == ir.ForKind.Parallel
+        _assert_range(for_stmt, start=0, stop=10, step=2)
+        assert len(for_stmt.iter_args) == 1
 
     def test_parallel_for_produces_parallel_kind(self):
         """Test that pl.parallel() produces ForKind.Parallel in the IR."""
@@ -401,7 +453,7 @@ class TestParallelForLoops:
 
     def test_invalid_iterator_rejected(self):
         """Test that invalid iterator (not range or parallel) is rejected."""
-        with pytest.raises(Exception):
+        with pytest.raises(ParserSyntaxError):
 
             @pl.function
             def bad_func(x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
@@ -420,6 +472,54 @@ def _find_for_stmt(func: ir.Function) -> ir.ForStmt:
             if isinstance(stmt, ir.ForStmt):
                 return stmt
     raise AssertionError("No ForStmt found in function body")
+
+
+def _top_level_stmts(stmt: ir.Stmt) -> list[ir.Stmt]:
+    """Return the statement list of a body, treating a bare Stmt as a 1-element body."""
+    return list(stmt.stmts) if isinstance(stmt, ir.SeqStmts) else [stmt]
+
+
+def _find_all_for_stmts(func: ir.Function) -> list[ir.ForStmt]:
+    """Helper to extract every top-level ForStmt from a function body, in order."""
+    return [s for s in _top_level_stmts(func.body) if isinstance(s, ir.ForStmt)]
+
+
+def _assert_range(for_stmt: ir.ForStmt, start: int, stop: int, step: int) -> None:
+    """Assert a ForStmt's constant loop bounds.
+
+    Pins the parsed ``pl.range(...)`` arguments; ``isinstance(stmt, ir.ForStmt)``
+    alone does not distinguish ``range(0, 10, 2)`` from ``range(10)``.
+    """
+    for name, expected in (("start", start), ("stop", stop), ("step", step)):
+        bound = getattr(for_stmt, name)
+        assert isinstance(bound, ir.ConstInt), f"{name} is {type(bound).__name__}, expected a constant"
+        assert bound.value == expected, f"{name} is {bound.value}, expected {expected}"
+
+
+def _find_binding(body: ir.Stmt, name: str) -> ir.AssignStmt:
+    """Return the AssignStmt in `body` that binds `name`."""
+    for stmt in _top_level_stmts(body):
+        if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint == name:
+            return stmt
+    raise AssertionError(f"No binding for {name!r} found in body")
+
+
+def _assert_var_is(expr: ir.Expr, definition: ir.AssignStmt) -> None:
+    """Assert `expr` is the very Var bound by `definition`.
+
+    Matching on ``name_hint`` alone would also accept a fresh, unbound Var that
+    merely shares the name -- i.e. a use that no longer refers to its definition.
+    """
+    assert isinstance(expr, ir.Var), f"expected Var, got {type(expr).__name__}"
+    assert expr is definition.var, f"operand {expr.name_hint!r} is not the Var bound at its definition"
+
+
+def _assert_body_kinds(body: ir.Stmt, *kinds: type) -> None:
+    """Assert the exact statement kinds making up a loop/branch body, in order."""
+    actual = [type(s) for s in _top_level_stmts(body)]
+    assert actual == list(kinds), (
+        f"body is {[k.__name__ for k in actual]}, expected {[k.__name__ for k in kinds]}"
+    )
 
 
 def _find_while_stmt(func: ir.Function) -> ir.WhileStmt:
@@ -507,10 +607,12 @@ class TestScalarRange:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
             return y
 
-        assert isinstance(scalar_expr_stop, ir.Function)
         for_stmt = _find_for_stmt(scalar_expr_stop)
-        # stop should be a Mul expression (n * 2)
+        # stop should be exactly `n * 2`, not merely "some Mul"
         assert isinstance(for_stmt.stop, ir.Mul)
+        assert for_stmt.stop.left is scalar_expr_stop.params[0]
+        assert isinstance(for_stmt.stop.right, ir.ConstInt)
+        assert for_stmt.stop.right.value == 2
 
     def test_scalar_complex_expression_as_stop(self):
         """Test pl.range(n * 2 + 1) where n is a Scalar[INT64] parameter."""
@@ -523,10 +625,16 @@ class TestScalarRange:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
             return y
 
-        assert isinstance(scalar_complex_expr, ir.Function)
         for_stmt = _find_for_stmt(scalar_complex_expr)
-        # stop should be an Add expression ((n * 2) + 1)
-        assert isinstance(for_stmt.stop, ir.Add)
+        # stop should be exactly `(n * 2) + 1`, preserving precedence
+        stop = for_stmt.stop
+        assert isinstance(stop, ir.Add)
+        assert isinstance(stop.right, ir.ConstInt)
+        assert stop.right.value == 1
+        assert isinstance(stop.left, ir.Mul)
+        assert stop.left.left is scalar_complex_expr.params[0]
+        assert isinstance(stop.left.right, ir.ConstInt)
+        assert stop.left.right.value == 2
 
     def test_scalar_floordiv_expression_as_stop(self):
         """Test pl.range(n // 4) where n is a Scalar[INT64] parameter."""
@@ -539,10 +647,12 @@ class TestScalarRange:
                 y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
             return y
 
-        assert isinstance(scalar_floordiv_expr, ir.Function)
         for_stmt = _find_for_stmt(scalar_floordiv_expr)
-        # stop should be a FloorDiv expression (n // 4)
+        # stop should be exactly `n // 4`
         assert isinstance(for_stmt.stop, ir.FloorDiv)
+        assert for_stmt.stop.left is scalar_floordiv_expr.params[0]
+        assert isinstance(for_stmt.stop.right, ir.ConstInt)
+        assert for_stmt.stop.right.value == 4
 
     def test_scalar_range_with_iter_args(self):
         """Test pl.range(n, init_values=(init,)) where n is a Scalar[INT64] parameter."""
@@ -645,16 +755,15 @@ class TestWhileLoops:
                 acc = pl.add(acc, x)
             return acc
 
-        assert isinstance(while_tensors, ir.Function)
-
-        # Find the while statement
         while_stmt = _find_while_stmt(while_tensors)
-        assert isinstance(while_stmt, ir.WhileStmt)
 
-        # Body should contain assignments
-        assert while_stmt.body is not None
-        if isinstance(while_stmt.body, ir.SeqStmts):
-            assert len(while_stmt.body.stmts) >= 1
+        # Condition is `i < n`, with `n` the Scalar parameter
+        assert isinstance(while_stmt.condition, ir.Lt)
+        _assert_var_is(while_stmt.condition.left, _find_binding(while_tensors.body, "i"))
+        assert while_stmt.condition.right is while_tensors.params[0]
+
+        # Body holds both assignments: the counter bump and the tensor accumulate
+        _assert_body_kinds(while_stmt.body, ir.AssignStmt, ir.AssignStmt)
 
     def test_nested_while_loops(self):
         """Test nested while loops."""
@@ -669,25 +778,25 @@ class TestWhileLoops:
                 x = x + 1
             return x
 
-        assert isinstance(nested_while, ir.Function)
-
-        # Find the outer while statement
         outer_while = _find_while_stmt(nested_while)
-        assert isinstance(outer_while, ir.WhileStmt)
 
-        # Find inner while statement in the outer while's body
-        inner_while = None
-        if isinstance(outer_while.body, ir.SeqStmts):
-            for stmt in outer_while.body.stmts:
-                if isinstance(stmt, ir.WhileStmt):
-                    inner_while = stmt
-                    break
+        # Outer condition is `x < n`, with `n` the Scalar parameter
+        assert isinstance(outer_while.condition, ir.Lt)
+        _assert_var_is(outer_while.condition.left, _find_binding(nested_while.body, "x"))
+        assert outer_while.condition.right is nested_while.params[0]
 
-        assert inner_while is not None, "Expected nested WhileStmt in outer while body"
+        # Outer body: `y = 0`, the nested loop, then `x = x + 1`
+        _assert_body_kinds(outer_while.body, ir.AssignStmt, ir.WhileStmt, ir.AssignStmt)
+
+        inner_while = _top_level_stmts(outer_while.body)[1]
         assert isinstance(inner_while, ir.WhileStmt)
 
-        # Inner condition should compare y < 3
+        # Inner condition is exactly `y < 3`
         assert isinstance(inner_while.condition, ir.Lt)
+        _assert_var_is(inner_while.condition.left, _find_binding(outer_while.body, "y"))
+        assert isinstance(inner_while.condition.right, ir.ConstInt)
+        assert inner_while.condition.right.value == 3
+        _assert_body_kinds(inner_while.body, ir.AssignStmt)
 
     def test_while_inside_for_loop(self):
         """Test while loop nested inside a for loop."""
@@ -705,22 +814,21 @@ class TestWhileLoops:
 
             return sum_out
 
-        assert isinstance(while_in_for, ir.Function)
-
-        # Find the for statement
         for_stmt = _find_for_stmt(while_in_for)
-        assert isinstance(for_stmt, ir.ForStmt)
+        _assert_range(for_stmt, start=0, stop=5, step=1)
+        assert len(for_stmt.iter_args) == 1
 
-        # Find while statement inside the for loop body
-        while_stmt = None
-        if isinstance(for_stmt.body, ir.SeqStmts):
-            for stmt in for_stmt.body.stmts:
-                if isinstance(stmt, ir.WhileStmt):
-                    while_stmt = stmt
-                    break
+        # For body: `x = 0`, the while loop, `new_sum = ...`, then the yield
+        _assert_body_kinds(for_stmt.body, ir.AssignStmt, ir.WhileStmt, ir.AssignStmt, ir.YieldStmt)
 
-        assert while_stmt is not None, "Expected WhileStmt in for loop body"
+        while_stmt = _top_level_stmts(for_stmt.body)[1]
         assert isinstance(while_stmt, ir.WhileStmt)
+
+        # The while condition closes over the enclosing loop variable: `x < i`
+        assert isinstance(while_stmt.condition, ir.Lt)
+        _assert_var_is(while_stmt.condition.left, _find_binding(for_stmt.body, "x"))
+        assert while_stmt.condition.right is for_stmt.loop_var
+        _assert_body_kinds(while_stmt.body, ir.AssignStmt)
 
     def test_for_inside_while_loop(self):
         """Test for loop nested inside a while loop."""

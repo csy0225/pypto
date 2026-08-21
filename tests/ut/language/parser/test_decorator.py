@@ -9,6 +9,8 @@
 
 """Unit tests for @pl.function, @pl.inline, and @pl.program decorators."""
 
+import ast
+import inspect
 import linecache
 import sys
 import textwrap
@@ -17,12 +19,40 @@ import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.language.parser import source_lookup
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.language.parser.diagnostics.exceptions import (
     ParserSyntaxError,
     UndefinedVariableError,
     UnsupportedFeatureError,
 )
+
+
+def _top_level_stmts(body: ir.Stmt) -> list[ir.Stmt]:
+    """Return a body's statement list, treating a bare Stmt as a 1-element body."""
+    return list(body.stmts) if isinstance(body, ir.SeqStmts) else [body]
+
+
+def _body_assigns(func: ir.Function) -> list[ir.AssignStmt]:
+    """Return the function body's top-level AssignStmts, in source order."""
+    return [s for s in _top_level_stmts(func.body) if isinstance(s, ir.AssignStmt)]
+
+
+def _int_elements(expr: ir.Expr) -> list[int]:
+    """Flatten a MakeTuple of integer constants into plain ints."""
+    assert isinstance(expr, ir.MakeTuple), f"expected MakeTuple, got {type(expr).__name__}"
+    values = []
+    for element in expr.elements:
+        assert isinstance(element, ir.ConstInt), f"expected ConstInt element, got {type(element).__name__}"
+        values.append(element.value)
+    return values
+
+
+def _call_of(stmt: ir.AssignStmt) -> ir.Call:
+    """Assert a binding's RHS is a Call and return it."""
+    value = stmt.value
+    assert isinstance(value, ir.Call), f"{stmt.var.name_hint} is {type(value).__name__}, expected Call"
+    return value
 
 
 class TestFunctionDecorator:
@@ -80,7 +110,11 @@ class TestFunctionDecorator:
             result: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
             return result
 
-        assert isinstance(create_tensor, ir.Function)
+        create_stmt = _body_assigns(create_tensor)[0]
+        assert _call_of(create_stmt).op.name == ir.get_op("tensor.create").name
+        result_type = create_stmt.var.type
+        assert isinstance(result_type, ir.TensorType)
+        assert result_type.dtype == pypto.DataType.FP32
 
     def test_function_with_binary_ops(self):
         """Test function with binary operations."""
@@ -91,7 +125,12 @@ class TestFunctionDecorator:
             result: pl.Tensor[[64], pl.FP32] = pl.add(pl.mul(x, 2.0), pl.create_tensor([64], dtype=pl.FP32))
             return result
 
-        assert isinstance(binary_ops, ir.Function)
+        # The nested calls stay nested as Call operands of the outer add
+        add_call = _call_of(_body_assigns(binary_ops)[0])
+        assert add_call.op.name == ir.get_op("tensor.add").name
+        lhs, rhs = add_call.args
+        assert isinstance(lhs, ir.Call) and lhs.op.name == ir.get_op("tensor.muls").name
+        assert isinstance(rhs, ir.Call) and rhs.op.name == ir.get_op("tensor.create").name
 
     def test_function_with_list_arguments(self):
         """Test function that uses list arguments."""
@@ -102,7 +141,11 @@ class TestFunctionDecorator:
             result: pl.Tensor[[32, 64], pl.FP32] = pl.slice(x, [32, 64], [0, 0])
             return result
 
-        assert isinstance(with_lists, ir.Function)
+        # Both list literals reach the op as MakeTuple args, in the order written
+        slice_call = _call_of(_body_assigns(with_lists)[0])
+        assert slice_call.op.name == ir.get_op("tensor.slice").name
+        assert _int_elements(slice_call.args[1]) == [32, 64]
+        assert _int_elements(slice_call.args[2]) == [0, 0]
 
     def test_function_with_eval_stmt(self):
         """Test parsing evaluation statements into EvalStmt."""
@@ -179,7 +222,10 @@ class TestFunctionDecorator:
             result: pl.Tensor[[64], pl.FP32] = pl.add(x, -1.5)
             return result
 
-        assert isinstance(with_negatives, ir.Function)
+        # The unary minus is folded into the literal, not left as a Neg node
+        scalar_arg = _call_of(_body_assigns(with_negatives)[0]).args[1]
+        assert isinstance(scalar_arg, ir.ConstFloat)
+        assert scalar_arg.value == -1.5
 
 
 class TestScalarParameters:
@@ -332,7 +378,17 @@ class TestTensorReadParsing:
                 _ = pl.tensor.read(t, [i])
             return out
 
-        assert isinstance(read_in_loop, ir.Function)
+        # The read's index is the enclosing loop variable, not a copy or a constant
+        for_stmt = next(s for s in _top_level_stmts(read_in_loop.body) if isinstance(s, ir.ForStmt))
+        read_stmt = next(s for s in _top_level_stmts(for_stmt.body) if isinstance(s, ir.AssignStmt))
+        read_call = _call_of(read_stmt)
+        assert read_call.op.name == ir.get_op("tensor.read").name
+        indices = read_call.args[1]
+        assert isinstance(indices, ir.MakeTuple)
+        # Compare by identity: ``Expr.__eq__`` builds an IR ``Eq`` node, so ``==``
+        # on Expr lists reports equality even for distinct nodes.
+        assert len(indices.elements) == 1
+        assert indices.elements[0] is for_stmt.loop_var
 
 
 class TestTupleReturnType:
@@ -484,7 +540,11 @@ class TestProgramDecorator:
                 result: pl.Tensor[[1], pl.INT32] = pl.add(n, one)
                 return result
 
-        assert isinstance(RecursiveTest, ir.Program)
+        # A single-method program keeps exactly that one function, `self` stripped
+        assert [f.name for f in RecursiveTest.functions] == ["factorial"]
+        factorial = RecursiveTest.get_function("factorial")
+        assert factorial is not None
+        assert [p.name_hint for p in factorial.params] == ["n"]
 
     def test_transitive_calls(self):
         """Test transitive calls where A calls B calls C."""
@@ -538,6 +598,160 @@ class TestProgramDecorator:
                 return x
 
         assert MyCustomProgram.name == "MyCustomProgram"
+
+    def test_function_attrs_preserve_evaluated_values(self):
+        """Program methods retain non-literal attrs evaluated by the decorator."""
+        marker = 7
+        expected_attrs = {
+            "marker": marker,
+            "dtype": pl.FP16,
+            "memory_space": pl.Mem.Vec,
+            "tensor_layout": pl.TensorLayout.ND,
+            "tile_layout": pl.TileLayout.row_major,
+            "pad": pl.PadValue.zero,
+            "direction": pl.adir.input,
+        }
+
+        @pl.program
+        class AttrProgram:
+            @pl.function(attrs=expected_attrs)
+            def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                return x
+
+        func = AttrProgram.get_function("kernel")
+        assert func is not None
+        assert dict(func.attrs) == expected_attrs
+
+        printed = AttrProgram.as_python()
+        assert '"marker": 7' in printed
+        assert '"dtype": pl.FP16' in printed
+        assert '"memory_space": pl.Mem.Vec' in printed
+        assert '"tensor_layout": pl.TensorLayout.ND' in printed
+        assert '"tile_layout": pl.TileLayout.row_major' in printed
+        assert '"pad": pl.PadValue.zero' in printed
+        assert '"direction": pl.adir.input' in printed
+        ir.assert_structural_equal(pl.parse_program(printed), AttrProgram)
+        ir.assert_structural_equal(ir.deserialize(ir.serialize(AttrProgram)), AttrProgram)
+
+    def test_unsupported_function_attr_fails_loudly(self):
+        """An unrepresentable Function attr is rejected instead of disappearing."""
+        with pytest.raises(ParserSyntaxError, match="Unsupported list element type for key: custom_list"):
+
+            @pl.program
+            class InvalidAttrProgram:
+                @pl.function(attrs={"custom_list": [1, 2]})
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+    def test_dsl_wrapper_attr_unwraps_and_round_trips(self):
+        """A DSL wrapper attr stores the IR Expr it carries, so printed source reparses.
+
+        The printer emits the value in DSL spelling
+        (``pl.system.available_cluster_count()``), which reparse evaluates back
+        into a ``Scalar`` wrapper — the attr store only accepts the ``Expr``.
+
+        Function attrs print as a ``pl.func_attr({...})`` body prologue rather
+        than into the decorator, so the deprecated ``attrs=`` keyword never
+        appears in compiler output (RFC #2338). The value spelling is unchanged;
+        only its position is.
+        """
+
+        @pl.program
+        class LaunchQueryProgram:
+            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": pl.system.available_cluster_count()})
+            def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                return x
+
+        func = LaunchQueryProgram.get_function("kernel")
+        assert func is not None
+        assert isinstance(dict(func.attrs)["core_num"], ir.Call)
+
+        printed = LaunchQueryProgram.as_python()
+        assert 'pl.func_attr({"core_num": pl.system.available_cluster_count()})' in printed
+        assert "attrs=" not in printed
+        ir.assert_structural_equal(pl.parse_program(printed), LaunchQueryProgram)
+
+    def test_function_attr_referencing_a_var_is_rejected(self):
+        """A Var in a Function attr has no legal decorator spelling (StaticAttrs)."""
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(pl.INT32), span)
+        with pytest.raises(ParserSyntaxError, match="references a variable"):
+
+            @pl.program
+            class VarAttrProgram:
+                @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": n})
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+    def test_function_attr_expression_over_a_var_is_rejected(self):
+        """The whole attr Expr tree is walked, not just its root node."""
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(pl.INT32), span)
+        core_num = ir.add(n, ir.ConstInt(1, pl.INT32, span))
+        with pytest.raises(ParserSyntaxError, match="references a variable"):
+
+            @pl.program
+            class VarExprAttrProgram:
+                @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": core_num})
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+    def test_malformed_attrs_container_is_rejected(self):
+        """A non-dict attrs= and a non-string key both raise a parser error."""
+        with pytest.raises(ParserSyntaxError, match="must be a dict"):
+
+            @pl.program
+            class NonDictAttrs:
+                @pl.function(attrs=5)  # type: ignore[arg-type]  # deliberate: validates runtime rejection
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+        with pytest.raises(ParserSyntaxError, match="keys must be strings"):
+
+            @pl.program
+            class NonStrKeyAttrs:
+                @pl.function(attrs={1: 2})  # type: ignore[arg-type]  # deliberate: validates runtime rejection
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+    def test_falsey_non_dict_attrs_is_rejected(self):
+        """A falsey non-dict must reach the validator, not be read as absent.
+
+        The callers gate on ``attrs is not None`` rather than truthiness, so
+        ``attrs=[]`` cannot slip past ``_normalize_attrs`` as though no attrs
+        were supplied.
+        """
+        with pytest.raises(ParserSyntaxError, match="must be a dict"):
+
+            @pl.program
+            class EmptyListAttrs:
+                @pl.function(attrs=[])  # type: ignore[arg-type]  # deliberate: validates runtime rejection
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+        with pytest.raises(ParserSyntaxError, match="must be a dict"):
+
+            @pl.program
+            class EmptyStrAttrs:
+                @pl.function(attrs="")  # type: ignore[arg-type]  # deliberate: validates runtime rejection
+                def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                    return x
+
+    def test_annotation_only_wrapper_attr_is_rejected(self):
+        """Annotation-only wrappers raise ValueError or RuntimeError on unwrap.
+
+        ``Scalar``/``Ptr`` raise ``RuntimeError`` while ``Tensor``/``Tile``/
+        ``Array`` raise ``ValueError``; both must surface as the actionable
+        parser diagnostic rather than escaping raw.
+        """
+        for annotation in (pl.Scalar[pl.INT32], pl.Tensor[[4], pl.FP16]):
+            with pytest.raises(ParserSyntaxError, match="annotation-only"):
+
+                @pl.program
+                class AnnotationAttrs:
+                    @pl.function(attrs={"bad": annotation})
+                    def kernel(self, x: pl.Tensor[[4], pl.FP16]) -> pl.Tensor[[4], pl.FP16]:
+                        return x
 
     def test_empty_class_error(self):
         """Test that empty class raises error."""
@@ -1503,7 +1717,7 @@ class TestCrossFunctionDynamicShapeSubstitution:
         M = pl.dynamic("M")
         N = pl.dynamic("N")
 
-        with pytest.raises(Exception, match="conflicting bindings"):
+        with pytest.raises(ParserSyntaxError, match="conflicting bindings"):
 
             @pl.program
             class ShapeMismatch:
@@ -2138,6 +2352,231 @@ class TestInlineFunctionControlFlow:
 
         assert len(YieldInlineLoop.functions) == 1
         ir.assert_structural_equal(YieldInlineLoop, Expected)
+
+
+# --- Fixtures for the class-source-lookup tests ------------------------------
+# These cover every branch of the qualname index: bare, decorated, class-nested,
+# function-local (`<locals>`), and shadowed definitions.
+
+
+def _identity_decorator(cls: type) -> type:
+    """Return the class unchanged, so the decorated shape stays a real class."""
+    return cls
+
+
+class _LookupPlain:
+    """Module-level class with a nested class."""
+
+    class Nested:
+        """Class-nested class -- qualname is `_LookupPlain.Nested`."""
+
+
+@_identity_decorator
+@_identity_decorator
+class _LookupDecorated:
+    """Decorated class -- lookup must start at the FIRST decorator line."""
+
+
+def _make_local_class() -> type:
+    """Return a function-local class, whose qualname carries a `<locals>` marker."""
+
+    class LocalInFunction:
+        """Defined inside a function."""
+
+    return LocalInFunction
+
+
+def _make_shadowed_classes() -> tuple[type, type]:
+    """Return two classes sharing one qualname, in definition order."""
+
+    class Shadowed:
+        WHICH = "first"
+
+    first = Shadowed
+
+    class Shadowed:  # noqa: F811 - deliberate duplicate qualname
+        WHICH = "second"
+
+    return first, Shadowed
+
+
+def _lookup_classes() -> list[type]:
+    """Every class shape the lookup must handle, including a shadowed qualname."""
+    first_shadowed, second_shadowed = _make_shadowed_classes()
+    return [
+        _LookupPlain,
+        _LookupPlain.Nested,
+        _LookupDecorated,
+        _make_local_class(),
+        first_shadowed,
+        second_shadowed,
+        TestClassSourceLookup,
+    ]
+
+
+# Whether this runtime actually consults the qualname index. CPython 3.13+ stamps
+# every class with `__firstlineno__`, so the parser defers to `inspect` there and
+# the index is never reached. Derived from real behaviour rather than a version
+# comparison, so it stays correct if the deferral rule changes.
+_INDEX_IN_USE = source_lookup._indexed_class_source_lines(_LookupPlain) is not None
+
+
+class TestClassSourceLookup:
+    """Source lookup for `@pl.program` classes.
+
+    Before CPython 3.13, `inspect.getsourcelines` on a class has no fast path: it
+    `ast.parse`s the whole containing file and walks the tree for a matching
+    qualname, so a module with N classes pays N full-file parses. The parser
+    resolves the line from a per-file index instead. From 3.13 on, every class
+    carries `__firstlineno__` and the parser defers to `inspect`, because only
+    that marker distinguishes two classes sharing a qualname.
+
+    These tests pin the contract that holds on *both* runtimes -- results
+    identical to `inspect` -- and, where the index is actually in use, that a
+    file is parsed only once.
+    """
+
+    def test_source_info_matches_inspect_for_every_class_shape(self):
+        """The parser's class lookup agrees with `inspect.getsourcelines` exactly.
+
+        Asserted end to end through `_get_source_info` so it holds on runtimes
+        that use the index and on those that defer to `inspect`.
+        """
+        for cls in _lookup_classes():
+            expected_lines, expected_start = inspect.getsourcelines(cls)
+            actual_lines, actual_start = source_lookup.get_class_source_lines(cls)
+
+            assert actual_start == expected_start, (
+                f"{cls.__qualname__}: start line {actual_start} != inspect's {expected_start}"
+            )
+            assert actual_lines == expected_lines, f"{cls.__qualname__}: source block differs from inspect's"
+
+    def test_defers_to_inspect_when_the_class_records_its_own_line(self):
+        """The index is bypassed exactly when the runtime stamps `__firstlineno__`.
+
+        That marker is what lets `inspect` tell apart two classes sharing a
+        qualname, which a qualname-keyed index cannot do -- so wherever it
+        exists, the lookup must stand aside.
+        """
+        for cls in _lookup_classes():
+            records_own_line = "__firstlineno__" in vars(cls)
+            deferred = source_lookup._indexed_class_source_lines(cls) is None
+            assert deferred == records_own_line, (
+                f"{cls.__qualname__}: deferred={deferred} but __firstlineno__={records_own_line}"
+            )
+
+    def test_defers_when_firstlineno_is_present_on_older_runtimes(self):
+        """A stamped `__firstlineno__` forces deferral even where it is not native.
+
+        Simulates the CPython 3.13+ contract on runtimes that lack it, so the
+        deferral branch is covered wherever this suite runs.
+        """
+
+        class Stamped:
+            pass
+
+        # Native state: only a runtime that stamps `__firstlineno__` skips the index.
+        assert source_lookup._records_own_first_line(Stamped) is (not _INDEX_IN_USE)
+        assert (source_lookup._indexed_class_source_lines(Stamped) is None) is (not _INDEX_IN_USE)
+
+        Stamped.__firstlineno__ = 1  # type: ignore[attr-defined]
+
+        assert source_lookup._records_own_first_line(Stamped) is True
+        assert source_lookup._indexed_class_source_lines(Stamped) is None
+
+    def test_decorated_class_starts_at_first_decorator(self):
+        """A stacked decorator resolves to the outermost decorator line, not `class`."""
+        expected_lines, expected_start = inspect.getsourcelines(_LookupDecorated)
+        actual_lines, actual_start = source_lookup.get_class_source_lines(_LookupDecorated)
+
+        assert actual_start == expected_start
+        assert actual_lines == expected_lines
+        assert actual_lines[0].lstrip().startswith("@_identity_decorator")
+
+    def test_index_keeps_the_first_of_two_same_qualname_classes(self):
+        """The index's tie-break matches `_ClassFinder`: first definition wins.
+
+        Exercises the index directly, so it documents that behaviour on every
+        runtime -- including those where `get_class_source_lines` defers and the
+        ambiguity is instead resolved by `__firstlineno__`.
+        """
+        source = "class Dup:\n    pass\n\n\nclass Dup:\n    pass\n"
+        indexer = source_lookup._ClassLineIndexer()
+        indexer.visit(ast.parse(source))
+
+        assert indexer.index["Dup"] == 1
+
+    @pytest.mark.skipif(not _INDEX_IN_USE, reason="runtime resolves classes via __firstlineno__")
+    def test_file_is_parsed_once_regardless_of_class_count(self, monkeypatch):
+        """N classes in one file cost one parse -- the O(N x file_size) regression."""
+        source_lookup._CLASS_LINE_INDEX_CACHE.clear()
+
+        parses = []
+        real_parse = ast.parse
+
+        def counting_parse(*args, **kwargs):
+            parses.append(args[0] if args else None)
+            return real_parse(*args, **kwargs)
+
+        monkeypatch.setattr(ast, "parse", counting_parse)
+
+        cases = [_LookupPlain, _LookupPlain.Nested, _LookupDecorated, _make_local_class()]
+        for cls in cases:
+            assert source_lookup._indexed_class_source_lines(cls) is not None
+
+        assert len(parses) == 1, f"expected 1 whole-file parse for {len(cases)} classes, got {len(parses)}"
+        assert len(source_lookup._CLASS_LINE_INDEX_CACHE) == 1
+
+    def test_index_refreshes_when_source_lines_are_replaced(self):
+        """A re-read file re-parses even when size, mtime and line count all match.
+
+        Both sources are 27 bytes over 3 lines with mtime `None`, so any
+        size/mtime/line-count stamp would serve a stale line number here.
+        """
+        filename = "<pypto_class_index_refresh_test>"
+        before: str = "class Alpha:\n    pass\n#pad\n"
+        after: str = "#pad\nclass Alpha:\n    pass\n"
+        assert len(before) == len(after)
+
+        try:
+            before_lines: list[str] = before.splitlines(keepends=True)
+            linecache.cache[filename] = (len(before), None, before_lines, filename)
+            assert source_lookup._class_line_index(filename, before_lines)["Alpha"] == 1
+
+            after_lines: list[str] = after.splitlines(keepends=True)
+            linecache.cache[filename] = (len(after), None, after_lines, filename)
+            assert source_lookup._class_line_index(filename, after_lines)["Alpha"] == 2
+        finally:
+            linecache.cache.pop(filename, None)
+            source_lookup._CLASS_LINE_INDEX_CACHE.pop(filename, None)
+
+    def test_local_program_keeps_file_accurate_spans(self):
+        """End-to-end: a function-local `@pl.program` still spans the real file lines."""
+        current_line = sys._getframe().f_lineno
+
+        @pl.program
+        class LocalProgram:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)  # line current_line + 6
+                return y
+
+        main_func = LocalProgram.get_function("main")
+        assert main_func is not None
+
+        # A scalar rhs lowers to tensor.adds, not tensor.add.
+        add_op = ir.get_op("tensor.adds").name
+        calls = [
+            stmt.value
+            for stmt in _top_level_stmts(main_func.body)
+            if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call)
+        ]
+        hits = [call for call in calls if call.op.name == add_op]
+
+        assert len(hits) == 1, f"expected one {add_op} call, got {[c.op.name for c in calls]}"
+        assert hits[0].span.begin_line == current_line + 6, (
+            f"span line {hits[0].span.begin_line} != {current_line + 6}"
+        )
 
 
 if __name__ == "__main__":

@@ -14,13 +14,26 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
 namespace backend {
+
+/**
+ * @brief The (src, dst) dtype pairs an architecture converts in one `pto.tcvt`.
+ *
+ * Transcribed from the ISA Supported Conversions table in the pto-isa tcvt
+ * documentation. Order is irrelevant; duplicates and self-edges are ignored by
+ * consumers.
+ */
+struct TcvtAdjacency {
+  std::vector<std::pair<DataType, DataType>> edges;
+};
 
 /**
  * @brief Closed-form GEMM cost-model parameters consumed by ChooseL0Tile.
@@ -154,6 +167,19 @@ class BackendHandler {
    */
   [[nodiscard]] virtual std::vector<std::string> GetExtraPtoasFlags() const = 0;
 
+  /**
+   * @brief Whether a dtype has an end-to-end in-core storage and PTO ABI on
+   *        this backend.
+   *
+   * Semantic 4-bit dtypes are packed in PyPTO's memory accounting, but that
+   * alone does not make them executable. Backends opt in only after their
+   * load/store and instruction ABI is available. Byte-addressable dtypes keep
+   * their existing support path.
+   */
+  [[nodiscard]] virtual bool SupportsIncoreDataType(const DataType& dtype) const {
+    return dtype.GetBit() != 4;
+  }
+
   // ---------------------------------------------------------------------------
   // Pass behavioural hooks
   // ---------------------------------------------------------------------------
@@ -225,17 +251,53 @@ class BackendHandler {
   /**
    * @brief Whether this backend's store pipe honours a bf16 atomic-add into GM.
    *
-   * The pto-isa `SetAtomicAdd<T>` dispatch accepts `__gm__ bfloat16_t`
-   * (`set_atomic_bf16`) on the A2/A3 store path (Ascend910B) but NOT on the A5
-   * path (Ascend950), where a bf16 atomic-add store fails a pto-isa
-   * `static_assert`. PTOCodegen gates a bf16 atomic-add `pto.tstore` on this so
-   * A5 users get a clean PyPTO error instead of a downstream C++ compile
-   * failure. The atomic dispatch keys on the GM *destination* dtype, so this
-   * also covers the cube path (fp32 Acc -> bf16 GM via fix-pipe).
+   * A bf16 atomic-add lowers to `set_atomic_bf16`, honoured on the A2/A3 store
+   * path (Ascend910B) and not on the A5 one (Ascend950). Both arches'
+   * `SetAtomicAdd<T>` helpers *do* list `bfloat16_t`, so that dispatch
+   * static_assert is not the evidence; the pinned ST suite is. a2a3 covers
+   * atomic-add into a bf16 destination (`tstore_acc2gm` case 60,
+   * `<1, float, bfloat16_t, bfloat16_t, ...>`) while a5's port of that same
+   * case runs it non-atomically (`<0, ...>`), and the `set_atomic_bf16`
+   * costmodel mock exists only under `costmodel/a2a3/`.
+   *
+   * The `AtomicAddDtypeValid` property verifier gates every atomic-add site on
+   * this, so A5 users get a clean PyPTO error at pipeline input instead of a
+   * downstream C++ compile failure. The atomic dispatch keys on the GM
+   * *destination* dtype, so this also covers the cube path (fp32 Acc -> bf16 GM
+   * via fix-pipe).
    *
    * Ascend910B: true. Ascend950: false.
    */
   [[nodiscard]] virtual bool SupportsBf16AtomicAdd() const = 0;
+
+  /**
+   * @brief Whether the cube fix-pipe may store an Acc-resident tile straight
+   *        into a GM tensor of @p dtype.
+   *
+   * The fix-pipe narrows an accumulator on its way to global memory, but only
+   * into a fixed destination set. pto-isa encodes this as the non-quant
+   * `CheckAcc2gm` whitelist and ptoas as a `pto.tstore` verifier rule:
+   *
+   *   Ascend910B (a2a3): INT32 / FP32 / FP16 / BF16
+   *   Ascend950  (a5)  : INT32 / FP32 / FP16 / BF16
+   *
+   * The two arches accept the same set today. The hook stays per-backend
+   * because the sets are independent facts about each pinned target, not one
+   * shared constant -- they have differed before and may again.
+   *
+   * Anything else -- notably INT8/INT16 -- must reach GM either through a Vec
+   * tile (an explicit `pl.cast` narrows in the vector unit, then stores) or via
+   * the quantized fix-pipe path, never a plain Acc->GM store. Legality is
+   * therefore a property of the *tile's memory space*, not of the user-visible
+   * dtypes: the identical DSL program is legal when its matmul result routes
+   * through Vec and illegal when it stays in Acc.
+   *
+   * The two sets above mirror ptoas exactly; keep them in step when the pinned
+   * assembler moves (`toolchain/versions.env`, `runtime/pto_isa.pin`). As of
+   * ptoas v0.57 / pto-isa 83d01313 both arches are `i32/f32/f16/bf16`
+   * (`PTO.cpp` "acc tstore dst element type", a2a3/a5 `CheckStaticAcc`).
+   */
+  [[nodiscard]] virtual bool SupportsAccToGmDtype(const DataType& dtype) const = 0;
 
   /**
    * @brief Compute the destination tile view for a cross-core transfer.
@@ -325,6 +387,27 @@ class BackendHandler {
   [[nodiscard]] virtual uint32_t GetL0cCapacityBytes() const = 0;
 
   /**
+   * @brief Bias-table on-chip SRAM capacity, in bytes.
+   *
+   * Used by AutoTileMatmulL0 to cap the N extent of ``tile.matmul_bias``
+   * output tiles. Must match the AIC-core ``MemorySpace::Bias`` size in the
+   * SoC config and the PTO ISA Mat-to-Bias transfer limit.
+   */
+  [[nodiscard]] virtual uint32_t GetBiasCapacityBytes() const = 0;
+
+  /**
+   * @brief Whether the PTO ISA can transfer this dtype pair from Mat to Bias.
+   *
+   * AutoTileMatmulL0 uses this before materialising a Mat-resident
+   * `tile.matmul_bias` operand in the architectural Bias table. The memory
+   * graph only describes reachability; this query captures the narrower raw
+   * PTO-ISA dtype contract for that edge. Callers must separately ensure their
+   * IR operation can express any requested dtype conversion.
+   */
+  [[nodiscard]] virtual bool SupportsMatToBiasMove(const DataType& source_dtype,
+                                                   const DataType& bias_dtype) const = 0;
+
+  /**
    * @brief Mat (L1) on-chip SRAM capacity, in bytes.
    *
    * Used by passes that need a conservative per-core capacity gate without
@@ -344,6 +427,19 @@ class BackendHandler {
   [[nodiscard]] virtual int GetL0FractalAlignment() const { return 16; }
 
   /**
+   * @brief Physical M-row alignment of an L0C accumulator allocation.
+   *
+   * This may be stricter than the legal cube work-shape alignment. The L0
+   * chooser, dbC planner, and InitMemRef allocator share it for physical SRAM
+   * footprint accounting; it does not reject a smaller logical or valid M
+   * extent.
+   */
+  [[nodiscard]] virtual int GetL0cMAlignment(const DataType& accumulator_dtype) const {
+    (void)accumulator_dtype;
+    return GetL0FractalAlignment();
+  }
+
+  /**
    * @brief Minimum legal value for L0 tile dimensions m, n, k.
    *
    * The cube unit cannot operate below this dimension; ChooseL0Tile rejects
@@ -361,6 +457,21 @@ class BackendHandler {
    * placeholder until characterised — override here once measured.
    */
   [[nodiscard]] virtual L0CostModel GetL0CostModel() const { return L0CostModel{}; }
+
+  /**
+   * @brief Native single-instruction `pto.tcvt` conversions for this architecture.
+   *
+   * Each entry is one (src, dst) dtype pair the ISA can emit as a single
+   * `tcvt`; the set differs per architecture (a5 has FP8/HF8/FP4 sources and
+   * no INT32 -> FP16 deq, a2a3 is the reverse). LegalizeTileCast treats this as
+   * a directed graph and expands any cast whose pair is absent into the
+   * shortest chain of native hops, so the table is the single source of truth
+   * for what a backend can convert directly.
+   *
+   * Returned by reference from a handler-owned static — callers may hold the
+   * reference for the duration of a pass.
+   */
+  [[nodiscard]] virtual const TcvtAdjacency& GetTcvtAdjacency() const = 0;
 };
 
 }  // namespace backend

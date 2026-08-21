@@ -114,14 +114,15 @@ def BuildBatchPagedAttentionProgram(
                     [q_tile, head_dim],
                     target_memory=pl.MemorySpace.Mat,
                 )
-                kj_l1 = pl.load(
+                kj_nat = pl.load(
                     key_cache,
                     [kj_row, 0],
                     [block_size, head_dim],
                     target_memory=pl.MemorySpace.Mat,
                 )
+                kj_l1 = pl.tile.transpose_view(kj_nat)
                 qi_l0a = pl.move(qi_l1, target_memory=pl.MemorySpace.Left)
-                kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right, transpose=True)
+                kj_l0b = pl.move(kj_l1, target_memory=pl.MemorySpace.Right)
                 sij_l0c = pl.matmul(qi_l0a, kj_l0b)
                 sij_batch_new = pl.store(sij_l0c, [b * q_tile, 0], sij_batch)
             return sij_batch_new
@@ -162,7 +163,7 @@ def BuildBatchPagedAttentionProgram(
                     [b * q_tile, 0],
                     [q_tile, block_size],
                     target_memory=pl.MemorySpace.Vec,
-                    valid_shapes=[q_tile, valid_len],
+                    valid_shape=[q_tile, valid_len],
                 )
 
                 s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
@@ -260,7 +261,7 @@ def BuildBatchPagedAttentionProgram(
             for b in pl.range(batch_count):
                 dst_row = b * num_heads_param + q_offset
 
-                if is_first:
+                if is_first != 0:
                     mij_tile = pl.load(
                         mij_batch,
                         [b * q_tile, 0],
@@ -284,7 +285,7 @@ def BuildBatchPagedAttentionProgram(
                     li_batch = pl.store(lij_tile, [b * q_tile, 0], li_batch, [q_tile, 1])
                     oi_batch = pl.store(oi_new_tile, [b * q_tile, 0], oi_batch, [q_tile, head_dim])
 
-                    if is_last:
+                    if is_last != 0:
                         dst_tile = pl.row_expand_div(oi_new_tile, lij_tile)
                         out_tensor = pl.store(dst_tile, [dst_row, 0], out_tensor, [q_tile, head_dim])
                 else:
@@ -350,7 +351,7 @@ def BuildBatchPagedAttentionProgram(
                     oi_new_scaled = pl.row_expand_mul(oi_new_tile, beta_dn)
                     oi_updated = pl.add(oi_scaled, oi_new_scaled)
 
-                    if is_last:
+                    if is_last != 0:
                         dst_tile = pl.row_expand_div(oi_updated, li_updated_dn)
                         out_tensor = pl.store(dst_tile, [dst_row, 0], out_tensor, [q_tile, head_dim])
                     else:
@@ -392,14 +393,15 @@ def BuildBatchPagedAttentionProgram(
             """
             batch_cfg = pl.tensor.read(config, [0])
             num_heads_cfg = pl.tensor.read(config, [1])
-            head_dim_cfg = pl.tensor.read(config, [3])
             block_size_cfg = pl.tensor.read(config, [4])
             block_num_cfg = pl.tensor.read(config, [5])
 
             q_loop_cfg = (num_heads_cfg + q_tile - 1) // q_tile
 
-            # Compute max_bn across all batches (mirrors C++ max_bn loop)
-            max_bn = pl.yield_(0)
+            # Compute max_bn across all batches (mirrors C++ max_bn loop).
+            # A loop carry may be seeded straight from a literal; codegen emits
+            # the constant as the carry's initializer.
+            max_bn: pl.Scalar[pl.INT64] = 0
             for b in pl.range(batch_cfg):
                 cur_seq_b = pl.tensor.read(context_lens, [b])
                 bn_b = (cur_seq_b + block_size_cfg - 1) // block_size_cfg
@@ -409,17 +411,17 @@ def BuildBatchPagedAttentionProgram(
                 q_offset = q_idx * q_tile
 
                 # Batch-sized accumulators (mirrors C++ oi_batch/li_batch/mi_batch)
-                oi_batch = pl.create_tensor([batch_cfg * q_tile, head_dim_cfg], dtype=pl.FP32)
-                li_batch = pl.create_tensor([batch_cfg * q_tile, 1], dtype=pl.FP32)
-                mi_batch = pl.create_tensor([batch_cfg * q_tile, 1], dtype=pl.FP32)
+                oi_batch = pl.create_tensor([batch_q_tile, head_dim], dtype=pl.FP32)
+                li_batch = pl.create_tensor([batch_q_tile, 1], dtype=pl.FP32)
+                mi_batch = pl.create_tensor([batch_q_tile, 1], dtype=pl.FP32)
 
                 for bn in pl.range(max_bn):
                     # Batch-sized intermediate tensors (mirrors C++ sij_b/pij_b/etc.)
-                    sij_b = pl.create_tensor([batch_cfg * q_tile, block_size_cfg], dtype=pl.FP32)
-                    pij_b = pl.create_tensor([batch_cfg * q_tile, block_size_cfg], dtype=pl.FP16)
-                    mij_b = pl.create_tensor([batch_cfg * q_tile, 1], dtype=pl.FP32)
-                    lij_b = pl.create_tensor([batch_cfg * q_tile, 1], dtype=pl.FP32)
-                    oi_new_b = pl.create_tensor([batch_cfg * q_tile, head_dim_cfg], dtype=pl.FP32)
+                    sij_b = pl.create_tensor([batch_q_tile, block_size], dtype=pl.FP32)
+                    pij_b = pl.create_tensor([batch_q_tile, block_size], dtype=pl.BF16)
+                    mij_b = pl.create_tensor([batch_q_tile, 1], dtype=pl.FP32)
+                    lij_b = pl.create_tensor([batch_q_tile, 1], dtype=pl.FP32)
+                    oi_new_b = pl.create_tensor([batch_q_tile, head_dim], dtype=pl.FP32)
 
                     # Stage 1: QK matmul (FUNC_QK_MATMUL, AIC / CUBE)
                     sij_b = self.KernelQkMatmul(

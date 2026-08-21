@@ -50,6 +50,9 @@ MULTI_PIPE_BUFFER_SIZE = MULTI_PIPE_SLOT_SIZE * 8
 # pins the local slot count. Reserve-buffer size is arch-dependent:
 #   a3 -> slot_size * local_slot_num ; a5 -> slot_size * slot_num.
 # Keeping local_slot_num == slot_num makes a single buffer size correct on both.
+# NOTE: a5 does not accept the operand at all -- ptoas rejects `local_slot_num`
+# on pto.{aic,aiv}_initialize_pipe regardless of its value, so this case is
+# a2/a3-only in practice; see the xfail on test_explicit_slot_num.
 SLOTNUM_DIM = 16
 SLOTNUM_SLOT_SIZE = SLOTNUM_DIM * SLOTNUM_DIM * 4
 SLOTNUM_SLOT_NUM = 4
@@ -930,10 +933,18 @@ class TestCrossCore:
         result = test_runner.run(MultiPipeNoSplitTest(backend_type=backend_type))
         assert result.passed, f"Cross-core explicit multi-pipe no-split failed: {result.error}"
 
-    def test_explicit_slot_num(self, test_runner, backend_type, platform):
+    # `local_slot_num` on pto.{aic,aiv}_initialize_pipe is an a2/a3-only operand,
+    # not an unimplemented 950 feature: ptoas rejects it outright for the 950
+    # frontend pipe lowering, whatever its value --
+    #   error: 'pto.aic_initialize_pipe' op 'local_slot_num' is only supported
+    #          for a2/a3 frontend pipe lowering
+    # so the whole manual pl.{aic,aiv}_initialize_pipe route this case exercises
+    # is a2/a3-only by design. Deselected rather than xfail-ed: xfail says "this
+    # ought to work and does not", which would keep a permanent platform
+    # limitation on the report as if it were a defect awaiting a fix.
+    @pytest.mark.platforms("a2a3", "a2a3sim")
+    def test_explicit_slot_num(self, test_runner, backend_type):
         """Explicit slot_num / local_slot_num: compile through full pipeline and verify correctness."""
-        if platform == "a5sim":
-            pytest.xfail("950 backend explicit slot_num pipe not yet validated on sim")
         result = test_runner.run(ExplicitSlotNumTest(backend_type=backend_type))
         assert result.passed, f"Cross-core explicit slot_num failed: {result.error}"
 

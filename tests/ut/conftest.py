@@ -9,13 +9,54 @@
 
 """Shared fixtures for unit tests."""
 
+import importlib
 import os
+import sys
+from types import SimpleNamespace
+from typing import Final
 
 import pytest
+from pypto import LogLevel, get_log_level, set_log_level
 from pypto import backend as _backend
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
-from pypto.pypto_core import passes
+from pypto.pypto_core import _clear_thread_log_level, passes
+
+# Snapshot the C++ log level at import — before any test has had a chance to
+# mutate it — so every unit test starts from whatever PYPTO_LOG_LEVEL / the
+# build-type default selected for this session. See `_reset_log_level`.
+_INITIAL_LOG_LEVEL: Final[LogLevel] = get_log_level()
+
+
+@pytest.fixture
+def device_runner(monkeypatch):
+    """Import ``device_runner`` without requiring the optional Simpler package."""
+    import pypto.runtime as runtime_package  # noqa: PLC0415
+
+    fake_kernel_compiler = SimpleNamespace(KernelCompiler=object)
+    fake_task_interface = SimpleNamespace(
+        CallConfig=object,
+        ChipCallable=object,
+        CoreCallable=object,
+        Worker=object,
+    )
+    monkeypatch.setitem(sys.modules, "pypto.runtime.kernel_compiler", fake_kernel_compiler)
+    monkeypatch.setitem(sys.modules, "pypto.runtime.task_interface", fake_task_interface)
+
+    module_name = "pypto.runtime.device_runner"
+    previous = sys.modules.pop(module_name, None)
+    previous_attribute = getattr(runtime_package, "device_runner", None)
+    try:
+        module = importlib.import_module(module_name)
+        yield module
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous is not None:
+            sys.modules[module_name] = previous
+        if previous_attribute is not None:
+            setattr(runtime_package, "device_runner", previous_attribute)
+        elif hasattr(runtime_package, "device_runner"):
+            delattr(runtime_package, "device_runner")
 
 
 @pytest.fixture
@@ -42,9 +83,9 @@ def default_pass_manager():
     """Return the default-strategy PassManager.
 
     Use this in tests that want to run the production pipeline without
-    constructing the manager inline. Strategy-specific tests (covering
-    ``DebugTileOptimization`` etc.) should keep building the manager
-    themselves so the choice stays visible at the test site.
+    constructing the manager inline. Strategy-specific tests should keep
+    building the manager themselves so the choice stays visible at the
+    test site.
     """
     return PassManager.get_strategy(OptimizationStrategy.Default)
 
@@ -67,6 +108,38 @@ def _reset_backend_singleton():
         yield
     finally:
         _backend.reset_for_testing()
+
+
+@pytest.fixture
+def initial_log_level():
+    """The C++ log level every unit test starts from (see ``_reset_log_level``)."""
+    return _INITIAL_LOG_LEVEL
+
+
+@pytest.fixture(autouse=True)
+def _reset_log_level():
+    """Pin the process-global C++ log level around every unit test.
+
+    ``LOG_WARN`` / ``LOG_INFO`` are gated on a process-global threshold, so a
+    sibling test that leaves it at ERROR or NONE silently empties the stderr
+    that diagnostic assertions read — e.g. MemoryReuse's "fell back to the
+    legacy packing" warning, whose assertion then fails against ``''``. That
+    made the failure depend on test order rather than on the code under test.
+    Restoring before and after each test makes those assertions
+    order-independent regardless of scheduling. Tests that choose a level
+    themselves are unaffected: the reset runs first, then their own set wins.
+
+    The thread-local override is cleared too — a test that installs one on the
+    main thread and fails before clearing it would suppress the same output
+    through a different door.
+    """
+    _clear_thread_log_level()
+    set_log_level(_INITIAL_LOG_LEVEL)
+    try:
+        yield
+    finally:
+        _clear_thread_log_level()
+        set_log_level(_INITIAL_LOG_LEVEL)
 
 
 @pytest.fixture(autouse=True)

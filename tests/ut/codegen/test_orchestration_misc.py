@@ -15,7 +15,9 @@ import pypto.language as pl
 import pytest
 from _orchestration_codegen_common import (
     SELF_ALIAS_RE,
+    _finalize_for_codegen,
     _generate_orch_code,
+    _orch_func_from_program,
 )
 from pypto import backend, codegen
 from pypto.backend import BackendType
@@ -48,7 +50,8 @@ class TestTaskIsValidCodegen:
             b = ib.let("b", check)
             ib.return_stmt(b)
         orch_func = orch_f.get_result()
-        program = ir.Program([orch_func], "test_task_is_valid", ir.Span.unknown())
+        program = _finalize_for_codegen(ir.Program([orch_func], "test_task_is_valid", ir.Span.unknown()))
+        orch_func = _orch_func_from_program(program)
 
         code = codegen.generate_orchestration(program, orch_func).code
         assert "bool b = tid.is_valid();" in code, code
@@ -65,8 +68,8 @@ class TestTupleLineagePointerKeying:
     propagated onto the other tuple's consumers. In the DeepSeek-V4 KV compressor
     this made the ``kv_state`` / ``score_state`` return aliases reuse the
     externalized ``kv_cache`` / ``kv`` window reshape names, so the generated
-    orchestration C++ declared those names twice (``Tensor X = ...`` then
-    ``const Tensor& X = ...``) and failed to compile with ``conflicting
+    orchestration C++ declared those names twice (``ChipTensor X = ...`` then
+    ``const ChipTensor& X = ...``) and failed to compile with ``conflicting
     declaration``.
     """
 
@@ -103,12 +106,13 @@ class TestTupleLineagePointerKeying:
             ib.return_stmt(ib.make_tuple([fa, fb]))
 
         orch_func = orch_f.get_result()
-        program = ir.Program([orch_func], "test_tuple_pointer_keying", span)
+        program = _finalize_for_codegen(ir.Program([orch_func], "test_tuple_pointer_keying", span))
+        orch_func = _orch_func_from_program(program)
         code = codegen.generate_orchestration(program, orch_func).code
 
         # No declared name may appear twice (the conflicting-declaration bug).
         declared = re.findall(
-            r"^\s*(?:const\s+Tensor&|Tensor|PTO2TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
+            r"^\s*(?:const\s+ChipTensor&|ChipTensor|PTO2TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
             code,
             flags=re.MULTILINE,
         )
@@ -117,8 +121,8 @@ class TestTupleLineagePointerKeying:
 
         # Each consumer must reshape from its OWN tuple's element, not a stale /
         # undeclared getitem name. Before the fix, ``fa`` read undeclared ``a0``.
-        assert "Tensor fa = rsh0.reshape" in code, code
-        assert "Tensor fb = rsh1.reshape" in code, code
+        assert "ChipTensor fa = rsh0.reshape" in code, code
+        assert "ChipTensor fb = rsh1.reshape" in code, code
         assert "a0.reshape" not in code and "b0.reshape" not in code, code
 
 
@@ -138,13 +142,14 @@ class TestUnregisteredOpError:
             ib.return_stmt(filled)
         orch_func = orch_f.get_result()
 
-        program = ir.Program([orch_func], "test_prog", ir.Span.unknown())
+        program = _finalize_for_codegen(ir.Program([orch_func], "test_prog", ir.Span.unknown()))
+        orch_func = _orch_func_from_program(program)
 
         with pytest.raises(RuntimeError, match="Misplaced tensor op.*tensor.full"):
             codegen.generate_orchestration(program, orch_func)
 
     def test_reinterpret_view_has_explicit_orchestration_error(self):
-        """Runtime Tensor views cannot change dtype; direct users get an actionable error."""
+        """Runtime ChipTensor views cannot change dtype; direct users get an actionable error."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -155,7 +160,10 @@ class TestUnregisteredOpError:
             orch_f.return_type(viewed.type)
             ib.return_stmt(viewed)
         orch_func = orch_f.get_result()
-        program = ir.Program([orch_func], "ReinterpretViewOrchestration", ir.Span.unknown())
+        program = _finalize_for_codegen(
+            ir.Program([orch_func], "ReinterpretViewOrchestration", ir.Span.unknown())
+        )
+        orch_func = _orch_func_from_program(program)
 
         with pytest.raises(ValueError, match="not supported in Orchestration functions.*InCore"):
             codegen.generate_orchestration(program, orch_func)
@@ -377,6 +385,7 @@ class TestArgDirectionsCodegen:
     @staticmethod
     def _generate_orch_direct(program) -> str:
         """Bypass ``_ensure_arg_directions`` so explicit overrides survive."""
+        program = _finalize_for_codegen(program)
         for func in program.functions.values():
             if func.func_type == ir.FunctionType.Orchestration:
                 return codegen.generate_orchestration(program, func).code
@@ -850,13 +859,15 @@ class TestTupleReturnNameHintCollision:
             "TupleNameHintCollisionProgram",
             span,
         )
+        program = _finalize_for_codegen(program)
+        orch = _orch_func_from_program(program)
 
         code = codegen.generate_orchestration(program, orch).code
 
         # tmp_first and tmp_second share the name_hint "ret__tmp_v0"; the tuple
         # metadata must still attach each call's elements to that call. Each
         # element is the in-place Out arg of its call, so it remaps to that arg
-        # (no ``const Tensor& first_a = ...`` alias is minted). The consumer
+        # (no ``const ChipTensor& first_a = ...`` alias is minted). The consumer
         # reading first_a/second_a/first_b/second_b therefore reads call_a's
         # outs then call_b's outs, in order — not cross-contaminated.
         i_a1 = code.index("// Task 2: kernel_consume")
@@ -868,10 +879,10 @@ class TestTupleReturnNameHintCollision:
         assert a1 < a2 < b1 < b2, code
         # No per-element const-ref alias survives the remap.
         for name in ("first_a", "second_a", "first_b", "second_b"):
-            assert f"const Tensor& {name} " not in code, code
+            assert f"const ChipTensor& {name} " not in code, code
 
         declared_names = re.findall(
-            r"^\s*(?:const\s+Tensor&|Tensor)\s+([A-Za-z_]\w*)\s*=",
+            r"^\s*(?:const\s+ChipTensor&|ChipTensor)\s+([A-Za-z_]\w*)\s*=",
             code,
             flags=re.MULTILINE,
         )
@@ -885,13 +896,13 @@ class TestScalarCarryPhiCodegen:
     """Regression tests for scalar loop carries in orchestration codegen."""
 
     def test_scalar_carry_phi_not_emitted_as_tensor(self):
-        """Regression for #1580: Scalar loop carry must not be aliased as const Tensor&.
+        """Regression for #1580: Scalar loop carry must not be aliased as const ChipTensor&.
 
         When a Scalar variable is defined before a pl.parallel loop and then
         reused (reassigned) inside it, alongside Tensor carries, ConvertToSSA
         promotes the scalar into the parallel-loop carry tuple.  The orchestration
         codegen must emit the Scalar carry phi as ``int64_t = 0`` (untraced scalar
-        default), NOT as ``const Tensor& = <carry_var>`` (type mismatch that causes
+        default), NOT as ``const ChipTensor& = <carry_var>`` (type mismatch that causes
         a C++ compile error).
         """
         backend.reset_for_testing()
@@ -928,7 +939,7 @@ class TestScalarCarryPhiCodegen:
 
                 # The parallel loop carries global_c_idx (Scalar) mixed with
                 # Tensor carries out_b, out_c.  Before the fix, the Scalar carry
-                # phi was emitted as ``const Tensor&`` causing a C++ compile error.
+                # phi was emitted as ``const ChipTensor&`` causing a C++ compile error.
                 for batch_idx in pl.parallel(0, N // TILE):
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="scope_b"):
                         for inner in pl.range(TILE):
@@ -942,12 +953,12 @@ class TestScalarCarryPhiCodegen:
         code = _generate_orch_code(transformed)
 
         # The Scalar carry phi must be emitted as int64_t = 0 (untraced scalar
-        # default), never as const Tensor& = <carry> (type mismatch / #1580).
+        # default), never as const ChipTensor& = <carry> (type mismatch / #1580).
         assert "int64_t global_c_idx__rv" in code, (
-            "global_c_idx carry phi should be emitted as int64_t, not const Tensor&\n" + code
+            "global_c_idx carry phi should be emitted as int64_t, not const ChipTensor&\n" + code
         )
-        assert "const Tensor& global_c_idx" not in code, (
-            "global_c_idx must not be aliased as const Tensor& (scalar/tensor type mismatch)\n" + code
+        assert "const ChipTensor& global_c_idx" not in code, (
+            "global_c_idx must not be aliased as const ChipTensor& (scalar/tensor type mismatch)\n" + code
         )
 
         # out_b and out_c Tensor carries must each alias to their own carry.
@@ -963,6 +974,101 @@ class TestScalarCarryPhiCodegen:
             # out_b phi must not be initialized from out_c's carry value
             if "out_b" in lhs and "out_c" in rhs and "out_b" not in rhs:
                 raise AssertionError(f"Wrong phi: out_b assigned from out_c value (scrambled):\n  {stripped}")
+
+    def test_literal_seeded_scalar_carry_emits_constant_init(self):
+        """A scalar carry seeded by a literal must compile, not raise InternalError.
+
+        ``max_bn = 0`` before the loop is a constant binding, so Simplify
+        propagates the literal into the ForStmt's ``init_values``: the iter_arg
+        init reaches codegen as a ``ConstInt``, not a ``Var``. The carry
+        declaration must emit the constant directly (``int64_t <carry> = 0;``).
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class LiteralSeededCarry:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, a_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                lens: pl.Tensor[[8], pl.INT64],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                max_bn: pl.Scalar[pl.INT64] = 0
+                for b in pl.range(8):
+                    bn_b = pl.tensor.read(lens, [b])
+                    max_bn = pl.max(max_bn, bn_b)
+                for _ in pl.range(max_bn):
+                    d = self.kernel_add(a, d)
+                return d
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(LiteralSeededCarry)
+        code = _generate_orch_code(transformed)
+
+        carry_decl = re.search(r"int64_t (max_bn\w*) = 0;", code)
+        assert carry_decl, "literal-seeded scalar carry must declare ``int64_t <carry> = 0;``\n" + code
+        carry = carry_decl.group(1)
+        # The carry feeds the running max, the yield writes back into it, and the
+        # post-loop use reads it as the second loop's trip count.
+        assert f"std::max<int64_t>({carry}," in code, "loop body must read the carry\n" + code
+        assert re.search(rf"^\s*{carry} = \w+;$", code, re.MULTILINE), (
+            "yield must write back into the carry\n" + code
+        )
+        assert f"< {carry};" in code, "post-loop use must read the carry variable\n" + code
+
+    def test_literal_seeded_trivial_carry_aliases_to_constant(self):
+        """A never-rebound carry seeded by a literal aliases straight to the constant.
+
+        ``pl.range(..., init_values=(4,))`` with a yield that returns the iter_arg
+        unchanged is a trivial alias: codegen declares no carry variable and
+        every use of the loop's return var emits the literal.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class TrivialLiteralCarry:
+            @pl.function(type=pl.FunctionType.AIV)
+            def kernel_add(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                a_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(a, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.add(a_tile, a_tile)
+                out: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], output)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                for _k, (acc,) in pl.range(8, init_values=(4,)):
+                    d = self.kernel_add(a, d)
+                    acc_out: pl.Scalar[pl.INT64] = pl.yield_(acc)
+                for _ in pl.range(acc_out):
+                    d = self.kernel_add(a, d)
+                return d
+
+        transformed = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(TrivialLiteralCarry)
+        code = _generate_orch_code(transformed)
+
+        assert "acc" not in code, "trivial literal carry must not declare a carry variable\n" + code
+        assert "< 4;" in code, "post-loop use of the trivial carry must emit the literal 4\n" + code
 
 
 if __name__ == "__main__":

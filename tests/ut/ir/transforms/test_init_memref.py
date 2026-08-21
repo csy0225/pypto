@@ -23,11 +23,15 @@ expressed via the DSL:
     Vars; this has no DSL syntax.
 """
 
+import re
 from typing import cast
 
+import pypto
 import pypto.language as pl
 import pytest
+from pypto import backend as _backend
 from pypto import ir, passes
+from pypto.backend import BackendType
 from pypto.ir import MemorySpace
 
 
@@ -145,6 +149,97 @@ class TestBasic:
 
         After = passes.init_mem_ref()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    @pytest.mark.parametrize(
+        ("backend_type", "expected_acc_bytes"),
+        [
+            pytest.param(None, 16384, id="unconfigured-safe-fallback"),
+            pytest.param(BackendType.Ascend910B, 16384, id="ascend910b"),
+            pytest.param(BackendType.Ascend950, 8192, id="ascend950"),
+        ],
+    )
+    def test_int32_acc_allocation_uses_backend_physical_m_rows(self, backend_type, expected_acc_bytes):
+        """A logical 16x128 INT32 accumulator occupies 32 physical M rows on
+        910B, while 950 retains the ordinary 16-row footprint. An unconfigured
+        bare pass uses the larger current-backend footprint rather than
+        underallocating."""
+        _backend.reset_for_testing()
+        if backend_type is not None:
+            _backend.set_backend_type(backend_type)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[16, 32], pl.INT8],
+                input_b: pl.Tensor[[32, 128], pl.INT8],
+                output: pl.Out[pl.Tensor[[16, 128], pl.INT32]],
+            ) -> pl.Tensor[[16, 128], pl.INT32]:
+                a_mat: pl.Tile[[16, 32], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [16, 32], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[32, 128], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [32, 128], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[16, 32], pl.INT8, pl.Mem.Left] = pl.tile.move(a_mat, target_memory=pl.Mem.Left)
+                b_l0: pl.Tile[[32, 128], pl.INT8, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 128], pl.INT32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                output = pl.tile.store(acc, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert f"pl.tile.alloc(pl.Mem.Acc, {expected_acc_bytes})" in printed
+        assert f", pl.const(0, pl.INT64), {expected_acc_bytes}), pl.Mem.Acc]" in printed
+
+    def test_acc_slice_span_does_not_reapply_root_row_padding(self):
+        """A lower-half view of a padded INT32 Acc ends at its root boundary.
+
+        The root [32,128] owns 16 KiB. Its [16,128] slice at row 16 starts at
+        byte 8192 and spans the remaining 8192 bytes; treating the view like a
+        fresh 32-row allocation would incorrectly record [8192,24576).
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[32, 32], pl.INT8],
+                input_b: pl.Tensor[[32, 128], pl.INT8],
+                output: pl.Out[pl.Tensor[[16, 128], pl.INT32]],
+            ) -> pl.Tensor[[16, 128], pl.INT32]:
+                a_mat: pl.Tile[[32, 32], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_a, [0, 0], [32, 32], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[32, 128], pl.INT8, pl.Mem.Mat] = pl.tile.load(
+                    input_b, [0, 0], [32, 128], target_memory=pl.Mem.Mat
+                )
+                a_l0: pl.Tile[[32, 32], pl.INT8, pl.Mem.Left] = pl.tile.move(a_mat, target_memory=pl.Mem.Left)
+                b_l0: pl.Tile[[32, 128], pl.INT8, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[32, 128], pl.INT32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                lower: pl.Tile[[16, 128], pl.INT32, pl.Mem.Acc] = pl.tile.slice(acc, [16, 128], [16, 0])
+                output = pl.tile.store(lower, [0, 0], output)
+                return output
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Acc, 16384)" in printed
+        root = re.search(
+            r"acc: .*pl\.MemRef\((mem_acc_\d+), pl\.const\(0, pl\.INT64\), 16384\), pl\.Mem\.Acc",
+            printed,
+        )
+        view = re.search(
+            r"lower: .*pl\.MemRef\((mem_acc_\d+), (?:8192|pl\.const\(8192, pl\.INT64\)), 8192\), "
+            r"pl\.Mem\.Acc",
+            printed,
+        )
+        assert root and view and root.group(1) == view.group(1), printed
 
 
 class TestMemRefSharing:
@@ -450,6 +545,64 @@ class TestSliceView:
 
         After = passes.init_mem_ref()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    @pytest.mark.parametrize("dtype", [pl.FP4, pl.INT4, pl.UINT4, pl.HF4])
+    def test_four_bit_dtypes_share_packed_allocation_accounting(self, dtype):
+        """All semantic 4-bit dtypes occupy one byte per two logical elements."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], dtype],
+                output: pl.Out[pl.Tensor[[8, 16], dtype]],
+            ) -> pl.Tensor[[8, 16], dtype]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16])
+                return pl.store(tile_a, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        zero = r"(?:0|pl\.const\(0, pl\.INT64\))"
+        assert re.search(rf'input_a: .*pl\.MemRef\("mem_ddr_0", {zero}, 64\)', printed), printed
+        assert re.search(rf'output: .*pl\.MemRef\("mem_ddr_1", {zero}, 64\)', printed), printed
+        assert re.search(rf"tile_a: .*pl\.MemRef\(mem_vec_\d+, {zero}, 64\)", printed), printed
+        assert "pl.tile.alloc(pl.Mem.Vec, 64)" in printed
+
+    def test_fp4_slice_uses_packed_byte_offset_and_span(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], pl.FP4],
+                output: pl.Out[pl.Tensor[[1, 16], pl.FP4]],
+            ) -> pl.Tensor[[1, 16], pl.FP4]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16])
+                row = pl.tile.slice(tile_a, [1, 16], [1, 0])
+                return pl.store(row, [0, 0], output)
+
+        printed = ir.python_print(passes.init_mem_ref()(Before))
+        assert "pl.tile.alloc(pl.Mem.Vec, 64)" in printed
+        assert re.search(
+            r"row: .*pl\.MemRef\(mem_vec_\d+, (?:8|pl\.const\(8, pl\.INT64\)), 8\)",
+            printed,
+        ), printed
+
+    def test_fp4_slice_rejects_second_nibble_origin(self):
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], pl.FP4],
+                output: pl.Out[pl.Tensor[[1, 14], pl.FP4]],
+            ) -> pl.Tensor[[1, 14], pl.FP4]:
+                tile_a = pl.load(input_a, [0, 0], [8, 16])
+                tail = pl.tile.slice(tile_a, [1, 14], [0, 1])
+                return pl.store(tail, [0, 0], output)
+
+        with pytest.raises(ValueError, match="Packed 4-bit slice origins must be byte-aligned"):
+            passes.init_mem_ref()(Before)
 
 
 class TestYieldMemRef:
@@ -841,7 +994,7 @@ class TestEdgeCases:
         func = ir.Function("test_func", [], [dynamic_tile_type], body, span)
         program = ir.Program([func], "test_program", span)
 
-        with pytest.raises(Exception, match="InitMemRef requires static shape"):
+        with pytest.raises(pypto.InternalError, match="InitMemRef requires static shape"):
             passes.init_mem_ref()(program)
 
 

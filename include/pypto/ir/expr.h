@@ -695,6 +695,16 @@ inline std::vector<std::pair<std::string, std::any>> WithArgDirectionOverridesAt
 inline constexpr const char* kAttrManualDepEdges = "manual_dep_edges";
 
 /**
+ * @brief Marks an outlined InCore function as a dedicated deferred waiter.
+ *
+ * Value type: ``bool``. ``ScopeOutliner`` sets this after validating the
+ * waiter-only structural contract. ``ExpandMixedKernel`` uses it for the
+ * final pure-AIV check. A caller captures the ordinary TaskId only when a
+ * later task needs to depend on the deferred completion.
+ */
+inline constexpr const char* kAttrDeferredCompletionWaiter = "deferred_completion_waiter";
+
+/**
  * @brief Reserved attr key marking an internal dependency-only TaskId call.
  *
  * Value type: ``bool``. Written by the manual phase-fence expansion pass on
@@ -844,6 +854,84 @@ inline std::vector<std::pair<std::string, std::any>> WithDumpVarsAttr(
 inline constexpr const char* kAttrDevice = "device";
 
 /**
+ * @brief Reserved attr keys for an SPMD launch spec on a dispatch ``Call``.
+ *
+ * Value types: ``ExprPtr`` for ``core_num`` (a ``ConstInt``, a caller-local
+ * ``Var``, index arithmetic over caller locals, or a launch-shape query such as
+ * ``pl.system.available_cluster_count()``); ``bool`` for ``sync_start``
+ * (emitted only when true — absent means false).
+ *
+ * The launch spec belongs to the launch SITE, not the launched function: its
+ * Vars are bound in the *dispatching* function, so a ``Function`` carrying it
+ * would reference names it does not bind — unprintable as a decorator (a
+ * decorator is evaluated before any body binds those names) and invisible to
+ * the visitor / mutator, which walk one function at a time. ``ScopeOutliner``
+ * therefore moves ``SpmdScopeStmt::core_num_`` onto the synthesised dispatch:
+ * these attrs on the plain-``Call`` path, and the first-class
+ * ``Submit::core_num_`` / ``sync_start_`` fields on the Submit path.
+ *
+ * SSA / substitution passes MUST rewrite Vars inside ``core_num`` — see
+ * ``kAttrDevice`` for the same requirement and the same failure mode.
+ */
+inline constexpr const char* kAttrCoreNum = "core_num";
+inline constexpr const char* kAttrSyncStart = "sync_start";
+
+/**
+ * @brief True for a ``Call`` attr key whose value is a single ``ExprPtr``
+ * naming an IR subtree evaluated in the node's own scope.
+ *
+ * Every walker that rewrites or collects Vars over Call attrs must recurse into
+ * these — the visitor (def-use / liveness), the mutator (substitution), and the
+ * SSA pass. They are listed here once because the set was previously spelled
+ * out per-site, and a key added to some sites but not others silently dangles
+ * in the ones that were missed.
+ *
+ * Scope note: this covers the ``Call`` arms only. ``Submit`` keeps its
+ * Expr-valued launch spec and predicate in first-class fields
+ * (``core_num_`` / ``predicate_``) that the base walkers already visit, so the
+ * Submit arms have no attr of this shape to consult. A ``kAttrDevice`` on a
+ * Submit would not be walked — a pre-existing gap, unrelated to these keys.
+ *
+ * Not included: ``VarPtr`` / ``vector<VarPtr>`` attrs (kAttrTaskIdVar,
+ * kAttrManualDepEdges, kAttrDumpVars, ...), which every walker handles
+ * separately because a Var is remapped rather than recursed into.
+ */
+[[nodiscard]] inline bool IsExprValuedCallAttr(const std::string& key) {
+  return key == kAttrDevice || key == kAttrCoreNum;
+}
+
+/**
+ * @brief Invoke ``fn`` on every ``ExprPtr`` an attr value references.
+ *
+ * Dispatches on the value's stored TYPE, never on its key name. This is the
+ * same discipline the serializer (``serializer.cpp``, ``value.type() ==
+ * typeid(ExprPtr)``), the deserializer and the printer (``PrintAttrValue``)
+ * already use, and it is what makes attr edges self-maintaining: a newly
+ * invented attr key that happens to hold a ``Var`` is walked automatically, so
+ * it cannot open a blind spot in SSA renaming, liveness, DCE or ``UseAfterDef``.
+ *
+ * A key-name-gated walk cannot offer that. The three former walk sites
+ * (``VisitExpr_(CallPtr)``, ``VisitExpr_(SubmitPtr)``, ``VisitScopeAttrs``)
+ * each carried a different hand-maintained list, which is how ``kAttrDevice``
+ * came to be walked on a ``Call`` but not on a ``Submit``.
+ *
+ * Non-reference values (scalars, enums, ``vector<int32_t>``,
+ * ``vector<ArgDirection>``) are ignored: they name nothing.
+ */
+template <typename F>
+void ForEachAttrExpr(const std::any& value, F&& fn) {
+  if (const auto* var = std::any_cast<VarPtr>(&value)) {
+    if (*var) fn(ExprPtr(*var));
+  } else if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&value)) {
+    for (const auto& v : *vars) {
+      if (v) fn(ExprPtr(v));
+    }
+  } else if (const auto* expr = std::any_cast<ExprPtr>(&value)) {
+    if (*expr) fn(*expr);
+  }
+}
+
+/**
  * @brief Reserved attr key for a dispatch predicate — ``predicate=(t[i] > 0)``.
  *
  * Value type: ``ExprPtr`` — the comparison Expr as written (e.g.
@@ -892,8 +980,78 @@ inline constexpr const char* kAttrPredicate = "predicate";
  */
 class Submit : public Expr {
  public:
-  OpPtr op_;                   // Callee (typically a GlobalVar)
-  std::vector<ExprPtr> args_;  // Positional arguments
+  OpPtr op_;  // Callee (typically a GlobalVar)
+  // Positional arguments. **Canonical statement of the args-coverage
+  // invariant** — every pass and codegen consumer reads this comment; do not
+  // restate it locally, cross-reference it.
+  //
+  // ``Call`` maps positionally by identity — ``args_[i]`` binds
+  // ``callee->params_[i]`` — with full coverage:
+  // ``args_.size() == params_.size()``.
+  //
+  // ``Submit`` has **bounded** coverage, ``args_.size() <= params_.size()``,
+  // and identity holds only over the leading caller-supplied args. Writing
+  // ``gap = params_.size() - args_.size()`` and ``ctx`` for the number of
+  // trailing ``CommCtxType`` params, the mapping is:
+  //
+  //   * ``i`` in ``[0, args_.size() - ctx)``    → ``params_[i]``
+  //   * ``i`` in ``[args_.size() - ctx, args_.size())`` → ``params_[i + gap]``
+  //
+  // so with params ``[x, omitted_out, ctx]`` the args are ``[x, ctx]`` and
+  // ``args_[1]`` binds ``params_[2]``, not ``params_[1]``. Identity is
+  // recovered exactly when ``gap == 0`` (which includes every ``Call``).
+  //
+  // The regions behind that mapping, in callee param order:
+  //
+  //   1. ``[0, args_.size() - ctx)`` — **caller-supplied**. Any direction:
+  //      ``In``, ``InOut``, *and* ``Out``. A caller-allocated ``Out`` param is
+  //      an ordinary positional arg and is NOT excluded from ``args_``;
+  //      orchestration codegen has a live branch for exactly this case
+  //      (``GenerateSubmitReturnAliases`` aliases the return-tuple element to
+  //      ``args_[param_idx]``, because the runtime's ``TaskOutputTensors``
+  //      holds only runtime-created outputs).
+  //   2. ``[args_.size() - ctx, params_.size() - ctx)`` — **runtime-allocated
+  //      outputs**, present only when the gap is non-empty. These must be
+  //      declared ``Out``; no arg is passed, so orchestration codegen synths
+  //      one ``add_output(TensorCreateInfo)`` per param, in callee param order
+  //      (``EmitSubmitSynthOutputEntry``), and the matching return-tuple
+  //      element aliases to ``task_<n>_outs.get_ref(param_idx - (args_.size()
+  //      - ctx))``.
+  //   3. ``[params_.size() - ctx, params_.size())`` — the **CommCtx suffix**
+  //      appended by ``MaterializeDistTensorCtx``. Both signature and call site
+  //      grow together, so ``args_`` carries this suffix in full and it is
+  //      *not* part of the prefix. ``ctx`` is the count of trailing
+  //      ``CommCtxType`` params. Consequently ``args_`` is a plain prefix of
+  //      ``params_`` only while ``ctx == 0``; after that pass it is a prefix
+  //      plus a suffix, with region 2 as the gap between them. Consumers that
+  //      index ``args_`` against ``params_`` must subtract ``ctx`` first.
+  //
+  // Region 2 comes from *user source*, not from a pass: writing
+  // ``pl.submit(self.kernel, x)`` against a kernel that declares a trailing
+  // ``pl.Out`` param is accepted by the parser and carries the gap through the
+  // whole pipeline. (Neither pass that appends a tail ``Out`` param to a callee
+  // signature opens it — ``ConvertTensorToTileOps`` and ``InjectGMPipeBuffer``
+  // both forward the matching arg at the Submit call site.) So a pass that
+  // bails on ``args_.size() != params_.size()`` mishandles ordinary DSL input,
+  // not just a hypothetical future rewrite: relax the guard to ``<=`` for
+  // Submit (see ``.claude/rules/pass-submit-awareness.md`` §5). Regression
+  // coverage: ``TestDeriveSubmit`` in
+  // tests/ut/ir/transforms/test_derive_call_directions.py (pass side) and
+  // ``test_submit_runtime_allocated_out_synths_add_output_and_get_ref_alias``
+  // in tests/ut/codegen/test_orchestration_manual_scope.py (codegen side,
+  // covering all three regions in one program).
+  //
+  // Note the args-side asymmetry does NOT change the return shape: the result
+  // stays ``Tuple[<callee return>..., Scalar[TASK_ID]]``. Appending an ``Out``
+  // param mirrors an existing declared return rather than adding one, so
+  // regions 1 and 2 both surface through the *same* return-tuple elements —
+  // only the aliasing target differs (arg vs synth output).
+  //
+  // This cannot be constructor-checked: ``op_`` is an ``OpPtr``, so the node
+  // has the callee's *name* but not its ``Function``, and ``params_`` is
+  // unreachable from here. The bound is enforced where the callee resolves —
+  // ``DeriveCallDirections`` and orchestration codegen's ``BuildTaskParams``.
+  std::vector<ExprPtr> args_;
   std::vector<ExprPtr> deps_;  // TaskId dependencies (Scalar[TASK_ID] / Array[N, TASK_ID])
   // SPMD launch spec — populated only by ``pl.spmd_submit(...)``.
   // ``core_num_`` is the block count (an INDEX/INT-typed Expr — typically a
@@ -1139,7 +1297,7 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
     // re-emitted below from core_num_ / sync_start_. Drop any stray attr of
     // the same key so the field stays the single source of truth (Call::GetAttr
     // returns the first match, so a stale attr would otherwise shadow it).
-    if (k != kAttrManualDepEdges && k != "core_num" && k != "sync_start" && k != "allow_early_resolve" &&
+    if (k != kAttrManualDepEdges && k != kAttrCoreNum && k != kAttrSyncStart && k != "allow_early_resolve" &&
         k != kAttrPredicate) {
       attrs.emplace_back(k, v);
     }
@@ -1176,8 +1334,8 @@ inline CallPtr SubmitToCallView(const SubmitPtr& submit) {
   // Spmd-wrapper function's attrs). core_num_/sync_start_ are first-class
   // Submit fields and never appear in submit->attrs_, so no duplication.
   if (submit->core_num_.has_value()) {
-    attrs.emplace_back("core_num", std::any(*submit->core_num_));
-    attrs.emplace_back("sync_start", std::any(submit->sync_start_));
+    attrs.emplace_back(kAttrCoreNum, std::any(*submit->core_num_));
+    attrs.emplace_back(kAttrSyncStart, std::any(submit->sync_start_));
   }
   // Speculative early-dispatch opt-in — surface as a Call-view attr so
   // orchestration codegen emits ``Arg::set_allow_early_resolve(true)``. Only

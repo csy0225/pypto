@@ -52,6 +52,11 @@ T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const st
 
 namespace {
 
+bool IsPtoRowMinDtype(const DataType& dtype) {
+  return dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::FP16 ||
+         dtype == DataType::FP32;
+}
+
 // Build the result type of a reduction over `axis`, given an already-validated input tensor.
 //
 // The reduction consumes the input's *valid* region on the reduced axis — the backend kernels bound
@@ -164,7 +169,12 @@ REGISTER_OP("tensor.row_min")
     .set_attr<bool>("keep_dim")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTensorReductionType(args, kwargs, "tensor.row_min");
+      auto result_type = DeduceTensorReductionType(args, kwargs, "tensor.row_min");
+      auto input_type = As<TensorType>(args[0]->GetType());
+      CHECK_SPAN(IsPtoRowMinDtype(input_type->dtype_), args[0]->span_)
+          << "The operator tensor.row_min requires input dtype in {INT16, INT32, FP16, FP32}, but got "
+          << input_type->dtype_.ToString();
+      return result_type;
     });
 
 REGISTER_OP("tensor.row_prod")

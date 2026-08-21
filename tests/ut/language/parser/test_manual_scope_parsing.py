@@ -18,6 +18,9 @@ from pypto.language.parser.diagnostics.exceptions import (
     UnsupportedFeatureError,
 )
 
+_OP_ARRAY_CREATE = ir.get_op("array.create").name
+_OP_ARRAY_UPDATE_ELEMENT = ir.get_op("array.update_element").name
+
 
 def _first_runtime_scope(stmt):
     """Return the first RuntimeScopeStmt found in a stmt subtree (DFS), or None."""
@@ -74,7 +77,7 @@ class TestManualScopeParsing:
         assert scope.manual is True
 
     def test_parse_manual_scope_rejects_arguments(self):
-        with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
+        with pytest.raises(ParserSyntaxError):
 
             @pl.program
             class _Prog:
@@ -185,7 +188,7 @@ class Prog:
 
     def test_plain_call_rejects_deps_kwarg(self):
         """``deps=`` on a plain ``self.kernel(...)`` call is rejected — use pl.submit."""
-        with pytest.raises(Exception):  # noqa: B017 — parser raises ParserTypeError
+        with pytest.raises(ParserTypeError):
 
             @pl.program
             class _Prog:
@@ -257,7 +260,7 @@ class Prog:
         assert edges[0].type.dtype == pl.TASK_ID
 
     def test_submit_as_bare_expression_is_rejected(self):
-        with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
+        with pytest.raises(ParserSyntaxError):
 
             @pl.program
             class _Prog:
@@ -331,7 +334,7 @@ class Prog:
         # First stmt: placeholder for t1.
         assert isinstance(stmts[0], ir.AssignStmt)
         assert isinstance(stmts[0].value, ir.Call)
-        assert stmts[0].value.op.name == "system.task_invalid"
+        assert stmts[0].value.op.name == ir.get_op("system.task_invalid").name
         # Second stmt: the first pl.at scope. Its ``task_id_var`` attr must
         # point at the same Var bound by the placeholder above (otherwise the
         # outliner couldn't unify the synthesised ``TupleGetItem`` binding
@@ -438,7 +441,7 @@ class Prog:
 
     def test_pl_at_as_on_non_at_scope_is_rejected(self):
         """``as`` is only meaningful on ``pl.at(...)``; other constructs reject it."""
-        with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
+        with pytest.raises(ParserSyntaxError):
 
             @pl.program
             class _Prog:
@@ -449,7 +452,7 @@ class Prog:
 
     def test_submit_nested_result_tuple_is_rejected(self):
         """pl.submit result targets must be plain names — no nested tuples."""
-        with pytest.raises(Exception):  # noqa: B017 — parser raises ParserSyntaxError
+        with pytest.raises(ParserSyntaxError):
 
             @pl.program
             class _Prog:
@@ -728,8 +731,8 @@ class TestSubmitDepsPerElementAndComprehension:
         assert edge.type.dtype == pl.TASK_ID
         # The synthesizer must emit one array.create + 3 array.update_element
         # calls *before* the consumer kernel call. Look for them by op name.
-        create_calls = [c for c in calls if c.op.name == "array.create"]
-        update_calls = [c for c in calls if c.op.name == "array.update_element"]
+        create_calls = [c for c in calls if c.op.name == _OP_ARRAY_CREATE]
+        update_calls = [c for c in calls if c.op.name == _OP_ARRAY_UPDATE_ELEMENT]
         assert len(create_calls) >= 1  # one for the user `tids` plus the synth buffer
         # Two `tids[n] = t` writes (from the producer loop) plus 3 from the synthesizer.
         assert len(update_calls) >= 3
@@ -953,7 +956,7 @@ class TestSubmitDepsPerElementAndComprehension:
         synth_creates = [
             c
             for c in calls
-            if c.op.name == "array.create"
+            if c.op.name == _OP_ARRAY_CREATE
             # locally-bound _submit_deps_buf would be the array.create's LHS;
             # the user wrote no array.create themselves here.
         ]
@@ -1085,8 +1088,8 @@ class TestSubmitDepsPerElementAndComprehension:
         for s in stmts[:scope2_idx]:
             if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call):
                 prior_calls.append(s.value)
-        synth_creates = [c for c in prior_calls if c.op.name == "array.create"]
-        synth_updates = [c for c in prior_calls if c.op.name == "array.update_element"]
+        synth_creates = [c for c in prior_calls if c.op.name == _OP_ARRAY_CREATE]
+        synth_updates = [c for c in prior_calls if c.op.name == _OP_ARRAY_UPDATE_ELEMENT]
         # Two array.create calls before scope2: the user's `tids` and the synth.
         # Two array.update_element calls: `tids[0] = t1` (user) + synthesized fill.
         assert len(synth_creates) == 2

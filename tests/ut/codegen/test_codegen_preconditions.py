@@ -7,11 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import backend, codegen, passes
 from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
 @pytest.fixture(autouse=True)
@@ -44,8 +46,77 @@ def test_distributed_codegen_requires_comm_domain_materialization_when_distribut
     # Deliberately omit MaterializeCommDomainScopes.
     program = passes.convert_to_ssa()(Input)
     cg = codegen.DistributedCodegen()
-    with pytest.raises(Exception, match="DistributedCodegen preconditions"):
+    with pytest.raises(pypto.InternalError, match="DistributedCodegen preconditions"):
         cg.generate(program)
+
+
+def test_device_kernel_rejects_descending_loop():
+    """A descending loop in a device function must fail loudly, not silently.
+
+    Regression: device code lowers to MLIR ``scf.for``, which counts upward
+    only. A ``pl.range(8, 0, -1)`` was transcribed verbatim into
+    ``scf.for %i = 8 to 0 step -1`` — a zero-trip loop that ptoas folded away,
+    dropping the entire loop body with no diagnostic from any stage. The kernel
+    loaded its input, computed nothing, and stored.
+
+    The PTOAS team has confirmed they will not support a non-positive
+    ``scf.for`` step in the foreseeable future — hw-native-sys/PTOAS#1288 will
+    be closed by adding the missing assertion only. So this rejection is
+    permanent, and the test stays: even once that assertion ships, the PyPTO
+    check fires earlier and names the user's loop instead of generated ``.pto``.
+    """
+    n = 64
+
+    @pl.program
+    class Descending:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kern(
+            self,
+            x: pl.Tensor[[n, n], pl.FP32],
+            out: pl.Out[pl.Tensor[[n, n], pl.FP32]],
+        ) -> pl.Tensor[[n, n], pl.FP32]:
+            acc: pl.Tile[[n, n], pl.FP32] = pl.load(x, [0, 0], [n, n])
+            for _i, (acc,) in pl.range(8, 0, -1, init_values=(acc,)):
+                acc = pl.add(acc, acc)
+                acc = pl.yield_(acc)
+            return pl.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Descending)
+
+    with pytest.raises(ValueError, match="must have a positive step"):
+        codegen.PTOCodegen().generate(optimized)
+
+
+def test_device_kernel_accepts_ascending_loop():
+    """The ascending counterpart of the descending-loop rejection still lowers.
+
+    Guards the rejection above against over-reach: only a non-positive constant
+    step is refused.
+    """
+    n = 64
+
+    @pl.program
+    class Ascending:
+        @pl.function(type=pl.FunctionType.AIV)
+        def kern(
+            self,
+            x: pl.Tensor[[n, n], pl.FP32],
+            out: pl.Out[pl.Tensor[[n, n], pl.FP32]],
+        ) -> pl.Tensor[[n, n], pl.FP32]:
+            acc: pl.Tile[[n, n], pl.FP32] = pl.load(x, [0, 0], [n, n])
+            for _i, (acc,) in pl.range(0, 8, 1, init_values=(acc,)):
+                acc = pl.add(acc, acc)
+                acc = pl.yield_(acc)
+            return pl.store(acc, [0, 0], out)
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Ascending)
+
+    mlir = codegen.PTOCodegen().generate(optimized)
+    assert "scf.for" in mlir, mlir
 
 
 def test_orchestration_codegen_precondition_entry_point():
@@ -53,19 +124,16 @@ def test_orchestration_codegen_precondition_entry_point():
 
     The precondition must be the first thing that runs in
     ``codegen.generate_orchestration`` — before any IR traversal or emission.
-    This smoke test confirms the entry point is wired: a valid program reaches
-    the precondition (which passes for well-formed IR from convert_to_ssa)
-    and proceeds to codegen, which fails later on a missing pass
-    (ExpandMixedKernel) with a distinct error — proving the precondition did
-    NOT block and the codegen pipeline advanced past it.
+    This smoke test confirms the entry point is wired: a program that satisfies
+    all IR-property preconditions (including RuntimeScopesMaterialized) reaches
+    codegen and fails later on a missing pass (ExpandMixedKernel) with a
+    distinct error — proving the precondition barrier did not spuriously block.
 
-    Note: triggering the IR-property checks (SplitIncoreOrch,
-    OrchestrationReferencesResolved, RuntimeScopesMaterialized) from Python
-    tests is currently limited because (a) SplitIncoreOrch is included in
-    convert_to_ssa, (b) OrchestrationReferencesResolved is enforced by the
-    DSL parser, and (c) RuntimeScopesMaterialized lacks a registered verifier.
-    Follow-up work should register a verifier for RuntimeScopesMaterialized
-    and add a targeted failure test.
+    Note: triggering every IR-property check from Python tests is still
+    partially limited because SplitIncoreOrch is included in convert_to_ssa and
+    OrchestrationReferencesResolved is enforced by the DSL parser.
+    RuntimeScopesMaterialized is registered — see
+    test_verify_runtime_scopes_materialized.py for targeted failure tests.
     """
 
     @pl.program
@@ -79,14 +147,16 @@ def test_orchestration_codegen_precondition_entry_point():
             y, _ = pl.submit(self.k, x)
             return y
 
-    program = passes.convert_to_ssa()(Input)
+    program = passes.classify_iter_arg_carry()(
+        passes.materialize_runtime_scopes()(passes.derive_call_directions()(passes.convert_to_ssa()(Input)))
+    )
     for func in program.functions.values():
         if func.func_type == pl.FunctionType.Orchestration:
-            # The precondition passes (properties are satisfied by
-            # convert_to_ssa). Codegen proceeds and fails at
-            # InferFunctionCoreType because ExpandMixedKernel was not run —
-            # proving the precondition did not block execution.
-            with pytest.raises(Exception, match="InferFunctionCoreType"):
+            # All codegen preconditions pass (including RuntimeScopesMaterialized).
+            # Codegen proceeds and fails at InferFunctionCoreType because
+            # ExpandMixedKernel was not run — proving the precondition did not
+            # block execution.
+            with pytest.raises(pypto.InternalError, match="InferFunctionCoreType"):
                 codegen.generate_orchestration(program, func)
             return
     pytest.fail("No orchestration function found in program")
@@ -149,7 +219,7 @@ def test_orchestration_codegen_requires_return_params_explicit_for_multi_out_cal
     the result aliases.
     """
     program = _finalize(_MultiOutProgram)
-    with pytest.raises(Exception, match="ReturnParamsExplicit"):
+    with pytest.raises(pypto.Error, match="ReturnParamsExplicit"):
         codegen.generate_orchestration(program, _orch_func(program))
 
 

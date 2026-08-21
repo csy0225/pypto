@@ -23,6 +23,7 @@ namespaces remain available for cases where the caller wants to be explicit.
 """
 
 from . import array_ops as array
+from . import prefetch_ops as prefetch
 from . import system_ops as system
 from . import tensor_ops as tensor
 from . import tile_ops as tile
@@ -40,81 +41,80 @@ from .system_ops import (
     tpush_to_aic,
     tpush_to_aiv,
 )
+from .tensor_ops import ci as arange
+from .tensor_ops import create as create_tensor
 
-# Promoted tensor-only ops (accessible as pl.create_tensor, etc.)
+# Promoted tensor-only ops (accessible as pl.create_tensor, etc.). Names that
+# also exist at tile level are re-exported below from ``unified_ops`` instead so
+# the Tensor/Tile dispatch wins — keep this block to names the tile layer does
+# not define, or whose tile twin takes a signature no dispatcher can reconcile
+# (``gather`` / ``scatter``), or that carry no operand to dispatch on at all
+# (``full``, ``random``, and the block-identity queries).
 from .tensor_ops import (
-    assemble,
-    cos,
     create_l1,
     dim,
     expand_clone,
     full,
     gather,
-    gather_row,
     get_block_idx,
     get_block_num,
     get_subblock_idx,
-    mrgsort,
     paged_gather,
     random,
     scatter,
-    scatter_update,
-    sin,
-    sort32,
 )
-from .tensor_ops import ci as arange
-from .tensor_ops import create as create_tensor
 
-# Promoted tile-only ops (accessible as pl.load, etc.). ``abs`` and
-# ``create_tile`` are re-exported below from ``unified_ops`` instead so
-# the unified Tensor/Tile dispatch wins.
+# Promoted tile-only ops (accessible as pl.load, etc.). ``abs`` and the
+# bitwise family are re-exported below from ``unified_ops`` instead so the
+# unified Tensor/Tile dispatch wins.
 from .tile_ops import (
     addc,
     addsc,
     aic_gather,
     aiv_shard,
-    and_,
-    ands,
     cmps,
+    create_tile,
+    gatherb,
     gemv,
     gemv_acc,
     gemv_bias,
     load,
     lrelu,
     matmul_bias,
+    matmul_mx,
+    matmul_mx_acc,
+    matmul_mx_bias,
     max,
     maximums,
+    mgather,
     min,
     minimums,
     move,
     mscatter,
-    not_,
-    or_,
-    ors,
     prelu,
     relu,
     rem,
     rems,
     sel,
     sels,
-    shl,
-    shls,
-    shr,
-    shrs,
     store,
     subc,
     subsc,
-    xor,
-    xors,
+    tri,
 )
 
 # Unified dispatch (overlapping ops). Imported AFTER tile_ops so the
-# unified versions override any same-named imports above (e.g. ``abs``,
-# ``create_tile``) — direct ``pl.abs(tensor)`` users get the unified
-# dispatch rather than the Tile-only path.
+# unified versions override any same-named imports above (e.g. ``abs``) —
+# direct ``pl.abs(tensor)`` users get the unified dispatch rather than the
+# Tile-only path. Only names that genuinely dispatch on Tensor/Tile belong
+# here: a pure forwarder would shadow the tile_ops version with a narrower
+# signature, and the parser resolves ``pl.<op>`` against this namespace.
 from .unified_ops import (
     abs,  # noqa: A004 (intentionally shadows builtin via DSL surface)
     add,
+    and_,
+    ands,
+    assemble,
     batch_matmul,
     cast,
     cmp,
@@ -133,7 +133,7 @@ from .unified_ops import (
     col_prod,
     col_sum,
     concat,
-    create_tile,
+    cos,
     div,
     exp,
     expands,
@@ -141,13 +141,18 @@ from .unified_ops import (
     fillpad_expand,
     fmod,
     fmods,
+    gather_row,
     log,
     matmul,
     matmul_acc,
     maximum,
     minimum,
+    mrgsort,
     mul,
     neg,
+    not_,
+    or_,
+    ors,
     part_add,
     part_max,
     part_min,
@@ -171,16 +176,26 @@ from .unified_ops import (
     row_prod,
     row_sum,
     rsqrt,
+    scatter_update,
     set_validshape,
+    shl,
+    shls,
+    shr,
+    shrs,
+    sin,
     slice,
+    sort32,
     sqrt,
     sub,
     transpose,
     write,
+    xor,
+    xors,
 )
 
 __all__ = [
     "array",
+    "prefetch",
     "tile",
     "system",
     "tensor",
@@ -235,7 +250,6 @@ __all__ = [
     "col_expand_max",
     "col_expand_min",
     "col_expand_expdif",
-    "expand_clone",
     "expands",
     "neg",
     "read",
@@ -253,6 +267,9 @@ __all__ = [
     "abs",
     "relu",
     "matmul_bias",
+    "matmul_mx",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
     "gemv",
     "gemv_acc",
     "gemv_bias",
@@ -276,6 +293,8 @@ __all__ = [
     "shrs",
     "maximums",
     "minimums",
+    "gatherb",
+    "mgather",
     "mscatter",
     "prelu",
     "not_",
@@ -286,27 +305,29 @@ __all__ = [
     "lrelu",
     "sel",
     "sels",
+    "tri",
+    # Unified dispatch (also defined at tile level)
+    "assemble",
+    "cos",
+    "gather_row",
+    "mrgsort",
+    "scatter_update",
+    "sin",
+    "sort32",
     # Promoted tensor-only
     "arange",
     "create_tensor",
-    "assemble",
-    "cos",
     "dim",
     "expand_clone",
     "full",
     "scatter",
-    "scatter_update",
-    "sin",
     "gather",
     "paged_gather",
     "random",
     "create_l1",
-    "gather_row",
     "get_block_idx",
     "get_block_num",
     "get_subblock_idx",
-    "mrgsort",
-    "sort32",
     # Promoted system ops
     "aic_initialize_pipe",
     "aiv_initialize_pipe",

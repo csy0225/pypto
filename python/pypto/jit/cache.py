@@ -29,10 +29,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pypto.pypto_core import DataType
+from pypto.pypto_core.passes import MemoryPlanner, RuntimeKind, runtime_kind_to_name
 
 if TYPE_CHECKING:
     from pypto.ir.pass_manager import OptimizationStrategy
-    from pypto.pypto_core.passes import MemoryPlanner
+    from pypto.pypto_core.ir import TensorLayout
 
 # Stable PyPTO version stamp included in every cache key so that upgrading
 # PyPTO (which may change the pass pipeline or codegen) automatically
@@ -54,11 +55,17 @@ class TensorCacheInfo:
         name: Parameter name.
         shape: Shape tuple with None for dynamic dimensions.
         dtype: DataType of the tensor.
+        layout: Annotated tensor layout, or None when the annotation omits it.
+            Included because a layout may reach the annotation through a
+            closure variable (``L = pl.NZ; ... pl.Tensor[[...], pl.FP32, L]``),
+            leaving the source text — and thus ``source_hash`` — unchanged
+            while the compiled artifact differs.
     """
 
     name: str
     shape: tuple[int | None, ...]
     dtype: DataType
+    layout: "TensorLayout | None" = None
 
 
 @dataclass(frozen=True)
@@ -135,8 +142,12 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     strategy: "OptimizationStrategy | None" = None,
     distributed_config: Any = None,
     analyze_auto_scopes_for_deps: bool = False,
+    dump_ptoas_passes: bool = False,
     memory_planner: "MemoryPlanner | None" = None,
     enable_pypto_l0c_double_buffer: bool = False,
+    tensor_layouts: dict[str, "TensorLayout | None"] | None = None,
+    dep_layouts: tuple[tuple[str, str, str], ...] = (),
+    runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
 ) -> CacheKey:
     """Build a cache key for a JIT call site.
 
@@ -145,6 +156,14 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         param_names: Ordered list of all parameter names (preserves arg order).
         tensor_shapes: Concrete shape per tensor parameter name.
         tensor_dtypes: DataType per tensor parameter name.
+        tensor_layouts: Annotated layout per tensor parameter name, where the
+            annotation declares one. See :class:`TensorCacheInfo.layout` for
+            why the layout has to split the key on its own.
+        dep_layouts: ``(dep name, parameter, layout)`` triples for layouts the
+            reachable deps declare themselves. Same reasoning as
+            ``tensor_layouts``, one call deeper: they shape the generated dep
+            signatures but appear in no entry-parameter meta, and a postponed
+            annotation hides a rebind from ``source_hash``.
         dynamic_dims: Set of (param_name, dim_index) pairs that are dynamic.
             Dynamic dims are stored as None in the cache key so different
             concrete values for that dimension produce the same cache entry.
@@ -152,12 +171,14 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         platform: Target platform string (e.g. "a2a3sim"). Included in the key
             because compiled artifacts are platform-specific; a cache entry
             compiled for one platform must not be reused for another.
-        strategy: Optimization strategy applied during compilation (an
-            ``OptimizationStrategy`` member, or ``None`` for the JIT default).
+        strategy: Optimization strategy applied during compilation, as an
+            ``OptimizationStrategy`` member. ``None`` is a distinct key value
+            for callers that omit the argument entirely; the JIT never passes
+            it, because ``JITFunction._resolve_compiled()`` normalizes a call
+            without a ``RunConfig`` to ``OptimizationStrategy.Default``.
             Included in the key because the strategy changes the compiled
-            artifact; without it, calling the same kernel with two strategies
-            (an A/B comparison) would return the first-compiled artifact for
-            both.
+            artifact; without it, artifacts compiled under different strategy
+            values would share one cache entry.
         distributed_config: Optional ``DistributedConfig`` forwarded to
             ``ir.compile()`` on the ``@pl.jit.host`` path. Included in the key
             because it is baked into the resulting
@@ -169,17 +190,25 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         analyze_auto_scopes_for_deps: Compile-side switch for deriving explicit
             task dependencies from AUTO runtime scopes. Included in the key
             because it changes generated orchestration dependencies.
-        memory_planner: Effective on-chip memory planner (``PYPTO`` or
-            ``PTOAS``) as resolved from the ``RunConfig`` field and any active
-            ``PassContext``. Included in the key because it decides whether
-            physical addresses are baked into the artifact (``--pto-level``
-            level3 vs level2); without it, compiling one kernel under both
-            planners would hand the second call the first one's artifact.
-        enable_pypto_l0c_double_buffer: Effective dbC=2 (L0C double-buffer) opt-in
-            under the PyPTO planner, resolved from the active ``PassContext``.
-            Included in the key because it changes the AutoTileMatmulL0 /
-            MemoryReuse output; without it a kernel first compiled with it off
-            would reuse that artifact when later called with it on (and vice versa).
+        dump_ptoas_passes: Whether ptoas writes intermediate IR after every
+            pass. Included in the key so enabling dumps cannot reuse an
+            artifact compiled without the requested dump output.
+        memory_planner: Effective on-chip memory planner (``PYPTO``,
+            ``DSA_RP``, or ``PTOAS``) as resolved from the ``RunConfig`` field
+            and any active ``PassContext``. Included in the key because it
+            changes the placement and whether physical addresses are baked
+            into the artifact; without it, compiling one kernel under multiple
+            planners would hand a later call the wrong artifact.
+        enable_pypto_l0c_double_buffer: Effective legacy-PYPTO chooser dbC=2
+            (L0C double-buffer) opt-in resolved from the active ``PassContext``.
+            Included for ``PYPTO`` because it changes AutoTileMatmulL0 output
+            and allocation. Canonicalized to false for ``DSA_RP`` and ``PTOAS``,
+            which enable dbC=2 automatically regardless of this flag.
+        runtime: Effective Simpler runtime ABI resolved from the active
+            ``PassContext``. Included in the key because it is baked into the
+            artifact's ``kernel_config.py`` and decides which worker can bind
+            the program; without it a ``host_build_graph`` call would silently
+            reuse a ``tensormap_and_ringbuffer`` artifact.
 
     Returns:
         Hashable CacheKey tuple.
@@ -192,7 +221,14 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         keyed_shape = tuple(
             None if (name, i) in dynamic_dims else dim for i, dim in enumerate(concrete_shape)
         )
-        tensor_infos.append(TensorCacheInfo(name=name, shape=keyed_shape, dtype=tensor_dtypes[name]))
+        tensor_infos.append(
+            TensorCacheInfo(
+                name=name,
+                shape=keyed_shape,
+                dtype=tensor_dtypes[name],
+                layout=(tensor_layouts or {}).get(name),
+            )
+        )
 
     scalar_infos = []
     for name in param_names:
@@ -201,10 +237,17 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         scalar_infos.append(ScalarCacheInfo(name=name, value=scalar_values[name]))
 
     dist_key = _freeze(distributed_config) if distributed_config is not None else None
+    effective_pypto_dbc = enable_pypto_l0c_double_buffer and memory_planner in (
+        None,
+        MemoryPlanner.PYPTO,
+    )
     compile_opts = (
         ("analyze_auto_scopes_for_deps", analyze_auto_scopes_for_deps),
+        ("dump_ptoas_passes", dump_ptoas_passes),
         ("memory_planner", None if memory_planner is None else str(memory_planner)),
-        ("enable_pypto_l0c_double_buffer", enable_pypto_l0c_double_buffer),
+        ("enable_pypto_l0c_double_buffer", effective_pypto_dbc),
+        ("dep_layouts", dep_layouts),
+        ("runtime", runtime_kind_to_name(runtime)),
     )
     return (
         source_hash,

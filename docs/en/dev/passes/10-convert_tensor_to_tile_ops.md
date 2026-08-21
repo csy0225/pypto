@@ -47,6 +47,57 @@ For each `FunctionType::InCore` function:
 
 4. **Insert tile.store (exit stores)**: For each return value converted from `TensorType` to `TileType`, add an `Out` parameter and insert `tile.store(tile, zeros, out_param)`. If the return value comes from a `tile.assemble` loop, the loop is rewritten to use `tile.store` directly (conversion-time assemble-loop rewrite; distinct from `OptimizeOrchTensors` Pattern 3 which handles cross-function optimization).
 
+5. **Upgrade written param directions**: An alias-origin analysis (`AnalyzeCallAccess`) attributes every read/write back to the parameter it originates from, then upgrades each `In` param that is written to `Out` (write-only) or `InOut` (read and written). Write targets recognised: `tile.store`, `tensor.write`, `tensor.assemble`, `pld.tile.remote_store`, `pld.tile.put` / `pld.tile.get`, `pld.system.notify` (`NotifyOp.Set` makes its `target` write-only; `NotifyOp.AtomicAdd` makes it read+write), `system.syncall` (workspace), plus the composite collectives `pld.tensor.allreduce` / `allgather` / `reduce_scatter` / `barrier` / `broadcast` / `all_to_all(_v)`, whose signal and target operands are marked read+write here because this pass runs upstream of `LowerCompositeOps`. Any other op's args count as reads only. Params the user already declared `Out` / `InOut` are left as-is.
+
+### GM Store Coherence Restriction
+
+An InCore function may not combine a bulk store (`tensor.assemble`, lowered to
+`tile.store`) with `tensor.write` on the same underlying GM tensor. The bulk
+store uses MTE3 while the scalar store uses the D-cache path; barriers alone do
+not guarantee cache-line coherence between those paths on A2/A3. The pass
+therefore rejects the combination instead of emitting code that can silently
+lose either the scalar overrides or neighbouring bulk-written bytes.
+
+Before applying the restriction, the pass canonicalizes a simple constant
+scalar-fill loop into `tensor.full` plus `tensor.assemble`, which then lowers to
+`tile.full` plus `tile.store`. The loop must be sequential, zero-based, and
+unit-stride; its body may contain one or more `tensor.write` operations and
+nothing else. Each write must cover a contiguous region with one loop-invariant
+constant value, and the flattened region must satisfy MTE3's 32-byte row
+alignment. This keeps full-block fallback fills on the MTE3 path instead of
+rejecting them as mixed stores. Dynamic values, non-canonicalizable partial
+updates, unaligned regions, and strided scalar loops remain on the D-cache path.
+
+The pass also stages a full-tensor `tensor.full` initialization followed only by
+scalar updates to that tensor. The scalar updates are redirected to the local
+tile, and one `tile.store` writes the completed value to GM at function exit.
+This supports dynamic sparse-map construction without mixing MTE3 and D-cache
+stores. The rewrite requires a zero-offset, full-shape initialization backed by
+a private `tensor.full` result; partial initialization, aliases, additional DMA
+stores, or other uses of the GM target remain rejected.
+
+The check follows assignment aliases and loop/branch carries. It is deliberately
+conservative: it rejects mixed store paths to one GM tensor even when source
+offsets appear disjoint, because the compiler does not yet prove cache-line
+separation across symbolic views and control flow. Mixed paths to distinct GM
+tensors remain valid.
+
+```python
+# Rejected: a partial assignment becomes MTE3 TSTORE, then pl.write uses D-cache.
+output[0:1, 0:16] = pl.full([1, 16], dtype=pl.INT32, value=-1)
+for i in pl.range(4):
+    pl.write(output, [0, i], pl.cast(i, pl.INT32))
+
+# Supported: update the local on-chip value, then issue one GM store.
+staged = pl.full([1, 32], dtype=pl.INT32, value=-1)
+for i in pl.range(4):
+    pl.write(staged, [0, i], pl.cast(i, pl.INT32))
+output[0:1, 0:32] = staged
+```
+
+Using `tensor.write` for every element is also supported when a single bulk
+store is not practical.
+
 ### Phase 2a: Propagate Added Outputs Through Spmd/Group Wrappers
 
 `OutlineClusterScopes` produces Spmd/Group wrappers that are transparent 1:1
@@ -83,6 +134,8 @@ already rewritten in Phase 1 / 2a.
 ## MatmulSlice Pattern
 
 When `tensor.slice` feeds into `tensor.matmul` or `tensor.matmul_acc`, the slice must produce a Mat-space tile instead of a Vec-space tile. The pass pre-scans for this pattern and emits a natural Mat `tile.load`; a transposed operand (`a_trans` for LHS, `b_trans` for RHS) gets a zero-copy `tile.transpose_view` at the matmul site.
+
+The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](21-expand_mixed_kernel.md) split it into an AIC/AIV pair.
 
 ## Transpose Lowering
 
@@ -166,9 +219,25 @@ Only the small index / page-table metadata is scalar-read from GM; the bulk KV d
 | Op | Lowers to | Role |
 | -- | --------- | ---- |
 | `tensor.create_l1(shape, dtype, transpose=...)` | `tile.create(target_memory=Mat, transpose=...)` | seed the loop-carried L1 accumulator |
-| `tensor.gather_row(acc, src, dst_off, src_off, shapes, transpose=...)` | `tile.gather_row` (DPS) | DMA one **caller-addressed** GM row into `acc` |
+| `tensor.gather_row(acc, src, dst_off, src_off, shapes, valid_shape=..., transpose=...)` | `tile.gather_row` (DPS) | DMA one **caller-addressed** GM row into `acc` |
 
 Both deduce a `TensorType`, so the gathered result composes with tensor-level `tensor.matmul` / softmax; both are registered self-loading (`src` stays GM). The caller computes `src_off` and the `dst_off` slot, then fills the accumulator row by row in its own loop.
+
+**Dynamic transfer length (`valid_shape`).** `shapes` must stay compile-time constant: it becomes `pto.subview`'s `sizes`, which the PTO dialect types as a static `I64ArrayAttr` (`SubViewOp` in `PTOOps.td`). The optional `valid_shape` carries the *runtime* extent instead — it feeds the subview's `valid_row` / `valid_col`, declared `Optional<Index>` SSA operands, and the GM `pto.partition_view` sizes, which accept a dynamic `?` dim. So a dynamic row count changes neither the allocation nor the box alignment below: the sub-region stays statically `shapes`-sized and only the copy length varies. Omitting `valid_shape` transfers the whole window, which is the pre-existing behaviour.
+
+This turns a run of consecutive rows whose length is only known at runtime into one call instead of a guarded per-row loop:
+
+```python
+kv = pl.create_l1([128, HEAD_DIM], pl.BF16)
+# r1 is a runtime Scalar[INDEX] — e.g. a page-boundary split point
+kv = pl.gather_row(kv, pool, [0, 0],  [b0, 0], [128, HEAD_DIM], valid_shape=[r1, HEAD_DIM])
+kv = pl.gather_row(kv, pool, [r1, 0], [b1, 0], [128, HEAD_DIM], valid_shape=[128 - r1, HEAD_DIM])
+oi = pl.matmul(q, kv, b_trans=True)
+```
+
+**Bounds are on the written region, not the window.** `shapes` sizes the static `pto.subview`, so with a runtime `dst_offset` the declared window may reach past the destination — in the example above run 2 declares rows `[r1, r1 + 128)` on a 128-row tile. That is sound only because the transfer is bounded by `valid_shape`, not by `shapes`: the rows actually written are `[r1, r1 + (128 - r1))`, which stay inside. The caller's obligation is therefore `dst_offset + valid_shape <= dst.shape` per dimension; `dst_offset + shapes` need not fit. The two-run form above is covered on device by `test_gather_row_two_run_split`.
+
+`valid_shape` is keyword-only in the DSL — `transpose` already owned the sixth positional slot, and taking it would silently reinterpret an existing `gather_row(..., shapes, True)` call. At the IR level it is a positional operand rather than an attr precisely because it may be a runtime value: it has to stay in the use-def chain so SSA/liveness keep the scalar alive. It is rejected together with `transpose=True` (see below) — that path would need a runtime *column* extent on a boxed NZ tile, which is unverified on device. The deducer rejects any *provable* violation of `0 <= valid_shape[i] <= shapes[i]`; a symbolic extent it cannot decide is accepted, which is the case the operand exists for.
 
 **Transpose (ZN) for a `b_trans` matmul operand.** `transpose=True` makes the gathered tile a transposed matmul B-operand without a GM round-trip:
 
@@ -188,7 +257,7 @@ for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
 oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor, OUTSIDE the region
 ```
 
-This pass lowers each **1:1** to its tile op (`tensor.aiv_shard` → `tile.aiv_shard`, `tensor.aic_gather` → `tile.aic_gather`), so from here on the IR is byte-identical to what the AUTO `pl.split` path produces via [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md) (pass 18). `ExpandMixedKernel` (pass 19) then folds both into the cross-core `tpush`/`tpop` machinery.
+This pass lowers each **1:1** to its tile op (`tensor.aiv_shard` → `tile.aiv_shard`, `tensor.aic_gather` → `tile.aic_gather`), so from here on the IR is byte-identical to what the AUTO `pl.split` path produces via [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) (pass 20). `ExpandMixedKernel` (pass 21) then folds both into the cross-core `tpush`/`tpop` machinery.
 
 **Constraints** (enforced by the tensor-level deducer and the DSL parser, not this pass):
 
@@ -266,8 +335,10 @@ Key changes:
 | Property | Value |
 | -------- | ----- |
 | Required | SSAForm, SplitIncoreOrch, NormalizedStmtStructure |
-| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure |
-| Invalidated | — |
+| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid |
+| Invalidated | AivSplitValid |
+
+`AivSplitValid` is both invalidated and re-produced, which forces a second verification of the split regions here. `OutlineIncoreScopes` establishes the property while the AIV-split boundary is still `tensor.aiv_shard` / `tensor.aic_gather`; a TensorType carries no memory space, so the verifier's boundary memory-contract check is necessarily skipped there. This pass rewrites those ops to their tile form and attaches the declared boundary memory, which is exactly what that check inspects.
 
 ## Key Components
 

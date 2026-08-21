@@ -36,6 +36,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13"
 ]
 
+[project.scripts]
+pypto-ir-trace = "pypto.tools.ir_trace.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
@@ -45,6 +48,10 @@ dev = [
     "ruff==0.14.8",
     "clang-tidy==21.1.0",
 ]
+# The documentation site toolchain is NOT an extra: it lives in
+# `docs/requirements.txt`, so the docs CI job installs it with a plain
+# `pip install -r` instead of `pip install -e ".[docs]"`, which would trigger a
+# full C++ build the site does not need.
 
 [project.urls]
 Homepage = "https://github.com/hw-native-sys/pypto"
@@ -99,6 +106,9 @@ fixable = ["ALL"]
 "tests/ut/language/parser/test_text_parser.py" = ["E501"]
 # IR dumps are formatted at 200-col for readability — suppress line-length lint
 "build_output/**" = ["E501"]
+# Embeds a verbatim pass dump as a fixture; tile annotations carry their MemRef
+# inline and cannot be wrapped without changing what is under test.
+"tests/ut/tools/test_memory_map.py" = ["E501"]
 
 [tool.ruff.lint.pylint]
 max-statements = 100

@@ -16,8 +16,12 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/distributed/distributed_codegen.h"
 #include "pypto/codegen/distributed/distributed_op_registry.h"
@@ -29,6 +33,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace codegen {
@@ -41,33 +46,49 @@ using ir::MakeTuple;
 
 namespace {
 
-std::string AllReduceOpSuffix(int reduce_op) {
+struct AllReduceOpVariant {
+  const char* suffix;
+  const char* cpp;
+  const char* instruction;
+};
+
+AllReduceOpVariant GetAllReduceOpVariant(int reduce_op) {
+  switch (static_cast<ir::ReduceOp>(reduce_op)) {
+    case ir::ReduceOp::kSum:
+      return {"sum", "ReduceOp::kSum", "TADD"};
+    case ir::ReduceOp::kMax:
+      return {"max", "ReduceOp::kMax", "TMAX"};
+    case ir::ReduceOp::kMin:
+      return {"min", "ReduceOp::kMin", "TMIN"};
+    case ir::ReduceOp::kProd:
+      return {"prod", "ReduceOp::kProd", "TMUL"};
+    default:
+      throw pypto::ValueError("unsupported builtin.tensor.allreduce ReduceOp " + std::to_string(reduce_op));
+  }
+}
+
+struct AllReduceDTypeVariant {
+  const char* suffix;
+  const char* cpp;
+};
+
+AllReduceDTypeVariant GetAllReduceDTypeVariant(const DataType& dtype) {
+  if (dtype == DataType::FP16) return {"fp16", "half"};
+  if (dtype == DataType::FP32) return {"fp32", "float"};
+  throw pypto::ValueError("unsupported builtin.tensor.allreduce dtype " + dtype.ToString());
+}
+
+std::string ReduceScatterOpSuffix(int reduce_op) {
   CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
-      << "builtin.tensor.allreduce variant mangling currently supports only ReduceOp.Sum, got " << reduce_op;
+      << "builtin.tensor.reduce_scatter variant mangling currently supports only ReduceOp.Sum, got "
+      << reduce_op;
   return "sum";
 }
 
-std::string AllReduceOpCpp(int reduce_op) {
+std::string ReduceScatterOpCpp(int reduce_op) {
   CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
-      << "builtin.tensor.allreduce currently supports only ReduceOp.Sum, got " << reduce_op;
+      << "builtin.tensor.reduce_scatter currently supports only ReduceOp.Sum, got " << reduce_op;
   return "ReduceOp::kSum";
-}
-
-std::string AllReduceDTypeSuffix(const DataType& dtype) {
-  CHECK(dtype == DataType::FP32)
-      << "builtin.tensor.allreduce variant mangling currently supports only FP32, got " << dtype.ToString();
-  return "fp32";
-}
-
-std::string AllReduceDTypeCpp(const DataType& dtype) {
-  CHECK(dtype == DataType::FP32)
-      << "builtin.tensor.allreduce template instantiation currently supports only FP32, got "
-      << dtype.ToString();
-  return "float";
-}
-
-std::string MangleTensorAllReduceVariant(const std::string& op_name, int reduce_op, const DataType& dtype) {
-  return op_name + "__" + AllReduceOpSuffix(reduce_op) + "__" + AllReduceDTypeSuffix(dtype);
 }
 
 std::string Fp32VariantSuffix(const DataType& dtype) {
@@ -99,7 +120,8 @@ std::string ArgDirectionToTensorArgType(ir::ArgDirection dir) {
 }
 
 void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const CallPtr& call,
-                                         const std::string& variant) {
+                                         const std::string& variant,
+                                         std::optional<int> core_num = std::nullopt) {
   INTERNAL_CHECK(call && call->op_)
       << "Internal error: builtin tensor collective dispatch needs a valid Call";
 
@@ -144,26 +166,38 @@ void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const Call
       const std::string shape = codegen.FormatShapeTuple(dist_type->shape_);
       const std::string dtype_enum =
           "DataType." + DistributedCodegen::DataTypeToSimplerEnum(dist_type->dtype_);
-      codegen.Emit(ta_var + ".add_tensor(Tensor.make(data=" + arg_handle + "[" + rank_expr +
-                   "].buffer_ptrs[\"" + name + "\"], shapes=" + shape + ", dtype=" + dtype_enum +
-                   ", child_memory=True), " + tag + ")");
+      codegen.Emit(ta_var + ".add_tensor(" + arg_handle + "[" + rank_expr + "].buffers[\"" + name +
+                   "\"].tensor(shapes=" + shape + ", dtype=" + dtype_enum + "), " + tag + ")");
       continue;
     }
     if (ir::As<ir::TileType>(call->args_[i]->GetType())) {
       const std::string arg_name = codegen.GetExprAsCode(call->args_[i]);
       INTERNAL_CHECK_SPAN(!arg_name.empty(), call->span_)
           << "Internal error: builtin tensor collective tile arg must resolve to a Python name";
-      codegen.Emit(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + arg_name + "\"]), " + tag + ")");
+      codegen.Emit(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + arg_name + "\"]), " +
+                   tag + ")");
       continue;
     }
     INTERNAL_CHECK_SPAN(false, call->span_)
         << "Internal error: unsupported builtin tensor collective arg type at index " << i;
   }
 
+  // Per-rank comm ordering token, appended as the LAST TENSOR (before the scalars, which
+  // TaskArgs requires). Builtin collectives submit through their own submit_next_level, so
+  // without this they sit outside the ordering chain that EmitCallToWorker builds: a rank
+  // mixing a builtin barrier/collective with a custom comm kernel — or issuing builtins
+  // across separate dispatches — would still let a waiting dispatch be routed ahead of its
+  // producer, which is the deadlock this token exists to prevent. All window args here are
+  // checked above to share one comm domain, so a single token is enough.
+  codegen.Emit(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + *handle_var + "_ord\"][" +
+               rank_expr + "]), TensorArgType.INOUT)");
+
   codegen.Emit(ta_var + ".add_scalar(" + *handle_var + "[" + rank_expr + "].domain_size)");
   codegen.Emit(ta_var + ".add_scalar(" + *handle_var + "[" + rank_expr + "].device_ctx)");
+  if (core_num.has_value()) {
+    codegen.Emit(ta_var + ".add_scalar(" + std::to_string(*core_num) + ")");
+  }
   codegen.Emit(cfg_var + " = CallConfig()");
-  codegen.Emit(cfg_var + ".block_dim = 1");
   codegen.Emit(cfg_var + ".aicpu_thread_num = config.aicpu_thread_num");
   codegen.Emit("_keep.append(" + ta_var + ")");
   codegen.Emit("orch.submit_next_level(callables[\"" + variant + "\"], " + ta_var + ", " + cfg_var +
@@ -180,7 +214,7 @@ void EmitBuiltinWindowCollectiveDispatch(DistributedCodegen& codegen, const Call
 // as part of the ``orch.allocate_domain(buffers=[CommBufferSpec(...), ...])``
 // spec list wrapping the host_orch body. The host_orch.py module never needs
 // to reach for the IR-level alloc op again — chip dispatch reads the device
-// pointer from ``__comm_d0[r].buffer_ptrs["<name>"]`` instead. Returning
+// wire view from ``__comm_d0[r].buffers["<name>"].tensor(...)`` instead. Returning
 // empty signals the surrounding ``AssignStmt`` visitor to drop the line.
 // ============================================================================
 REGISTER_DISTRIBUTED_OP(pld_tensor_alloc_window_buffer, "pld.tensor.alloc_window_buffer") {
@@ -194,7 +228,7 @@ REGISTER_DISTRIBUTED_OP(pld_tensor_alloc_window_buffer, "pld.tensor.alloc_window
 //
 // ``pld.tensor.window`` materialises a window-bound view at IR construction
 // time; ``MaterializeCommDomainScopes`` rewires every dispatch site so the per-rank
-// device pointer is read from ``__comm_d0[r].buffer_ptrs["<name>"]`` at
+// wire view is derived from ``__comm_d0[r].buffers["<name>"]`` at
 // chip-arg emission time. The host_orch.py module never calls back into
 // the IR window op.
 // ============================================================================
@@ -207,19 +241,62 @@ REGISTER_DISTRIBUTED_OP(pld_tensor_window, "pld.tensor.window") {
 // ============================================================================
 // builtin.tensor.allreduce: compiler-generated host collective chip dispatch.
 // ============================================================================
+
+/// Emit the chip dispatch shared by the mesh and ring host AllReduce builtins.
+///
+/// ``multicore`` is set only for the mesh builtin, which launches a synchronized
+/// SPMD AIV grid of ``core_num`` blocks. The ring builtin stays single-block, so
+/// it neither carries a ``core_num`` attr nor renders a launch-spec method.
+/// ``core_num`` itself is validated by ``LowerHostTensorCollectives`` — including
+/// the backend capacity bound — so codegen only forwards it.
+std::string EmitAllReduceLikeDispatch(DistributedCodegen& dist_codegen, const CallPtr& op,
+                                      bool include_reduce_inst, bool multicore) {
+  const int reduce_op = op->GetAttr<int>("op");
+  const auto dtype = op->GetAttr<DataType>("dtype");
+  const auto reduce_variant = GetAllReduceOpVariant(reduce_op);
+  const auto dtype_variant = GetAllReduceDTypeVariant(dtype);
+  const std::string variant = op->op_->name_ + "__" + reduce_variant.suffix + "__" + dtype_variant.suffix;
+
+  std::optional<int> core_num;
+  if (multicore) {
+    const int requested = op->GetAttr<int>("core_num");
+    INTERNAL_CHECK_SPAN(requested > 0, op->span_)
+        << "Internal error: builtin.tensor.allreduce core_num must be positive, got " << requested
+        << "; LowerHostTensorCollectives should have rejected it";
+    core_num = requested;
+  }
+
+  if (dist_codegen.MarkBuiltinEmitted(variant)) {
+    std::map<std::string, std::string> template_vars{{"op_cpp", reduce_variant.cpp},
+                                                     {"dtype_cpp", dtype_variant.cpp}};
+    if (include_reduce_inst) {
+      template_vars["reduce_inst"] = reduce_variant.instruction;
+    }
+    if (multicore) {
+      template_vars["launch_core_count_method"] =
+          pypto::backend::GetBackend()->GetHandler()->GetLaunchSpecCoreCountMethod();
+    }
+    dist_codegen.RecordBuiltinNextLevel(op, variant, std::move(template_vars));
+  }
+  EmitBuiltinWindowCollectiveDispatch(dist_codegen, op, variant, core_num);
+  return "";
+}
+
 REGISTER_DISTRIBUTED_OP(builtin_tensor_allreduce, "builtin.tensor.allreduce") {
   auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
   INTERNAL_CHECK(dist_codegen) << "builtin.tensor.allreduce codegen requires DistributedCodegen";
-  const int reduce_op = op->GetAttr<int>("op");
-  const auto dtype = op->GetAttr<DataType>("dtype");
-  const std::string variant = MangleTensorAllReduceVariant(op->op_->name_, reduce_op, dtype);
+  return EmitAllReduceLikeDispatch(*dist_codegen, op, /*include_reduce_inst=*/true,
+                                   /*multicore=*/true);
+}
 
-  if (dist_codegen->MarkBuiltinEmitted(variant)) {
-    dist_codegen->RecordBuiltinNextLevel(
-        op, variant, {{"op_cpp", AllReduceOpCpp(reduce_op)}, {"dtype_cpp", AllReduceDTypeCpp(dtype)}});
-  }
-  EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant);
-  return "";
+// ============================================================================
+// builtin.tensor.allreduce_ring: host ring allreduce chip dispatch.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(builtin_tensor_allreduce_ring, "builtin.tensor.allreduce_ring") {
+  auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
+  INTERNAL_CHECK(dist_codegen) << "builtin.tensor.allreduce_ring codegen requires DistributedCodegen";
+  return EmitAllReduceLikeDispatch(*dist_codegen, op, /*include_reduce_inst=*/false,
+                                   /*multicore=*/false);
 }
 
 // ============================================================================
@@ -265,11 +342,11 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_reduce_scatter, "builtin.tensor.reduce_sc
   const int reduce_op = op->GetAttr<int>("op");
   const auto dtype = op->GetAttr<DataType>("dtype");
   const std::string variant =
-      op->op_->name_ + "__" + AllReduceOpSuffix(reduce_op) + "__" + Fp32VariantSuffix(dtype);
+      op->op_->name_ + "__" + ReduceScatterOpSuffix(reduce_op) + "__" + Fp32VariantSuffix(dtype);
 
   if (dist_codegen->MarkBuiltinEmitted(variant)) {
     dist_codegen->RecordBuiltinNextLevel(
-        op, variant, {{"op_cpp", AllReduceOpCpp(reduce_op)}, {"dtype_cpp", Fp32TypeCpp(dtype)}});
+        op, variant, {{"op_cpp", ReduceScatterOpCpp(reduce_op)}, {"dtype_cpp", Fp32TypeCpp(dtype)}});
   }
   EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant);
   return "";
@@ -308,6 +385,22 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all, "builtin.tensor.all_to_all") 
 }
 
 // ============================================================================
+// builtin.tensor.all_to_all_v: compiler-generated chip dispatch for pld.tensor.all_to_all_v.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all_v, "builtin.tensor.all_to_all_v") {
+  auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
+  INTERNAL_CHECK(dist_codegen) << "builtin.tensor.all_to_all_v codegen requires DistributedCodegen";
+  const auto dtype = op->GetAttr<DataType>("dtype");
+  const std::string variant = op->op_->name_ + "__" + Fp32VariantSuffix(dtype);
+
+  if (dist_codegen->MarkBuiltinEmitted(variant)) {
+    dist_codegen->RecordBuiltinNextLevel(op, variant, {{"dtype_cpp", Fp32TypeCpp(dtype)}});
+  }
+  EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant);
+  return "";
+}
+
+// ============================================================================
 // tensor.slice — emit Python tensor indexing into ``tensors[...]``.
 //
 // IR form:
@@ -320,13 +413,13 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_all_to_all, "builtin.tensor.all_to_all") 
 //   * otherwise        → slice ``offset[axis] : offset[axis] + shape[axis]``
 //
 // The result is registered into the ``tensors`` dict so downstream
-// dispatch sites can ``chip_args.add_tensor(make_tensor_arg(tensors["t"]), ...)``
+// dispatch sites can ``chip_args.add_tensor(make_tensor_arg(orch._worker, tensors["t"]), ...)``
 // without an extra binding step.
 // ============================================================================
 REGISTER_DISTRIBUTED_OP(tensor_slice, "tensor.slice") {
   auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);
 
-  CHECK(op->args_.size() == 3 || op->args_.size() == 4 || op->args_.size() == 5)
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3 || op->args_.size() == 4 || op->args_.size() == 5, op->span_)
       << "tensor.slice host_orch codegen expects 3-5 args (input, shape, offset[, valid_shape[, "
          "drop_dims]]), "
          "got "
@@ -383,19 +476,93 @@ REGISTER_DISTRIBUTED_OP(tensor_slice, "tensor.slice") {
 }
 
 // ============================================================================
-// tensor.reshape — emit a metadata-only reshape of a host/runtime tensor view.
+// tensor.assemble — write a source tensor into a target tensor slice.
 //
-// The whole-network host orchestrator first selects one rank's contiguous
-// weight slab, then flattens its layer dimensions before the unique CHIP
-// dispatch.  The selected object can be either a torch.Tensor or a
-// worker-resident DeviceTensor; both expose ``reshape(shape)`` with
-// metadata-only semantics for contiguous storage.
+// IR form:
+//   result = tensor.assemble(target, source, offset, *, atomic)
 //
-// Use the result TensorType as the source of truth for the complete target
-// shape.  Falling back to generic op printing would stringify the shape
-// MakeTuple incorrectly (historically emitting only the trailing dimension)
-// and would also produce an undefined ``tensor.reshape(...)`` symbol in the
-// generated Python module.
+// The operation is SSA-functional but writes in place: ``result`` aliases
+// ``target`` after the source's valid region has been copied into the target
+// window. HOST orchestrators have no atomic-combine instruction, so atomic add
+// is rejected instead of being silently reduced to a plain Python assignment.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(tensor_assemble, "tensor.assemble") {
+  auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);
+
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "Internal error: tensor.assemble expects 3 arguments";
+
+  const int atomic = op->GetKwarg<int>("atomic", static_cast<int>(ir::AtomicType::kNone));
+  CHECK_SPAN(atomic == static_cast<int>(ir::AtomicType::kNone), op->span_)
+      << "pl.assemble(..., atomic=pl.AtomicType.Add) is only supported inside an InCore function. "
+         "This assemble is in a HOST orchestrator, where no atomic-combine instruction exists. Move it "
+         "inside the scope that produces the partial result.";
+
+  const std::string target_name = codegen.GetExprAsCode(op->args_[0]);
+  const std::string source_name = codegen.GetExprAsCode(op->args_[1]);
+  const std::string lhs = codegen.GetCurrentResultTarget();
+  CHECK(!target_name.empty()) << "tensor.assemble target must resolve to a non-empty Python name";
+  CHECK(!source_name.empty()) << "tensor.assemble source must resolve to a non-empty Python name";
+  CHECK(!lhs.empty()) << "tensor.assemble in a HOST orchestrator must have an assignment target";
+
+  auto target_type = ir::As<ir::TensorType>(op->args_[0]->GetType());
+  auto source_type = ir::As<ir::TensorType>(op->args_[1]->GetType());
+  CHECK_SPAN(target_type && source_type, op->span_)
+      << "tensor.assemble in a HOST orchestrator currently supports plain Tensor operands only";
+
+  auto offset_tuple = As<MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK_SPAN(offset_tuple, op->span_) << "Internal error: tensor.assemble offset must be MakeTuple";
+  const size_t target_rank = target_type->shape_.size();
+  const size_t source_rank = source_type->shape_.size();
+  CHECK_SPAN(offset_tuple->elements_.size() == target_rank, op->span_)
+      << "tensor.assemble in a HOST orchestrator requires offset rank to match target rank";
+  CHECK_SPAN(source_rank <= target_rank, op->span_)
+      << "tensor.assemble in a HOST orchestrator requires source rank not to exceed target rank";
+
+  const std::vector<ExprPtr> source_valid_shape = ir::GetValidShape(source_type);
+  const size_t leading_target_rank = target_rank - source_rank;
+  std::ostringstream target_indices;
+  std::ostringstream source_indices;
+  for (size_t i = 0; i < target_rank; ++i) {
+    if (i > 0) {
+      target_indices << ", ";
+    }
+    const std::string offset_i = codegen.GetExprAsCode(offset_tuple->elements_[i]);
+    const std::string extent_i =
+        i < leading_target_rank ? "1" : codegen.GetExprAsCode(source_valid_shape[i - leading_target_rank]);
+    auto offset_const = As<ConstInt>(offset_tuple->elements_[i]);
+    if (offset_const && offset_const->value_ == 0) {
+      target_indices << "0:" << extent_i;
+    } else {
+      target_indices << offset_i << ":" << offset_i << " + " << extent_i;
+    }
+  }
+  for (size_t i = 0; i < source_rank; ++i) {
+    if (i > 0) {
+      source_indices << ", ";
+    }
+    source_indices << "0:" << codegen.GetExprAsCode(source_valid_shape[i]);
+  }
+
+  std::string source_expr = "tensors[\"" + source_name + "\"]";
+  if (source_rank > 0) {
+    source_expr += "[" + source_indices.str() + "]";
+  }
+  codegen.Emit("tensors[\"" + target_name + "\"][" + target_indices.str() + "] = " + source_expr);
+  if (lhs != target_name) {
+    codegen.Emit("tensors[\"" + lhs + "\"] = tensors[\"" + target_name + "\"]");
+  }
+  dist_codegen.MarkDeclared(lhs);
+  return "";
+}
+
+// ============================================================================
+// tensor.reshape — metadata-only reshape of a host/runtime tensor view.
+//
+// The result TensorType is the source of truth for the target shape: generic op
+// printing stringifies the shape MakeTuple incorrectly (historically emitting
+// only the trailing dimension) and emits an undefined ``tensor.reshape(...)``
+// symbol into the generated Python module.
 // ============================================================================
 REGISTER_DISTRIBUTED_OP(tensor_reshape, "tensor.reshape") {
   auto& dist_codegen = dynamic_cast<DistributedCodegen&>(codegen);

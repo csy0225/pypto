@@ -12,6 +12,7 @@
 import tempfile
 from pathlib import Path
 
+import pypto.language as pl
 import pytest
 from pypto import ir
 from pypto.backend import Backend950, BackendType
@@ -66,13 +67,17 @@ class TestBackend950MemorySize:
 
         # Test cases: (memory_type, expected_size_in_KB)
         # Based on Create950SoC() in soc.cpp:
-        #   AIC core: Mat=512KB, Left=64KB, Right=64KB, Acc=256KB, Bias=4KB
+        #   AIC core: Mat=512KB, Left=64KB, Right=64KB, Acc=256KB, Bias=4KB,
+        #            LeftScale=4KB, RightScale=4KB
         #   AIV core: Vec=240KB safe (248KB physical, capped per pto-isa#170)
         test_cases = [
             (ir.MemorySpace.Mat, 512),  # 512KB Mat per AIC core
             (ir.MemorySpace.Left, 64),  # 64KB Left per AIC core
             (ir.MemorySpace.Right, 64),  # 64KB Right per AIC core
             (ir.MemorySpace.Acc, 256),  # 256KB Acc per AIC core
+            (ir.MemorySpace.Bias, 4),  # 4KB Bias per AIC core
+            (ir.MemorySpace.LeftScale, 4),  # 4KB L0A MX scale sidecar
+            (ir.MemorySpace.RightScale, 4),  # 4KB L0B MX scale sidecar
             # Safe Vec UB is capped at 240KB (248KB physical) per pto-isa#170;
             # restore to 248 once PTO-ISA stops reserving the top ~8KB.
             (ir.MemorySpace.Vec, 240),  # 240KB safe Vec per AIV core (248KB physical)
@@ -94,10 +99,10 @@ class TestBackend950MemoryPath:
     def test_find_mem_paths(self):
         """Test finding memory paths between different memory spaces.
 
-        950 memory graph (same topology as 910B):
+        950 memory graph extends the common cube topology with Bias and scale tables:
           DDR -> Vec, Mat
           Vec -> Mat, DDR
-          Mat -> Left, Right
+          Mat -> Left, Right, Bias, LeftScale, RightScale
           Acc -> Vec, Mat, DDR
         """
         backend = Backend950.instance()
@@ -117,6 +122,14 @@ class TestBackend950MemoryPath:
             # Mat connections
             (ir.MemorySpace.Mat, ir.MemorySpace.Left, [ir.MemorySpace.Mat, ir.MemorySpace.Left]),
             (ir.MemorySpace.Mat, ir.MemorySpace.Right, [ir.MemorySpace.Mat, ir.MemorySpace.Right]),
+            (ir.MemorySpace.Mat, ir.MemorySpace.Bias, [ir.MemorySpace.Mat, ir.MemorySpace.Bias]),
+            (
+                ir.MemorySpace.DDR,
+                ir.MemorySpace.Bias,
+                [ir.MemorySpace.DDR, ir.MemorySpace.Mat, ir.MemorySpace.Bias],
+            ),
+            (ir.MemorySpace.Mat, ir.MemorySpace.LeftScale, [ir.MemorySpace.Mat, ir.MemorySpace.LeftScale]),
+            (ir.MemorySpace.Mat, ir.MemorySpace.RightScale, [ir.MemorySpace.Mat, ir.MemorySpace.RightScale]),
             # Acc connections
             (ir.MemorySpace.Acc, ir.MemorySpace.Mat, [ir.MemorySpace.Acc, ir.MemorySpace.Mat]),
             (ir.MemorySpace.Acc, ir.MemorySpace.DDR, [ir.MemorySpace.Acc, ir.MemorySpace.DDR]),
@@ -174,16 +187,31 @@ class TestBackend950L0Tiling:
         assert handler.get_l0a_capacity_bytes() == 64 * 1024
         assert handler.get_l0b_capacity_bytes() == 64 * 1024
         assert handler.get_l0c_capacity_bytes() == 256 * 1024
+        assert handler.get_bias_capacity_bytes() == 4 * 1024
         assert handler.get_mat_capacity_bytes() == 512 * 1024
 
         assert handler.get_l0a_capacity_bytes() == backend.get_mem_size(ir.MemorySpace.Left)
         assert handler.get_l0b_capacity_bytes() == backend.get_mem_size(ir.MemorySpace.Right)
         assert handler.get_l0c_capacity_bytes() == backend.get_mem_size(ir.MemorySpace.Acc)
+        assert handler.get_bias_capacity_bytes() == backend.get_mem_size(ir.MemorySpace.Bias)
         assert handler.get_mat_capacity_bytes() == backend.get_mem_size(ir.MemorySpace.Mat)
 
     def test_l0_fractal_alignment_default(self):
         handler = Backend950.instance().get_handler()
         assert handler.get_l0_fractal_alignment() == 16
+
+    def test_l0c_physical_m_alignment_default(self):
+        handler = Backend950.instance().get_handler()
+        assert handler.get_l0c_m_alignment(pl.INT32) == 16
+        assert handler.get_l0c_m_alignment(pl.FP32) == 16
+
+    def test_mat_to_bias_move_dtype_contract(self):
+        handler = Backend950.instance().get_handler()
+        assert handler.supports_mat_to_bias_move(pl.INT32, pl.INT32)
+        assert handler.supports_mat_to_bias_move(pl.FP32, pl.FP32)
+        assert handler.supports_mat_to_bias_move(pl.FP16, pl.FP32)
+        assert handler.supports_mat_to_bias_move(pl.BF16, pl.FP32)
+        assert not handler.supports_mat_to_bias_move(pl.BF16, pl.INT32)
 
     def test_min_l0_tile_dim_default(self):
         handler = Backend950.instance().get_handler()

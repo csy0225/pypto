@@ -35,6 +35,7 @@
 #include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
@@ -89,15 +90,15 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   auto shapes_tuple = As<ir::MakeTuple>(op->args_[2]);
   INTERNAL_CHECK_SPAN(shapes_tuple, op->span_) << "tile.load third argument must be a tuple (shapes)";
 
-  // valid_shapes is optional: when omitted (callers built before the 4-arg
+  // valid_shape is optional: when omitted (callers built before the 4-arg
   // signature was introduced, or hand-written IR), fall back to shapes so the
   // partition_view covers the entire physical region — equivalent to the DSL
-  // behavior `pl.load(..., valid_shapes=None)`.
-  auto valid_shapes_tuple = shapes_tuple;
+  // behavior `pl.load(..., valid_shape=None)`.
+  auto valid_shape_tuple = shapes_tuple;
   if (op->args_.size() >= 4) {
-    valid_shapes_tuple = As<ir::MakeTuple>(op->args_[3]);
-    INTERNAL_CHECK_SPAN(valid_shapes_tuple, op->span_)
-        << "tile.load fourth argument must be a tuple (valid_shapes)";
+    valid_shape_tuple = As<ir::MakeTuple>(op->args_[3]);
+    INTERNAL_CHECK_SPAN(valid_shape_tuple, op->span_)
+        << "tile.load fourth argument must be a tuple (valid_shape)";
   }
 
   auto tensor_type = AsTensorTypeLike(tensor->GetType());
@@ -114,13 +115,24 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
 
-  // RFC #1300 P7: the IR's offsets / shapes / valid_shapes are already in
+  // PTOAS needs the MX layout on tload in addition to the source TensorView.
+  std::string pto_layout;
+  if (tensor_type->tensor_view_.has_value()) {
+    if (tensor_type->tensor_view_->layout == ir::TensorLayout::MX_A_ZZ) {
+      pto_layout = "mx_a_zz";
+    } else if (tensor_type->tensor_view_->layout == ir::TensorLayout::MX_B_NN) {
+      pto_layout = "mx_b_nn";
+    }
+  }
+  const bool is_mx_load = !pto_layout.empty();
+
+  // RFC #1300 P7: the IR's offsets / shapes / valid_shape are already in
   // canonical coordinates (matching the source TensorType's shape). There is
   // no implicit dn_swap here — earlier passes ensure all coordinate systems
   // match before codegen.
-  std::vector<std::string> partition_dims = GetDimStrings(valid_shapes_tuple->elements_);
+  std::vector<std::string> partition_dims = GetDimStrings(valid_shape_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
-  std::vector<std::string> size_codes = GetSizeCodes(valid_shapes_tuple->elements_, codegen);
+  std::vector<std::string> size_codes = GetSizeCodes(valid_shape_tuple->elements_, codegen);
 
   std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
@@ -129,6 +141,9 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
+  if (is_mx_load) {
+    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
+  }
   codegen.Emit(tload_line.str());
 
   // No follow-up `pto.set_validshape` is emitted: every `pto.alloc_tile`
@@ -219,20 +234,9 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
                       op->span_)
       << "tile.store atomic kwarg must encode AtomicType::kNone or kAdd, got " << atomic_int;
   if (atomic_int == static_cast<int>(ir::AtomicType::kAdd)) {
-    // bf16 atomic-add into GM is only honoured on the A2/A3 store path
-    // (pto-isa set_atomic_bf16); the A5 store path rejects it. Fail here with a
-    // clean, backend-aware user error instead of deferring to a downstream
-    // pto-isa static_assert. The hardware atomic dispatch keys on the GM
-    // *destination* dtype, so this also guards the cube path (fp32 Acc -> bf16
-    // GM via fix-pipe), where the source tile is fp32 but the target is bf16.
-    if (tensor_type->dtype_ == DataType::BF16) {
-      const auto* handler = codegen.GetBackendHandler();
-      CHECK_SPAN(handler->SupportsBf16AtomicAdd(), op->span_)
-          << "tile.store with atomic=AtomicType.Add into a bf16 global tensor is not supported on the '"
-          << handler->GetPtoTargetArch()
-          << "' backend; bf16 atomic-add requires the Ascend910B (A2/A3) profile. Accumulate into an fp32 "
-             "tensor and cast to bf16 after the reduction instead.";
-    }
+    // Destination-dtype legality (notably bf16, which only the A2/A3 store pipe
+    // combines) is checked by the AtomicAddDtypeValid property verifier at
+    // pipeline input, where the error still carries the user's own span.
     tstore_line << " {atomicType = #pto<atomic_type atomic_add>}";
   }
   codegen.Emit(tstore_line.str());
@@ -333,6 +337,152 @@ static std::string MakeTileMscatterCodegenPTO(const CallPtr& op, codegen::Codege
   return "";
 }
 
+// tile.mgather(mem, idx[, scratch]) -> pto.mgather (fresh Vec or Mat tile).
+static std::string MakeTileMgatherCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK(op->args_.size() >= 2 && op->args_.size() <= 4)
+      << "tile.mgather requires 2 to 4 arguments, got " << op->args_.size();
+
+  auto mem = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(mem) << "tile.mgather mem must be a Var or IterArg";
+  auto idx = AsVarLike(op->args_[1]);
+  INTERNAL_CHECK(idx) << "tile.mgather idx must be a Var or IterArg";
+
+  auto tensor_type = AsTensorTypeLike(mem->GetType());
+  INTERNAL_CHECK(tensor_type) << "tile.mgather mem must have TensorType or DistributedTensorType";
+
+  const int coalesce = op->GetKwarg<int>("coalesce", static_cast<int>(ir::MgatherCoalesceMode::kRow));
+  INTERNAL_CHECK(coalesce == static_cast<int>(ir::MgatherCoalesceMode::kRow) ||
+                 coalesce == static_cast<int>(ir::MgatherCoalesceMode::kElem))
+      << "tile.mgather coalesce must be 0 (row) or 1 (elem), got " << coalesce;
+  const char* coalesce_name = coalesce == static_cast<int>(ir::MgatherCoalesceMode::kElem) ? "elem" : "row";
+  const int gather_oob = op->GetKwarg<int>("gather_oob", 0);
+  INTERNAL_CHECK(gather_oob >= 0 && gather_oob <= 3)
+      << "tile.mgather gather_oob must be in [0, 3], got " << gather_oob;
+  static constexpr const char* kGatherOobNames[] = {"undefined", "clamp", "wrap", "zero"};
+  const ir::MemorySpace target_memory = op->GetKwarg<ir::MemorySpace>("target_memory", ir::MemorySpace::Vec);
+  const auto* handler = codegen.GetBackendHandler();
+  INTERNAL_CHECK(handler) << "tile.mgather requires a backend handler";
+  const bool is_a2a3 = handler->GetPtoTargetArch() == "a2a3";
+
+  if (is_a2a3 && (tensor_type->dtype_ == DataType::FP8E4M3FN || tensor_type->dtype_ == DataType::FP8E5M2 ||
+                  tensor_type->dtype_ == DataType::HF8)) {
+    CHECK_SPAN(false, op->span_) << "tile.mgather dtype " << tensor_type->dtype_.ToString()
+                                 << " is not supported on the 'a2a3' backend; use the A5 backend";
+  }
+
+  auto result_type = As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK(result_type) << "tile.mgather result must be a TileType";
+  if (is_a2a3 && target_memory == ir::MemorySpace::Vec) {
+    auto idx_tile = As<ir::TileType>(idx->GetType());
+    INTERNAL_CHECK(idx_tile) << "tile.mgather Vec idx must be a TileType";
+    auto idx_rows = As<ir::ConstInt>(idx_tile->shape_[0]);
+    if (coalesce == static_cast<int>(ir::MgatherCoalesceMode::kRow)) {
+      CHECK_SPAN(idx_rows && idx_rows->value_ == 1, op->span_)
+          << "tile.mgather row mode on the 'a2a3' backend requires idx shape [1, R]";
+    }
+    CHECK_SPAN(
+        !tensor_type->tensor_view_.has_value() || tensor_type->tensor_view_->layout == ir::TensorLayout::ND,
+        op->span_)
+        << "tile.mgather Vec output on the 'a2a3' backend currently requires an ND source tensor";
+    const auto& result_view = ir::tile_view_semantics::GetEffectiveTileView(*result_type);
+    CHECK_SPAN(
+        result_view.blayout == ir::TileLayout::row_major && result_view.slayout == ir::TileLayout::none_box,
+        op->span_)
+        << "tile.mgather Vec output from an ND tensor on the 'a2a3' backend requires "
+           "row_major/none layout";
+    auto result_cols = As<ir::ConstInt>(result_type->shape_[1]);
+    INTERNAL_CHECK(result_cols) << "tile.mgather Vec output columns must be static";
+    CHECK_SPAN((result_cols->value_ * static_cast<int64_t>(tensor_type->dtype_.GetByte())) % 32 == 0,
+               op->span_)
+        << "tile.mgather Vec output on the 'a2a3' backend requires each physical row to be "
+           "32-byte aligned";
+  }
+
+  auto emit_full_partition = [&](const ir::VarPtr& tensor) {
+    auto type = AsTensorTypeLike(tensor->GetType());
+    INTERNAL_CHECK(type) << "tile.mgather GM operand must be tensor-like";
+    const std::string dtype = codegen.GetTypeString(type->dtype_);
+    const std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
+    const std::string tensor_view_type = codegen.GetTensorViewTypeString(type.get());
+    std::vector<std::string> dims;
+    std::vector<std::string> offsets;
+    std::vector<std::string> sizes;
+    dims.reserve(type->shape_.size());
+    offsets.reserve(type->shape_.size());
+    sizes.reserve(type->shape_.size());
+    for (const auto& dim : type->shape_) {
+      offsets.push_back(codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX));
+      if (auto constant = As<ir::ConstInt>(dim)) {
+        dims.push_back(std::to_string(constant->value_));
+        sizes.push_back(codegen.GetOrEmitConstant(constant->value_, DataType::INDEX));
+      } else {
+        dims.emplace_back("?");
+        sizes.push_back(codegen.GetExprAsCode(dim));
+      }
+    }
+    const std::string partition_type = MakePartitionTensorViewType(dims, dtype);
+    const std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                            partition_type, offsets, sizes, codegen);
+    return std::pair<std::string, std::string>{partition_view, partition_type};
+  };
+
+  const auto [mem_view, mem_view_type] = emit_full_partition(mem);
+  std::string idx_name;
+  std::string idx_type;
+  std::string scratch_name;
+  std::string scratch_type;
+  if (target_memory == ir::MemorySpace::Mat) {
+    const auto [view, type] = emit_full_partition(idx);
+    idx_name = view;
+    idx_type = type;
+    if (coalesce == static_cast<int>(ir::MgatherCoalesceMode::kElem)) {
+      INTERNAL_CHECK(op->args_.size() >= 3) << "tile.mgather Mat elem mode requires scratch";
+      auto scratch = AsVarLike(op->args_[2]);
+      INTERNAL_CHECK(scratch) << "tile.mgather scratch must be a Var or IterArg";
+      CHECK_SPAN(scratch.get() != mem.get() && scratch.get() != idx.get(), op->span_)
+          << "tile.mgather Mat elem scratch must not alias mem or idx";
+      auto scratch_tensor_type = AsTensorTypeLike(scratch->GetType());
+      INTERNAL_CHECK(scratch_tensor_type) << "tile.mgather scratch must be tensor-like";
+      if (scratch_tensor_type->memref_.has_value() && tensor_type->memref_.has_value()) {
+        CHECK_SPAN(!ir::MemRef::MayAlias(*scratch_tensor_type->memref_, *tensor_type->memref_), op->span_)
+            << "tile.mgather Mat elem scratch must not overlap mem";
+      }
+      auto idx_tensor_type = AsTensorTypeLike(idx->GetType());
+      INTERNAL_CHECK(idx_tensor_type) << "tile.mgather Mat idx must be tensor-like";
+      if (scratch_tensor_type->memref_.has_value() && idx_tensor_type->memref_.has_value()) {
+        CHECK_SPAN(!ir::MemRef::MayAlias(*scratch_tensor_type->memref_, *idx_tensor_type->memref_), op->span_)
+            << "tile.mgather Mat elem scratch must not overlap idx";
+      }
+      const auto [scratch_view, type] = emit_full_partition(scratch);
+      scratch_name = scratch_view;
+      scratch_type = type;
+    }
+  } else {
+    idx_name = codegen.GetVarName(idx);
+    idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  }
+
+  const std::string dst = codegen.GetCurrentResultTarget();
+  const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  std::ostringstream mgather_line;
+  mgather_line << "pto.mgather ins(" << mem_view << ", " << idx_name;
+  if (!scratch_name.empty()) mgather_line << ", " << scratch_name;
+  if (!idx_type.empty()) {
+    mgather_line << " : " << mem_view_type << ", " << idx_type;
+    if (!scratch_type.empty()) mgather_line << ", " << scratch_type;
+  }
+  mgather_line << ") outs(" << dst;
+  if (!dst_type.empty()) mgather_line << " : " << dst_type;
+  mgather_line << ") {coalesce = #pto<coalesce " << coalesce_name << ">";
+  if (gather_oob != 0) {
+    mgather_line << ", gatherOob = #pto<gather_oob " << kGatherOobNames[gather_oob] << ">";
+  }
+  mgather_line << "}";
+  codegen.Emit(mgather_line.str());
+  return "";
+}
+
 // Helper function for tile.alloc (no-op: allocation handled elsewhere)
 static std::string MakeTileAllocCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   (void)op;
@@ -386,7 +536,8 @@ static std::string GetFlatOffsetSSA(const ir::MakeTuplePtr& indices_tuple,
 // Helper function for tile.read (indices -> flat offset -> pto.tgetval)
 static std::string MakeTileReadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "tile.read requires 2 arguments, but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "tile.read requires 2 arguments, but got " << op->args_.size();
 
   auto tile_type = As<ir::TileType>(op->args_[0]->GetType());
   INTERNAL_CHECK_SPAN(tile_type, op->span_) << "tile.read first argument must be TileType";
@@ -416,7 +567,8 @@ static std::string MakeTileReadCodegenPTO(const CallPtr& op, codegen::CodegenBas
 // Helper function for tile.write (indices -> flat offset -> pto.tsetval)
 static std::string MakeTileWriteCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "tile.write requires 3 arguments, but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tile.write requires 3 arguments, but got " << op->args_.size();
 
   auto tile_type = As<ir::TileType>(op->args_[0]->GetType());
   INTERNAL_CHECK_SPAN(tile_type, op->span_) << "tile.write first argument must be TileType";
@@ -449,7 +601,8 @@ static std::string MakeTileWriteCodegenPTO(const CallPtr& op, codegen::CodegenBa
 
 static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "tensor.read requires 2 arguments, but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "tensor.read requires 2 arguments, but got " << op->args_.size();
 
   auto tensor_type_ptr = AsTensorTypeLike(op->args_[0]->GetType());
   INTERNAL_CHECK_SPAN(tensor_type_ptr, op->span_) << "tensor.read first argument must be TensorType";
@@ -485,7 +638,8 @@ static std::string MakeTensorReadCodegenPTO(const CallPtr& op, codegen::CodegenB
 
 static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 3) << "tensor.write requires 3 arguments, but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+      << "tensor.write requires 3 arguments, but got " << op->args_.size();
 
   auto tensor_type_ptr = AsTensorTypeLike(op->args_[0]->GetType());
   INTERNAL_CHECK_SPAN(tensor_type_ptr, op->span_) << "tensor.write first argument must be TensorType";
@@ -528,7 +682,8 @@ static std::string MakeTensorWriteCodegenPTO(const CallPtr& op, codegen::Codegen
 
 static std::string MakeTensorDimCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 2) << "tensor.dim requires 2 arguments, but got " << op->args_.size();
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+      << "tensor.dim requires 2 arguments, but got " << op->args_.size();
   auto input_tensor = ir::As<ir::TensorType>(op->args_[0]->GetType());
   CHECK(input_tensor) << "tensor.dim need TensorType for first arg, but got "
                       << op->args_[0]->GetType()->TypeName();
@@ -602,7 +757,7 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
   // pto.local_array_set mutates the same `pto.declare_local_array` storage.
   reg("array.create", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 1) << "array.create requires 1 argument (extent)";
+    INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_) << "array.create requires 1 argument (extent)";
     auto array_type = ir::As<ir::ArrayType>(op->GetType());
     CHECK(array_type) << "array.create must return ArrayType";
     std::string result = codegen.GetCurrentResultTarget();
@@ -614,7 +769,8 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("array.get_element", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 2) << "array.get_element requires 2 arguments (array, index)";
+    INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
+        << "array.get_element requires 2 arguments (array, index)";
     auto array_type = ir::As<ir::ArrayType>(op->args_[0]->GetType());
     CHECK(array_type) << "array.get_element first argument must be an ArrayType";
     std::string result = codegen.GetCurrentResultTarget();
@@ -629,7 +785,8 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("array.update_element", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
-    CHECK(op->args_.size() == 3) << "array.update_element requires 3 arguments (array, index, value)";
+    INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
+        << "array.update_element requires 3 arguments (array, index, value)";
     auto array_type = ir::As<ir::ArrayType>(op->args_[0]->GetType());
     CHECK(array_type) << "array.update_element first argument must be an ArrayType";
     // arr resolves to the input array's SSA; the AssignStmt dispatch has already
@@ -655,7 +812,8 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
   auto reg_spmd_identity_op = [&](const char* tile_op, std::string (codegen::PTOCodegen::*getter)() const) {
     reg(tile_op, [tile_op, getter](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
       auto& codegen = AsPto(codegen_base);
-      CHECK(op->args_.empty()) << tile_op << " takes no arguments, got " << op->args_.size();
+      INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+          << tile_op << " takes no arguments, got " << op->args_.size();
       std::string result = codegen.GetCurrentResultTarget();
       INTERNAL_CHECK_SPAN(!result.empty(), op->span_) << tile_op << " requires assignment target";
       std::string arg_ssa = (codegen.*getter)();
@@ -748,6 +906,12 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
       case ir::TensorLayout::NZ:
         layout_str = "nz";
         break;
+      case ir::TensorLayout::MX_A_ZZ:
+        layout_str = "mx_a_zz";
+        break;
+      case ir::TensorLayout::MX_B_NN:
+        layout_str = "mx_b_nn";
+        break;
       case ir::TensorLayout::ND:
         break;
     }
@@ -763,8 +927,8 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
       if (j > 0) oss << ", ";
       oss << stride_names[j];
     }
-    oss << "] {layout = #pto.layout<" << layout_str << ">}";
-    oss << ": !pto.tensor_view<";
+    oss << "] {layout = #pto.layout<" << layout_str << ">} : ";
+    oss << "!pto.tensor_view<";
     for (size_t j = 0; j < rank; ++j) {
       if (j > 0) oss << "x";
       oss << "?";
@@ -788,6 +952,12 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_input_layout(1, ir::TileLayout::row_major);
+  }
+
+  if (exclude_ops.count("tile.mgather") == 0) {
+    backend.RegisterOp("tile.mgather").f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTileMgatherCodegenPTO(op, codegen);
+    });
   }
 
   reg("tile.alloc", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
@@ -818,8 +988,14 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("system.cacheinvalid", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
+    // No-arg form: invalidate the whole GM address space.
+    if (op->args_.empty()) {
+      codegen.Emit("pto.cmo.cacheinvalid all #pto.address_space<gm>");
+      return std::string("");
+    }
     INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
-        << "system.cacheinvalid takes 3 arguments (tensor, offsets, shapes), got " << op->args_.size();
+        << "system.cacheinvalid takes 0 (whole-GM) or 3 arguments (tensor, shapes, offsets), got "
+        << op->args_.size();
     const auto tensor_var = AsVarLike(op->args_[0]);
     INTERNAL_CHECK_SPAN(tensor_var, op->span_)
         << "system.cacheinvalid first argument must be a tensor variable";
@@ -832,40 +1008,36 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
     const std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
 
-    // A region of all-ones sizes is a single element (scalar write): flatten the
-    // N-D offsets into a linear element offset and invalidate through a raw ptr.
-    // Any larger dimension (or a dynamic size) is a tile store: address the region
-    // through a partition_tensor_view, matching tile.store's outs() operand.
-    bool is_scalar_write = true;
-    for (const auto& size : shapes_tuple->elements_) {
-      auto size_const = As<ir::ConstInt>(size);
-      if (!size_const || size_const->value_ != 1) {
-        is_scalar_write = false;
-        break;
-      }
-    }
-
-    if (is_scalar_write) {
-      const std::string base_ptr = codegen.GetTensorBasePtr(tensor_var);
-      const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
-      const std::string off = GetFlatOffsetSSA(offsets_tuple, tensor_type->shape_, codegen);
-      const std::string write_ptr = codegen.NewTemp();
-      codegen.Emit(write_ptr + " = pto.addptr " + base_ptr + ", " + off + " : " + ptr_type + " -> " +
-                   ptr_type);
-      codegen.Emit("pto.cmo.cacheinvalid " + write_ptr + " single_cache_line");
-    } else {
-      const std::string tensor_view = codegen.GetOrCreateTensorView(tensor_var);
-      const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
-      const std::string partition_type =
-          MakePartitionTensorViewType(GetDimStrings(shapes_tuple->elements_), dtype_str);
-      const std::string payload_view =
-          EmitPartitionViewPTO(tensor_var->name_hint_, tensor_view, tensor_view_type, partition_type,
-                               GetIndexOffsetCodes(offsets_tuple->elements_, codegen),
-                               GetSizeCodes(shapes_tuple->elements_, codegen), codegen);
-      codegen.Emit("pto.cmo.cacheinvalid " + payload_view + " single_cache_line : " + partition_type);
-    }
+    // Every region — a single element included — is addressed through a
+    // partition_tensor_view, matching tile.store's outs() operand. ptoas lowers
+    // that to a DCCI on the view's base address (hw-native-sys/PTOAS#1001, in
+    // v0.52), so the all-ones case needs no special handling: a raw `!pto.ptr`
+    // operand is rejected outright, at parse without a type annotation and by
+    // the lowering pass with one.
+    const std::string tensor_view = codegen.GetOrCreateTensorView(tensor_var);
+    const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
+    const std::string partition_type =
+        MakePartitionTensorViewType(GetDimStrings(shapes_tuple->elements_), dtype_str);
+    const std::string payload_view =
+        EmitPartitionViewPTO(tensor_var->name_hint_, tensor_view, tensor_view_type, partition_type,
+                             GetIndexOffsetCodes(offsets_tuple->elements_, codegen),
+                             GetSizeCodes(shapes_tuple->elements_, codegen), codegen);
+    codegen.Emit("pto.cmo.cacheinvalid " + payload_view + " single_cache_line : " + partition_type);
     return std::string("");
   });
+
+  const auto register_pipe_barrier = [&reg](const char* op_name, const char* pipe) {
+    reg(op_name, [op_name, pipe](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
+      auto& codegen = AsPto(codegen_base);
+      INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+          << op_name << " takes no arguments, got " << op->args_.size();
+      codegen.Emit(std::string("pto.barrier <") + pipe + ">");
+      return std::string("");
+    });
+  };
+  register_pipe_barrier("system.bar_v", "PIPE_V");
+  register_pipe_barrier("system.bar_m", "PIPE_M");
+  register_pipe_barrier("system.bar_all", "PIPE_ALL");
 }
 }  // namespace backend
 }  // namespace pypto

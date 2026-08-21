@@ -24,6 +24,13 @@
 namespace pypto {
 namespace ir {
 
+/// Private provenance on every compiler-generated ``tile.load(GM -> Mat)``
+/// call introduced while bridging a Tensor operand to tile IR.
+/// ``InferTileMemorySpace`` consumes this evidence when deciding whether a
+/// stationary operand is eligible for loop residency; user-authored tile loads
+/// deliberately do not carry it.
+inline constexpr const char* kCompilerTensorToTileMatBridgeAttr = "__compiler_tensor_to_tile_mat_bridge";
+
 /// Attribute key for ``pl.pipeline(N, stage=F)`` — appears on ``ForStmt.attrs_``
 /// if and only if ``ForStmt.kind_ == ForKind::Pipeline`` (bidirectional invariant
 /// enforced by the structural verifier ``PipelineLoopValid``).
@@ -59,9 +66,12 @@ inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stor
 /// ``false``): when ``true``, ``CanonicalizeIOOrder`` floats the Acc-draining ops
 /// into a tier *above all compute* in the loop body, so every sibling-iteration
 /// drain sorts after every matmul — ``matmul_i, matmul_{i+1}, drain_i, drain_{i+1}``
-/// instead of ``matmul_i, drain_i, matmul_{i+1}, drain_{i+1}``. The drain op is
-/// ``tile.store`` on the direct-store (Acc→GM) path and ``tile.assemble`` on the
-/// Mat-scratch (Acc→Mat) path.
+/// instead of ``matmul_i, drain_i, matmul_{i+1}, drain_{i+1}``. For a source
+/// pipeline deeper than two, this ordering repeats in depth-two chunks
+/// (``MMSS MMSS ...``), so operand prefetch depth remains user-selected while
+/// L0C membership still rotates over two stage residues in each fully
+/// replicated group. The drain op is ``tile.store`` on the direct-store
+/// (Acc→GM) path and ``tile.assemble`` on the Mat-scratch (Acc→Mat) path.
 ///
 /// This is a *stronger* float than ``pipeline_overlap_stores`` (which only orders
 /// store-after-compute *within* a stage — the compute/store tier is shared and
@@ -69,13 +79,18 @@ inline constexpr const char* kPipelineOverlapStoresAttr = "pipeline_overlap_stor
 /// It keeps the two iterations' L0C accumulators genuinely co-live, which is the
 /// dbC=2 (double-buffered L0C) ping-pong: overlapping their live ranges forces any
 /// correct allocator to give them distinct L0C offsets, so tile i's FIXPIPE drain
-/// overlaps tile i+1's MAD.  The co-live pair only survives under
-/// ``memory_planner=PTOAS``, which skips MemoryReuse (whose opportunistic reuse
-/// over-coalesces the pair into one buffer); InitMemRef then keeps the two buffers
-/// distinct and ptoas places them.  AutoTileMatmulL0 sets it only when the chooser
-/// picked ``double_buffer_c`` (ptoas planner + accumulator budgeted at L0C/2);
-/// under the pypto planner it stays absent (⇒ ``false``).  Consumed (stripped) by
-/// ``CanonicalizeIOOrder`` alongside ``pipeline_stages`` and ``pipeline_overlap_stores``.
+/// overlaps tile i+1's MAD. Under ``memory_planner=PTOAS``, InitMemRef keeps the
+/// co-live buffers distinct and ptoas places them. Under the PyPTO planner,
+/// ``LowerPipelineLoops`` adds a depth-2 pipeline membership and MemoryReuse
+/// preserves the pair. ``AutoTileMatmulL0`` sets the attr either when the chooser
+/// picked ``double_buffer_c`` (with the accumulator budgeted at L0C/2), or when it
+/// recognizes a user-authored pipeline containing one canonical directly drained
+/// L0 matmul whose path-specific trip-count/Acc-size gate is profitable and whose
+/// conservative whole-function Acc footprint still fits after adding the extra
+/// slot. Direct-to-GM ``tile.store`` and Acc-to-Mat ``tile.assemble`` have
+/// separate conservative admission thresholds. Consumed (stripped) by
+/// ``CanonicalizeIOOrder`` alongside ``pipeline_stages`` and
+/// ``pipeline_overlap_stores``.
 inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffer_c";
 
 /// Attribute key marking a tile-producing ``Call`` with the pipeline-stage
@@ -95,8 +110,8 @@ inline constexpr const char* kPipelineDoubleBufferCAttr = "pipeline_double_buffe
 /// iteration i's compute); compute intermediates of different stages may still
 /// coalesce, because forbidding *all* cross-stage reuse (depth = F) overflows the
 /// on-chip budget on real kernels (e.g. stage=4 RMSNorm). The L0 matmul spaces
-/// (Left/Right/Acc/Bias) are exempt entirely — they are matmul-managed and
-/// capacity-bound.
+/// (Left/Right/Acc/Bias/LeftScale/RightScale) are exempt entirely — they are
+/// matmul-managed and capacity-bound.
 ///
 /// Value encoding (``std::string`` — round-trip-safe via the existing
 /// python-printer / ast-parser string-attr codec, with no integer-width
@@ -200,7 +215,7 @@ inline constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler
 //
 // The rebind attr is stamped for **every** iter_arg (even when false) so its
 // presence proves the pass ran; the array-size attr is stamped only when
-// positive. See ``docs/en/dev/passes/42-classify_iter_arg_carry.md``.
+// positive. See ``docs/en/dev/passes/43-classify_iter_arg_carry.md``.
 
 /// Prefix of the per-iter_arg ``bool`` "needs a materialised carry" attr.
 inline constexpr const char* kIterArgRebindAttrPrefix = "iter_arg_rebind_";
@@ -214,6 +229,55 @@ inline std::string IterArgRebindAttrKey(size_t idx) {
 inline std::string IterArgArraySizeAttrKey(size_t idx) {
   return std::string(kIterArgArraySizeAttrPrefix) + std::to_string(idx);
 }
+
+// ---------------------------------------------------------------------------
+// Region placement carrier (``LowerAutoVectorSplit`` -> ``ExpandMixedKernel``)
+// ---------------------------------------------------------------------------
+//
+// ``pl.split_aiv`` opens an explicit AIV region as a first-class
+// ``SplitAivScopeStmt``. ``LowerAutoVectorSplit`` (pass 20) lowers each region
+// and ERASES the wrapper, so by the time ``ExpandMixedKernel`` (pass 21)
+// partitions the function into an AIC and an AIV lane the region node is gone
+// and nothing records that the author pinned those statements to the vector
+// lane. Without that record pass 21 duplicates every SHARED statement onto BOTH
+// lanes — which for a side effect that must not run on a second core, such as
+// ``pld.system.notify``, is wrong. The hazard is not double-counting but
+// PREMATURE RELEASE FROM THE WRONG LANE: the cube copy can publish the signal
+// before the vector lane's TPUT has landed the data that signal releases, so
+// the peer reads stale bytes. A ``NotifyOp::kSet`` fires that race as readily
+// as an atomic-add.
+//
+// Pass 20 therefore stamps ``attrs["core_placement"] = "aiv"`` on the region
+// calls whose lane the region DECIDES, and ``ClassifyCallAffinity`` reads it as
+// the placement authority. This is a plain string attr, exactly like the
+// per-op ``split`` ints and the function-level ``split_aiv_region_validated``
+// flag the same pass already stamps, so it needs no new IR concept and keeps
+// pass 21's "no live SplitAivScopeStmt survives" invariant intact.
+//
+// The attr asserts a placement, so it is written only where the region is what
+// settles one: a call that STATES its own lane (`tile.create`, a
+// `core_type=`-dispatched barrier) or whose lane its memory spec already fixes
+// (any ordinary vector op is VECTOR; the `aiv_shard` / `aic_gather` boundary is
+// MIXED because it really does run on both lanes) is placed without it. See
+// ``RegionPlacementStamper`` in lower_auto_vector_split_pass.cpp for the full
+// rule; in practice a mixed comm kernel gains exactly one of these, on the
+// notify.
+//
+// LIFECYCLE: strictly the pass 20 -> pass 21 window. ``ExpandMixedKernel``
+// strips the attr from every function it emits once it has consumed it, so no
+// downstream pass, printed dump, ``.pto`` round-trip or structural comparison
+// ever sees it. (``Call::attrs_`` is a reflection ``UsualField`` and the python
+// printer serialises attrs open-world, so an un-stripped stamp WOULD leak into
+// both.) Same shape as ``kPipelineStagesAttr``, which lives from
+// ``LowerPipelineLoops`` until ``CanonicalizeIOOrder`` strips it.
+inline constexpr const char* kCorePlacementAttr = "core_placement";
+
+/// The only value ``kCorePlacementAttr`` currently takes: "this call was
+/// written inside a ``pl.split_aiv`` region, so the author placed it on the
+/// vector lane". A string (rather than a bool) leaves room for a cube-side
+/// placement authority without a second key, and round-trips through the
+/// existing string attr codec.
+inline constexpr const char* kCorePlacementAiv = "aiv";
 
 }  // namespace ir
 }  // namespace pypto

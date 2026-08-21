@@ -100,12 +100,14 @@ CLI flags (forwarded to ``pypto.runtime.debug.replay._main``)
   --platform PLAT          target platform (default: {default_platform})
   --device-id N            hardware device index (default: 0)
   --pmu LEVEL              enable PMU profiling at LEVEL
-  --swimlane               enable L2 swimlane capture
+  --swimlane               chip swimlane capture at the full level (4)
+  --swimlane-level N       chip swimlane level: 1=AICore timing, 2=+dispatch/finish,
+                           3=+sched phases, 4=+orch phases
   --dump-args [LEVEL]      dump per-task arguments to disk (bare=1 partial, 2 full)
   --dep-gen                enable dep_gen profiling
-  --no-recompile           reuse cached .so/.bin (ignores cpp edits)
+  --no-recompile           skip forced cpp-edit invalidation; compatibility checks may rebuild
   --no-rebuild-from-pto    skip ptoas/*.pto -> kernels/*.cpp rebuild
-  --log-level LEVEL        runtime log level: debug/v0..v9/info/warn/error/null
+  --log-level LEVEL        runtime log level: debug/info/timing/warn/error/null
   --log-sync-pypto         also push --log-level to PyPTO's C++ logger
   --validate               compare outputs vs. golden.py (auto-on if golden.py exists)
   --no-validate            skip golden validation; runs ``_user_compare`` instead
@@ -114,7 +116,8 @@ Examples:
   python {{this_file}} --pmu 2 --swimlane              # DFX-on run
   python {{this_file}} --log-level debug               # verbose runtime trace
   python {{this_file}} --no-validate                   # skip golden, run _user_compare
-  python {{this_file}} --no-recompile --no-rebuild-from-pto   # fast re-run, no rebuild
+  # Skip forced invalidation; compatibility checks still apply.
+  python {{this_file}} --no-recompile --no-rebuild-from-pto
 
 Run ``python {{this_file}} --help`` for the authoritative list — flags are
 defined in :func:`pypto.runtime.debug.replay._main`, not here, so the

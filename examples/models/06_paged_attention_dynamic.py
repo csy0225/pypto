@@ -129,7 +129,7 @@ def build_dynamic_paged_attention_program(
             sij,
             [0, 0],
             [_Q_TILE, _BLOCK_SIZE],
-            valid_shapes=[_Q_TILE, valid_len],
+            valid_shape=[_Q_TILE, valid_len],
             target_memory=pl.MemorySpace.Vec,
         )
         s_padded = pl.tile.fillpad(s_tile, pad_value=pl.PadValue.min)
@@ -512,7 +512,7 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Dynamic paged attention example")
     parser.add_argument(
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
         action="store_true",
         default=False,
         help="Enable on-device runtime profiling and generate swimlane JSON",
@@ -556,7 +556,7 @@ def main():
             strategy=OptimizationStrategy.Default,
             dump_passes=True,
             backend_type=BackendType.Ascend910B,
-            enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_chip_swimlane=args.enable_chip_swimlane,
         ),
     )
 

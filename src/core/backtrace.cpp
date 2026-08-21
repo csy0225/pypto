@@ -10,15 +10,17 @@
  */
 
 #include <backtrace.h>
-#include <dlfcn.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <ios>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/error.h"
@@ -27,12 +29,13 @@ namespace pypto {
 
 /// Patterns to filter out from backtraces (internal/infrastructure frames)
 const std::vector<std::string> kFileNameFilter = {
-    "libbacktrace",  // backtrace infrastructure
-    "nanobind",      // Python binding layer
-    "__libc_",       // C library internals
-    "include/c++/",  // C++ standard library
-    "object.h",      // Python object.h
-    "error.h"        // exception throwing infrastructure
+    "libbacktrace",   // backtrace infrastructure
+    "nanobind",       // Python binding layer
+    "__libc_",        // C library internals
+    "include/c++/",   // C++ standard library
+    "object.h",       // Python object.h
+    "error.h",        // exception throwing infrastructure
+    "core/logging.h"  // CHECK / INTERNAL_CHECK macro throw site
 };
 
 std::string StackFrame::to_string() const {
@@ -60,24 +63,40 @@ Backtrace& Backtrace::GetInstance() {
 }
 
 Backtrace::Backtrace() {
-  // Get the path of the current shared library using dladdr
-  Dl_info info;
-  const char* filename = nullptr;
-
-  // Use the address of this function to find the shared library path
-  if (dladdr(reinterpret_cast<void*>(&Backtrace::GetInstance), &info)) {
-    filename = info.dli_fname;
-  }
-
-  // Use the filename from dladdr - this is the shared library path
-  state_ = backtrace_create_state(filename, 1, ErrorCallback, nullptr);
+  // The filename argument names the *main executable*, not this module. Passing nullptr lets
+  // libbacktrace find it itself (/proc/self/exe on Linux); every loaded shared object, including
+  // this one, is then registered separately via dl_iterate_phdr at its true load address.
+  //
+  // Do not pass this module's own path (e.g. from dladdr): libbacktrace treats it as the
+  // executable, elf_add() rejects the ET_DYN file, and phdr_callback pairs the descriptor with the
+  // real executable instead. That registers *this* module's DWARF at the *executable's* load base,
+  // so every PC in the CPython interpreter resolves to whichever PyPTO line sits at the same
+  // offset — real-looking frames that were never on the call path.
+  state_ = backtrace_create_state(nullptr, 1, ErrorCallback, nullptr);
 }
 
 void Backtrace::ErrorCallback(void* data, const char* msg, int errnum) {
-  // Always report libbacktrace errors to stderr so failures in backtrace generation are not silent
-  if (msg) {
-    fprintf(stderr, "libbacktrace error: %s (errno: %d)\n", msg, errnum);
+  // Report libbacktrace errors to stderr so failures in backtrace generation are not silent, but
+  // report each distinct message only once. When a platform cannot supply symbol information at
+  // all, the same failure repeats without bound. macOS is the case in practice: upstream
+  // libbacktrace accepts only MH_EXECUTE / MH_DYLIB / MH_DSYM Mach-O files, and a CPython
+  // extension module is an MH_BUNDLE. Its dyld initialization path still succeeds overall, so it
+  // installs macho_nodebug as the fileline handler — and that fires once per *frame* of every
+  // captured trace, on top of one rejection message per loaded bundle.
+  if (msg == nullptr) {
+    return;
   }
+
+  // The state is created with threaded=1, so the dedupe set needs its own lock. Holding it across
+  // the write also keeps concurrent reports from interleaving.
+  static std::mutex reported_mutex;
+  static std::set<std::pair<std::string, int>> reported;
+  std::scoped_lock lock(reported_mutex);
+  if (!reported.emplace(msg, errnum).second) {
+    return;
+  }
+
+  fprintf(stderr, "libbacktrace error: %s (errno: %d)\n", msg, errnum);
 }
 
 /// Clean up file paths from debug info that may contain temp build directory prefixes.

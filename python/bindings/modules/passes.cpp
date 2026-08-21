@@ -12,16 +12,17 @@
 #include "pypto/ir/transforms/passes.h"
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/function.h>
-#include <nanobind/stl/shared_ptr.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
+#include <nanobind/stl/function.h>    // NOLINT(misc-include-cleaner) -- registers std::function casters
+#include <nanobind/stl/shared_ptr.h>  // NOLINT(misc-include-cleaner) -- registers shared_ptr casters
+#include <nanobind/stl/string.h>      // NOLINT(misc-include-cleaner) -- registers std::string casters
+#include <nanobind/stl/vector.h>      // NOLINT(misc-include-cleaner) -- registers std::vector casters
 
 #include <string>
 #include <vector>
 
 #include "pypto/core/error.h"
-#include "pypto/ir/reporter/report.h"
+#include "pypto/ir/program.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/ir_property.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/utils/l0_tile_chooser.h"
@@ -29,6 +30,7 @@
 #include "pypto/ir/verifier/diagnostic_check_registry.h"
 #include "pypto/ir/verifier/property_verifier_registry.h"
 #include "pypto/ir/verifier/verification_error.h"
+#include "pypto/ir/verifier/verifier.h"
 
 namespace nb = nanobind;
 
@@ -95,6 +97,9 @@ void BindPass(nb::module_& m) {
       .value("CommDomainScopesMaterialized", IRProperty::CommDomainScopesMaterialized,
              "Host_orch bodies are wrapped in CommDomainScopeStmts (one per inferred comm domain) and "
              "pld.tensor.window result types carry DistributedTensorType.window_buffer_ back-references")
+      .value("DistTensorCtxMaterialized", IRProperty::DistTensorCtxMaterialized,
+             "No pld.system.get_comm_ctx survives outside host orchestration; every chip-orchestration / "
+             "device communication context is an explicit CommCtxType SSA value traceable to a parameter")
       .value("RuntimeScopesMaterialized", IRProperty::RuntimeScopesMaterialized,
              "Orchestration functions carry explicit RuntimeScopeStmt nodes for the function body and "
              "for/if bodies; codegen no longer emits implicit PTO2_SCOPE() wrappers")
@@ -115,7 +120,16 @@ void BindPass(nb::module_& m) {
       .value("IterArgCarryClassified", IRProperty::IterArgCarryClassified,
              "Every ForStmt with iter_args in an Orchestration function carries an "
              "attrs['iter_arg_rebind_<i>'] classification per slot (plus attrs['iter_arg_array_size_<i>'] "
-             "for TaskId array carries), so orchestration codegen reads the carry lowering");
+             "for TaskId array carries), so orchestration codegen reads the carry lowering")
+      .value("AccToGmStoreValid", IRProperty::AccToGmStoreValid,
+             "Every tile.store draining an Acc-resident tile targets a GM tensor whose dtype the "
+             "backend fix-pipe can narrow into (INT32/FP32/FP16[/BF16]); INT8/INT16 must route "
+             "through a Vec tile instead")
+      .value("AtomicAddDtypeValid", IRProperty::AtomicAddDtypeValid,
+             "Every atomic-add write into GM (tile.store / tensor.assemble / pld.tensor.put / "
+             "pld.tile.put / pld.tensor.remote_store / pld.tile.remote_store) targets a dtype the "
+             "backend store pipe can combine; a bf16 destination requires the Ascend910B (A2/A3) "
+             "profile");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -157,8 +171,22 @@ void BindPass(nb::module_& m) {
   nb::enum_<MemoryPlanner>(passes, "MemoryPlanner", "Selects who plans on-chip buffer memory")
       .value("PYPTO", MemoryPlanner::PyPTO,
              "PyPTO's AllocateMemoryAddr bakes physical addresses (ptoas --pto-level=level3)")
+      .value("DSA_RP", MemoryPlanner::DsaRP,
+             "PyPTO's in-tree DSA planner minimizes recognized reuse penalties within capacity")
       .value("PTOAS", MemoryPlanner::PtoAS,
              "Skip pypto allocation passes; ptoas PlanMemory allocates (--pto-level=level2)");
+
+  nb::enum_<RuntimeKind>(passes, "RuntimeKind", "Which Simpler runtime ABI a compilation targets")
+      .value("TENSORMAP_AND_RINGBUFFER", RuntimeKind::TensorMapAndRingBuffer,
+             "Task graph built on the AICPU, dependencies auto-derived through the TensorMap "
+             "(default)")
+      .value("HOST_BUILD_GRAPH", RuntimeKind::HostBuildGraph,
+             "Host CPU builds the whole task graph up front; required for Graph Execution");
+
+  passes.def("runtime_kind_to_name", &RuntimeKindToName, nb::arg("kind"),
+             "Wire name written to RUNTIME_CONFIG[\"runtime\"], e.g. \"host_build_graph\"");
+  passes.def("runtime_kind_from_name", &RuntimeKindFromName, nb::arg("name"),
+             "Parse a RUNTIME_CONFIG[\"runtime\"] wire name back into a RuntimeKind");
 
   // Bind DiagnosticPhase enum
   nb::enum_<DiagnosticPhase>(passes, "DiagnosticPhase",
@@ -180,7 +208,9 @@ void BindPass(nb::module_& m) {
       .value("UnusedControlFlowResult", DiagnosticCheck::UnusedControlFlowResult,
              "Unused return variable from for/while/if statement")
       .value("TileInnermostDimGranularity", DiagnosticCheck::TileInnermostDimGranularity,
-             "Tile innermost dim below recommended HW memory-access granularity (PH001)");
+             "Tile innermost dim below recommended HW memory-access granularity (PH001)")
+      .value("OutParamWriteDropped", DiagnosticCheck::OutParamWriteDropped,
+             "Rebinding an Out/InOut parameter drops the caller's write");
 
   // Bind DiagnosticCheckSet
   auto diagnostic_check_set =
@@ -252,16 +282,10 @@ void BindPass(nb::module_& m) {
            nb::arg("name") = "CallbackInstrument",
            "Create a callback instrument with optional before/after callbacks");
 
-  // ReportType enum
-  nb::enum_<ReportType>(passes, "ReportType", "Type of report to generate")
-      .value("Memory", ReportType::Memory, "Memory usage per MemorySpace");
-
   // ReportInstrument
   nb::class_<ReportInstrument, PassInstrument>(
-      passes, "ReportInstrument", "Instrument that generates reports to files after specified passes")
+      passes, "ReportInstrument", "Instrument that names the directory pipeline artifacts are written to")
       .def(nb::init<std::string>(), nb::arg("output_dir"), "Create a report instrument with output directory")
-      .def("enable_report", &ReportInstrument::EnableReport, nb::arg("type"), nb::arg("trigger_pass"),
-           "Enable a report type after a specific pass")
       .def("get_output_dir", &ReportInstrument::GetOutputDir,
            "Path of the directory that holds report files (used by perf hints to "
            "persist `perf_hints.log` alongside other reports)");
@@ -281,15 +305,16 @@ void BindPass(nb::module_& m) {
                           "verification and the diagnostic channel (warnings + performance\n"
                           "hints) for PassPipeline.")
       .def(nb::init<std::vector<PassInstrumentPtr>, VerificationLevel, DiagnosticPhase, DiagnosticCheckSet,
-                    MemoryPlanner, bool>(),
+                    MemoryPlanner, bool, RuntimeKind>(),
            nb::arg("instruments"), nb::arg("verification_level") = VerificationLevel::Basic,
            nb::arg("diagnostic_phase") = DiagnosticPhase::PrePipeline,
            nb::arg("disabled_diagnostics") = DiagnosticCheckSet{DiagnosticCheck::UnusedControlFlowResult},
            nb::arg("memory_planner") = MemoryPlanner::PyPTO,
-           nb::arg("enable_pypto_l0c_double_buffer") = false,
+           nb::arg("enable_pypto_l0c_double_buffer") = false, nb::arg("runtime") = kDefaultRuntimeKind,
            "Create a PassContext with instruments, verification level, diagnostic phase gate, "
-           "optional disabled diagnostic checks, memory planner selection, and the experimental "
-           "PyPTO-planner L0C double-buffer (dbC=2) opt-in")
+           "optional disabled diagnostic checks, memory planner selection, the experimental "
+           "legacy-PyPTO chooser-emitted L0C double-buffer (dbC=2) opt-in, and the target Simpler "
+           "runtime ABI")
       .def("__enter__",
            [](PassContext& self) -> PassContext& {
              self.EnterContext();
@@ -306,7 +331,9 @@ void BindPass(nb::module_& m) {
       .def("get_memory_planner", &PassContext::GetMemoryPlanner,
            "Get the memory planner selection for this context")
       .def("get_enable_pypto_l0c_double_buffer", &PassContext::GetEnablePyptoL0cDoubleBuffer,
-           "Whether L0C double-buffering (dbC=2) is enabled under the PyPTO memory planner")
+           "Whether chooser-emitted L0C double-buffering (dbC=2) is enabled under the legacy PyPTO "
+           "memory planner")
+      .def("get_runtime", &PassContext::GetRuntime, "Get the target Simpler runtime ABI for this context")
       .def_static("current", &PassContext::Current, nb::rv_policy::reference,
                   "Get the currently active context, or None if no context is active");
 
@@ -328,7 +355,7 @@ void BindPass(nb::module_& m) {
              "Create the semantic must-alias materialization pass\n\n"
              "Propagates loop-carried iter_arg/initValue MemRefs down the yield/producer chain so\n"
              "accumulator producers write directly into the carried buffer. Split out of MemoryReuse\n"
-             "so it can run without the opportunistic lifetime-reuse phase (memory_planner=PTOAS).");
+             "so it can run without legacy opportunistic reuse (memory_planner=DSA_RP or PTOAS).");
 
   passes.def("memory_reuse", &pass::MemoryReuse,
              "Create a memory reuse pass\n\n"
@@ -420,6 +447,15 @@ void BindPass(nb::module_& m) {
              "or multi-round-trip loop demotes to a plain Sequential loop (order-preserving).\n"
              "Output is Sequential with no pipeline marker, so lower_pipeline_loops and\n"
              "canonicalize_io_order leave it alone. Non-cross-core loops are untouched.");
+  passes.def("lower_pipeline_to_slots", &pass::LowerPipelineToSlots,
+             "Rotate ``pl.pipeline`` loops through the slots of one declared allocation;\n"
+             "runs immediately before lower_pipeline_loops. Rebinds each top-level\n"
+             "``tile.load`` / ``tile.read`` whose args read the induction variable onto\n"
+             "``pl.MemRef(name, slots=F)[iv % F]`` and demotes the loop to Sequential,\n"
+             "keeping ONE body instead of F copies (no remainder dispatch needed).\n"
+             "Self-gated on ``memory_planner=PTOAS`` — the only planner under which codegen\n"
+             "emits a ptoas multi-buffer region today. Any loop it declines is left intact\n"
+             "for lower_pipeline_loops to replicate.");
   passes.def("lower_pipeline_loops", &pass::LowerPipelineLoops,
              "Lower ``pl.pipeline(N, stage=F)`` loops at the tile level (triggers on F > 1):\n"
              "replicate the body F times per outer iteration with a bare-SeqStmts remainder\n"
@@ -460,21 +496,27 @@ void BindPass(nb::module_& m) {
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"
              "E.g., tile [A, B, C] becomes [A*B, C]. Only converts 3D+ tiles.");
+  passes.def("legalize_tile_cast", &pass::LegalizeTileCast,
+             "Expand hardware-unsupported tile.cast pairs into native cast chains\n\n"
+             "Rewrites each non-native tile.cast into the shortest sequence of\n"
+             "pto.tcvt-supported casts for the active backend (A5 / A2A3).\n"
+             "Prefer same byte-width→float then adjust width (e.g. A5 INT32→FP16\n"
+             "becomes INT32→FP32→FP16). Already-native casts are left untouched.");
   passes.def("auto_tile_matmul_l0", &pass::AutoTileMatmulL0,
-             "Create a pass that auto-tiles Mat-resident tile.matmul / tile.matmul_acc into a\n"
-             "C-stationary K-loop\n\n"
-             "Rewrites each tile.matmul or tile.matmul_acc whose Mat operands have static 2D\n"
-             "shape into a range(0, K, k) loop. For tile.matmul the body branches on `ko == 0`\n"
-             "between tile.matmul (fresh accumulator) and tile.matmul_acc (accumulating). For\n"
-             "tile.matmul_acc the body is uniform — every iteration is tile.matmul_acc with the\n"
-             "iter-arg init = caller's accumulator. The K-loop is marked ForKind::Pipeline +\n"
-             "pipeline_stages=2 so LowerPipelineLoops produces a 2-deep ping-pong. Already-L0-\n"
-             "sized matmuls are left untouched. tile.matmul_bias is not yet supported. The tile\n"
-             "(m,n,k,stationarity) comes from a roofline cost-model search: besides the K-loop\n"
-             "the pass emits M/N output tiling (direct-store grid or on-chip Mat-scratch\n"
-             "assemble), a non-divisor-K boundary peel for 16-aligned K, and operand-stationary\n"
-             "(A/B-stationary) schedules. Non-16-aligned K and other deferred regimes emit a\n"
-             "PerfHint and are left untouched.");
+             "Create a pass that auto-tiles static 2D tile.matmul family calls for L0\n\n"
+             "The active backend's roofline chooser selects (m,n,k,stationarity,dbC). K-split\n"
+             "reductions use a 2-stage pipelined loop and peel a supported non-divisor aligned\n"
+             "tail. Plain tile.matmul may also use an M/N grid with direct-GM placement or an\n"
+             "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
+             "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
+             "B-stationary schedules. dbC=2 is enabled automatically under DSA_RP and PTOAS\n"
+             "and available as a legacy-PyPTO opt-in. Under PyPTO, a canonical already-L0 stationary-panel "
+             "pipeline\n"
+             "may automatically use two L0C slots when its post-lowering Acc footprint fits.\n"
+             "Mat-resident tile.matmul_bias is supported with accumulator-typed bias, bias-once K\n"
+             "reduction, and bias-capacity-bounded N-window reloads followed by Mat-to-Bias moves. Other\n"
+             "already-L0-sized and unsupported regimes are left untouched;\n"
+             "useful deferred cases emit PerfHint diagnostics.");
   passes.def("canonicalize_tile_slice", &pass::CanonicalizeTileSlice,
              "Create a pass that lowers Mat-resident tile.slice into tile.extract\n\n"
              "A tile.slice whose result tile is Mem.Mat (e.g. a batch-page slice emitted by\n"
@@ -485,6 +527,13 @@ void BindPass(nb::module_& m) {
              "The dead tile.slice is then dropped, unifying Mat->Left/Right on pto.textract.");
   passes.def("infer_tile_memory_space", &pass::InferTileMemorySpace,
              "Create a pass that infers memory_space for TileType variables in InCore functions");
+  passes.def("insert_mx_scale_addr", &pass::InsertMxScaleAddr,
+             "Create a pass that inserts tile.tget_scale_addr before MX matmul consumers\n\n"
+             "Requires InferTileMemorySpace first so Left/LeftScale and Right/RightScale\n"
+             "pairs are resolved. Rewrites each matmul_mx family call to consume the bound\n"
+             "scale SSA. Bindings are never reused across MX consumers because\n"
+             "tget_scale_addr mutates a shared physical scale buffer whose aliases are\n"
+             "not represented by SSA identity.");
   passes.def("materialize_tensor_strides", &pass::MaterializeTensorStrides,
              "Create the MaterializeTensorStrides pass (RFC #1300 §2.4).\n\n"
              "Walks every TensorType reachable from the program and rewrites any\n"
@@ -548,6 +597,12 @@ void BindPass(nb::module_& m) {
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
   passes.def("materialize_dist_tensor_ctx", &pass::MaterializeDistTensorCtx,
              "Materialize CommCtx parameters and arguments for DistributedTensor function parameters.");
+  passes.def("materialize_valid_shape_symbols", &pass::MaterializeValidShapeSymbols,
+             "Materialize a Scalar[INDEX] parameter per unbindable device-kernel valid_shape symbol.\n\n"
+             "A pl.dynamic() symbol named only in a parameter's pl.TensorView(valid_shape=...) is\n"
+             "neither a physical tensor dimension nor a scalar parameter, so a precompiled kernel\n"
+             "never receives it. Adds the symbol as a leading Scalar[INDEX] parameter and passes\n"
+             "the caller's actual extent at every call/submit site.");
   passes.def("stamp_tfree_split", &pass::StampTfreeSplit,
              "Copy each cross-core tpop's split/pipe-id onto its matching tfree op so codegen\n"
              "reads them from the op directly. Covers mixed-kernel and explicit AIC/AIV tfrees.");
@@ -563,6 +618,16 @@ void BindPass(nb::module_& m) {
              "slot) and attrs['iter_arg_array_size_<i>'] (int, positive extents only) onto each\n"
              "ForStmt, so orchestration codegen reads the carry lowering instead of re-deriving\n"
              "it from an alias fixpoint. Runs last, after materialize_runtime_scopes.");
+  passes.def("insert_comm_fence", &pass::InsertCommFence,
+             "Insert the ptoas data-before-signal markers. Local publishing write\n"
+             "(tile.store or tensor.write into a window-bound dst, get into a window-bound\n"
+             "local dst): a region system.cacheinvalid\n"
+             "+ GM system.fence. Remote write (remote_store / put): only system.fence — its\n"
+             "peer-region cacheinvalid is emitted by codegen (peer offset not yet\n"
+             "IR-expressible). Opaque write (Submit / unregistered call): a conservative\n"
+             "whole-GM system.cacheinvalid + system.fence. After each wait: a whole-GM\n"
+             "system.cacheinvalid. Notify: nothing. Idempotent. Runs last, after all\n"
+             "statement-reordering passes.");
   passes.def("normalize_stmt_structure", &pass::NormalizeStmtStructure,
              "Create a pass that normalizes statement structure");
   passes.def("derive_call_directions", &pass::DeriveCallDirections,
@@ -723,8 +788,12 @@ void BindPass(nb::module_& m) {
       .value("AStationary", utils::Stationarity::kAStationary)
       .value("BStationary", utils::Stationarity::kBStationary);
 
-  nb::class_<utils::L0TileConfig>(l0_tile, "L0TileConfig",
-                                  "Inputs to ChooseL0Tile: problem dims + hardware + schedule knobs")
+  nb::class_<utils::L0TileConfig>(
+      l0_tile, "L0TileConfig",
+      "Inputs to ChooseL0Tile: problem dims + hardware + schedule knobs. max_n caps the logical chosen "
+      "tile-N extent (not the problem N); max_n_pipelined may tighten that bound when N moves through "
+      "a full-K output pipeline, and max_n_nested_pipelined handles two nested pipeline levels. Zero "
+      "means unbounded.")
       .def(nb::init<>())
       .def_rw("M", &utils::L0TileConfig::M)
       .def_rw("N", &utils::L0TileConfig::N)
@@ -741,6 +810,12 @@ void BindPass(nb::module_& m) {
       .def_rw("align_m", &utils::L0TileConfig::align_m)
       .def_rw("align_n", &utils::L0TileConfig::align_n)
       .def_rw("align_k", &utils::L0TileConfig::align_k)
+      .def_rw("l0c_align_m", &utils::L0TileConfig::l0c_align_m)
+      .def_rw("box_align_m", &utils::L0TileConfig::box_align_m)
+      .def_rw("box_align_n", &utils::L0TileConfig::box_align_n)
+      .def_rw("max_n", &utils::L0TileConfig::max_n)
+      .def_rw("max_n_pipelined", &utils::L0TileConfig::max_n_pipelined)
+      .def_rw("max_n_nested_pipelined", &utils::L0TileConfig::max_n_nested_pipelined)
       .def_rw("allow_a_stationary", &utils::L0TileConfig::allow_a_stationary)
       .def_rw("allow_b_stationary", &utils::L0TileConfig::allow_b_stationary)
       .def_rw("allow_double_buffer_c", &utils::L0TileConfig::allow_double_buffer_c)

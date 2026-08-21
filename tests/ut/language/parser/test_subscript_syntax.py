@@ -18,6 +18,8 @@ from pypto import ir
 from pypto.language.parser.diagnostics import ParserTypeError
 from pypto.language.parser.diagnostics.exceptions import UnsupportedFeatureError
 
+_OP_TILE_SLICE = ir.get_op("tile.slice").name
+
 
 class TestTensorSubscript:
     """Tests for tensor subscript syntax: A[i, j], A[0:16, :]."""
@@ -220,7 +222,7 @@ class TestTileSubscript:
         slice_stmt = slice_tile_dynamic.body.stmts[1]
         assert isinstance(slice_stmt, ir.AssignStmt)
         assert isinstance(slice_stmt.value, ir.Call)
-        assert slice_stmt.value.op.name == "tile.slice"
+        assert slice_stmt.value.op.name == _OP_TILE_SLICE
         assert len(slice_stmt.value.args) == 4
 
         shape_tuple = slice_stmt.value.args[1]
@@ -239,7 +241,7 @@ class TestTileSubscript:
             x: pl.Tensor[[64, 128], pl.FP32],
             valid_cols: pl.Scalar[pl.INDEX],
         ) -> pl.Tensor[[64, 128], pl.FP32]:
-            t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [0, 0], [64, 128], valid_shapes=[64, valid_cols])
+            t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [0, 0], [64, 128], valid_shape=[64, valid_cols])
             sliced: pl.Tile[[64, 128], pl.FP32] = t[:, :]
             return pl.store(sliced, [0, 0], x)
 
@@ -249,7 +251,7 @@ class TestTileSubscript:
         slice_stmt = slice_tile_full.body.stmts[1]
         assert isinstance(slice_stmt, ir.AssignStmt)
         assert isinstance(slice_stmt.value, ir.Call)
-        assert slice_stmt.value.op.name == "tile.slice"
+        assert slice_stmt.value.op.name == _OP_TILE_SLICE
         assert len(slice_stmt.value.args) == 4
 
         valid_shape_tuple = slice_stmt.value.args[3]
@@ -265,7 +267,7 @@ class TestTileSubscript:
             x: pl.Tensor[[64, 128], pl.FP32],
             valid_cols: pl.Scalar[pl.INDEX],
         ) -> pl.Tensor[[64, 128], pl.FP32]:
-            t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [0, 0], [64, 128], valid_shapes=[64, valid_cols])
+            t: pl.Tile[[64, 128], pl.FP32] = pl.load(x, [0, 0], [64, 128], valid_shape=[64, valid_cols])
             sliced: pl.Tile[[64, 16], pl.FP32] = t[:, :16]
             return pl.store(sliced, [0, 0], x)
 
@@ -275,7 +277,7 @@ class TestTileSubscript:
         slice_stmt = slice_tile_capped.body.stmts[1]
         assert isinstance(slice_stmt, ir.AssignStmt)
         assert isinstance(slice_stmt.value, ir.Call)
-        assert slice_stmt.value.op.name == "tile.slice"
+        assert slice_stmt.value.op.name == _OP_TILE_SLICE
         assert len(slice_stmt.value.args) == 4
 
         shape_tuple = slice_stmt.value.args[1]
@@ -303,7 +305,7 @@ class TestTileSubscript:
         slice_stmt = slice_tile_clamped.body.stmts[1]
         assert isinstance(slice_stmt, ir.AssignStmt)
         assert isinstance(slice_stmt.value, ir.Call)
-        assert slice_stmt.value.op.name == "tile.slice"
+        assert slice_stmt.value.op.name == _OP_TILE_SLICE
         assert len(slice_stmt.value.args) == 3
 
         shape_tuple = slice_stmt.value.args[1]
@@ -425,7 +427,26 @@ class TestTupleSubscript:
                 acc_out: pl.Tensor[[1], pl.FP32] = pl.yield_(new_acc)
             return acc_out
 
-        assert isinstance(tuple_access, ir.Function)
+        # The `for i, (acc,)` unpacking still yields one loop var plus one carry,
+        # and the slice offset is the loop var itself.
+        body = tuple_access.body
+        assert isinstance(body, ir.SeqStmts)
+        for_stmt = next(s for s in body.stmts if isinstance(s, ir.ForStmt))
+        assert len(for_stmt.iter_args) == 1
+        assert len(for_stmt.return_vars) == 1
+
+        loop_body = for_stmt.body
+        assert isinstance(loop_body, ir.SeqStmts)
+        slice_call = next(
+            s.value for s in loop_body.stmts if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call)
+        )
+        assert slice_call.op.name == ir.get_op("tensor.slice").name
+        offsets = slice_call.args[2]
+        assert isinstance(offsets, ir.MakeTuple)
+        # Compare by identity: ``Expr.__eq__`` builds an IR ``Eq`` node, so ``==``
+        # on Expr lists reports equality even for distinct nodes.
+        assert len(offsets.elements) == 1
+        assert offsets.elements[0] is for_stmt.loop_var
 
 
 class TestTensorSubscriptWrite:
@@ -465,7 +486,7 @@ class TestTensorSubscriptWrite:
         assemble_stmt = write_const.body.stmts[0]
         assert isinstance(assemble_stmt, ir.AssignStmt)
         assert isinstance(assemble_stmt.value, ir.Call)
-        assert assemble_stmt.value.op.name == "tensor.assemble"
+        assert assemble_stmt.value.op.name == ir.get_op("tensor.assemble").name
 
         offset_tuple = assemble_stmt.value.args[2]
         assert isinstance(offset_tuple, ir.MakeTuple)
@@ -770,7 +791,7 @@ class TestTileSubscriptWrite:
         assemble_stmt = write_tile.body.stmts[1]
         assert isinstance(assemble_stmt, ir.AssignStmt)
         assert isinstance(assemble_stmt.value, ir.Call)
-        assert assemble_stmt.value.op.name == "tile.assemble"
+        assert assemble_stmt.value.op.name == ir.get_op("tile.assemble").name
 
         offset_tuple = assemble_stmt.value.args[2]
         assert isinstance(offset_tuple, ir.MakeTuple)
@@ -860,23 +881,44 @@ class TestTileSubscriptWrite:
         # not src.shape[0] (= the floor's lead unit).
         assert "pl.tile.reshape(row, [1, 1, 128])" in printed
 
-    def test_tile_subscript_write_rank_reduce_narrow_valid_rejected(self):
-        """Tile rank-reduce + narrow valid_shape is rejected: tile.reshape
-        cannot carry valid_shape, so the rank lift would silently lose the
-        narrowing. Force users to take the pl.store path instead."""
+    def test_tile_subscript_write_rank_reduce_carries_narrow_valid(self):
+        """Tile rank-reduce + narrow valid_shape keeps the narrowing.
 
-        with pytest.raises(UnsupportedFeatureError, match=r"tile\.reshape cannot carry valid_shape"):
+        The lift only inserts a unit axis, which tile.reshape reproduces as a
+        coordinate-only rank change, so a [8, 8] region of a 16x16 source
+        survives as [1, 8, 8]. This region is not a contiguous flat prefix --
+        only the unit-axis rule can map it -- and before reshape mapped validity
+        at all the lift silently widened it back to the full 16x16.
+        """
 
-            @pl.function
-            def bad_tile(
-                x: pl.Tensor[[32, 16, 16], pl.FP32],
-                src: pl.Tile[[16, 16], pl.FP32],
-                i: pl.Scalar[pl.INDEX],
-            ) -> pl.Tensor[[32, 16, 16], pl.FP32]:
-                t: pl.Tile[[8, 16, 16], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 16, 16])
-                narrowed = pl.set_validshape(src, 8, 8)
-                t[i, :, :] = narrowed
-                return pl.tile.store(t, [0, 0, 0], x)
+        @pl.function
+        def narrow_tile_lift(
+            x: pl.Tensor[[32, 16, 16], pl.FP32],
+            src: pl.Tile[[16, 16], pl.FP32],
+            i: pl.Scalar[pl.INDEX],
+        ) -> pl.Tensor[[32, 16, 16], pl.FP32]:
+            t: pl.Tile[[8, 16, 16], pl.FP32] = pl.tile.load(x, [0, 0, 0], [8, 16, 16])
+            narrowed = pl.set_validshape(src, 8, 8)
+            t[i, :, :] = narrowed
+            return pl.tile.store(t, [0, 0, 0], x)
+
+        printed = narrow_tile_lift.as_python()
+        assert "tile.assemble" in printed
+        assert "pl.tile.reshape(narrowed, [1, 16, 16])" in printed
+
+        assert isinstance(narrow_tile_lift, ir.Function)
+        assert isinstance(narrow_tile_lift.body, ir.SeqStmts)
+        assemble_stmt = narrow_tile_lift.body.stmts[2]
+        assert isinstance(assemble_stmt, ir.AssignStmt)
+        assert isinstance(assemble_stmt.value, ir.Call)
+        reshaped = assemble_stmt.value.args[1]
+        assert isinstance(reshaped, ir.Call)
+        assert reshaped.op.name == ir.get_op("tile.reshape").name
+
+        reshaped_type = reshaped.type
+        assert isinstance(reshaped_type, ir.TileType)
+        valid = reshaped_type.get_effective_tile_view().valid_shape
+        assert [cast(ir.ConstInt, dim).value for dim in valid] == [1, 8, 8]
 
 
 if __name__ == "__main__":

@@ -45,6 +45,29 @@ class TestResolveBackendOpLayouts:
     reshaping back to `[N, 1]` afterwards.
     """
 
+    def test_row_expand_add_keeps_col_major_row_vector(self):
+        """Only src0/dst have PTOAS row-major hints; a [M, 1] src1 remains DN."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def repro(
+                self,
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                src: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                row: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
+                    [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tile[[16, 32], pl.FP32] = pl.tile.row_expand_add(src, row)
+                stored: pl.Tensor[[16, 32], pl.FP32] = pl.store(result, [0, 0], out)
+                return stored
+
+        After = _run_pass(Before)
+        ir.assert_structural_equal(After, Before)
+
     def test_rewrites_column_vector_add_through_row_major_reshape(self):
         """`tile.add` on `[N, 1]` vectors should be repaired through `[1, N] row_major`."""
 
@@ -231,6 +254,50 @@ class TestResolveBackendOpLayouts:
                 scaled_rm: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.muls(partial_rm, 2.0)
                 scaled: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(scaled_rm, [16, 1])
                 stored: pl.Tensor[[16, 1], pl.FP32] = pl.store(scaled, [0, 0], out)
+                return stored
+
+        After = _run_pass(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rewrites_column_vector_subs_through_row_major_reshape(self):
+        """`tile.subs` repairs a col-major vector before reaching PTOAS."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def repro(
+                self,
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                chunk: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
+                shifted: pl.Tile[[16, 1], pl.FP32] = pl.tile.subs(partial, 2.0)
+                stored: pl.Tensor[[16, 1], pl.FP32] = pl.store(shifted, [0, 0], out)
+                return stored
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def repro(
+                self,
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                chunk: pl.Tile[[16, 256], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                tmp: pl.Tile[[16, 256], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                partial: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.row_sum(chunk, tmp)
+                partial_rm: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(partial, [1, 16])
+                shifted_rm: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.subs(partial_rm, 2.0)
+                shifted: pl.Tile[[16, 1], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reshape(shifted_rm, [16, 1])
+                stored: pl.Tensor[[16, 1], pl.FP32] = pl.store(shifted, [0, 0], out)
                 return stored
 
         After = _run_pass(Before)

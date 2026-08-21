@@ -81,6 +81,28 @@ PyPTO（发音：pai p-t-o）是一个面向 AI 加速器的高性能编程框�
   sudo apt-get install ccache  # Ubuntu/Debian
   ```
 
+### AI 助手插件
+
+PyPTO 公共 skills 通过
+[`hw-native-sys/pypto-skills`](https://github.com/hw-native-sys/pypto-skills)
+发布为两个插件：`pypto-developer` 提供仓库开发工作流，`pypto-user` 提供面向用户的检查和性能分析工作流。可按需安装其中一个或两个插件。
+
+Codex：
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-developer@pypto-skills
+codex plugin add pypto-user@pypto-skills
+```
+
+Claude Code：
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-developer@pypto-skills
+claude plugin install pypto-user@pypto-skills
+```
+
 ### 运行示例
 
 PyPTO 包含按复杂度组织的示例：
@@ -88,13 +110,13 @@ PyPTO 包含按复杂度组织的示例：
 #### 1. Hello World（最简单的程序）
 
 ```bash
-python examples/hello_world.py
+python examples/beginner/01_hello_world.py
 ```
 
-#### 2. 算子示例（逐元素、矩阵乘、softmax 等）
+#### 2. 入门与进阶示例（逐元素、矩阵乘、softmax 等）
 
 ```bash
-python examples/kernels/06_softmax.py
+python examples/intermediate/02_softmax.py
 ```
 
 #### 3. 模型示例（FFN、paged attention、LLaMA 等）
@@ -120,6 +142,30 @@ python -m pytest tests/ut/core/test_error.py -n auto --maxprocesses 8 -v
 ```
 
 系统测试请参见 `tests/st/README.md`。
+
+## 文档
+
+文档站点发布在 **<https://hw-native-sys.github.io/pypto/>**。
+其源文件是 [`docs/`](docs/) 下的 markdown，在 GitHub 上可直接阅读：
+
+| 章节 | 内容 |
+| ---- | ---- |
+| [用户手册](docs/zh/user/index.md) | 入门、语言指南、操作参考、调试 |
+| [参考](docs/zh/reference/index.md) | PTO ISA —— 集群架构、TPUSH/TPOP、缓冲区管理 |
+| [开发者](docs/zh/dev/index.md) | IR、passes、代码生成、后端分派 |
+| [运行时](https://hw-native-sys.github.io/simpler/) | 执行已编译程序的 `simpler` 运行时 |
+
+英文文档位于 [`docs/en/`](docs/en/)（以英文为准），可从站点的语言菜单切换。
+
+本地构建站点：
+
+```bash
+# 只需文档工具链 —— 构建站点不需要已编译的 pypto
+pip install -r docs/requirements.txt
+
+mkdocs serve            # 在 http://127.0.0.1:8000 实时预览
+mkdocs build --strict   # 与 CI 一致；断链会导致构建失败
+```
 
 ## 许可证
 

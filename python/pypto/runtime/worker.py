@@ -42,8 +42,12 @@ Example — explicit dispatch::
 from __future__ import annotations
 
 import contextvars
+import ctypes
 import weakref
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any
+
+from pypto.pypto_core.passes import RuntimeKind, runtime_kind_to_name
 
 from .runner import RunConfig
 from .runtime_base import Worker
@@ -95,8 +99,20 @@ _ACTIVE_WORKERS: contextvars.ContextVar[tuple[ChipWorker, ...]] = contextvars.Co
 # the value ``CompiledProgram.runtime_name`` reports and the one the reuse
 # lookup in ``device_runner.execute_on_device`` searches for, so a
 # default-constructed ``with ChipWorker():`` bind-matches a freshly compiled
-# program instead of silently falling through to a one-shot worker.
-_DEFAULT_RUNTIME = "tensormap_and_ringbuffer"
+# program instead of silently falling through to a one-shot worker. Derived from
+# the RuntimeKind enum that compilation selects, so the two cannot drift apart.
+_DEFAULT_RUNTIME = runtime_kind_to_name(RuntimeKind.TENSORMAP_AND_RINGBUFFER)
+
+
+def _close_simpler_worker_best_effort(impl: Any) -> None:
+    """Retry terminal simpler cleanup when a wrapper becomes unreachable."""
+    try:
+        impl.close()
+    except BaseException:
+        # Finalizers cannot surface cleanup failures.  Simpler keeps cleanup
+        # retryable, so this still gives an abandoned construction one final
+        # opportunity to drain its native cleanup journal.
+        pass
 
 
 class ChipWorker(Worker):
@@ -110,8 +126,10 @@ class ChipWorker(Worker):
     Inside a ``with`` block, ``CompiledProgram.__call__`` and
     :func:`pypto.runtime.run` find this worker via a ``ContextVar`` and reuse
     its initialized device context instead of creating a fresh worker per call.
-    Reuse only happens when all four binding fields match — otherwise the
-    caller falls through to the one-shot path.
+    Reuse only happens when all four binding fields match and the worker has
+    every capability required by the artifact — otherwise the caller either
+    falls through to the one-shot path (binding mismatch) or raises (capability
+    mismatch on the same device).
 
     .. note::
        Distinct from ``simpler.worker.ChipWorker`` (the C++ L2 backend handle
@@ -130,6 +148,8 @@ class ChipWorker(Worker):
             program is compiled against; otherwise reuse silently falls
             through to the one-shot path. Defaults to
             ``"tensormap_and_ringbuffer"``.
+        enable_sdma: Whether the underlying runtime worker provisions the SDMA
+            workspace required by prefetch artifacts. Defaults to ``False``.
         auto_init: If ``True``, call :meth:`init` from ``__init__``. Default
             is ``True``.
     """
@@ -140,6 +160,7 @@ class ChipWorker(Worker):
         *,
         level: int = 2,
         runtime: str = _DEFAULT_RUNTIME,
+        enable_sdma: bool = False,
         auto_init: bool | None = None,
     ) -> None:
         if level != 2:
@@ -153,14 +174,20 @@ class ChipWorker(Worker):
         self._config = config or RunConfig()
         self._level = level
         self._runtime = runtime
+        self._enable_sdma = bool(enable_sdma)
         self._token: contextvars.Token | None = None
+        # Simpler's owner-side memory API now returns Buffer objects, while
+        # PyPTO intentionally keeps its public raw-pointer surface stable.
+        self._device_buffers: dict[tuple[int, int], Any] = {}
 
-        self._impl = _get_simpler_worker_cls()(
-            level=level,
-            device_id=self._config.device_id,
-            platform=self._config.platform,
-            runtime=runtime,
-        )
+        self._impl = self._new_impl()
+        # ``auto_init=True`` can raise from __init__.  If both startup and its
+        # immediate cleanup fail, callers never receive the wrapper and cannot
+        # call close() themselves.  Keep an impl-only finalizer armed until a
+        # successful close so that unreachable wrappers retry that journal.
+        self._impl_finalizer = weakref.finalize(self, _close_simpler_worker_best_effort, self._impl)
+        self._impl_close_pending = False
+        self._impl_needs_rebuild = False
         self._initialized = False
         # Maps id(chip_callable) -> handle returned by simpler Worker.register()
         # (an opaque ``CallableHandle`` since runtime #891; typed ``Any`` to
@@ -178,7 +205,31 @@ class ChipWorker(Worker):
         if auto_init is None:
             auto_init = True
         if auto_init:
-            self.init()
+            try:
+                self.init()
+            except BaseException:
+                # __init__ is about to abandon the wrapper, so callers cannot
+                # drive Simpler's retryable cleanup themselves.  Retry once
+                # synchronously; if it is still pending, the impl-only
+                # finalizer above remains armed for eventual reclamation.
+                if self._impl_close_pending:
+                    with suppress(BaseException):
+                        self.close()
+                raise
+
+    def _new_impl(self) -> Any:
+        """Construct a fresh simpler Worker for this immutable binding."""
+        impl = _get_simpler_worker_cls()(
+            level=self._level,
+            device_id=self._config.device_id,
+            platform=self._config.platform,
+            runtime=self._runtime,
+            enable_sdma=self._enable_sdma,
+        )
+        from .tensor_arg import bind_tensor_arg_owner  # noqa: PLC0415
+
+        bind_tensor_arg_owner(impl, self)
+        return impl
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -188,6 +239,18 @@ class ChipWorker(Worker):
         """Initialize device state. Idempotent — a second call is a no-op."""
         if self._initialized:
             return
+        if self._impl_close_pending:
+            raise RuntimeError(
+                "ChipWorker.init() cannot reuse a simpler Worker whose close() failed; "
+                "call ChipWorker.close() again to finish cleanup first."
+            )
+        # simpler Worker.close() is terminal. Preserve PyPTO's documented
+        # close→init contract by creating a new backend object after the prior
+        # one has closed successfully.
+        if self._impl_needs_rebuild:
+            self._impl = self._new_impl()
+            self._impl_finalizer = weakref.finalize(self, _close_simpler_worker_best_effort, self._impl)
+            self._impl_needs_rebuild = False
         # Prewarm the prebuilt runtime-arena cache so the first run() hits it
         # instead of paying the ~800ms cold build inside a (usually timed)
         # dispatch. Only ring sizing keys the cache, and dispatch takes its ring
@@ -197,33 +260,56 @@ class ChipWorker(Worker):
         # Transcribing ``_config``'s rings here would instead build an arena no
         # dispatch asks for. A per-call RunConfig that sizes the rings differently
         # rebuilds once, as before. No-op without a prebuilt arena.
-        self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
+        try:
+            self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
+        except BaseException:
+            # Simpler marks a partially failed startup terminal. Drive its
+            # retryable cleanup immediately; if cleanup itself fails, retain
+            # this exact impl so a later close() can replay its journal.
+            try:
+                self._impl.close()
+            except BaseException:
+                self._impl_close_pending = True
+            else:
+                self._impl_finalizer.detach()
+                self._impl_needs_rebuild = True
+            raise
         self._initialized = True
 
     def close(self) -> None:
-        """Release device state. Idempotent. The ChipWorker may be re-``init()``'d."""
-        if not self._initialized:
+        """Release device state. Idempotent; a later :meth:`init` uses a new backend."""
+        if not self._initialized and not self._impl_close_pending:
             return
-        # Auto-free any DeviceTensors the caller forgot. Run BEFORE we drop
-        # cid registrations / tear down the impl so the underlying free path
-        # is still live.
-        self._close_owned_tensors()
-        # Drop per-handle host-side state before tearing down the device so
-        # the underlying ChipWorker.finalize() doesn't observe stale
-        # registrations on a re-init(). ``unregister`` accepts the opaque
-        # ``CallableHandle`` returned by ``register`` (runtime #891 renamed
-        # ``unregister_callable(cid)`` to ``unregister(handle)``).
-        for cid in self._cid_cache.values():
-            self._impl.unregister(cid)
+        if self._initialized:
+            # Auto-free tracked DeviceTensors while public memory ops are still
+            # admitted. Any failed free is logged by the shared helper and the
+            # backend's own close journal remains the final reclamation owner.
+            self._close_owned_tensors()
+            # Explicit unregister is best-effort. Simpler.close() owns the full
+            # registry teardown; retain the cache until close succeeds so a
+            # failed close never looks like completed cleanup in PyPTO state.
+            for cid in self._cid_cache.values():
+                with suppress(Exception):
+                    self._impl.unregister(cid)
+            for handle in list(self._handles):
+                handle._mark_closed()
+            self._initialized = False
+            self._impl_close_pending = True
+
+        try:
+            self._impl.close()
+        except BaseException:
+            # Simpler close is terminal but retryable: keep the impl, Buffer
+            # map, and registration cache intact so the same cleanup journal
+            # can be driven again.
+            raise
+        self._impl_close_pending = False
+        self._impl_needs_rebuild = True
+        self._impl_finalizer.detach()
+        self._owned_tensors.clear()
         self._cid_cache.clear()
-        # Mark every still-alive RegistrationHandle as closed so subsequent
-        # handle(...) calls raise instead of silently dispatching to a
-        # released cid.
-        for handle in list(self._handles):
-            handle._mark_closed()
         self._handles.clear()
-        self._impl.close()
-        self._initialized = False
+        self._device_buffers.clear()
 
     # ------------------------------------------------------------------
     # Device memory primitives (forwarded to the underlying chip worker)
@@ -244,6 +330,11 @@ class ChipWorker(Worker):
         # Worker ABC hook: device-memory ops need an initialized ChipWorker.
         self._require_initialized(op)
 
+    @staticmethod
+    def _require_local_worker_id(worker_id: int, op: str) -> None:
+        if worker_id != 0:
+            raise ValueError(f"ChipWorker.{op}() only supports worker_id=0, got {worker_id}")
+
     def malloc(self, nbytes: int, *, worker_id: int = 0) -> int:
         """Allocate ``nbytes`` of device memory; returns an opaque pointer.
 
@@ -252,14 +343,47 @@ class ChipWorker(Worker):
         closed, otherwise the device memory is leaked.
         """
         self._require_initialized("malloc")
+        self._require_local_worker_id(worker_id, "malloc")
         if not isinstance(nbytes, int) or nbytes <= 0:
             raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
-        return self._impl.malloc(nbytes, worker_id)
+        handle = self._impl.malloc(nbytes)
+        try:
+            ptr = int(handle.base)
+        except (AttributeError, TypeError, ValueError) as e:
+            with suppress(Exception):
+                self._impl.free(handle)
+            raise TypeError("simpler Worker.malloc() must return a Buffer with an integer base") from e
+        if ptr <= 0:
+            with suppress(Exception):
+                self._impl.free(handle)
+            raise ValueError(f"simpler Worker.malloc() returned an invalid Buffer base {ptr!r}")
+        self._device_buffers[(worker_id, ptr)] = handle
+        return ptr
+
+    def _device_buffer(self, ptr: int, worker_id: int, op: str) -> Any:
+        self._require_local_worker_id(worker_id, op)
+        try:
+            return self._device_buffers[(worker_id, ptr)]
+        except KeyError as e:
+            raise ValueError(
+                f"ChipWorker.{op}() requires the allocation base returned by "
+                f"this ChipWorker.malloc(..., worker_id={worker_id}); got 0x{ptr:x}. "
+                "PyPTO cannot safely reconstruct an owner Buffer for an interior pointer."
+            ) from e
+
+    def _buffer_for_ptr(self, ptr: int, *, worker_id: int = 0) -> Any:
+        return self._device_buffer(ptr, worker_id, "alloc_tensor")
 
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_initialized("free")
-        self._impl.free(ptr, worker_id)
+        handle = self._device_buffer(ptr, worker_id, "free")
+        self._impl.free(handle)
+        # Keep the mapping until backend admission + free succeeds. An error
+        # before simpler's provenance commit barrier is safely retryable; an
+        # error after it is rejected by simpler on retry and ultimately cleaned
+        # by Worker.close().
+        del self._device_buffers[(worker_id, ptr)]
 
     def copy_to(
         self,
@@ -276,7 +400,11 @@ class ChipWorker(Worker):
         this call returns.
         """
         self._require_initialized("copy_to")
-        self._impl.copy_to(dst_dev_ptr, src_host_ptr, nbytes, worker_id)
+        dst = self._device_buffer(dst_dev_ptr, worker_id, "copy_to")
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
+        src = (ctypes.c_ubyte * nbytes).from_address(src_host_ptr)
+        self._impl.copy_to(dst, src)
 
     def copy_from(
         self,
@@ -288,7 +416,11 @@ class ChipWorker(Worker):
     ) -> None:
         """D2H copy: ``nbytes`` bytes from device *src_dev_ptr* back to host *dst_host_ptr*."""
         self._require_initialized("copy_from")
-        self._impl.copy_from(dst_host_ptr, src_dev_ptr, nbytes, worker_id)
+        src = self._device_buffer(src_dev_ptr, worker_id, "copy_from")
+        if nbytes <= 0:
+            raise ValueError(f"nbytes must be a positive int, got {nbytes!r}")
+        dst = (ctypes.c_ubyte * nbytes).from_address(dst_host_ptr)
+        self._impl.copy_from(dst, src)
 
     # ``alloc_tensor`` / ``free_tensor`` are inherited from Worker (ABC).
     # L2 uses the default ``_prepare_init`` (a defensive contiguous CPU copy);
@@ -346,16 +478,28 @@ class ChipWorker(Worker):
     # ------------------------------------------------------------------
 
     @classmethod
-    def current(cls, *, level: int, platform: str, device_id: int, runtime: str) -> ChipWorker | None:
+    def current(
+        cls,
+        *,
+        level: int,
+        platform: str,
+        device_id: int,
+        runtime: str,
+        require_sdma: bool = False,
+    ) -> ChipWorker | None:
         """Return the topmost active ChipWorker matching the binding, or ``None``.
 
         Used by :func:`pypto.runtime.device_runner.execute_on_device` to
         decide whether to reuse a user-published ChipWorker or fall through
-        to constructing a fresh one-shot worker.
+        to constructing a fresh one-shot worker. A matching worker without a
+        required SDMA capability raises instead of opening a second worker on
+        the same device.
         """
         target = (level, platform, device_id, runtime)
         for w in reversed(_ACTIVE_WORKERS.get()):
             if w._binding == target:
+                if require_sdma and not w._enable_sdma:
+                    raise RuntimeError("active ChipWorker was created without enable_sdma=True")
                 return w
         return None
 
@@ -364,7 +508,7 @@ class ChipWorker(Worker):
     # ------------------------------------------------------------------
 
     def _check_binding(self, compiled: CompiledProgram) -> None:
-        """Raise ValueError on platform / runtime_name mismatch.
+        """Raise on a binding or worker-capability mismatch.
 
         ``compiled.runtime_name`` triggers ``compile_and_assemble`` lazily,
         which is acceptable because any subsequent dispatch needs it anyway.
@@ -381,6 +525,9 @@ class ChipWorker(Worker):
                 f"ChipWorker was constructed with runtime={self._runtime!r}. "
                 f"Construct ChipWorker(..., runtime={compiled.runtime_name!r})."
             )
+        requires_sdma = bool(compiled.runtime_config.get("enable_sdma", False))
+        if requires_sdma and not self._enable_sdma:
+            raise RuntimeError("ChipWorker was created without enable_sdma=True")
 
     def run(
         self,
@@ -403,7 +550,8 @@ class ChipWorker(Worker):
         Raises:
             ValueError: ``compiled.platform`` != ``self.platform`` or
                 ``compiled.runtime_name`` != ``self.runtime``.
-            RuntimeError: ChipWorker not initialized.
+            RuntimeError: ChipWorker not initialized, or the compiled program
+                requires SDMA but this worker was created without it.
         """
         outputs = self._dispatch(compiled, args, config, op="run")
         return outputs
@@ -437,7 +585,7 @@ class ChipWorker(Worker):
             dfx_dir = Path(compiled.output_dir) / "dfx_outputs"
             dfx_dir.mkdir(parents=True, exist_ok=True)
 
-        orch_args, coerced, return_style = compiled.build_orch_args(*args)
+        orch_args, coerced, return_style = compiled.build_orch_args(*args, worker=self._impl)
         cfg = compiled.build_call_config(rc, dfx_dir=dfx_dir)
         self._run_chip(compiled.chip_callable, orch_args, cfg)
 
@@ -462,7 +610,8 @@ class ChipWorker(Worker):
 
         Raises:
             ValueError: Binding mismatch (see :meth:`run`).
-            RuntimeError: ChipWorker not initialized.
+            RuntimeError: ChipWorker not initialized, or the compiled program
+                requires SDMA but this worker was created without it.
         """
         self._require_initialized("register")
         self._check_binding(compiled)

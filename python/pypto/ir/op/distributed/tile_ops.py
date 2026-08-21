@@ -10,7 +10,7 @@
 """IR builders for ``pld.tile.*`` distributed tile ops.
 
 The IR op signature is positional (matching ``tile.load``); the DSL wrapper
-keeps ``peer`` / ``offsets`` / ``shape`` keyword-only for readability.
+accepts the same positional-or-keyword form so printed IR round-trips.
 """
 
 from collections.abc import Sequence
@@ -27,10 +27,11 @@ def remote_load(
     peer: Expr,
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
     *,
     span: Span | None = None,
 ) -> Call:
-    """Build a ``pld.tile.remote_load(target, peer, offsets, shape)`` Call.
+    """Build a ``pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])`` Call.
 
     Args:
         target: A :class:`ir.Expr` with type :class:`ir.DistributedTensorType`
@@ -39,19 +40,66 @@ def remote_load(
         offsets: Per-dimension offsets into ``target``'s coordinate space —
             sequence of ints/:class:`ir.Expr`, or an existing :class:`ir.MakeTuple`.
         shape: Per-dimension tile shape — same shape conventions as ``offsets``.
+        valid_shape: Optional valid extent inside the physical ``shape``. Use a
+            smaller final dimension for a fixed-width ragged tail. Every
+            symbolic source or requested valid extent that survives inference
+            must be runtime-bound by a kernel scalar, loop variable, or physical
+            tensor-shape parameter; a type-metadata-only symbol is rejected
+            during PTO codegen.
         span: Optional source span (auto-captured if absent).
 
     Returns:
         :class:`ir.Call` with result type :class:`ir.TileType` (shape =
         ``shape``, dtype = ``target.dtype``).
     """
-    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _build_remote_load(target, peer, offsets, shape, valid_shape, span=span)
+
+
+def _remote_load_with_physical_tail_padding(
+    target: Expr,
+    peer: Expr,
+    offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Build the lowering-only FP16 remote-load tail variant."""
+    return _build_remote_load(
+        target,
+        peer,
+        offsets,
+        shape,
+        valid_shape,
+        allow_physical_tail_padding=True,
+        span=span,
+    )
+
+
+def _build_remote_load(
+    target: Expr,
+    peer: Expr,
+    offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None,
+    *,
+    allow_physical_tail_padding: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Build a public or lowering-only remote-load call."""
+    actual_span = _get_span_or_capture(span, frame_offset=2)
     offsets_tuple = _to_make_tuple(offsets, actual_span)
     shape_tuple = _to_make_tuple(shape, actual_span)
+    args = [target, peer, offsets_tuple, shape_tuple]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    kwargs = {}
+    if allow_physical_tail_padding:
+        kwargs["allow_physical_tail_padding"] = True
     return _ir_core.create_op_call(
         "pld.tile.remote_load",
-        [target, peer, offsets_tuple, shape_tuple],
-        {},
+        args,
+        kwargs,
         actual_span,
     )
 
@@ -62,18 +110,23 @@ def remote_store(
     peer: int | Expr,
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
     *,
+    atomic: int = 0,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tile.remote_store(src_tile, target, peer, offsets)`` Call.
 
     Args:
-        src_tile: Local :class:`ir.Expr` with :class:`ir.TileType` (dtype must
-            match ``target.dtype``).
+        src_tile: Local :class:`ir.Expr` with 2-D :class:`ir.TileType` (dtype
+            must match ``target.dtype``).
         target: A :class:`ir.Expr` with type :class:`ir.DistributedTensorType`
             (the verifier rejects plain :class:`ir.TensorType`).
         peer: Scalar peer rank index (:class:`ir.Expr` of :class:`ir.ScalarType`).
         offsets: Per-dimension offsets into ``target``'s coordinate space —
             sequence of ints/:class:`ir.Expr`, or an existing :class:`ir.MakeTuple`.
+        atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite)
+            or 1 (``kAdd``, atomic-add into the peer's region). The kwarg is
+            omitted entirely when 0 so non-atomic stores print unchanged,
+            mirroring :func:`pypto.ir.op.tile_ops.store`.
         span: Optional source span (auto-captured if absent).
 
     Returns:
@@ -85,7 +138,7 @@ def remote_store(
     return _ir_core.create_op_call(
         "pld.tile.remote_store",
         [src_tile, target, peer_expr, offsets_tuple],
-        {},
+        {"atomic": int(atomic)} if atomic else {},
         actual_span,
     )
 
@@ -108,6 +161,10 @@ def put(
     ``stage2`` is the optional second VEC staging tile; when supplied, codegen
     emits the ping-pong (double-buffered) TPUT form. It must have the same shape
     and dtype as ``stage``.
+
+    ``atomic=Add`` requires an fp32/bf16/fp16/int32/int16/int8 destination (the
+    hardware atomic-add dtypes); a bf16 destination is Ascend910B-only, checked
+    by the ``AtomicAddDtypeValid`` verifier.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     peer_expr = _normalize_expr(peer, actual_span, int_dtype=DataType.INT32)

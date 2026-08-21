@@ -49,12 +49,15 @@ class IRProperty(Enum):
     TensorViewCanonical = ...
     ArrayNotEscaped = ...
     CommDomainScopesMaterialized = ...
+    DistTensorCtxMaterialized = ...
     RuntimeScopesMaterialized = ...
     AssignTypeSymmetry = ...
     ManualDepsOnSubmitOnly = ...
     ReturnParamsExplicit = ...
     AivSplitValid = ...
     IterArgCarryClassified = ...
+    AccToGmStoreValid = ...
+    AtomicAddDtypeValid = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -97,7 +100,23 @@ class MemoryPlanner(Enum):
     """Selects who plans on-chip buffer memory."""
 
     PYPTO = ...
+    DSA_RP = ...
     PTOAS = ...
+
+class RuntimeKind(Enum):
+    """Which Simpler runtime ABI a compilation targets."""
+
+    TENSORMAP_AND_RINGBUFFER = ...
+    """Task graph built on the AICPU, dependencies auto-derived through the TensorMap."""
+
+    HOST_BUILD_GRAPH = ...
+    """Host CPU builds the whole task graph up front; required for Graph Execution."""
+
+def runtime_kind_to_name(kind: RuntimeKind) -> str:
+    """Wire name written to ``RUNTIME_CONFIG["runtime"]``, e.g. ``"host_build_graph"``."""
+
+def runtime_kind_from_name(name: str) -> RuntimeKind:
+    """Parse a ``RUNTIME_CONFIG["runtime"]`` wire name back into a :class:`RuntimeKind`."""
 
 class DiagnosticPhase(Enum):
     """Controls when DiagnosticInstrument runs registered checks (warnings + perf hints)."""
@@ -113,6 +132,7 @@ class DiagnosticCheck(Enum):
     UnusedVariable = ...
     UnusedControlFlowResult = ...
     TileInnermostDimGranularity = ...
+    OutParamWriteDropped = ...
 
 class DiagnosticCheckSet:
     """A set of diagnostic checks backed by a bitset."""
@@ -235,21 +255,11 @@ class DiagnosticInstrument(PassInstrument):
         """Create a diagnostic instrument running the given check set."""
         ...
 
-class ReportType(Enum):
-    """Type of report to generate."""
-
-    Memory = ...
-    """Memory usage per MemorySpace."""
-
 class ReportInstrument(PassInstrument):
-    """Instrument that generates reports to files after specified passes."""
+    """Instrument that names the directory pipeline artifacts are written to."""
 
     def __init__(self, output_dir: str) -> None:
         """Create a report instrument with output directory."""
-        ...
-
-    def enable_report(self, type: ReportType, trigger_pass: str) -> None:
-        """Enable a report type after a specific pass."""
         ...
 
     def get_output_dir(self) -> str:
@@ -273,12 +283,19 @@ class PassContext:
         disabled_diagnostics: DiagnosticCheckSet = ...,  # default: {UnusedControlFlowResult}
         memory_planner: MemoryPlanner = MemoryPlanner.PYPTO,
         enable_pypto_l0c_double_buffer: bool = False,
+        runtime: RuntimeKind = RuntimeKind.TENSORMAP_AND_RINGBUFFER,
     ) -> None:
         """Create a PassContext with instruments and pass configuration (incl. memory planner).
 
-        ``enable_pypto_l0c_double_buffer`` opts in to L0C double-buffering (dbC=2)
-        under the PyPTO memory planner (experimental, default off; no effect under
-        PtoAS, which already emits dbC=2).
+        ``enable_pypto_l0c_double_buffer`` opts the legacy ``PYPTO`` planner in
+        to chooser-emitted L0C double-buffering (dbC=2; experimental, default
+        off). It has no effect under ``DSA_RP`` or ``PTOAS``, which enable
+        chooser dbC=2 automatically.
+
+        ``runtime`` selects the target Simpler runtime ABI; its wire name is
+        what lands in ``RUNTIME_CONFIG["runtime"]`` in the generated
+        ``kernel_config.py``. Passes that legalize runtime-specific IR read it
+        from the context.
         """
         ...
 
@@ -305,8 +322,12 @@ class PassContext:
         """Get the memory planner selection for this context."""
         ...
 
+    def get_runtime(self) -> RuntimeKind:
+        """Get the target Simpler runtime ABI for this context."""
+        ...
+
     def get_enable_pypto_l0c_double_buffer(self) -> bool:
-        """Whether L0C double-buffering (dbC=2) is enabled under the PyPTO memory planner."""
+        """Whether chooser-emitted dbC=2 is enabled under legacy PYPTO."""
         ...
 
     def get_instruments(self) -> list[PassInstrument]:
@@ -409,6 +430,31 @@ def skew_cross_core_pipeline() -> Pass:
     ``lower_pipeline_loops``.
     """
 
+def lower_pipeline_to_slots() -> Pass:
+    """Create a pass that multi-buffers ``pl.pipeline`` loops via MemRef slots.
+
+    Runs immediately before ``lower_pipeline_loops``. Instead of replicating the
+    body ``F`` times, keeps one body and rebinds every top-level ``tile.load`` /
+    ``tile.read`` whose arguments read the induction variable onto
+    ``pl.MemRef(name, slots=F)[iv % F]``, then demotes the loop to
+    ``ForKind.Sequential`` with ``pipeline_stages`` stripped. Bounds, step and
+    ``iter_args`` are untouched, so no remainder dispatch is needed.
+
+    Self-gated on ``memory_planner=PTOAS``: only that planner's codegen path emits
+    a ptoas multi-buffer region today, so under the default PyPTO planner the pass
+    returns every function untouched. The gate tracks that codegen limitation, not
+    a ptoas one — an addressed region synchronizes identically at level3, and
+    widening the gate is follow-up work in the address allocator. Loops it
+    declines — an unsupported
+    slot count, a step other than 1, a start not a multiple of ``F``, no eligible
+    load, an unsupported memory space or runtime valid shape, a tile carried out as
+    a phi or consumed by a view op, or nesting under a declined pipeline loop — are
+    left intact for ``lower_pipeline_loops`` to replicate.
+
+    Returns:
+        Function-level pass
+    """
+
 def lower_pipeline_loops() -> Pass:
     """Create a tile-level lowering pass for ``pl.pipeline(N, stage=F)`` loops.
 
@@ -461,34 +507,44 @@ def optimize_orch_tensors() -> Pass:
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
+def legalize_tile_cast() -> Pass:
+    """Create a pass that expands hardware-unsupported ``tile.cast`` pairs.
+
+    ``pto.tcvt`` supports only a profile-dependent subset of (src, dst) dtype
+    pairs. Each non-native cast is rewritten into the shortest chain of native
+    casts for the active backend's ISA (e.g. on A5 ``INT32 -> FP16`` becomes
+    ``INT32 -> FP32 -> FP16``). Already-native casts are left untouched.
+    """
+
 def auto_tile_matmul_l0() -> Pass:
-    """Create a pass that auto-tiles Mat-resident matmul / matmul_acc into a C-stationary K-loop.
+    """Create a pass that auto-tiles static 2D ``tile.matmul`` family calls for L0.
 
-    Rewrites each ``tile.matmul`` or ``tile.matmul_acc`` whose Mat operands
-    have static 2D shape into a ``range(0, K, k)`` loop:
+    The active backend's roofline chooser selects
+    ``(m, n, k, stationarity, dbC)``. K-split reductions use a 2-stage
+    pipelined loop and peel a supported non-divisor aligned tail. Plain
+    ``tile.matmul`` may also use an M/N grid with direct-GM placement or an
+    on-chip Mat scratch for chained matmul consumers; compatible
+    f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
 
-    * For ``tile.matmul``, the loop body branches on ``ko == 0`` between
-      ``tile.matmul`` (fresh accumulator) and ``tile.matmul_acc``
-      (accumulating into the iter-arg).
-    * For ``tile.matmul_acc``, every iteration is ``tile.matmul_acc`` with
-      the iter-arg init set to the caller's accumulator — the chain is
-      uniform from the first iteration so no if-else is needed.
+    Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
+    enabled automatically under DSA_RP and PTOAS and available as a legacy-PYPTO opt-in. Eligible calls
+    require static 2D operands with B in Mat and A in Mat or Vec. When the
+    chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
+    although a chained result may still be remapped to Mat by the compatible
+    cast-fold placement above. Other unsupported regimes are left untouched;
+    useful deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias``
+    is supported for Mat-resident matrix operands and an accumulator-typed
+    bias: the bias is applied once on the first K block and a Mat-resident bias
+    is reconstructed from single-use tensor loads separated from the call only
+    by sibling loads, then moved to Bias as independent N windows. Candidate N is bounded by
+    the backend bias-table capacity and the emitted pipeline replication depth
+    for those Mat-backed windows. An already-Bias-resident source remains one
+    external full-N slot and is never N-tiled.
 
-    The L0 tile shape ``(m, n, k)`` is chosen by ``utils.choose_l0_tile``
-    from the active backend's L0 capacities. The K-loop is marked
-    ``ForKind.Pipeline`` with ``pipeline_stages=2`` so the downstream
-    ``LowerPipelineLoops`` pass produces a 2-deep ping-pong on the
-    auto-inserted Mat→Left/Right moves. Already-L0-sized matmuls are left
-    untouched.
-
-    Supported today: ``tile.matmul`` and ``tile.matmul_acc``
-    (``tile.matmul_bias`` is deferred). The chooser is a roofline cost-model
-    search over ``(m, n, k, stationarity)``; besides the K-loop it emits
-    **M/N output tiling** (a direct-store grid, or an on-chip **Mat-scratch**
-    assemble when the result is consumed as a matmul operand), a
-    **non-divisor-K boundary peel** for 16-aligned K, and **operand-stationary**
-    (A/B-stationary) schedules. Non-16-aligned K and the other deferred regimes
-    emit a perf hint and are left untouched.
+    Under the PyPTO planner, a canonical static already-L0 pipeline containing
+    one stationary-panel ``tile.matmul`` and one direct store or assemble drain
+    may automatically use two L0C slots when its conservative post-lowering
+    Acc footprint fits.
     """
 
 def canonicalize_tile_slice() -> Pass:
@@ -509,7 +565,28 @@ def canonicalize_tile_slice() -> Pass:
     """
 
 def infer_tile_memory_space() -> Pass:
-    """Create a pass that infers memory_space for TileType variables in InCore functions."""
+    """Infer TileType memory spaces and safe stationary matmul residency.
+
+    Besides assigning ``Vec``/``Mat``/``Left``/``Right``/``Acc`` and inserting
+    required moves, the pass runs a focused internal transform for
+    compiler-generated invariant GM→Mat matmul operand paths. The candidate
+    caller storage must be created by ``tensor.create`` in root orchestration
+    IR. K-tiled fanout may retain the whole GM→Mat panel while leaving
+    K-dependent Left/Right staging inside its original pipeline. External
+    inputs, Submit sites, and direct/external InCore entries decline.
+    User-authored tile loads are never moved, and internal bridge provenance is
+    consumed before the pass returns.
+    """
+
+def insert_mx_scale_addr() -> Pass:
+    """Insert ``tile.tget_scale_addr`` before MX matmul consumers.
+
+    Requires ``infer_tile_memory_space`` first so Left/LeftScale and
+    Right/RightScale pairs are resolved. Rewrites each ``matmul_mx`` family
+    call to consume the bound scale SSA. Bindings are never reused across MX
+    consumers because ``tget_scale_addr`` mutates a shared physical scale
+    buffer whose aliases are not represented by SSA identity.
+    """
 
 def materialize_tensor_strides() -> Pass:
     """Create the MaterializeTensorStrides pass (RFC #1300 §2.4).
@@ -660,6 +737,16 @@ def lower_host_tensor_collectives() -> Pass:
 def materialize_dist_tensor_ctx() -> Pass:
     """Materialize CommCtx parameters and arguments for DistributedTensor function parameters."""
 
+def materialize_valid_shape_symbols() -> Pass:
+    """Materialize a Scalar[INDEX] parameter per unbindable device-kernel valid_shape symbol.
+
+    A ``pl.dynamic()`` symbol named only in a parameter's
+    ``pl.TensorView(valid_shape=...)`` is neither a physical tensor dimension nor a
+    scalar parameter, so a precompiled kernel never receives it. Adds the symbol
+    as a leading ``Scalar[INDEX]`` parameter and passes the caller's actual extent
+    at every call/submit site.
+    """
+
 def stamp_tfree_split() -> Pass:
     """Copy each cross-core tpop's split/pipe-id onto its matching tfree op.
 
@@ -699,6 +786,31 @@ def classify_iter_arg_carry() -> Pass:
 
     Runs last, after :func:`materialize_runtime_scopes`, so the classified IR is
     exactly the IR codegen lowers.
+    """
+
+def insert_comm_fence() -> Pass:
+    """Insert the ptoas data-before-signal markers (all via ``system.cacheinvalid``).
+
+    The ``pld.system.notify`` itself needs no marker:
+
+    * After each **local** publishing write — a ``tile.store`` or ``tensor.write``
+      into a window-bound ``DistributedTensor`` (a peer can ``remote_load`` it), or
+      a ``get`` into a window-bound local destination — a region
+      ``system.cacheinvalid`` of the written region immediately followed by a GM
+      ``system.fence``.
+    * After each **remote** publishing write (``remote_store`` / ``put``) — only a
+      GM ``system.fence``. Its peer-offset address is not yet expressible in the IR,
+      so the peer-region cacheinvalid is emitted by the op's codegen as a workaround;
+      the release fence is always an explicit ``system.fence`` op inserted here.
+    * After each **opaque** publishing write — a ``Submit`` or a call to an
+      unregistered user function (no single addressable region) — a conservative
+      whole-GM ``system.cacheinvalid`` + ``system.fence``.
+    * After each **wait** — a no-arg (whole-GM) ``system.cacheinvalid``.
+
+    The pass carries no control-flow state and is idempotent.
+
+    Runs last in the Default pipeline, after all statement-reordering passes, so the
+    inserted markers stay adjacent through codegen.
     """
 
 class NestedCallErrorType(Enum):
@@ -783,7 +895,14 @@ class l0_tile_chooser:
         BStationary = 2
 
     class L0TileConfig:
-        """Inputs to choose_l0_tile: problem dims + hardware + realizable-mask gates."""
+        """Inputs to choose_l0_tile: problem dims + hardware + realizable-mask gates.
+
+        ``max_n`` caps the logical N extent of a chosen tile, not the full
+        problem N. ``max_n_pipelined`` may impose a tighter bound when N is
+        used under one level of a full-K output-grid pipeline, while
+        ``max_n_nested_pipelined`` covers two nested pipeline levels. A value
+        of zero leaves the corresponding bound disabled.
+        """
 
         M: int
         N: int
@@ -800,6 +919,12 @@ class l0_tile_chooser:
         align_m: int
         align_n: int
         align_k: int
+        l0c_align_m: int
+        box_align_m: int
+        box_align_n: int
+        max_n: int
+        max_n_pipelined: int
+        max_n_nested_pipelined: int
         allow_a_stationary: bool
         allow_b_stationary: bool
         allow_double_buffer_c: bool
@@ -858,7 +983,6 @@ __all__ = [
     "PassInstrument",
     "VerificationInstrument",
     "CallbackInstrument",
-    "ReportType",
     "ReportInstrument",
     "PassContext",
     "PassPipeline",
@@ -880,9 +1004,11 @@ __all__ = [
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
     "flatten_tile_nd_to_2d",
+    "legalize_tile_cast",
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
+    "insert_mx_scale_addr",
     "materialize_tensor_strides",
     "resolve_backend_op_layouts",
     "normalize_return_order",
@@ -893,6 +1019,7 @@ __all__ = [
     "simplify",
     "lower_composite_ops",
     "materialize_dist_tensor_ctx",
+    "materialize_valid_shape_symbols",
     "flatten_call_expr",
     "inline_functions",
     "inline_orchestration_helpers",

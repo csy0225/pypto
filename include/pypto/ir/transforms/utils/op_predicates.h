@@ -12,6 +12,8 @@
 #ifndef PYPTO_IR_TRANSFORMS_UTILS_OP_PREDICATES_H_
 #define PYPTO_IR_TRANSFORMS_UTILS_OP_PREDICATES_H_
 
+#include <cstddef>
+#include <optional>
 #include <string>
 
 #include "pypto/ir/expr.h"
@@ -19,6 +21,26 @@
 namespace pypto {
 namespace ir {
 namespace op_predicates {
+
+/// Index of the argument a builtin *output-side* op binds its result to.
+///
+/// These ops do not allocate: they bind a fresh SSA var to a buffer an existing
+/// value already names, so the result inherits that argument's identity — and
+/// with it anything derived from identity, such as which function parameter a
+/// value traces back to or which communication context a DistributedTensor
+/// belongs to (`tile.store(value, indices, target)` -> `args[2]`,
+/// `tensor.assemble(target, source, offset)` -> `args[0]`).
+///
+/// The op declares this itself via `set_output_reuses_input(idx)`; this is a
+/// registry read, not an op list, so a newly added in-place op is picked up
+/// without touching every lineage analysis. Note the sibling declaration
+/// `set_output_memory_inherit_input()` is a *different* statement — it fixes the
+/// output's memory SPACE, not its buffer, and carries no argument index (see
+/// `IsBufferAliasingViewOp`).
+///
+/// @return the aliased argument index, or nullopt when @p op declares no reuse
+///         or @p arg_count is too small for the declared index
+[[nodiscard]] std::optional<size_t> BuiltinWritebackArgIndex(const OpPtr& op, size_t arg_count);
 
 /// True if the Call targets a tpop op (tile.tpop_from_aic / tile.tpop_from_aiv).
 /// Decided by the registry's CrossCoreRole, not by op-name string matching.
@@ -46,9 +68,24 @@ bool IsInitializePipe(const CallPtr& call);
 /// propagation and the tpop lifetime / tfree finalizer.
 bool IsBufferAliasingViewOp(const std::string& op_name);
 
+/// True when the op's output lands in a source operand's storage rather than a
+/// buffer of its own — either a buffer-aliasing view (`IsBufferAliasingViewOp`)
+/// or an in-place / accumulate op (`GetOutputReusesInputArg`).
+///
+/// Broader than `IsBufferAliasingViewOp` by the in-place / accumulate case only.
+/// Both exclude `tile.transpose`: it inherits the input's memory *space* but
+/// permutes into a fresh buffer, so it does own its storage.
+///
+/// Use this to answer "does this output get to choose its own buffer" —
+/// InitMemRef rejects a declared allocation on such an output, and MemoryReuse
+/// excludes those tiles from the co-live check because they occupy storage the
+/// source already accounts for.
+bool OutputInheritsSourceBuffer(const std::string& op_name);
+
 /// True for builtin ops whose name is namespaced `tile.` / `tensor.` /
-/// `system.` / `array.`. Builtin ops are never user Functions, so they carry
-/// no callee body and no Out/InOut params to trace.
+/// `system.` / `array.`, or for the distributed context query
+/// `pld.system.get_comm_ctx`. Builtin ops are never user Functions, so they
+/// carry no callee body and no Out/InOut params to trace.
 ///
 /// This is a deliberate string-prefix *family* check, not a registry lookup:
 /// it must classify op names that may not be registered (e.g. during `.pto`
@@ -57,6 +94,17 @@ bool IsBufferAliasingViewOp(const std::string& op_name);
 /// (see `operator-identity-checks.md`). It is the single canonical home for a
 /// predicate that was previously copy-pasted across the IR and codegen layers.
 bool IsBuiltinOp(const std::string& op_name);
+
+/// True if the Call publishes data that a peer rank may read after a subsequent
+/// `pld.system.notify`, so a GM `system.fence` must separate it from that notify:
+///   - remote writes: `pld.tile.remote_store` / `pld.tile.put` / `pld.tensor.put`;
+///   - a local `tile.store` whose destination tensor (arg 2) is window-bound
+///     (`DistributedTensorType`) — a peer can `remote_load` it;
+///   - a `pld.tile.get` / `pld.tensor.get` whose local destination (arg 0) is
+///     window-bound — same publishing obligation as a local store;
+///   - conservatively, a call to an unregistered op name (a user function whose
+///     body is not analysed interprocedurally).
+bool IsPublishingWrite(const CallPtr& call);
 
 }  // namespace op_predicates
 }  // namespace ir

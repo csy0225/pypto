@@ -21,8 +21,10 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -66,13 +68,13 @@ static std::string JoinPairs(const std::vector<std::string>& lhs, const std::str
 // ========================================================================
 
 void PTOCodegen::VisitStmt_(const EvalStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null EvalStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null EvalStmt";
   INTERNAL_CHECK_SPAN(op->expr_ != nullptr, op->span_) << "Internal error: EvalStmt has null expression";
   VisitExpr(op->expr_);
 }
 
 void PTOCodegen::VisitStmt_(const YieldStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null YieldStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null YieldStmt";
 
   if (op->value_.empty()) {
     return;
@@ -210,7 +212,7 @@ bool IsDefinedInBranch(const ir::Var* var, const StmtPtr& body) {
 }  // namespace
 
 void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null IfStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null IfStmt";
   INTERNAL_CHECK_SPAN(op->condition_ != nullptr, op->span_) << "Internal error: IfStmt has null condition";
   INTERNAL_CHECK_SPAN(op->then_body_ != nullptr, op->span_) << "Internal error: IfStmt has null then_body";
 
@@ -221,19 +223,19 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
 
   if (op->return_vars_.empty()) {
     // Simple scf.if (no return values)
-    Emit("scf.if " + condition + " {");
+    EmitStructural("scf.if " + condition + " {");
     indent_level_++;
     VisitStmt(op->then_body_);
     indent_level_--;
 
     const auto& else_body = op->else_body_;
     if (else_body) {
-      Emit("} else {");
+      EmitStructural("} else {");
       indent_level_++;
       VisitStmt(*else_body);
       indent_level_--;
     }
-    Emit("}");
+    EmitStructural("}");
   } else {
     // Like loops, keep tile return values out of scf.if results. Pre-declare
     // tile buffers for return_vars using the canonical MemRef address (assigned
@@ -243,6 +245,7 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     std::vector<bool> returns_via_scf(op->return_vars_.size(), false);
     std::vector<std::string> scf_return_names;
     std::vector<std::string> scf_return_types;
+    std::vector<std::pair<std::string, AllocTileFields>> deferred_tile_valid_shapes;
 
     for (size_t i = 0; i < op->return_vars_.size(); ++i) {
       const auto& return_var = op->return_vars_[i];
@@ -255,10 +258,24 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
       } else if (auto tile_type = As<TileType>(return_var->GetType())) {
         INTERNAL_CHECK_SPAN(tile_type->memref_.has_value(), op->span_)
             << "TileType return_var must have a MemRef at codegen stage for var: " << return_var->name_hint_;
-        // Reuse the same alloc_tile rules as EmitAllocTileForVar so this
-        // deferred alloc emits a dynamic-validShape `pto.alloc_tile` with
-        // explicit valid_row / valid_col operands.
-        AllocTileFields fields = ComputeAllocTileFields(tile_type);
+        // A tile phi handle is declared in the function head so it dominates
+        // both branches and every post-if read. A dynamic valid_shape may be
+        // computed only in the surrounding loop/body, however, and therefore
+        // cannot be an operand of that head declaration. Declare such a handle
+        // with its physical box and restore the logical valid shape here,
+        // immediately before the if uses it.
+        AllocTileFields logical_fields = ComputeAllocTileFields(tile_type);
+        bool has_dynamic_valid_shape = false;
+        if (const auto& tile_view = tile_type->tile_view_; tile_view.has_value()) {
+          for (const auto& dim : tile_view->valid_shape) {
+            if (dim && !As<ir::ConstInt>(dim)) {
+              has_dynamic_valid_shape = true;
+              break;
+            }
+          }
+        }
+        AllocTileFields alloc_fields =
+            has_dynamic_valid_shape ? ComputeAllocTileFields(tile_type, true) : logical_fields;
         // Under PTOAS no `addr` is baked, so variables denoting the same buffer
         // must share ONE tile_buf handle — two addr-less allocs are two
         // independent buffers to ptoas PlanMemory. When the phi's MemRef is
@@ -273,16 +290,19 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
           // The shared handle must dominate both branches and the post-if read.
           // Hoist its declaration to the function head unless the body already
           // emitted it before this region.
-          DeclareTileBufAtHead(ret_name, fields);
+          DeclareTileBufAtHead(ret_name, alloc_fields);
         } else {
-          ret_name = AllocNewTileBuf(fields.type_str, return_var->name_hint_, fields.addr_ssa,
-                                     fields.valid_row_ssa, fields.valid_col_ssa);
+          ret_name = AllocNewTileBuf(alloc_fields.type_str, return_var->name_hint_, alloc_fields.addr_ssa,
+                                     alloc_fields.valid_row_ssa, alloc_fields.valid_col_ssa);
           // This head-declared handle is the phi buffer. Under PTOAS the branch
           // producers are re-bound to it (see emit_branch, fix #1956); mark it
           // emitted so their EmitAllocTileForVar dedups instead of re-declaring it.
           if (!emit_tile_addr_) fs_.emitted_tile_alloc_names.insert(ret_name);
         }
         BindVarToMlir(return_var, ret_name);
+        if (has_dynamic_valid_shape) {
+          deferred_tile_valid_shapes.emplace_back(ret_name, std::move(logical_fields));
+        }
       } else if (ir::AsTensorTypeLike(return_var->GetType()) || As<ir::ArrayType>(return_var->GetType())) {
         // Tensors and on-core arrays are mutable references mutated in place
         // (pl.assemble lowers to a tile store into the backing memref; arrays
@@ -301,11 +321,18 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
 
     CHECK(op->else_body_.has_value()) << "IfStmt with return_vars requires else_body";
 
+    for (const auto& [tile_buf, fields] : deferred_tile_valid_shapes) {
+      INTERNAL_CHECK_SPAN(!fields.valid_row_ssa.empty() && !fields.valid_col_ssa.empty(), op->span_)
+          << "Internal error: dynamic IfStmt tile return_var requires both valid_shape operands";
+      Emit("pto.set_validshape " + tile_buf + ", " + fields.valid_row_ssa + ", " + fields.valid_col_ssa +
+           " : " + fields.type_str);
+    }
+
     if (!scf_return_names.empty()) {
-      Emit(JoinCommaSep(scf_return_names) + " = scf.if " + condition + " -> (" +
-           JoinCommaSep(scf_return_types) + ") {");
+      EmitStructural(JoinCommaSep(scf_return_names) + " = scf.if " + condition + " -> (" +
+                     JoinCommaSep(scf_return_types) + ") {");
     } else {
-      Emit("scf.if " + condition + " {");
+      EmitStructural("scf.if " + condition + " {");
     }
     indent_level_++;
 
@@ -446,14 +473,14 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
     emit_branch(op->then_body_, "then");
     indent_level_--;
 
-    Emit("} else {");
+    EmitStructural("} else {");
     indent_level_++;
     const auto& else_body = op->else_body_;
     INTERNAL_CHECK_SPAN(else_body.has_value(), op->span_)
         << "Internal error: IfStmt with return_vars has no else_body";
     emit_branch(*else_body, "else");
     indent_level_--;
-    Emit("}");
+    EmitStructural("}");
 
     // Bind in-place return vars (array / tensor) to the shared backing SSA both
     // branches mutated in place. Reads after the IfStmt then resolve to that
@@ -490,11 +517,11 @@ void PTOCodegen::VisitStmt_(const IfStmtPtr& op) {
 }
 
 void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null ForStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null ForStmt";
   INTERNAL_CHECK_SPAN(op->loop_var_ != nullptr, op->span_) << "Internal error: ForStmt has null loop_var";
   INTERNAL_CHECK_SPAN(op->body_ != nullptr, op->span_) << "Internal error: ForStmt has null body";
 
-  CHECK(op->iter_args_.size() == op->return_vars_.size())
+  INTERNAL_CHECK_SPAN(op->iter_args_.size() == op->return_vars_.size(), op->span_)
       << "ForStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 
@@ -505,6 +532,40 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
       << "Internal error: ForKind::Pipeline reached codegen — LowerPipelineLoops "
       << "and CanonicalizeIOOrder should have demoted it to Sequential. "
       << "The pipeline is incomplete.";
+
+  // Device loops lower to MLIR ``scf.for``, which iterates lower -> upper bound
+  // and is defined for a positive step only. A descending ``ForStmt`` has no
+  // faithful lowering: emitting it verbatim yields a zero-trip ``scf.for`` that
+  // the assembler folds away, silently discarding the loop body. Surface it as
+  // a user-facing limitation instead of miscompiling.
+  //
+  // This check is permanent, not a workaround pending an assembler fix. The
+  // PTOAS team has confirmed they will not support a non-positive ``scf.for``
+  // step in the foreseeable future; hw-native-sys/PTOAS#1288 will be closed by
+  // adding the missing assertion only (today ptoas silently accepts such a
+  // step — a negative one drops the body, a zero one emits ``i += 0``). So a
+  // descending device loop stays unrepresentable, and this check is the only
+  // thing standing between the user and a silently empty kernel.
+  //
+  // Keep it even once that assertion ships: it fires earlier, names the user's
+  // loop through the ``Span``, and says how to rewrite it, whereas the
+  // assembler can only report against generated ``.pto`` the user never wrote.
+  //
+  // Only a compile-time step is checked. A runtime step that turns out negative
+  // still lowers to the same ill-defined ``scf.for``; proving its sign needs the
+  // arith analyzer. Closing that gap would mean normalizing descending loops to
+  // ascending form here (deriving the induction variable from an ascending
+  // counter), which is the only route to supporting them at all now that the
+  // assembler will not. Orchestration functions emit C++ directly and are
+  // unaffected — they support descending loops natively.
+  if (auto const_step = ir::transform_utils::EvalConstInt(op->step_)) {
+    CHECK_SPAN(*const_step > 0, op->span_)
+        << "loops in device functions must have a positive step, but this loop steps by " << *const_step
+        << ". Device code lowers to MLIR 'scf.for', which only counts upward. "
+           "Rewrite the loop in ascending form and invert the index in the body — "
+           "replace 'for i in pl.range(64, 0, -1)' with 'for t in pl.range(0, 64)' plus "
+           "'i = 64 - t'. Orchestration functions support descending loops directly.";
+  }
 
   // Evaluate loop bounds and ensure they are index-typed for scf.for.
   // EmitCastToIndex is a no-op when the bound is already DataType::INDEX
@@ -586,7 +647,7 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
 
   if (!has_scalar_iter_args) {
     // Simple scf.for (no iter_args, or all iter_args are non-scalar)
-    Emit("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {");
+    EmitStructural("scf.for " + loop_var_name + " = " + start + " to " + stop + " step " + step + " {");
     indent_level_++;
 
     fs_.yield_buffer.clear();
@@ -594,7 +655,7 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
     fs_.yield_buffer.clear();
 
     indent_level_--;
-    Emit("}");
+    EmitStructural("}");
   } else {
     // scf.for with scalar iter_args only
     std::vector<std::string> init_values;
@@ -628,9 +689,9 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
 
     // Emit: %ret0 = scf.for %i = %start to %stop step %step
     //           iter_args(%acc = %init) -> (type) {
-    Emit(JoinCommaSep(return_var_names) + " = scf.for " + loop_var_name + " = " + start + " to " + stop +
-         " step " + step + " iter_args(" + JoinPairs(iter_arg_names, " = ", init_values) + ") -> (" +
-         JoinCommaSep(iter_arg_types) + ") {");
+    EmitStructural(JoinCommaSep(return_var_names) + " = scf.for " + loop_var_name + " = " + start + " to " +
+                   stop + " step " + step + " iter_args(" + JoinPairs(iter_arg_names, " = ", init_values) +
+                   ") -> (" + JoinCommaSep(iter_arg_types) + ") {");
     indent_level_++;
 
     fs_.yield_buffer.clear();
@@ -665,16 +726,16 @@ void PTOCodegen::VisitStmt_(const ForStmtPtr& op) {
     fs_.yield_buffer.clear();
 
     indent_level_--;
-    Emit("}");
+    EmitStructural("}");
   }
 }
 
 void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
-  INTERNAL_CHECK_SPAN(op != nullptr, op->span_) << "Internal error: null WhileStmt";
+  INTERNAL_CHECK(op != nullptr) << "Internal error: null WhileStmt";
   INTERNAL_CHECK_SPAN(op->condition_ != nullptr, op->span_) << "Internal error: WhileStmt has null condition";
   INTERNAL_CHECK_SPAN(op->body_ != nullptr, op->span_) << "Internal error: WhileStmt has null body";
 
-  CHECK(op->iter_args_.size() == op->return_vars_.size())
+  INTERNAL_CHECK_SPAN(op->iter_args_.size() == op->return_vars_.size(), op->span_)
       << "WhileStmt iter_args size (" << op->iter_args_.size() << ") must equal return_vars size ("
       << op->return_vars_.size() << ")";
 
@@ -736,7 +797,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
 
   if (!has_scalar_iter_args) {
     // Simple scf.while (no iter_args, or all iter_args are non-scalar)
-    Emit("scf.while : () -> () {");
+    EmitStructural("scf.while : () -> () {");
     indent_level_++;
 
     VisitExpr(op->condition_);
@@ -745,7 +806,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     Emit("scf.condition(" + cond + ")");
 
     indent_level_--;
-    Emit("} do {");
+    EmitStructural("} do {");
     indent_level_++;
 
     fs_.yield_buffer.clear();
@@ -755,7 +816,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     fs_.yield_buffer.clear();
 
     indent_level_--;
-    Emit("}");
+    EmitStructural("}");
   } else {
     // scf.while with scalar iter_args only
     std::vector<std::string> init_values;
@@ -801,8 +862,9 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     std::string types_str = "(" + JoinCommaSep(iter_arg_types) + ")";
 
     // Emit: %ret0, %ret1 = scf.while (%before0 = %init0, ...) : (types) -> (types) {
-    Emit(JoinCommaSep(return_var_names) + " = scf.while (" + JoinPairs(before_arg_names, " = ", init_values) +
-         ") : " + types_str + " -> " + types_str + " {");
+    EmitStructural(JoinCommaSep(return_var_names) + " = scf.while (" +
+                   JoinPairs(before_arg_names, " = ", init_values) + ") : " + types_str + " -> " + types_str +
+                   " {");
     indent_level_++;
 
     // Before region: register before-region args, evaluate condition
@@ -817,10 +879,10 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
          JoinCommaSep(iter_arg_types));
 
     indent_level_--;
-    Emit("} do {");
+    EmitStructural("} do {");
 
     // After region: emit ^bb0 block header with typed arguments
-    Emit("^bb0(" + JoinPairs(after_arg_names, " : ", iter_arg_types) + "):");
+    EmitStructural("^bb0(" + JoinPairs(after_arg_names, " : ", iter_arg_types) + "):");
     indent_level_++;
 
     // Re-register iter_args with after-region SSA names
@@ -848,7 +910,7 @@ void PTOCodegen::VisitStmt_(const WhileStmtPtr& op) {
     fs_.yield_buffer.clear();
 
     indent_level_--;
-    Emit("}");
+    EmitStructural("}");
   }
 }
 

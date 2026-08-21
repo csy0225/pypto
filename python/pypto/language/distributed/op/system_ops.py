@@ -19,7 +19,8 @@ cross-rank synchronisation primitives:
 * :func:`get_comm_ctx` — lift a :class:`pld.DistributedTensor` to its
   :class:`pld.CommCtx` handle. The op verifier (C++) refuses any argument
   that is not :class:`ir.DistributedTensorType`.
-* :func:`notify` / :func:`wait` — cross-rank TNOTIFY / TWAIT on a window-bound
+* :func:`notify` / :func:`wait` / :func:`defer_wait` — cross-rank notification,
+  blocking wait, and deferred task-completion registration on a window-bound
   signal matrix. Side-effect-only; the C++ verifier refuses a plain
   :class:`pl.Tensor` target.
 * :func:`rank` / :func:`nranks` — CommContext scalar reads (``INT32``). The
@@ -53,6 +54,18 @@ def world_size() -> Scalar:
     return wrapping lets call sites compose naturally with Python operators
     (``pld.world_size() * 4``, ``pl.range(pld.world_size())``), which the
     parser's ``invoke_dsl`` unwraps back to the underlying Call.
+
+    .. warning::
+
+       This function is callable **only** inside HOST-level orchestration
+       (``level=pl.Level.HOST, role=pl.Role.Orchestrator``). Calling it
+       inside InCore (``type=pl.FunctionType.InCore``) raises a parser error.
+
+    .. seealso::
+
+       :func:`rank` and :func:`nranks` — the per-rank equivalents for InCore
+       kernels, called on a :class:`CommCtx` obtained via
+       :func:`get_comm_ctx`.
     """
     return Scalar(expr=_ir_system.world_size())
 
@@ -120,13 +133,19 @@ def notify(
     """Cross-rank notify: deposit ``value`` at the peer rank's slot of ``target``.
 
     Side-effect-only (the returned Call carries ``UnknownType``). Lowers to
-    ``CommRemoteOffset(ctx, peer) + addptr + make_tensor_view + TNOTIFY`` at
+    inline peer-offset arithmetic + ``addptr`` + ``make_tensor_view`` + ``TNOTIFY`` at
     codegen.
 
     ``target`` / ``peer`` / ``offsets`` / ``value`` are positional-or-keyword
     so the printed IR (which emits them positionally) round-trips through the
     parser; ``op`` stays keyword-only because it lowers to an IR attr (printed
     as ``op=<int>``), mirroring ``pld.tensor.window``'s ``dtype``.
+
+    .. note::
+
+       ``notify`` names this operand ``target``; the companion ``wait`` names
+       the same logical operand ``signal``. Both refer to the same
+       window-bound signal tensor.
 
     Args:
         target: Window-bound :class:`pld.DistributedTensor` signal matrix. The
@@ -167,4 +186,28 @@ def wait(
     return _ir_system.wait(_unwrap(signal), _normalize_intlike(offsets), _unwrap(expected), cmp)
 
 
-__all__ = ["get_comm_ctx", "notify", "nranks", "rank", "wait", "world_size"]
+def defer_wait(
+    signal: Tensor,
+    offsets: Sequence[IntLike],
+    expected: IntLike,
+    *,
+    cmp: WaitCmp,
+) -> Call:
+    """Register a deferred completion condition on a local signal slot.
+
+    Unlike :func:`wait`, this operation does not block the device core and does
+    not resume the kernel when the condition becomes true. The enclosing task
+    may finish executing, while its TaskId remains incomplete until
+    ``signal[offsets] >= expected``. Continuation work must therefore be placed
+    in a dependent task.
+
+    Args:
+        signal: Window-bound INT32 :class:`pld.DistributedTensor` signal matrix.
+        offsets: Offsets into the local slice, one per ``signal`` dimension.
+        expected: Integer scalar threshold value to compare against.
+        cmp: Must be :class:`pld.WaitCmp.Ge` (keyword-only).
+    """
+    return _ir_system.defer_wait(_unwrap(signal), _normalize_intlike(offsets), _unwrap(expected), cmp)
+
+
+__all__ = ["defer_wait", "get_comm_ctx", "notify", "nranks", "rank", "wait", "world_size"]

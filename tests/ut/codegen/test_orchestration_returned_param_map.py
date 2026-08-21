@@ -101,10 +101,29 @@ def _layer_guarded(
         pl.system.syncall(core_type="mix")
 
         mm = pl.matmul(pl.slice(q_pad, [ROWS_PER_CORE, HIDDEN], [pr0, 0]), wid, out_dtype=pl.FP32)
-        k_p = pl.cast(pl.slice(k_cache, [ROWS_PER_CORE, HIDDEN], [cache_base + pr0, 0]), target_type=pl.FP32)
-        v_p = pl.cast(pl.slice(v_cache, [ROWS_PER_CORE, HIDDEN], [cache_base + pr0, 0]), target_type=pl.FP32)
-        oi = pl.sub(pl.add(mm, k_p), pl.mul(v_p, 0.5))
-        attn_out = pl.assemble(attn_out, pl.cast(oi, target_type=pl.BF16), [r0, 0])
+        # The second vector phase. Once a function opens ANY pl.split_aiv region
+        # the regions become authoritative for vector placement, so full-width
+        # vector compute has to live in a region of its own -- mode=NONE, whose
+        # meaning is exactly "both AIV lanes run the full body". That is what
+        # this phase already did: the region above makes the whole AIV function
+        # dual_aiv_dispatch, so wrapping changes the text and not the execution.
+        # The cube pl.matmul and the SHARED mix barrier stay outside.
+        for aiv_lane in pl.split_aiv(2, mode=pl.SplitMode.NONE):  # noqa: B007 - full-width phase
+            # ``mm`` is cube-produced outside the region, so bringing it onto the
+            # vector lane crosses the AIC -> AIV boundary. In manual mode that
+            # crossing is written, not inferred: pl.aiv_shard names it. In a
+            # mode=NONE region it preserves the shape (there is no split axis) and
+            # lowers to the same split=0 tpush/tpop pair the implicit form used to
+            # emit silently.
+            mm_v = pl.aiv_shard(mm)
+            k_p = pl.cast(
+                pl.slice(k_cache, [ROWS_PER_CORE, HIDDEN], [cache_base + pr0, 0]), target_type=pl.FP32
+            )
+            v_p = pl.cast(
+                pl.slice(v_cache, [ROWS_PER_CORE, HIDDEN], [cache_base + pr0, 0]), target_type=pl.FP32
+            )
+            oi = pl.sub(pl.add(mm_v, k_p), pl.mul(v_p, 0.5))
+            attn_out = pl.assemble(attn_out, pl.cast(oi, target_type=pl.BF16), [r0, 0])
 
     # The downstream consumer. Its one producer-written input is attn_out.
     for c in pl.spmd(NUM_CORES, name_hint="out_proj"):
@@ -232,21 +251,25 @@ def guarded_one_trip(
 # Helpers: compile (no device) and read the emitted orchestration back as a string.
 # ---------------------------------------------------------------------------------------------
 
-# "// Group out_proj: ..." introduces a task; "L0TaskArgs params_tN;" declares its arg list and
+# "// Group out_proj: ..." introduces a task; "CoreTaskArgs params_tN;" declares its arg list and
 # the add_input/add_inout/add_output calls fill that list in order.
 _TASK_RE = re.compile(
     r"^\s*//\s*(?:Group|Spmd)\s+(?P<hdr>[^\n]*?)\s*:\s*(?P<tail>[^\n]*)$\n"
-    r"\s*L0TaskArgs\s+(?P<params>\w+);\n"
+    r"\s*CoreTaskArgs\s+(?P<params>\w+);\n"
     r"(?P<ops>(?:\s*(?P=params)\.add_\w+\([^\n]*\n)+)",
     re.MULTILINE,
 )
 _OP_RE = re.compile(r"\.add_(input|inout|output)\((\w+)\)")
 
+# A loop-tail carry rebind, e.g. "cur__rv_v3 = cur__ssa_v4;". Matches the bare assignment
+# only -- the "ChipTensor cur__rv_v3 = cur;" declaration above the loop is not a rebind.
+_CARRY_RE = re.compile(r"^\s*(\w+)__rv_v\d+\s*=\s*(\w+);\s*$", re.MULTILINE)
+
 
 def _orch_code(kernel) -> str:
     """Specialize + run the Default pipeline, then emit the orchestration C++ in-process.
 
-    ``compile_for_test`` returns the post-pass ``ir.Program`` without dispatching to a device;
+    ``lower`` returns the post-pass ``ir.Program`` without dispatching to a device;
     the torch tensors are read for shape/dtype only. ``codegen.generate_orchestration`` is the
     same emitter that writes ``<build>/orchestration/<name>.cpp``.
 
@@ -265,9 +288,8 @@ def _orch_code(kernel) -> str:
         torch.empty(CACHE_ROWS, HIDDEN, dtype=torch.bfloat16),
         torch.empty(ROWS, HIDDEN, dtype=torch.float32),
     )
-    kernel._cache.clear()
     with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
-        program = kernel.compile_for_test(*sample)
+        program = kernel.lower(*sample)
     for func in program.functions.values():
         if func.func_type == ir.FunctionType.Orchestration:
             return codegen.generate_orchestration(program, func).code
@@ -318,13 +340,32 @@ class TestReturnedParamMapBinding:
         _assert_consumer_reads_producer_buffer(code)
 
         # The poisoned map also yields garbage into the loop carry: a k/v cache carry must
-        # never be re-bound from an unrelated scratch buffer.
-        for m in re.finditer(r"^\s*(\w+)__rv_v\d+\s*=\s*(\w+);\s*$", code, re.MULTILINE):
-            carry, src = m.group(1), m.group(2)
-            if carry in ("k_cache", "v_cache"):
-                assert src.startswith(("k_cache", "v_cache")), (
-                    f"GARBAGE LOOP CARRY: {carry!r} is yielded from {src!r} (line: {m.group(0).strip()})"
-                )
+        # never be re-bound from an unrelated scratch buffer. This is an ABSENCE check --
+        # correct codegen rebinds only 'cur', so the k/v branch below is expected not to be
+        # taken; the bug shows up as an EXTRA "v_cache__rv_vN = q_pad_inlineNN;" line.
+        carries = list(_CARRY_RE.finditer(code))
+
+        # Canary: the absence check above is only meaningful while _CARRY_RE still matches the
+        # carry rebinds it is meant to police. Without this, renaming the __rv_vN suffix in
+        # codegen would silently retire the check instead of failing here.
+        assert carries, (
+            "no '<name>__rv_vN = <src>;' loop-carry rebinds found in the generated orchestration "
+            "-- has the carry naming scheme changed? The k/v garbage-carry check below is dead "
+            f"until this scan is repaired.\n{code}"
+        )
+
+        # Stated as a direct absence, not a per-match branch, so the intent reads as one
+        # claim. Prefix-matched on both sides: an SSA- or index-suffixed carry base
+        # (v_cache__ssa_v1, v_cache_0) must not slip past as an exact-match miss.
+        garbage = [
+            m.group(0).strip()
+            for m in carries
+            if m.group(1).startswith(("k_cache", "v_cache"))
+            and not m.group(2).startswith(("k_cache", "v_cache"))
+        ]
+        assert not garbage, (
+            f"GARBAGE LOOP CARRY: a k/v cache carry is re-bound from an unrelated scratch buffer: {garbage}"
+        )
 
     def test_unconditional_param_write_binds_consumer_correctly(self):
         """Control (b) removed: same param writes without the runtime guard bind correctly."""

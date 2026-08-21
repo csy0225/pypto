@@ -24,6 +24,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
@@ -74,13 +75,36 @@ std::string SplitModeToPythonString(SplitMode mode) {
   throw pypto::TypeError("Unknown SplitMode");
 }
 
-/// True when a scope must emit a ``pl.split(...)`` optimization entry: it carries
-/// a concrete split mode (UP_DOWN / LEFT_RIGHT) or a ``slot_num`` ring depth.
-/// ``slot_num`` is valid with ``SplitMode.None`` too (a NONE mixed kernel still
-/// drives a cube->vector pipe), so a bare ``slot_num`` forces the entry.
-bool ScopeHasSplitInfo(const std::optional<SplitMode>& split, const ScopeStmtPtr& slot_holder) {
-  const bool has_mode = split.has_value() && split.value() != SplitMode::None;
-  return has_mode || (slot_holder && slot_holder->HasAttr("slot_num"));
+/// Detects a ``tile.get_block_idx`` read anywhere in a statement subtree.
+class BlockIdxReadDetector : public IRVisitor {
+ public:
+  void VisitExpr_(const CallPtr& op) override {
+    if (IsOp(op, "tile.get_block_idx")) found_ = true;
+    IRVisitor::VisitExpr_(op);
+  }
+
+  [[nodiscard]] bool found() const { return found_; }
+
+ private:
+  bool found_ = false;
+};
+
+/// True when re-parsing ``with pl.spmd(...):`` with ``incore``'s statements printed
+/// inline would rebuild the InCore carrier.
+///
+/// The with-form parser synthesises a carrier only for a body that carries an
+/// ``optimizations=`` entry (a concrete split mode or a ``slot_num`` slot count —
+/// the same pair ``PrintScopeOptimizations`` emits) or reads the per-block index.
+/// For any other body the sugar is lossy: the carrier must be spelled out as a
+/// nested ``pl.at(level=pl.Level.CORE_GROUP)`` instead, or the round-trip silently
+/// drops it.
+bool SpmdInlineBodyRebuildsCarrier(const InCoreScopeStmtPtr& incore) {
+  if (!incore) return false;
+  const bool has_mode = incore->split_ != SplitMode::None;
+  if (has_mode || incore->HasAttr("slot_num")) return true;
+  BlockIdxReadDetector detector;
+  detector.VisitStmt(incore->body_);
+  return detector.found();
 }
 
 /// Convert cast round mode integer to its string name for printing.
@@ -104,6 +128,33 @@ std::string CastModeToString(int mode) {
     default:
       throw ValueError("Cast round mode must be in range [0, 6], got " + std::to_string(mode));
   }
+}
+
+/// Whether an op's printed DSL spelling needs a trailing underscore.
+///
+/// PyPTO spells wrappers whose name is a Python keyword with a trailing underscore
+/// (``pypto/language/op/{tile,tensor}_ops.py``: ``and_``/``or_``/``not_``) while the IR
+/// keeps the bare operator name. Printing the bare name yields ``pl.tile.and(a, b)``,
+/// which is a syntax error — the round-trip parser cannot even compile it.
+///
+/// Keyed off the full Python keyword set rather than the three leaves that exist
+/// today, so a future ``REGISTER_OP`` with a keyword leaf cannot silently
+/// reintroduce unparseable output.
+///
+/// A predicate over ``string_view``, not a name-rewriting function: this runs on every
+/// printed ``Call``, and roundtrip verification re-prints the whole program after every
+/// pass. Returning a rewritten name would allocate on every call to serve the three ops
+/// that actually need the suffix. The keys are string literals with static storage
+/// duration, so the ``string_view`` set is safe.
+bool NeedsDslUnderscore(std::string_view op_name) {
+  static const std::unordered_set<std::string_view> kPythonKeywords = {
+      "False", "None",     "True",  "and",    "as",   "assert", "async",  "await",    "break",
+      "class", "continue", "def",   "del",    "elif", "else",   "except", "finally",  "for",
+      "from",  "global",   "if",    "import", "in",   "is",     "lambda", "nonlocal", "not",
+      "or",    "pass",     "raise", "return", "try",  "while",  "with",   "yield"};
+  const size_t dot = op_name.rfind('.');
+  if (dot == std::string_view::npos) return false;
+  return kPythonKeywords.count(op_name.substr(dot + 1)) > 0;
 }
 
 }  // namespace
@@ -298,6 +349,12 @@ class IRPythonPrinter : public IRVisitor {
   // Vars defined in the current function body (for PrintMemRef formatting).
   std::unordered_set<const Var*> body_defined_vars_;
 
+  // True while printing a function signature (parameter annotations and return
+  // types). Body definitions are not in scope there, so a MemRef whose base Ptr
+  // is allocated in the body must print as a string literal rather than a bare
+  // name — see PrintMemRef.
+  bool printing_signature_ = false;
+
   // Free variables of the current function: Vars used in the body that are
   // neither a parameter nor a body-local definition. A well-formed function is
   // a closed scope, so a non-empty set marks malformed IR (e.g. a transform
@@ -326,6 +383,16 @@ class IRPythonPrinter : public IRVisitor {
 
   // Return the printed name for a Var, using rename map if SSA name shadowing occurred.
   std::string GetVarName(const Var* var) const;
+
+  // Print an expression to a string without disturbing the main stream.
+  //
+  // Nested inside a type annotation (a MemRef byte offset, a slot index), an
+  // expression cannot go through the main stream, so it needs its own printer.
+  // That printer must still inherit the naming state: an offset or slot index may
+  // name a Var whose printed name was disambiguated (two loops both spelled `i`
+  // print as `i` and `i_1`), and a fresh printer would emit the bare name_hint_
+  // and rebind it to the wrong Var on reparse.
+  std::string PrintSubExpr(const ExprPtr& expr) const;
 
   // Build var_rename_map_ from a body stmt (and optional params).
   // Assigns unique suffixed names (e.g., "i", "i_1") when two distinct Vars share a name.
@@ -390,15 +457,16 @@ class IRPythonPrinter : public IRVisitor {
   // Emit ``windowize=True`` for an explicitly opted-in InCore scope.
   bool PrintScopeWindowizeAttr(const ScopeStmtPtr& op);
 
-  // Emit ``pl.split(pl.SplitMode.X[, slot_num=N])`` (a single optimizations list
-  // entry, no leading comma / wrapper), reading the optional ``slot_num`` ring
-  // depth from ``slot_num_holder``'s attrs (the scope carrying it).
-  void PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder);
-
-  // Emit ``, optimizations=[pl.split(pl.SplitMode.X[, slot_num=N])]`` for a
-  // split scope. Used by the flattened spmd with-tid / for-loop forms; the
-  // nested-scope forms round-trip slot_num via the InCoreScopeStmt printer.
-  void PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder);
+  // Emit ``, optimizations=[...]`` for a scope carrying a concrete split mode
+  // (UP_DOWN / LEFT_RIGHT) and/or a ``slot_num`` cross-core slot count, read
+  // from ``slot_num_holder``'s attrs (the scope carrying it). The two are
+  // independent entries — ``pl.split(pl.SplitMode.X)`` and
+  // ``pl.cross_core_slot(slot_num=N)`` — so a bare slot count never fabricates
+  // a ``pl.SplitMode.NONE`` (which OutlineIncoreScopes rejects on a scope
+  // holding pl.split_aiv regions). Emits nothing when the scope carries
+  // neither. Used by the flattened spmd with-tid / for-loop forms; the
+  // nested-scope forms round-trip via the InCoreScopeStmt printer.
+  void PrintScopeOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder);
 
   // Emit `` as <tid>`` if the scope carries ``kAttrTaskIdVar``. The caller is
   // responsible for placing the ``)`` before and the ``:\n`` after this call.
@@ -665,6 +733,21 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     return "pld.CommCtxType";
   }
 
+  // Async-prefetch handle markers — fieldless singletons, rendered as bare
+  // public wrapper attributes on the main DSL namespace so the output can be
+  // evaluated by normal Python as well as round-tripped through the parser.
+  if (As<PrefetchAsyncContextType>(type)) {
+    return prefix_ + ".PrefetchAsyncContext";
+  }
+
+  if (As<AsyncEventType>(type)) {
+    return prefix_ + ".AsyncEvent";
+  }
+
+  if (As<AsyncSessionType>(type)) {
+    return prefix_ + ".AsyncSession";
+  }
+
   return prefix_ + ".UnknownType";
 }
 
@@ -744,6 +827,37 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     stream_ << std::quoted(std::any_cast<std::string>(value));
   } else if (t == typeid(double)) {
     stream_ << FormatFloatLiteral(std::any_cast<double>(value));
+  } else if (t == typeid(float)) {
+    stream_ << FormatFloatLiteral(static_cast<double>(std::any_cast<float>(value)));
+  } else if (t == typeid(DataType)) {
+    // ``LowerHostTensorCollectives`` stamps a DataType attr on every
+    // ``builtin.tensor.<collective>`` call. Printed in the ``pl.<DTYPE>`` DSL
+    // form the dtype resolver reads back (ast_parser._parse_attr_value).
+    stream_ << prefix_ << "." << DataTypeToString(std::any_cast<DataType>(value));
+  } else if (t == typeid(MemorySpace)) {
+    stream_ << prefix_ << ".Mem." << MemorySpaceToString(std::any_cast<MemorySpace>(value));
+  } else if (t == typeid(TensorLayout)) {
+    stream_ << prefix_ << ".TensorLayout." << TensorLayoutToString(std::any_cast<TensorLayout>(value));
+  } else if (t == typeid(TileLayout)) {
+    stream_ << prefix_ << ".TileLayout." << TileLayoutToString(std::any_cast<TileLayout>(value));
+  } else if (t == typeid(PadValue)) {
+    stream_ << prefix_ << ".PadValue.";
+    switch (std::any_cast<PadValue>(value)) {
+      case PadValue::null:
+        stream_ << "null";
+        break;
+      case PadValue::zero:
+        stream_ << "zero";
+        break;
+      case PadValue::max:
+        stream_ << "max";
+        break;
+      case PadValue::min:
+        stream_ << "min";
+        break;
+    }
+  } else if (t == typeid(ArgDirection)) {
+    stream_ << prefix_ << ".adir." << ArgDirectionToDslName(std::any_cast<ArgDirection>(value));
   } else if (t == typeid(std::vector<ArgDirection>)) {
     const auto& dirs = std::any_cast<std::vector<ArgDirection>>(value);
     stream_ << "[";
@@ -785,8 +899,8 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
     // the source rather than masked by a dropped attr.
     INTERNAL_CHECK_SPAN(false, span)
         << "Internal error: no DSL attr-value codec for type '" << DemangleTypeName(t.name())
-        << "'. The python printer round-trips int/bool/str/double/vector<ArgDirection>/"
-           "vector<int32_t>/vector<VarPtr>/VarPtr/ExprPtr attrs; add a PrintAttrValue arm, a "
+        << "'. The python printer round-trips scalar, supported enum, vector, VarPtr, and ExprPtr "
+           "attrs; add a PrintAttrValue arm, a "
            "matching _parse_attr_value case, and ConvertKwargsDict support for this type instead "
            "of dropping it.";
   }
@@ -914,6 +1028,14 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // Operations are stored with internal names like "tensor.adds" or "tile.matmul"
   // and are printed in parseable format like "pl.tensor.adds"
   std::string op_name = op->op_->name_;
+  const bool has_physical_remote_tail =
+      IsOp(op, "pld.tile.remote_load") && op->GetKwarg<bool>("allow_physical_tail_padding", false);
+  if (has_physical_remote_tail) {
+    // The aligned FP16 tail is a compiler-only lowering detail. Print a private
+    // parser sentinel that reconstructs the marker instead of exposing the
+    // internal kwarg on the public pld.tile.remote_load API.
+    op_name = "pld.tile._remote_load_with_physical_tail_padding";
+  }
 
   // Normalize tensor.add with scalar rhs to tensor.adds (matches Python API dispatch)
   if (IsOp(op, "tensor.add") && op->args_.size() == 2) {
@@ -929,25 +1051,48 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     // to ``pld`` by the parser). Print them bare so the roundtrip parser
     // resolves them correctly via the same ``pld`` import path.
     if (op_name.rfind("pld.", 0) == 0) {
-      stream_ << op_name << "(";
+      stream_ << op_name;
     } else {
       // Print with pl. prefix for the standard pl namespace.
-      stream_ << prefix_ << "." << op_name << "(";
+      stream_ << prefix_ << "." << op_name;
     }
+    // ``tile.and`` / ``tensor.not`` and friends must print as the DSL's
+    // underscore-suffixed spelling to stay valid Python.
+    if (NeedsDslUnderscore(op_name)) stream_ << "_";
+    stream_ << "(";
   } else {
     // Not a registered operation, print as-is
     stream_ << op_name << "(";
   }
 
-  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
-  // via an explicit allowlist. Most attrs are re-derived by the parser or have
-  // bespoke syntax. ``pipeline_membership`` has neither and must survive until
-  // MemoryReuse consumes it. Keep this helper available to special call forms
-  // below so an early return cannot silently drop the attr.
+  // Serialize op-call attrs into a trailing machine-only ``attrs={...}`` dict
+  // via an open-world DENYLIST: EVERY key round-trips unless it already owns a
+  // bespoke surface. This mirrors the GlobalVar-call branch above and the
+  // Submit branch below, so the three call-like paths share one policy — a new
+  // attr on a builtin-op call can never be silently dropped on print -> parse.
+  // A value type without a codec fails loudly inside ``PrintAttrValue``
+  // (surfacing the gap) rather than vanishing. The matching reader is
+  // ``ast_parser._parse_op_attrs`` -> ``_parse_attr_value``. Keep this helper
+  // available to the special call forms below so an early return cannot skip
+  // the dict.
+  const bool is_task_dummy = IsOp(op, "system.task_dummy");
   auto print_serialized_attrs = [&](bool need_comma) {
     std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
     for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr) serialized_attrs.push_back(&kv);
+      if (kv.first == kAttrManualDepEdges || kv.first == kAttrDummyTask) {
+        // Bespoke surfaces, but ONLY on ``system.task_dummy``: there
+        // ``manual_dep_edges`` prints as ``deps=[...]`` and ``dummy_task`` is
+        // re-derived by the parser from the op itself. On any other op neither
+        // surface exists, so skipping the key would be precisely the silent
+        // drop this denylist removes — fail loud instead. Manual dependency
+        // edges belong on ``Submit::deps_`` (ManualDepsOnSubmitOnly).
+        INTERNAL_CHECK_SPAN(is_task_dummy, op->span_)
+            << "Internal error: call to '" << op->op_->name_ << "' carries attrs[\"" << kv.first
+            << "\"], which has a DSL surface only on system.task_dummy; manual dependency edges "
+               "belong on Submit::deps_";
+        continue;
+      }
+      serialized_attrs.push_back(&kv);
     }
     if (serialized_attrs.empty()) return;
 
@@ -1018,16 +1163,12 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     return;
   }
 
-  // system.syncall soft form operands:
-  //   aiv_only/aic_only: [gm_workspace, scratch, used_cores]         (3 args)
-  //   mix:               [gm_workspace, ub_scratch, l1_scratch, used_cores] (4 args)
-  // The scratch tile(s) are compiler-synthesized staging buffers, so print the
-  // high-level DSL surface (mode=/core_type=/gm_workspace=/used_cores=/scratch=
-  // [/scratch_l1=]) and let the parser thread the existing scratch(es) back on
-  // reparse instead of re-synthesizing.
-  if (IsOp(op, "system.syncall") && (op->args_.size() == 3 || op->args_.size() == 4)) {
+  // The current PTO-ISA gives every system.syncall soft form the same operands:
+  // [gm_workspace] or [gm_workspace, used_cores]. Print them through the
+  // high-level keyword-only DSL surface so the program round-trips.
+  if (IsOp(op, "system.syncall") && (op->args_.size() == 1 || op->args_.size() == 2)) {
     std::string core_type = "mix";
-    std::string mode = "soft";
+    std::string mode = "hard";
     for (const auto& [key, val] : op->kwargs_) {
       if (key == "core_type") {
         core_type = AnyCast<std::string>(val, "syncall core_type");
@@ -1035,30 +1176,44 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         mode = AnyCast<std::string>(val, "syncall mode");
       }
     }
-    const size_t used_idx = op->args_.size() - 1;
-    stream_ << "mode=\"" << mode << "\", core_type=\"" << core_type << "\", gm_workspace=";
-    VisitExpr(op->args_[0]);
-    stream_ << ", used_cores=";
-    if (auto ci = As<ConstInt>(op->args_[used_idx])) {
-      stream_ << ci->value_;
-    } else {
-      VisitExpr(op->args_[used_idx]);
+    if (mode == "soft") {
+      stream_ << R"(mode="soft", core_type=")" << core_type << R"(", gm_workspace=)";
+      VisitExpr(op->args_[0]);
+      if (op->args_.size() == 2) {
+        stream_ << ", used_cores=";
+        if (auto ci = As<ConstInt>(op->args_[1])) {
+          stream_ << ci->value_;
+        } else {
+          VisitExpr(op->args_[1]);
+        }
+      } else {
+        // The high-level API requires an explicit participant-count choice so
+        // users do not accidentally select PTO-ISA's runtime-sensitive auto
+        // path. An explicit zero reconstructs this one-operand IR form.
+        stream_ << ", used_cores=0";
+      }
+      print_serialized_attrs(/*need_comma=*/true);
+      stream_ << ")";
+      return;
     }
-    // scratch= is the UB (Vec) tile for aiv_only/mix and the flat L1 (Mat) tile
-    // for aic_only; mix additionally threads its flat L1 tile via scratch_l1=.
-    stream_ << ", scratch=";
-    VisitExpr(op->args_[1]);
-    if (op->args_.size() == 4) {
-      stream_ << ", scratch_l1=";
-      VisitExpr(op->args_[2]);
-    }
-    print_serialized_attrs(/*need_comma=*/true);
-    stream_ << ")";
-    return;
   }
+
+  // gather_row's optional 6th operand is keyword-only in the DSL: `transpose`
+  // already owned the 6th positional slot before valid_shape existed, and taking
+  // it would silently reinterpret an existing `gather_row(..., shapes, True)` as
+  // a shape. Print it as a kwarg so the round-trip matches the Python signature.
+  const bool gather_row_kw_valid =
+      (IsOp(op, "tile.gather_row") || IsOp(op, "tensor.gather_row")) && op->args_.size() == 6;
+  const bool mgather = IsOp(op, "tile.mgather");
+  const int mgather_coalesce = mgather ? op->GetKwarg<int>("coalesce", 0) : 0;
+  const bool mgather_kw_scratch = mgather && mgather_coalesce == 1 && op->args_.size() >= 3;
+  const bool mgather_kw_valid = mgather && ((mgather_coalesce == 0 && op->args_.size() == 3) ||
+                                            (mgather_coalesce == 1 && op->args_.size() == 4));
 
   // Print positional arguments
   for (size_t i = 0; i < op->args_.size(); ++i) {
+    if (gather_row_kw_valid && i == 5) continue;
+    if (mgather && i >= 2) continue;
     if (i > 0) stream_ << ", ";
 
     // Special handling for tile.alloc/tensor.alloc first argument (memory_space)
@@ -1077,6 +1232,21 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
 
   // Print kwargs as keyword arguments
   bool need_comma = !op->args_.empty();
+  if (gather_row_kw_valid) {
+    stream_ << ", valid_shape=";
+    VisitExpr(op->args_[5]);
+    need_comma = true;
+  }
+  if (mgather_kw_scratch) {
+    stream_ << ", scratch=";
+    VisitExpr(op->args_[2]);
+    need_comma = true;
+  }
+  if (mgather_kw_valid) {
+    stream_ << ", valid_shape=";
+    VisitExpr(op->args_[mgather_coalesce == 1 ? 3 : 2]);
+    need_comma = true;
+  }
   if (IsOp(op, "system.task_dummy")) {
     const std::vector<VarPtr>* deps_to_print = nullptr;
     for (const auto& [k, v] : op->attrs_) {
@@ -1099,6 +1269,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     need_comma = true;
   }
   for (const auto& [key, value] : op->kwargs_) {
+    if (has_physical_remote_tail && key == "allow_physical_tail_padding") continue;
     // ``pld.tensor.alloc_window_buffer`` injects its ``name`` kwarg from the LHS
     // at parse time and explicitly rejects a user-written ``name=`` kwarg. Skip
     // it on print so the round-trip parser can re-derive the name from the
@@ -1769,17 +1940,18 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
-void IRPythonPrinter::PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
-  stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split);
-  if (slot_num_holder && slot_num_holder->HasAttr("slot_num")) {
-    stream_ << ", slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0);
-  }
-  stream_ << ")";
-}
-
-void IRPythonPrinter::PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
+void IRPythonPrinter::PrintScopeOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
+  const bool has_mode = split != SplitMode::None;
+  const bool has_slot_num = slot_num_holder && slot_num_holder->HasAttr("slot_num");
+  if (!has_mode && !has_slot_num) return;
   stream_ << ", optimizations=[";
-  PrintSplitCall(split, slot_num_holder);
+  if (has_mode) {
+    stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split) << ")";
+  }
+  if (has_slot_num) {
+    if (has_mode) stream_ << ", ";
+    stream_ << prefix_ << ".cross_core_slot(slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0) << ")";
+  }
   stream_ << "]";
 }
 
@@ -1874,14 +2046,11 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 
 void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP";
-  // Emit the surviving ``optimizations=[pl.split(mode[, slot_num=N])]`` form
-  // whenever there is a slot_num (a NONE mixed kernel still drives a
-  // cube->vector pipe and carries a ring depth) or a non-None split mode. A
-  // plain InCore with no split prints as ``pl.at(level=...)`` with no
+  // Emit ``optimizations=[...]`` for a non-None split mode and/or a slot_num
+  // (a NONE mixed kernel still drives a cross-core pipe and carries a slot
+  // count). A plain InCore with neither prints as ``pl.at(level=...)`` with no
   // optimizations list.
-  if (op->HasAttr("slot_num") || (op->split_.has_value() && op->split_.value() != SplitMode::None)) {
-    PrintSplitOptimizations(op->split_.value_or(SplitMode::None), op);
-  }
+  PrintScopeOptimizations(op->split_, op);
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
@@ -1912,10 +2081,8 @@ void IRPythonPrinter::VisitStmt_(const ClusterScopeStmtPtr& op) {
 void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   // Detect the ``for i in pl.spmd(...):`` desugaring emitted by the parser:
   // SpmdScopeStmt(body=InCoreScopeStmt(body=<AssignStmt(i, Call(tile.get_block_idx)), ...>)).
-  // Printing it back as a for-loop keeps round-trips stable (the
-  // with-form parser enforces a single kernel call, so printing a
-  // multi-statement InCore-wrapped body as `with pl.spmd():` would fail
-  // to reparse).
+  // Printing it back as a for-loop keeps round-trips stable: the for-form binds the
+  // loop variable to the leading get_block_idx read, which the with-form does not.
   auto incore = As<InCoreScopeStmt>(op->body_);
   auto incore_seq = incore ? As<SeqStmts>(incore->body_) : nullptr;
 
@@ -1935,8 +2102,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
-      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
+    if (incore) {
+      PrintScopeOptimizations(incore->split_, incore);
     }
     PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
@@ -1945,17 +2112,23 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     PrintScopeTaskIdVarSuffix(op);
     stream_ << ":\n";
     IncreaseIndent();
-    if (incore_seq && !incore_seq->stmts_.empty()) {
+    if (!SpmdInlineBodyRebuildsCarrier(incore)) {
+      // Print the body as-is. Either inlining would drop the carrier — the parser
+      // re-synthesises an InCore only for a body that carries a split or reads the
+      // per-block index, so the carrier must be spelled out as a nested
+      // ``pl.at(level=pl.Level.CORE_GROUP)``, the same shape the plain with-form
+      // prints — or (defensively) there is no InCore wrapper at all, which an
+      // `as tid` Spmd scope should never be missing.
+      PrintStmtBlock(op->body_);
+    } else if (incore_seq && !incore_seq->stmts_.empty()) {
       for (size_t i = 0; i < incore_seq->stmts_.size(); ++i) {
         if (ShouldSuppressPlaceholder(incore_seq->stmts_, i)) continue;
         PrintStmtBlock(incore_seq->stmts_[i]);
         if (i + 1 < incore_seq->stmts_.size()) stream_ << "\n";
       }
-    } else if (incore) {
-      PrintStmtBlock(incore->body_);
     } else {
-      // Defensive: an `as tid` Spmd scope should always wrap its body in InCore.
-      PrintStmtBlock(op->body_);
+      // Non-null: SpmdInlineBodyRebuildsCarrier only returns true for a real InCore.
+      PrintStmtBlock(incore->body_);
     }
     DecreaseIndent();
     return;
@@ -1975,8 +2148,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
-      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
+    if (incore) {
+      PrintScopeOptimizations(incore->split_, incore);
     }
     PrintScopeAllowEarlyResolveAttr(op);
     PrintScopePredicateAttr(op);
@@ -2259,6 +2432,14 @@ std::string IRPythonPrinter::GetVarName(const Var* var) const {
   return var->name_hint_ + suffix;
 }
 
+std::string IRPythonPrinter::PrintSubExpr(const ExprPtr& expr) const {
+  IRPythonPrinter sub_printer(prefix_);
+  sub_printer.var_rename_map_ = var_rename_map_;
+  sub_printer.dyn_var_rename_map_ = dyn_var_rename_map_;
+  sub_printer.free_body_vars_ = free_body_vars_;
+  return sub_printer.Print(expr);
+}
+
 void IRPythonPrinter::BuildVarRenameMap(const std::vector<VarPtr>& params, const StmtPtr& body,
                                         bool is_function) {
   // Collect Var/IterArg pointers in DFS pre-order: params, then body defs,
@@ -2319,41 +2500,49 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
   // Build rename map for this function to handle SSA name shadowing.
   BuildVarRenameMap(func);
 
+  // A ``split`` of ``SplitMode::None`` is filtered because it is a non-canonical
+  // spelling of "no split" (``Function::GetSplitMode`` maps a stored 0 to
+  // ``nullopt``, exactly as an absent key does), and the parser drops it — so
+  // emitting it would make print -> parse lossy. No pass produces it; this only
+  // normalizes IR that bypassed them (a ``.pto`` blob written before
+  // OutlineIncoreScopes stopped stamping it, a programmatically built Function).
+  // ``auto_scope`` rides in attrs_ but prints as a dedicated kwarg.
+  // The pointer form of ``any_cast`` keeps a mistyped attr failing at the
+  // existing print site rather than in this predicate, which also runs for the
+  // ``has_attrs`` tests.
+  // Every function attr prints as a ``pl.func_attr({...})`` body prologue except
+  // the two the parser must read BEFORE it can walk the body — a body-position
+  // declaration would arrive too late to take effect. Those two print as their
+  // own ``@pl.function(...)`` keyword (``auto_scope=`` / ``external_source=``),
+  // which is also the user-facing spelling, so reparsing never goes through the
+  // deprecated ``attrs=`` keyword and the compiler never warns on its own
+  // output. Kept in sync with the parser's ``_DECORATOR_ONLY_FUNC_ATTRS``.
+  auto is_filtered_attr = [](const std::string& k, const std::any& v) {
+    if (k == kAttrAutoScope || k == kAttrExternalSource) return true;
+    if (k != "split") return false;
+    const int* split_value = std::any_cast<int>(&v);
+    return split_value != nullptr && *split_value == static_cast<int>(SplitMode::None);
+  };
+  auto print_func_attr_value = [&](const std::string& key, const std::any& value) {
+    if (key == "split") {
+      int split_value = AnyCast<int>(value, "func attr key: " + key);
+      auto split_mode = static_cast<SplitMode>(split_value);
+      stream_ << prefix_ << ".SplitMode." << SplitModeToPythonString(split_mode);
+    } else {
+      PrintAttrValue(value, func->span_);
+    }
+  };
+
   // Print decorator
   stream_ << GetIndent() << "@" << prefix_ << ".function";
   {
     bool has_type = func->func_type_ != FunctionType::Opaque;
     bool has_level = func->level_.has_value();
     bool has_role = func->role_.has_value();
-    // ``auto_scope`` rides in attrs_ but prints as a dedicated kwarg (and is
-    // filtered from the attrs={...} dict). Absent ⇒ default True ⇒ not printed.
-    bool auto_scope_off = !func->GetAttr<bool>("auto_scope", true);
-    auto is_filtered_attr_key = [](const std::string& k) { return k == "auto_scope"; };
-    bool has_attrs = std::any_of(func->attrs_.begin(), func->attrs_.end(),
-                                 [&](const auto& kv) { return !is_filtered_attr_key(kv.first); });
-    auto print_func_attr_value = [&](const std::string& key, const std::any& value) {
-      if (key == "split") {
-        int split_value = AnyCast<int>(value, "func attr key: " + key);
-        auto split_mode = static_cast<SplitMode>(split_value);
-        stream_ << prefix_ << ".SplitMode." << SplitModeToPythonString(split_mode);
-      } else if (value.type() == typeid(int)) {
-        stream_ << AnyCast<int>(value, "func attr key: " + key);
-      } else if (value.type() == typeid(double)) {
-        stream_ << FormatFloatLiteral(AnyCast<double>(value, "func attr key: " + key));
-      } else if (value.type() == typeid(float)) {
-        stream_ << FormatFloatLiteral(static_cast<double>(AnyCast<float>(value, "func attr key: " + key)));
-      } else if (value.type() == typeid(bool)) {
-        stream_ << (AnyCast<bool>(value, "func attr key: " + key) ? "True" : "False");
-      } else if (value.type() == typeid(std::string)) {
-        stream_ << std::quoted(AnyCast<std::string>(value, "func attr key: " + key));
-      } else if (value.type() == typeid(ExprPtr)) {
-        VisitExpr(AnyCast<ExprPtr>(value, "func attr key: " + key));
-      } else {
-        INTERNAL_CHECK(false) << "Unsupported function attrs value type for key '" << key
-                              << "': " << DemangleTypeName(value.type().name());
-      }
-    };
-    if (has_type || has_level || has_role || auto_scope_off || has_attrs) {
+    // Absent ⇒ default True ⇒ not printed.
+    bool auto_scope_off = !func->GetAttr<bool>(kAttrAutoScope, true);
+    std::string external_source = func->GetAttr<std::string>(kAttrExternalSource, "");
+    if (has_type || has_level || has_role || auto_scope_off || !external_source.empty()) {
       stream_ << "(";
       bool first = true;
       if (has_type) {
@@ -2375,18 +2564,10 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
         stream_ << "auto_scope=False";
         first = false;
       }
-      if (has_attrs) {
+      // Last keyword: nothing reads `first` after this, so it is not updated.
+      if (!external_source.empty()) {
         if (!first) stream_ << ", ";
-        stream_ << "attrs={";
-        bool first_attr = true;
-        for (const auto& [key, value] : func->attrs_) {
-          if (is_filtered_attr_key(key)) continue;
-          if (!first_attr) stream_ << ", ";
-          stream_ << std::quoted(key) << ": ";
-          print_func_attr_value(key, value);
-          first_attr = false;
-        }
-        stream_ << "}";
+        stream_ << "external_source=" << std::quoted(external_source);
       }
       stream_ << ")";
     }
@@ -2403,6 +2584,12 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
   if (emit_self) {
     stream_ << "self";
   }
+
+  // Everything from here to the closing ":" is the signature, which Python
+  // evaluates before the body binds any name. Flag it so a MemRef annotation
+  // referring to a body-allocated base Ptr prints its name as a string instead
+  // of an unbound forward reference (see PrintMemRef).
+  printing_signature_ = true;
 
   // Print parameters with type annotations and direction wrappers
   for (size_t i = 0; i < func->params_.size(); ++i) {
@@ -2436,10 +2623,36 @@ void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
     }
   }
 
+  printing_signature_ = false;
+
   stream_ << ":\n";
 
   // Print body - convert yield to return in function context
   IncreaseIndent();
+
+  // ``pl.func_attr({...})`` prologue: every attr that is not decorator-only.
+  // Emitted before the body statements so it reparses as a prologue. Skipped
+  // for bodyless functions (abstract SubWorker / external kernel), which must
+  // round-trip as a bare ``...`` — those carry only decorator-only attrs.
+  std::vector<const std::pair<std::string, std::any>*> prologue_attrs;
+  for (const auto& kv : func->attrs_) {
+    if (is_filtered_attr(kv.first, kv.second)) continue;
+    prologue_attrs.push_back(&kv);
+  }
+  // An abstract SubWorker prints its prologue too, before the bare ``...``.
+  // ``_is_abstract_subworker_body`` skips the directive exactly as it skips a
+  // docstring, so the body still reads as abstract on reparse and the attrs
+  // survive — they would otherwise have no printable position at all.
+  if (!prologue_attrs.empty()) {
+    stream_ << GetIndent() << prefix_ << ".func_attr({";
+    for (size_t i = 0; i < prologue_attrs.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      stream_ << std::quoted(prologue_attrs[i]->first) << ": ";
+      print_func_attr_value(prologue_attrs[i]->first, prologue_attrs[i]->second);
+    }
+    stream_ << "})\n";
+  }
+
   if (func->requires_runtime_binding_) {
     // Abstract SubWorker: runtime-bound callback. Round-trips as `...`, which
     // the parser re-detects (see `_is_abstract_subworker_body`).
@@ -2677,10 +2890,57 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
     }
   }
 
+  // A parameter whose name is ALSO read inside a parameter *type annotation*
+  // still needs its pl.dynamic() declaration: Python evaluates annotations in the
+  // enclosing scope, before any parameter exists, so without the declaration the
+  // printed signature raises NameError on re-parse. MaterializeValidShapeSymbols
+  // produces exactly this shape — the valid_shape symbol becomes a scalar
+  // parameter while the tensor parameter's annotation keeps naming it — and the
+  // parser re-unifies the two (see ast_parser's DynVar re-point on f.param).
+  // Collected separately from the pass above: that one dedups through seen_ptrs,
+  // which would swallow every repeat occurrence.
+  // Deliberately narrow (issue #854 keeps the other two cases undeclared):
+  //   * a body-local var read in a valid_shape stays undeclared — it is defined
+  //     in the body, so the annotation resolves against the local;
+  //   * a param read as a *physical* dim stays undeclared — orchestration codegen
+  //     defines those symbols from the runtime tensor's shapes[].
+  // Only a param read in a valid_shape has neither escape, which is exactly what
+  // MaterializeValidShapeSymbols produces.
+  std::unordered_set<const Var*> read_in_param_types;
+  {
+    std::unordered_set<const Var*> param_vars;
+    for (const auto& [gvar, func] : program->functions_) {
+      for (const auto& param : func->params_) param_vars.insert(param.get());
+    }
+    std::function<void(const ExprPtr&)> collect_reads = [&](const ExprPtr& expr) {
+      if (!expr) return;
+      if (auto var = As<Var>(expr)) {
+        if (param_vars.count(var.get()) > 0) read_in_param_types.insert(var.get());
+      } else if (auto bin = As<BinaryExpr>(expr)) {
+        collect_reads(bin->left_);
+        collect_reads(bin->right_);
+      } else if (auto unary = As<UnaryExpr>(expr)) {
+        collect_reads(unary->operand_);
+      }
+    };
+    for (const auto& [gvar, func] : program->functions_) {
+      for (const auto& param : func->params_) {
+        // AsTensorTypeLike, not As<TensorType>: DistributedTensorType has its own
+        // ObjectKind and carries valid_shape symbols the same way.
+        auto tensor_type = AsTensorTypeLike(param->GetType());
+        if (!tensor_type || !tensor_type->tensor_view_.has_value()) continue;
+        for (const auto& dim : tensor_type->tensor_view_->valid_shape) collect_reads(dim);
+      }
+    }
+  }
+
   // Filter out locally-defined vars and function params: they should not get
-  // pl.dynamic() declarations — only truly free dimension variables should.
+  // pl.dynamic() declarations — only truly free dimension variables should, plus
+  // the params that a parameter annotation reads (see read_in_param_types above).
   dyn_var_ptrs.erase(std::remove_if(dyn_var_ptrs.begin(), dyn_var_ptrs.end(),
-                                    [&defined_vars](const Var* v) { return defined_vars.count(v) > 0; }),
+                                    [&defined_vars, &read_in_param_types](const Var* v) {
+                                      return defined_vars.count(v) > 0 && read_in_param_types.count(v) == 0;
+                                    }),
                      dyn_var_ptrs.end());
 
   // Phase 2: Assign unique printed names, disambiguating collisions.
@@ -2777,27 +3037,59 @@ void IRPythonPrinter::PrintShapeDims(std::ostringstream& oss, const std::vector<
 // Helper methods for MemRef and TileView printing
 std::string IRPythonPrinter::PrintMemRef(const MemRef& memref) {
   std::ostringstream oss;
+
+  // An author-declared allocation prints in the one-argument form: it carries no
+  // size or address to print, since InitMemRef derives both. Printing it with the
+  // invented pair would make it indistinguishable from a compiler allocation on
+  // reparse.
+  if (memref.is_pinned_) {
+    oss << prefix_ << ".MemRef(\"" << GetVarName(memref.base_.get()) << "\"";
+    // `slots=` is what makes the subscript below legal on reparse, so it has to
+    // ride along; omitted at 1 so an unsubscripted declaration prints as before.
+    if (memref.slot_count_ > 1) oss << ", slots=" << memref.slot_count_;
+    oss << ")";
+    if (memref.slot_index_.has_value() && *memref.slot_index_) {
+      // The index may be a runtime expression, so print it through the expression
+      // printer rather than assuming a constant.
+      oss << "[" << PrintSubExpr(*memref.slot_index_) << "]";
+    }
+    return oss.str();
+  }
+
   oss << prefix_ << ".MemRef(";
 
   // Base Ptrs defined in the function body (by alloc statements) are printed as
   // bare variable references; everything else uses a string literal (forward
   // references in parameter annotations, standalone type printing, etc.).
-  if (body_defined_vars_.count(memref.base_.get())) {
+  //
+  // A signature annotation is exactly such a forward reference: it is emitted
+  // before the body, so even a base Ptr that *is* body-defined is not yet bound
+  // there and must take the string form, or the reparse fails with NameError.
+  if (!printing_signature_ && body_defined_vars_.count(memref.base_.get())) {
     oss << GetVarName(memref.base_.get());
   } else {
     oss << "\"" << GetVarName(memref.base_.get()) << "\"";
   }
 
-  // Print byte offset using a temp printer to avoid corrupting the main stream.
-  // The temp printer has its own stream_ but shares no rename maps — that's fine
-  // because byte_offset expressions are ConstInt or arithmetic trees of loop vars
-  // which print by name_hint_ and don't need SSA renaming.
-  oss << ", ";
-  IRPythonPrinter temp_printer(prefix_);
-  oss << temp_printer.Print(memref.byte_offset_);
+  // Print byte offset off the main stream, but with this printer's naming state:
+  // a dynamic offset (a tile.slice view) names loop vars, which may have been
+  // disambiguated.
+  oss << ", " << PrintSubExpr(memref.byte_offset_);
 
   // Print size
-  oss << ", " << memref.size_ << ")";
+  oss << ", " << memref.size_;
+
+  // Slot geometry survives InitMemRef (it says which slot of what this MemRef is,
+  // not merely how to compute its offset), so a resolved slot has to print it too
+  // or the reparsed MemRef silently becomes an ordinary one at the same offset —
+  // and PTO codegen would emit N unrelated allocs instead of one multi-buffer.
+  if (memref.slot_count_ > 1) oss << ", slots=" << memref.slot_count_;
+  oss << ")";
+  if (memref.slot_index_.has_value() && *memref.slot_index_) {
+    // The index may be a runtime expression, so print it through the expression
+    // printer rather than assuming a constant.
+    oss << "[" << PrintSubExpr(*memref.slot_index_) << "]";
+  }
   return oss.str();
 }
 
@@ -2915,6 +3207,20 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
         break;
       case PadValue::min:
         oss << "min";
+        break;
+    }
+  }
+
+  // compact — omit if null (default)
+  if (tile_view.compact != CompactMode::null) {
+    maybe_comma();
+    oss << "compact=" << prefix_ << ".CompactMode.";
+    switch (tile_view.compact) {
+      case CompactMode::null:
+        oss << "null";
+        break;
+      case CompactMode::normal:
+        oss << "normal";
         break;
     }
   }

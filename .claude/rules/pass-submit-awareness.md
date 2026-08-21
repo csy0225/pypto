@@ -23,8 +23,8 @@ and the bug only surfaces inside `pl.manual_scope` bodies.
 | ------ | ------ | -------- |
 | Semantics | Synchronous function call | Asynchronous task launch |
 | Where it appears | Anywhere | Inside `manual_scope` bodies |
-| Return type | Callee's declared return | `Tuple[<runtime-allocated Out params>..., <callee return>..., TASK_ID]` |
-| `args_` vs callee `params_` | Identity, full coverage: `args_.size() == params_.size()` | Identity, *prefix*: `args_.size() <= params_.size()` |
+| Return type | Callee's declared return | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
+| `args_` vs callee `params_` | Identity, full coverage: `args_.size() == params_.size()` | Identity, *bounded*: `args_.size() <= params_.size()` (see rule 5) |
 | Has `deps` | No | First-class `deps_` field — TaskId `Var`s / `Array`s |
 | Use-def chain | `args_` only | `args_` **and** `deps_` |
 | Python syntax | `out = self.foo(...)` | `out, tid = pl.submit(self.foo, ...)` |
@@ -99,59 +99,65 @@ before comparing against the callee's declared signature.
 
 ### 5. When matching `args_` against callee `params_`
 
-`Submit::args_` is a positional *prefix* of callee `params_`. Mapping is
-identity (`args_[i] ↔ params_[i]`) up to `args_.size()`, but Submit may carry
-fewer args than the callee declares:
+**Canonical statement: `Submit::args_` in `include/pypto/ir/expr.h`.** Read it
+there — this is the pass-author summary, not a second source of truth.
 
-- Indices `[0, args_.size())` are caller-supplied (any direction — In, InOut,
-  *or* Out for caller-allocated outputs).
-- Indices `[args_.size(), params_.size())` are **runtime-allocated outputs**:
-  they must be declared `Out` and the IR builder appends them at the *tail*
-  of the callee signature (e.g. `ConvertTensorToTileOps` lowers a local
-  `pl.create_tensor` consumed across scopes into an appended `pl.Out` param).
-  These materialise as leading return-tuple elements before `TASK_ID`.
+`Call` maps by identity (`args_[i]` ↔ `params_[i]`) with full coverage.
+`Submit` has **bounded** coverage (`args_.size() <= params_.size()`), and
+identity holds only over the leading caller-supplied args. With
+`gap = params_.size() - args_.size()` and `ctx` = number of trailing
+`CommCtxType` params, a Submit's args split into three regions:
 
-**Important runtime caveat for orchestration codegen:** `TaskOutputTensors`
-(returned by `rt_submit_*_task`) stores only `add_output(TensorCreateInfo)`
-entries — runtime-allocated outputs (see `runtime/.../pto_types.h:72` "Only
-runtime-created outputs are stored here"). `add_inout(Tensor&)` and
-in-args caller-allocated `add_output(Tensor&)` slots do **not** appear in
-`task_<n>_outs`. So aliasing a Submit's tuple-return element must dispatch:
+| Callee param indices | In `args_`? | Notes |
+| -------------------- | ----------- | ----- |
+| `[0, args_.size() - ctx)` | Yes, at `args_[i]` | **Any** direction — In / InOut / **and Out** |
+| `[args_.size() - ctx, params_.size() - ctx)` | No — the gap | Runtime-allocated; must be declared `Out` |
+| `[params_.size() - ctx, params_.size())` | Yes, at `args_[i - gap]` | CommCtx suffix; `MaterializeDistTensorCtx` grows signature and call site together |
 
-- Caller-allocated (callee param at index < `args_.size()`): alias to the
-  arg's emit name (`ext_<arg>` / the user-passed variable).
-- Runtime-allocated (callee param at index `>= args_.size()`): alias to
-  `task_<n>_outs.get_ref(runtime_out_pos)` where `runtime_out_pos =
-  param_idx - args_.size()` (one synth `add_output` per tail Out, appended
-  in callee param order).
+Easy to get wrong:
 
-For a plain `Call`, args is full coverage: `args_.size() == params_.size()`.
+- **Caller-allocated `Out` params are NOT excluded from `args_`.** Coverage is
+  bounded, not direction-filtered.
+- **`args_[i] ↔ params_[i]` breaks once `gap > 0` and `ctx > 0` coexist.** For
+  params `[x, omitted_out, ctx]` the args are `[x, ctx]`, so `args_[1]` binds
+  `params_[2]`, and indexing `param_directions_` by arg index is wrong.
+  `DeriveCallDirections` is safe only by ordering: pass 37 runs before
+  `MaterializeDistTensorCtx` (43) makes `ctx` non-zero.
+- **The gap comes from user source, not a pass.** `pl.submit(self.kernel, x)`
+  against a kernel declaring a trailing `pl.Out` parses fine and carries the
+  gap through the pipeline, so bailing on `!=` mishandles ordinary DSL input.
+  (No pass opens it: `ConvertTensorToTileOps` and `InjectGMPipeBuffer` both
+  forward the arg they append.)
 
-A pass that hard-codes `args_.size() == params_.size()` (typical size guard)
-will silently bail on Submit and leave attrs empty. Use a kind-aware bound:
+This does **not** change the return shape (rule 4): an appended `Out` param
+mirrors an existing declared return, so caller- and runtime-allocated params
+surface through the *same* return-tuple elements — only the alias target differs.
+
+**Orchestration codegen:** `TaskOutputTensors` holds only runtime-created
+outputs, so aliasing a tuple-return element must dispatch on region —
+caller-supplied → the arg's emit name; runtime-allocated →
+`task_<n>_outs.get_ref(param_idx - (args_.size() - ctx))`. Details on
+`Submit::args_`.
+
+A pass that hard-codes `args_.size() == params_.size()` silently bails on
+Submit and leaves attrs empty. Use a kind-aware bound:
 
 ```cpp
-// ❌ Wrong for Submit when callee has tail-appended runtime-allocated outputs
-if (call->args_.size() != callee->params_.size()) return call;  // bails on Submit
+// ❌ Wrong for Submit — bails whenever the callee has uncovered params
+if (call->args_.size() != callee->params_.size()) return call;
 
-// ✅ Identity mapping; relax the size check for Submit (prefix), keep it
-//    exact for Call (full coverage).
+// ✅ Relax the size check for Submit, keep it exact for Call.
 const bool size_ok = is_submit ? (call->args_.size() <= callee->params_.size())
                                : (call->args_.size() == callee->params_.size());
 if (!size_ok) return call;
-for (size_t i = 0; i < call->args_.size(); ++i) {
-  auto dir = callee->param_directions_[i];   // identity — always safe
-  ...
-}
-// For Submit, callee params beyond args_.size() are runtime-allocated
-// outputs — pass them through the runtime's add_output / TaskOutputTensors
-// path (orchestration codegen) rather than args_-indexed code.
+// Valid only while gap == 0 or ctx == 0; after MaterializeDistTensorCtx a
+// pass must map suffix args by `i + gap`.
+for (size_t i = 0; i < call->args_.size(); ++i) { auto dir = callee->param_directions_[i]; ... }
 ```
 
-This is the args-side dual of the return-type asymmetry in rule 4. If your
-pass uses a `SubmitToCallView`–style adapter to share code with the Call
-path, the adapter does **not** fix this — `args_` is copied through
-unchanged, so the size-vs-params guard will still mis-fire.
+Route gap params through `add_output`, not args-indexed code. A
+`SubmitToCallView`-style adapter does **not** fix this: `args_` is copied
+through unchanged.
 
 ### 6. Verifier hooks
 
@@ -182,7 +188,7 @@ Before merging a new or updated pass that touches calls, verify:
 - [ ] If the pass collects variable uses, `Submit::deps_` is included
 - [ ] If the pass rewrites or clones calls, Submit-ness is preserved
 - [ ] If the pass examines call return types, the `TASK_ID` suffix on `Submit` is accounted for
-- [ ] If the pass matches `args_` against callee `params_`, it allows the Submit prefix invariant (size_ok = `args_.size() <= params_.size()`, not `==`)
+- [ ] If the pass matches `args_` against callee `params_`, it allows the Submit coverage bound (size_ok = `args_.size() <= params_.size()`, not `==`) and does not assume Out params are absent from `args_`
 - [ ] If the pass produces a structural invariant, the verifier covers `Submit` too
 - [ ] Tests cover at least one `pl.manual_scope` / `pl.submit` case if the pass is reachable from there
 

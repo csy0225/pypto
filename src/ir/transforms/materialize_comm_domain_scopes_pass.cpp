@@ -66,6 +66,13 @@ namespace {
   return call && call->op_ && IsOp(call, "pld.tensor.allgather");
 }
 
+// pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)
+// also returns `target` in-place (args_[1]) — same aliasing discipline as
+// IsTensorAllToAll above.
+[[nodiscard]] bool IsTensorAllToAllV(const CallPtr& call) {
+  return call && call->op_ && IsOp(call, "pld.tensor.all_to_all_v");
+}
+
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
 struct DeviceDescriptor {
   bool is_all = false;
@@ -76,6 +83,7 @@ struct DeviceDescriptor {
   }
   bool operator<(const DeviceDescriptor& o) const {
     if (is_all != o.is_all) return is_all < o.is_all;
+    if (is_all) return false;  // all-device: subset is meaningless, matches operator==
     return subset < o.subset;
   }
 
@@ -273,8 +281,20 @@ class DispatchAnalyzer : public IRVisitor {
 
   void VisitStmt_(const ForStmtPtr& op) override {
     for_stack_.push_back(op);
+    ++repeating_scope_depth_;
     IRVisitor::VisitStmt_(op);
+    --repeating_scope_depth_;
     for_stack_.pop_back();
+  }
+
+  // WhileStmt carries no device-descriptor role (unlike ForStmt, which
+  // for_stack_ tracks for ResolveDeviceDescriptor), but it must still count
+  // toward repeating_scope_depth_ so the all_to_all_v loop-use guard in
+  // AnalyzeCollective rejects a call nested in a while loop too.
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    ++repeating_scope_depth_;
+    IRVisitor::VisitStmt_(op);
+    --repeating_scope_depth_;
   }
 
   void AnalyzeDispatch(const CallPtr& op) {
@@ -360,6 +380,41 @@ class DispatchAnalyzer : public IRVisitor {
       collective_consumers.push_back({data_alloc, signal_alloc, op->span_});
       return;
     }
+
+    if (IsOp(op, "pld.tensor.all_to_all_v")) {
+      // 5-arg push-based form:
+      // pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)
+      // args[0] = input        (window-bound on HOST path; distinct from target)
+      // args[1] = target       (DistributedTensor, window-bound, window-as-result)
+      // args[2] = signal       (DistributedTensor, window-bound, barrier)
+      // args[3] = send_counts  (window-bound on HOST path; LOCAL only, never
+      //                          cross-rank-notified — no consumer entry,
+      //                          same rationale as `input` above)
+      // args[4] = recv_counts  (DistributedTensor, window-bound; published
+      //                          cross-rank via notify, so needs target's
+      //                          device coverage exactly like `signal` does)
+      INTERNAL_CHECK_SPAN(op->args_.size() == 5, op->span_)
+          << "MaterializeCommDomainScopes: pld.tensor.all_to_all_v expects exactly 5 args";
+      // LowerCompositeOps' CheckAllReduceLoopUse guards the InCore path but
+      // never runs for a HOST-orch call (LowerCompositeOps just defers it
+      // there). This is the HOST-side equivalent, using repeating_scope_depth_
+      // (tracked across both ForStmt and WhileStmt — see the VisitStmt_
+      // overrides above).
+      CHECK_SPAN(repeating_scope_depth_ == 0, op->span_)
+          << "pld.tensor.all_to_all_v is not supported inside a for/while loop in a HOST "
+             "orchestrator. The signal protocol is single-use and cannot reuse a signal "
+             "across dynamic invocations (same restriction LowerCompositeOps enforces on "
+             "the InCore path via CheckAllReduceLoopUse).";
+      auto* data_alloc = ResolveWindowAlloc(op->args_[1], "pld.tensor.all_to_all_v", "target");
+      auto* signal_alloc = ResolveWindowAlloc(op->args_[2], "pld.tensor.all_to_all_v", "signal");
+      auto* recv_counts_alloc = ResolveWindowAlloc(op->args_[4], "pld.tensor.all_to_all_v", "recv_counts");
+      // Two consumer entries sharing the same data_alloc: both signal and
+      // recv_counts need to inherit target's device coverage (Phase 3 loop
+      // below merges generically per entry).
+      collective_consumers.push_back({data_alloc, signal_alloc, op->span_});
+      collective_consumers.push_back({data_alloc, recv_counts_alloc, op->span_});
+      return;
+    }
   }
 
   void VisitExpr_(const CallPtr& op) override {
@@ -404,6 +459,9 @@ class DispatchAnalyzer : public IRVisitor {
     if (call && IsTensorAllGather(call) && call->args_.size() > 1) {
       return ResolveWindowRecord(As<Var>(call->args_[1]), visited);
     }
+    if (call && IsTensorAllToAllV(call) && call->args_.size() > 1) {
+      return ResolveWindowRecord(As<Var>(call->args_[1]), visited);
+    }
     return nullptr;
   }
 
@@ -411,6 +469,7 @@ class DispatchAnalyzer : public IRVisitor {
   const std::map<std::string, FunctionPtr>& chip_orchs_;
   const std::unordered_map<const Var*, ExprPtr>& var_defs_;
   std::vector<ForStmtPtr> for_stack_;
+  int repeating_scope_depth_ = 0;
 };
 
 /// A host-orchestration function in PyPTO is declared as either
@@ -427,6 +486,11 @@ class DispatchAnalyzer : public IRVisitor {
 
 [[nodiscard]] bool IsChipOrch(const FunctionPtr& func) {
   if (!func || !func->level_.has_value() || *func->level_ != Level::CHIP) return false;
+  // A Graph function carries {CHIP, Orchestrator} exactly like a chip entry, so
+  // the role disjunct below matches it even though its func_type_ does not. It
+  // is a task launched *by* a chip entry, never a host dispatch target, so
+  // exclude it explicitly — narrowing the func_type_ term alone would not help.
+  if (func->func_type_ == FunctionType::Graph) return false;
   return func->func_type_ == FunctionType::Orchestration ||
          (func->role_.has_value() && *func->role_ == Role::Orchestrator);
 }
@@ -566,7 +630,12 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   // Phase 6: cluster allocs into pending domain entries by merged descriptor
   // (alloc-order within a domain). Use a vector for deterministic order: scan
   // collector.allocs in source order and append to the first matching entry
-  // or create a new one.
+  // or create a new one. `desc_to_index` maps a merged descriptor to its
+  // `pending` slot (O(log domains) via DeviceDescriptor::operator<, per
+  // pass-complexity.md — a per-alloc linear scan of `pending` would make this
+  // Phase O(allocs^2) for programs with many distinct comm domains). Store
+  // indices, not pointers, into the map: `pending.push_back` may reallocate
+  // and invalidate any previously-taken `PendingDomain*`.
   struct PendingDomain {
     DeviceDescriptor desc;
     std::vector<WindowBufferPtr> slots;
@@ -574,24 +643,24 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     Span span;
   };
   std::vector<PendingDomain> pending;
+  std::map<DeviceDescriptor, size_t> desc_to_index;
   for (const auto& rec : collector.allocs) {
     DeviceDescriptor merged;
     for (const auto& d : rec->seen) merged.Merge(d);
-    PendingDomain* tgt = nullptr;
-    for (auto& g : pending) {
-      if (g.desc == merged) {
-        tgt = &g;
-        break;
-      }
-    }
-    if (!tgt) {
+    auto it = desc_to_index.find(merged);
+    size_t index;
+    if (it == desc_to_index.end()) {
+      index = pending.size();
+      desc_to_index.emplace(merged, index);
       pending.push_back({merged, {}, {}, rec->span});
-      tgt = &pending.back();
+    } else {
+      index = it->second;
     }
-    INTERNAL_CHECK_SPAN(tgt->names.insert(rec->name).second, rec->span)
+    PendingDomain& tgt = pending[index];
+    INTERNAL_CHECK_SPAN(tgt.names.insert(rec->name).second, rec->span)
         << "MaterializeCommDomainScopes: duplicate allocation name '" << rec->name
         << "' within the same comm domain";
-    tgt->slots.push_back(rec->wb);
+    tgt.slots.push_back(rec->wb);
   }
 
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result

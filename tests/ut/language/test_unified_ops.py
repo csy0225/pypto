@@ -14,12 +14,19 @@ using the explicit ``pl.tensor.X`` / ``pl.tile.X`` API — then asserts
 they produce structurally equal IR.
 """
 
+import os
+import pathlib
+import subprocess
+import sys
+import warnings
+
+import pypto.ir.utils as pypto_ir_utils
 import pypto.language as pl
 import pypto.language.op as language_op
 import pytest
 from pypto import DataType, ir
-from pypto.language.op import unified_ops
-from pypto.language.typing import Tensor, Tile
+from pypto.language.op import tile_ops, unified_ops
+from pypto.language.typing import Scalar, Tensor, Tile
 
 
 class TestUnifiedTensorDispatch:
@@ -115,15 +122,29 @@ class TestUnifiedTensorDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_div(self):
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_div(self, high_precision):
         @pl.function
         def unified(a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.div(a, b)
+            c: pl.Tensor[[64], pl.FP32] = pl.div(a, b, high_precision=high_precision)
             return c
 
         @pl.function
         def explicit(a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.tensor.div(a, b)
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.div(a, b, high_precision=high_precision)
+            return c
+
+        ir.assert_structural_equal(unified, explicit)
+
+    def test_log_high_precision_uses_unified_export(self):
+        @pl.function
+        def unified(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            c: pl.Tensor[[64], pl.FP32] = pl.log(a, high_precision=True)
+            return c
+
+        @pl.function
+        def explicit(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.log(a, high_precision=True)
             return c
 
         ir.assert_structural_equal(unified, explicit)
@@ -167,15 +188,16 @@ class TestUnifiedTensorDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_recip(self):
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_recip(self, high_precision):
         @pl.function
         def unified(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.recip(a)
+            c: pl.Tensor[[64], pl.FP32] = pl.recip(a, high_precision=high_precision)
             return c
 
         @pl.function
         def explicit(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.tensor.recip(a)
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.recip(a, high_precision=high_precision)
             return c
 
         ir.assert_structural_equal(unified, explicit)
@@ -542,13 +564,14 @@ class TestUnifiedBlockDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_recip(self):
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_recip(self, high_precision):
         @pl.function
         def unified(
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.recip(a)
+            b: pl.Tile[[64, 64], pl.FP32] = pl.recip(a, high_precision=high_precision)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
@@ -557,7 +580,7 @@ class TestUnifiedBlockDispatch:
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.recip(a)
+            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.recip(a, high_precision=high_precision)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
@@ -698,14 +721,17 @@ class TestUnifiedBlockDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_row_expand_add(self):
+    def test_row_expand_add_with_tmp(self):
         @pl.function
         def unified(
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
             rv: pl.Tile[[64, 1], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 1])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.row_expand_add(a, rv)
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            b: pl.Tile[[64, 64], pl.FP32] = pl.row_expand_add(a, rv, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
@@ -715,11 +741,25 @@ class TestUnifiedBlockDispatch:
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
             rv: pl.Tile[[64, 1], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 1])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.row_expand_add(a, rv)
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.row_expand_add(a, rv, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
         ir.assert_structural_equal(unified, explicit)
+
+    def test_row_expand_add_without_tmp(self):
+        """The Tile overload keeps the original two-operand dispatch."""
+        span = ir.Span.unknown()
+        lhs = Tile(expr=ir.Var("lhs", ir.TileType([8, 8], DataType.FP32), span))
+        rhs = Tile(expr=ir.Var("rhs", ir.TileType([8, 1], DataType.FP32), span))
+
+        unified = pl.row_expand_add(lhs, rhs)
+        explicit = pl.tile.row_expand_add(lhs, rhs)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
 
     def test_row_expand_sub(self):
         @pl.function
@@ -1046,6 +1086,101 @@ class TestPromotedOps:
         assert "reinterpret_view" in pl.__all__
         assert "reinterpret_view" in language_op.__all__
 
+    def test_namespaces_agree_on_shared_names(self):
+        """A DSL name must resolve to one object in ``pl`` and ``pl.op``.
+
+        The parser resolves unified ``pl.<op>`` calls against
+        ``pypto.language.op``, while ``inspect.signature``, IDE autocomplete and
+        docstrings all show what ``pypto.language`` exports. A name bound to two
+        different functions makes the parser reject arguments the visible
+        signature advertises.
+        """
+        divergent = {
+            name: (
+                getattr(getattr(pl, name), "__module__", repr(getattr(pl, name))),
+                getattr(getattr(language_op, name), "__module__", repr(getattr(language_op, name))),
+            )
+            for name in dir(language_op)
+            if not name.startswith("_")
+            and hasattr(pl, name)
+            and getattr(pl, name) is not getattr(language_op, name)
+            and callable(getattr(language_op, name))
+        }
+        assert not divergent, (
+            f"names bound to different objects in pypto.language vs pypto.language.op: {divergent}"
+        )
+
+    @pytest.mark.parametrize("module", [pl, language_op], ids=["pl", "pl.op"])
+    def test_all_lists_each_name_once(self, module):
+        """``__all__`` must not repeat a name.
+
+        ``pypto.language.op.__all__`` groups names by dispatch category
+        (unified / tile-only / tensor-only). A name listed under two groups is
+        invisible at runtime — ``from ... import *`` de-duplicates — but it
+        makes the groups drift, and lets a later edit delete one entry while
+        the name still looks unexported.
+        """
+        duplicates = sorted({name for name in module.__all__ if module.__all__.count(name) > 1})
+        assert not duplicates, f"{module.__name__}.__all__ lists these names more than once: {duplicates}"
+
+    def test_create_tile_single_binding(self):
+        """``create_tile`` is the ``tile_ops.create`` alias in both namespaces."""
+        assert pl.create_tile is language_op.create_tile is tile_ops.create
+        assert "create_tile" in pl.__all__
+        assert "create_tile" in language_op.__all__
+
+    def test_promoted_create_tile_transpose(self):
+        """``pl.create_tile(..., transpose=True)`` matches the explicit form.
+
+        ``transpose=True`` is Mat-only (L1) and 2D-only — it allocates the
+        transposed ZN fractal layout for a matmul ``b_trans`` B-operand.
+        """
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def unified(src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[256, 128], pl.BF16]:
+            _t: pl.Tile[[16, 128], pl.BF16] = pl.create_tile(
+                [16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat, transpose=True
+            )
+            return src
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def explicit(src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[256, 128], pl.BF16]:
+            _t: pl.Tile[[16, 128], pl.BF16] = pl.tile.create(
+                [16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat, transpose=True
+            )
+            return src
+
+        ir.assert_structural_equal(unified, explicit)
+        # The kwarg must take effect, not merely be accepted: transpose flips
+        # the sub-block layout to col_major (ZN).
+        assert "slayout=pl.TileLayout.col_major" in unified.as_python()
+
+    def test_promoted_create_tile_flat_layout(self):
+        """``pl.create_tile(..., flat_layout=True)`` matches the explicit form.
+
+        ``flat_layout`` is keyword-only and allocates a flat (non-fractal,
+        ``slayout=none_box``) L1 staging buffer.
+        """
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def unified(src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[256, 128], pl.BF16]:
+            _t: pl.Tile[[16, 128], pl.BF16] = pl.create_tile(
+                [16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat, flat_layout=True
+            )
+            return src
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def explicit(src: pl.Tensor[[256, 128], pl.BF16]) -> pl.Tensor[[256, 128], pl.BF16]:
+            _t: pl.Tile[[16, 128], pl.BF16] = pl.tile.create(
+                [16, 128], dtype=pl.BF16, target_memory=pl.Mem.Mat, flat_layout=True
+            )
+            return src
+
+        ir.assert_structural_equal(unified, explicit)
+        # The kwarg must take effect, not merely be accepted: flat_layout drops
+        # the fractal sub-block boxing.
+        assert "slayout=pl.TileLayout.none_box" in unified.as_python()
+
     def test_promoted_create(self):
         @pl.function
         def unified(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
@@ -1054,7 +1189,7 @@ class TestPromotedOps:
 
         @pl.function
         def explicit(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.create([64], dtype=pl.FP32)
             return c
 
         ir.assert_structural_equal(unified, explicit)
@@ -1067,7 +1202,7 @@ class TestPromotedOps:
 
         @pl.function
         def explicit(a: pl.Tensor[[64, 128], pl.FP32]) -> pl.Scalar[pl.INT64]:
-            d: pl.Scalar[pl.INT64] = pl.dim(a, 0)
+            d: pl.Scalar[pl.INT64] = pl.tensor.dim(a, 0)
             return d
 
         ir.assert_structural_equal(unified, explicit)
@@ -1103,7 +1238,7 @@ class TestPromotedSinCos:
         assert isinstance(result, Tensor)
         call = result.unwrap()
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tensor.sin"
+        assert call.op.name == ir.get_op("tensor.sin").name
         result_type = call.type
         assert isinstance(result_type, ir.TensorType)
         assert result_type.dtype == DataType.FP32
@@ -1116,7 +1251,7 @@ class TestPromotedSinCos:
         assert isinstance(result, Tensor)
         call = result.unwrap()
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tensor.cos"
+        assert call.op.name == ir.get_op("tensor.cos").name
         result_type = call.type
         assert isinstance(result_type, ir.TensorType)
         assert result_type.dtype == DataType.FP32
@@ -1177,7 +1312,7 @@ class TestPromotedTileSinCos:
         assert isinstance(result, Tile)
         call = result.unwrap()
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.sin"
+        assert call.op.name == ir.get_op("tile.sin").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -1190,7 +1325,7 @@ class TestPromotedTileSinCos:
         assert isinstance(result, Tile)
         call = result.unwrap()
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.cos"
+        assert call.op.name == ir.get_op("tile.cos").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -1245,6 +1380,85 @@ class TestUnifiedOpsTypeErrors:
         with pytest.raises(TypeError, match="expected Tensor or Tile"):
             unified_ops.reinterpret_view(123, DataType.INT16)  # type: ignore
 
+    def test_row_expand_add_rejects_tmp_for_tensor_inputs(self):
+        span = ir.Span.unknown()
+        lhs = Tensor(expr=ir.Var("lhs", ir.TensorType([8, 8], DataType.FP32), span))
+        rhs = Tensor(expr=ir.Var("rhs", ir.TensorType([8, 1], DataType.FP32), span))
+        tmp = Tile(expr=ir.Var("tmp", ir.TileType([8, 8], DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="Tensor inputs must not pass tmp"):
+            unified_ops.row_expand_add(lhs, rhs, tmp)  # type: ignore[call-overload]
+
+    def test_div_rejects_high_precision_for_scalar_paths(self):
+        span = ir.Span.unknown()
+        cases = [
+            (
+                Tensor(expr=ir.Var("tensor", ir.TensorType([8], DataType.FP32), span)),
+                2.0,
+            ),
+            (
+                Tile(expr=ir.Var("tile", ir.TileType([8], DataType.FP32), span)),
+                2.0,
+            ),
+            (
+                Scalar(expr=ir.Var("lhs", ir.ScalarType(DataType.FP32), span)),
+                Scalar(expr=ir.Var("rhs", ir.ScalarType(DataType.FP32), span)),
+            ),
+        ]
+
+        for lhs, rhs in cases:
+            with pytest.raises(TypeError, match="high_precision"):
+                unified_ops.div(lhs, rhs, high_precision=True)  # type: ignore[call-overload]
+
+    @pytest.mark.parametrize(
+        "op_name",
+        [
+            "row_max",
+            "row_sum",
+            "row_min",
+            "row_prod",
+            "row_argmax",
+            "row_argmin",
+            "col_argmax",
+            "col_argmin",
+        ],
+    )
+    def test_reduction_requires_tmp_tile_for_tile_inputs(self, op_name):
+        """The scratch operand the Tensor path must omit is the one the Tile path must get.
+
+        Both directions raise ``TypeError``: a Tile cannot synthesize caller-owned
+        scratch, so omitting it is a wrong-arguments error, not a bad value.
+        """
+        span = ir.Span.unknown()
+        tile = Tile(expr=ir.Var("input", ir.TileType([8, 64], DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="Tile inputs require tmp_tile"):
+            getattr(unified_ops, op_name)(tile)
+
+    @pytest.mark.parametrize("op_name", ["xor", "xors"])
+    def test_bitwise_requires_scratch_tile_for_tile_inputs(self, op_name):
+        """Same guard as the reductions, for the ops whose scratch operand is positional."""
+        span = ir.Span.unknown()
+        lhs = Tile(expr=ir.Var("lhs", ir.TileType([8, 64], DataType.INT32), span))
+
+        with pytest.raises(TypeError, match="Tile inputs require an explicit scratch tile"):
+            getattr(unified_ops, op_name)(lhs, 1)
+
+    def test_cast_rejects_non_default_mode_for_scalar(self):
+        """A *valid* mode the Scalar path cannot honour is a TypeError...
+
+        ...while a mode that is not a mode at all stays a ValueError from
+        ``resolve_cast_mode``, which runs first.
+        """
+        span = ir.Span.unknown()
+        scalar = Scalar(expr=ir.Var("s", ir.ScalarType(DataType.FP32), span))
+
+        with pytest.raises(TypeError, match="Scalar inputs do not support non-default mode"):
+            unified_ops.cast(scalar, DataType.INT32, mode="floor")
+
+        with pytest.raises(ValueError, match="Invalid rounding mode"):
+            unified_ops.cast(scalar, DataType.INT32, mode="not_a_mode")
+
     def test_matmul_invalid_lhs(self):
         with pytest.raises(TypeError, match="expected Tensor or Tile operands"):
             unified_ops.matmul(1, 2)  # type: ignore
@@ -1271,6 +1485,465 @@ class TestUnifiedOpsTypeErrors:
         """batch_matmul with non-Tensor/Tile input raises TypeError."""
         with pytest.raises(TypeError, match="expected Tensor or Tile operands"):
             unified_ops.batch_matmul(1, 2)  # type: ignore
+
+
+# The unified wrappers accept the union of both levels' kwargs. A kwarg only the
+# *other* dispatch path can honour must raise instead of being dropped — a
+# discarded ``b_trans`` compiles wrong math, and a discarded scratch tile leaves
+# the caller's buffer dead while still consuming UB budget. Only a non-default
+# value raises; spelling out the documented default keeps working.
+_TMP_TILE_REDUCTIONS = [
+    "row_max",
+    "row_sum",
+    "row_min",
+    "row_prod",
+    "col_sum",
+    "row_argmax",
+    "row_argmin",
+    "col_argmax",
+    "col_argmin",
+]
+
+
+def _tile(name: str, shape: list[int], dtype: DataType = DataType.FP16) -> Tile:
+    return Tile(expr=ir.Var(name, ir.TileType(shape, dtype), ir.Span.unknown()))
+
+
+def _tensor(name: str, shape: list[int], dtype: DataType = DataType.FP32) -> Tensor:
+    return Tensor(expr=ir.Var(name, ir.TensorType(shape, dtype), ir.Span.unknown()))
+
+
+class TestUnifiedOpsCrossPathKwargs:
+    """Kwargs only one dispatch path can honour raise instead of being dropped."""
+
+    @pytest.mark.parametrize(
+        "kwarg,remedy",
+        [
+            ("a_trans", "transpose_view"),
+            ("b_trans", "transpose_view"),
+            ("c_matrix_nz", "Acc tile type"),
+        ],
+    )
+    def test_matmul_tile_rejects_tensor_only_flags(self, kwarg, remedy):
+        """Tensor-level matmul flags have no tile equivalent, so they must raise."""
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+        with pytest.raises(TypeError) as exc_info:
+            unified_ops.matmul(lhs, rhs, **{kwarg: True})  # type: ignore[call-overload]
+
+        msg = str(exc_info.value)
+        assert f"'{kwarg}'" in msg
+        assert "not supported for Tile operands" in msg
+        assert remedy in msg
+
+    def test_matmul_tile_accepts_explicit_default_flags(self):
+        """Spelling out the defaults is a no-op and yields plain pl.tile.matmul IR."""
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+
+        unified = unified_ops.matmul(lhs, rhs, a_trans=False, b_trans=False, c_matrix_nz=False)
+        explicit = pl.tile.matmul(lhs, rhs)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_matmul_tile_accepts_out_dtype_matching_deduction(self):
+        """tile.matmul deduces FP32 for float operands; asking for FP32 is honoured."""
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+
+        unified = unified_ops.matmul(lhs, rhs, out_dtype=DataType.FP32)
+        explicit = pl.tile.matmul(lhs, rhs)
+
+        result_type = unified.unwrap().type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.FP32
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_matmul_tile_rejects_out_dtype_the_accumulator_cannot_produce(self):
+        """The Cube accumulator is fixed at FP32 here, so FP16 must raise, not drop."""
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+        with pytest.raises(TypeError) as exc_info:
+            unified_ops.matmul(lhs, rhs, out_dtype=DataType.FP16)
+
+        msg = str(exc_info.value)
+        assert "out_dtype" in msg
+        assert "fp32" in msg  # names what it actually deduced
+        assert "pl.cast" in msg
+
+    def test_matmul_tile_rejects_unverifiable_int_out_dtype(self):
+        """A raw int dtype code cannot be compared against the deduction, so it raises.
+
+        ``DataType`` exposes no Python int conversion, so an int value cannot be
+        checked against what tile.matmul actually deduced — and skipping the
+        check is the silent drop this guard exists to prevent. The Tile overload
+        already rejects this statically (hence the suppression); the runtime
+        check still matters because the DSL parser reaches the wrapper
+        dynamically.
+        """
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+        with pytest.raises(TypeError, match="out_dtype"):
+            unified_ops.matmul(lhs, rhs, out_dtype=51)  # pyright: ignore[reportArgumentType]
+
+    def test_matmul_tensor_still_honors_all_kwargs(self):
+        """The Tensor path is untouched — every kwarg still reaches tensor.matmul."""
+        # b_trans=True means rhs is [N, K], so [512, 128] against an lhs K of 128.
+        lhs, rhs = _tensor("lhs", [32, 128], DataType.BF16), _tensor("rhs", [512, 128], DataType.BF16)
+
+        unified = unified_ops.matmul(lhs, rhs, out_dtype=DataType.FP32, a_trans=False, b_trans=True)
+        explicit = pl.tensor.matmul(lhs, rhs, DataType.FP32, False, True)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    @pytest.mark.parametrize("kwarg", ["a_trans", "b_trans"])
+    def test_matmul_acc_tile_rejects_transpose_flags(self, kwarg):
+        acc = _tile("acc", [32, 128], DataType.FP32)
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+        with pytest.raises(TypeError) as exc_info:
+            unified_ops.matmul_acc(acc, lhs, rhs, **{kwarg: True})  # type: ignore[call-overload]
+
+        msg = str(exc_info.value)
+        assert f"'{kwarg}'" in msg
+        assert "transpose_view" in msg
+
+    def test_matmul_acc_tile_accepts_explicit_default_flags(self):
+        acc = _tile("acc", [32, 128], DataType.FP32)
+        lhs, rhs = _tile("lhs", [32, 128]), _tile("rhs", [128, 128])
+
+        unified = unified_ops.matmul_acc(acc, lhs, rhs, a_trans=False, b_trans=False)
+        explicit = pl.tile.matmul_acc(acc, lhs, rhs)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_rsqrt_tile_rejects_high_precision(self):
+        """tile.rsqrt selects precision by taking a scratch tile, not by a flag."""
+        with pytest.raises(TypeError) as exc_info:
+            unified_ops.rsqrt(_tile("t", [64, 64], DataType.FP32), high_precision=True)  # type: ignore[call-overload]
+
+        msg = str(exc_info.value)
+        assert "'high_precision'" in msg
+        assert "pl.tile.rsqrt(tile, tmp)" in msg
+
+    def test_rsqrt_tile_default_still_lowers(self):
+        t = _tile("t", [64, 64], DataType.FP32)
+
+        unified = unified_ops.rsqrt(t)
+        explicit = pl.tile.rsqrt(t)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_rsqrt_tile_accepts_explicit_default_high_precision(self):
+        """Spelling out the default is a no-op the overloads must also accept."""
+        t = _tile("t", [64, 64], DataType.FP32)
+
+        unified = unified_ops.rsqrt(t, high_precision=False)
+        explicit = pl.tile.rsqrt(t)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_rsqrt_tensor_still_honors_high_precision(self):
+        x = _tensor("x", [64, 64])
+
+        unified = unified_ops.rsqrt(x, high_precision=True)
+        explicit = pl.tensor.rsqrt(x, high_precision=True)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    @pytest.mark.parametrize("op_name", _TMP_TILE_REDUCTIONS)
+    def test_reduction_tensor_path_rejects_tmp_tile(self, op_name):
+        """The conversion pass allocates the scratch, so a user tmp_tile must raise."""
+        x = _tensor("x", [64, 64])
+        tmp = _tile("tmp", [64, 64], DataType.FP32)
+        with pytest.raises(TypeError) as exc_info:
+            getattr(unified_ops, op_name)(x, tmp)  # type: ignore[call-overload]
+
+        msg = str(exc_info.value)
+        assert f"pl.{op_name}" in msg
+        assert "tmp_tile" in msg
+
+    @pytest.mark.parametrize("op_name", _TMP_TILE_REDUCTIONS)
+    def test_reduction_tensor_path_without_tmp_tile_unchanged(self, op_name):
+        """Omitting tmp_tile on the Tensor path still matches pl.tensor.<op>."""
+        x = _tensor("x", [64, 64])
+
+        unified = getattr(unified_ops, op_name)(x)
+        explicit = getattr(pl.tensor, op_name)(x)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    @pytest.mark.parametrize("op_name", _TMP_TILE_REDUCTIONS)
+    def test_reduction_tensor_path_accepts_explicit_none_tmp_tile(self, op_name):
+        """Passing the default explicitly stays legal — only a real tile raises."""
+        x = _tensor("x", [64, 64])
+
+        unified = getattr(unified_ops, op_name)(x, None)
+        explicit = getattr(pl.tensor, op_name)(x)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
+    def test_col_sum_tile_path_still_selects_binary_tree(self):
+        """tmp_tile is honoured on the Tile path — it selects binary-tree reduction."""
+        t = _tile("t", [64, 64], DataType.FP32)
+        tmp = _tile("tmp", [64, 64], DataType.FP32)
+
+        unified = unified_ops.col_sum(t, tmp)
+        explicit = pl.tile.col_sum(t, tmp)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        # The binary-tree form is distinguishable from the sequential one.
+        assert not ir.structural_equal(unified.unwrap(), pl.tile.col_sum(t).unwrap())
+
+
+# Run in a subprocess with the ``pypto`` package reached through a symlink.
+# ``argv[1]`` is the symlinked sys.path entry the import is expected to use.
+_SYMLINKED_IMPORT_PROBE = """\
+import sys
+import warnings
+
+import pypto
+from pypto import DataType, ir
+from pypto.language.op import unified_ops
+from pypto.language.typing import Tensor
+
+link_root = sys.argv[1]
+# Without this an installed copy or a stray PYTHONPATH would make the whole
+# check vacuous by importing through the real path.
+assert pypto.__file__.startswith(link_root), f"import bypassed the symlink: {pypto.__file__}"
+
+src = Tensor(expr=ir.Var("x", ir.TensorType([16, 32], DataType.FP32), ir.Span.unknown()))
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("default")
+    unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+    unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+    unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+
+assert len(caught) == 3, f"expected one warning per call site, got {len(caught)}"
+blamed = {w.filename for w in caught}
+assert blamed == {__file__}, f"warnings blamed {sorted(blamed)}, not {__file__}"
+"""
+
+
+class TestUnifiedSlicePadValue:
+    """``pl.slice`` forwards ``pad_value``, which both dispatch paths honour.
+
+    ``clamp`` is the only slice kwarg one path cannot honour; ``pad_value``
+    exists at both levels, so it is plain forwarding rather than a cross-path
+    guard. Each test pairs the structural match against the explicit call with
+    a negative assertion that the no-``pad_value`` IR differs — otherwise the
+    match would stay green if both sides dropped the kwarg.
+    """
+
+    def _pad_of(self, value: Tensor | Tile) -> ir.PadValue:
+        """Padding mode recorded on a sliced value's view."""
+        value_type = value.unwrap().type
+        view = getattr(value_type, "tensor_view", None)
+        if view is None:
+            view = getattr(value_type, "tile_view", None)
+        assert view is not None, "a narrowed slice must carry a view"
+        return view.pad
+
+    def test_tensor_path_forwards_pad_value(self):
+        x = _tensor("x", [16, 32])
+
+        unified = unified_ops.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=ir.PadValue.min)
+        explicit = pl.tensor.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=ir.PadValue.min)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        assert self._pad_of(unified) == ir.PadValue.min
+        unpadded = pl.tensor.slice(x, [8, 32], [0, 0], valid_shape=[8, 8])
+        assert not ir.structural_equal(unified.unwrap(), unpadded.unwrap())
+
+    def test_tile_path_forwards_pad_value(self):
+        t = _tile("t", [16, 32])
+
+        unified = unified_ops.slice(t, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=ir.PadValue.min)
+        explicit = pl.tile.slice(t, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=ir.PadValue.min)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        assert self._pad_of(unified) == ir.PadValue.min
+        unpadded = pl.tile.slice(t, [8, 32], [0, 0], valid_shape=[8, 8])
+        assert not ir.structural_equal(unified.unwrap(), unpadded.unwrap())
+
+    def test_literal_sugar_forwards(self):
+        """The ``0`` / ``inf`` sugars resolve on the unified path too."""
+        x = _tensor("x", [16, 32])
+
+        unified = unified_ops.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=0)
+        explicit = pl.tensor.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=ir.PadValue.zero)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        assert self._pad_of(unified) == ir.PadValue.zero
+
+    def test_pad_value_binds_sixth_positional(self):
+        """Positional order matches ``pl.tensor.slice`` — pad_value precedes clamp."""
+        x = _tensor("x", [16, 32])
+
+        unified = unified_ops.slice(x, [8, 32], [0, 0], [8, 8], None, ir.PadValue.max)
+        explicit = pl.tensor.slice(x, [8, 32], [0, 0], [8, 8], None, ir.PadValue.max)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        assert self._pad_of(unified) == ir.PadValue.max
+
+    def test_pad_value_rides_alongside_clamp(self):
+        """clamp narrows the valid region, so pad_value has something to paint."""
+        x = _tensor("x", [16, 32])
+
+        unified = unified_ops.slice(x, [16, 32], [8, 0], pad_value=ir.PadValue.max, clamp=True)
+        explicit = pl.tensor.slice(x, [16, 32], [8, 0], pad_value=ir.PadValue.max, clamp=True)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        assert self._pad_of(unified) == ir.PadValue.max
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_omitted_pad_value_is_unchanged(self, kind):
+        """The default stays byte-identical to the pre-``pad_value`` behaviour."""
+        # One shared source Var — structural equality matches Vars by pointer.
+        if kind == "tensor":
+            src: Tensor | Tile = _tensor("x", [16, 32])
+            explicit = pl.tensor.slice(src, [8, 32], [0, 0], valid_shape=[8, 8])
+        else:
+            src = _tile("t", [16, 32])
+            explicit = pl.tile.slice(src, [8, 32], [0, 0], valid_shape=[8, 8])
+
+        unified = unified_ops.slice(src, [8, 32], [0, 0], valid_shape=[8, 8])
+        with_none = unified_ops.slice(src, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=None)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+        ir.assert_structural_equal(with_none.unwrap(), explicit.unwrap())
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_pad_value_without_narrowing_still_warns(self, kind):
+        """The underlying no-op warning is not swallowed by the dispatcher."""
+        src: Tensor | Tile = _tensor("x", [16, 32]) if kind == "tensor" else _tile("t", [16, 32])
+
+        with pytest.warns(UserWarning, match="pad_value has no effect"):
+            unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_warning_names_the_caller_not_the_dispatcher(self, kind):
+        """The warning must point at user code, not at ``unified_ops``.
+
+        ``pytest.warns`` checks neither filename nor lineno, so it cannot catch
+        this; the assertion has to read the record.
+        """
+        src: Tensor | Tile = _tensor("x", [16, 32]) if kind == "tensor" else _tile("t", [16, 32])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+
+        assert len(caught) == 1
+        assert caught[0].filename == __file__
+
+    @pytest.mark.parametrize("kind", ["tensor", "tile"])
+    def test_each_call_site_warns_under_the_default_filter(self, kind):
+        """Distinct call sites must not collapse into a single warning.
+
+        The default filter dedupes on ``(text, category, lineno)`` in the frame
+        named by ``stacklevel``. A dispatcher-fixed stacklevel would key every
+        call site to one library line, showing the first and silently dropping
+        the rest.
+        """
+        src: Tensor | Tile = _tensor("x", [16, 32]) if kind == "tensor" else _tile("t", [16, 32])
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+            unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+            unified_ops.slice(src, [8, 32], [0, 0], pad_value=ir.PadValue.min)
+
+        assert len(caught) == 3, "each distinct call site must surface its own warning"
+
+    def test_pad_value_reaches_the_parser_path(self):
+        """A DSL body reaches the wrapper dynamically — pad_value must survive that."""
+
+        @pl.function
+        def unified(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            narrowed = pl.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=pl.PadValue.min)
+            return pl.fillpad_expand(narrowed, [16, 32])
+
+        @pl.function
+        def explicit(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            narrowed = pl.tensor.slice(x, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=pl.PadValue.min)
+            return pl.fillpad_expand(narrowed, [16, 32])
+
+        ir.assert_structural_equal(unified, explicit)
+
+        @pl.function
+        def unpadded(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            narrowed = pl.tensor.slice(x, [8, 32], [0, 0], valid_shape=[8, 8])
+            return pl.fillpad_expand(narrowed, [16, 32])
+
+        assert not ir.structural_equal(unified, unpadded)
+
+    def test_sibling_directory_is_not_mistaken_for_library_code(self):
+        """A user path that merely *starts with* the package dir is user code.
+
+        ``<parent>/pypto_kernels/k.py`` prefix-matches ``<parent>/pypto``, so a
+        bare ``startswith`` on the package directory would skip a real user
+        frame and walk on to name someone else's. The match has to be on a path
+        component.
+        """
+        pkg_dir = pathlib.Path(pypto_ir_utils.__file__).resolve().parent.parent
+        sibling = f"{pkg_dir}_kernels{os.sep}k.py"
+
+        namespace = {"probe": pypto_ir_utils.caller_warning_stacklevel}
+        exec(compile("def warn_site():\n    return probe()\n", sibling, "exec"), namespace)  # noqa: S102
+
+        # The frame that would call warnings.warn is itself user code, so the
+        # level naming it is 1 — not 2, which would name this test instead.
+        assert namespace["warn_site"]() == 1
+
+    def test_symlinked_import_path_still_names_the_caller(self, tmp_path):
+        """Reaching PyPTO through a symlink must not break caller attribution.
+
+        ``co_filename`` keeps the spelling the import used, so a package prefix
+        built by resolving symlinks never matches it under a symlinked
+        ``sys.path`` entry. Every library frame then reads as user code, the
+        walk stops at level 1, and ``warnings.warn`` names its own line —
+        collapsing the probe's three call sites onto a single warning.
+
+        Only a real import through a symlink makes ``__file__`` and the sibling
+        frames share the aliased spelling, so this needs a subprocess; an
+        in-process fake frame would not reproduce it.
+        """
+        package_root = pathlib.Path(pypto_ir_utils.__file__).resolve().parent.parent.parent
+        link_root = tmp_path / "linked_python"
+        link_root.symlink_to(package_root, target_is_directory=True)
+
+        script = tmp_path / "user_kernel.py"
+        script.write_text(_SYMLINKED_IMPORT_PROBE)
+
+        result = subprocess.run(
+            [sys.executable, str(script), str(link_root)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(link_root)},
+            check=False,
+        )
+
+        assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    def test_pad_value_reaches_the_parser_path_for_tiles(self):
+        """The Tile forward is reached dynamically through the parser too."""
+
+        @pl.function
+        def unified(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            t = pl.load(x, [0, 0], [16, 32], target_memory=pl.MemorySpace.Vec)
+            narrowed = pl.slice(t, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=pl.PadValue.min)
+            return pl.store(pl.fillpad_expand(narrowed, [16, 32]), [0, 0], x)
+
+        @pl.function
+        def explicit(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            t = pl.load(x, [0, 0], [16, 32], target_memory=pl.MemorySpace.Vec)
+            narrowed = pl.tile.slice(t, [8, 32], [0, 0], valid_shape=[8, 8], pad_value=pl.PadValue.min)
+            return pl.store(pl.fillpad_expand(narrowed, [16, 32]), [0, 0], x)
+
+        ir.assert_structural_equal(unified, explicit)
+
+        @pl.function
+        def unpadded(x: pl.Tensor[[16, 32], pl.FP32]) -> pl.Tensor[[16, 32], pl.FP32]:
+            t = pl.load(x, [0, 0], [16, 32], target_memory=pl.MemorySpace.Vec)
+            narrowed = pl.tile.slice(t, [8, 32], [0, 0], valid_shape=[8, 8])
+            return pl.store(pl.fillpad_expand(narrowed, [16, 32]), [0, 0], x)
+
+        assert not ir.structural_equal(unified, unpadded)
 
 
 if __name__ == "__main__":

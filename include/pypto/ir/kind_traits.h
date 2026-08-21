@@ -12,9 +12,13 @@
 #ifndef PYPTO_IR_KIND_TRAITS_H_
 #define PYPTO_IR_KIND_TRAITS_H_
 
+#include <any>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
@@ -118,6 +122,9 @@ DEFINE_KIND_TRAIT(MemRefType, ObjectKind::MemRefType)
 DEFINE_KIND_TRAIT(PtrType, ObjectKind::PtrType)
 DEFINE_KIND_TRAIT(WindowBufferType, ObjectKind::WindowBufferType)
 DEFINE_KIND_TRAIT(CommCtxType, ObjectKind::CommCtxType)
+DEFINE_KIND_TRAIT(PrefetchAsyncContextType, ObjectKind::PrefetchAsyncContextType)
+DEFINE_KIND_TRAIT(AsyncEventType, ObjectKind::AsyncEventType)
+DEFINE_KIND_TRAIT(AsyncSessionType, ObjectKind::AsyncSessionType)
 
 // Other IR node types
 DEFINE_KIND_TRAIT(Function, ObjectKind::Function)
@@ -154,7 +161,7 @@ struct KindTrait<Stmt> {
                                          ObjectKind::BreakStmt,
                                          ObjectKind::ContinueStmt,
                                          ObjectKind::InlineStmt};
-  static constexpr size_t count = 18;
+  static constexpr size_t count = sizeof(kinds) / sizeof(ObjectKind);
 };
 
 // ScopeStmt base class - matches any scope kind (7 derived classes)
@@ -171,19 +178,21 @@ struct KindTrait<ScopeStmt> {
 template <>
 struct KindTrait<Expr> {
   static constexpr ObjectKind kinds[] = {
-      // Direct expression types
-      ObjectKind::Var, ObjectKind::IterArg, ObjectKind::MemRef, ObjectKind::Call, ObjectKind::Submit,
-      ObjectKind::MakeTuple, ObjectKind::TupleGetItemExpr, ObjectKind::ConstInt, ObjectKind::ConstFloat,
-      ObjectKind::ConstBool,
-      // Binary expressions (22 kinds)
+      // Direct expression types. IterArg, MemRef and WindowBuffer are Var
+      // subclasses carrying their own ObjectKind, so each must be listed
+      // explicitly — see .claude/rules/ir-kind-traits.md.
+      ObjectKind::Var, ObjectKind::IterArg, ObjectKind::MemRef, ObjectKind::WindowBuffer, ObjectKind::Call,
+      ObjectKind::Submit, ObjectKind::MakeTuple, ObjectKind::TupleGetItemExpr, ObjectKind::ConstInt,
+      ObjectKind::ConstFloat, ObjectKind::ConstBool,
+      // Binary expressions — must stay a superset of KindTrait<BinaryExpr>
       ObjectKind::Add, ObjectKind::Sub, ObjectKind::Mul, ObjectKind::FloorDiv, ObjectKind::FloorMod,
       ObjectKind::FloatDiv, ObjectKind::Min, ObjectKind::Max, ObjectKind::Pow, ObjectKind::Eq, ObjectKind::Ne,
       ObjectKind::Lt, ObjectKind::Le, ObjectKind::Gt, ObjectKind::Ge, ObjectKind::And, ObjectKind::Or,
       ObjectKind::Xor, ObjectKind::BitAnd, ObjectKind::BitOr, ObjectKind::BitXor, ObjectKind::BitShiftLeft,
       ObjectKind::BitShiftRight,
-      // Unary expressions (5 kinds)
+      // Unary expressions — must stay a superset of KindTrait<UnaryExpr>
       ObjectKind::Abs, ObjectKind::Neg, ObjectKind::Not, ObjectKind::BitNot, ObjectKind::Cast};
-  static constexpr size_t count = 38;
+  static constexpr size_t count = sizeof(kinds) / sizeof(ObjectKind);
 };
 
 // BinaryExpr base class - matches any binary expression kind
@@ -211,6 +220,8 @@ struct KindTrait<UnaryExpr> {
 template <>
 struct KindTrait<Type> {
   static constexpr ObjectKind kinds[] = {ObjectKind::UnknownType,
+                                         ObjectKind::MemRefType,
+                                         ObjectKind::PtrType,
                                          ObjectKind::ScalarType,
                                          ObjectKind::ShapedType,
                                          ObjectKind::TensorType,
@@ -219,7 +230,10 @@ struct KindTrait<Type> {
                                          ObjectKind::ArrayType,
                                          ObjectKind::TupleType,
                                          ObjectKind::WindowBufferType,
-                                         ObjectKind::CommCtxType};
+                                         ObjectKind::CommCtxType,
+                                         ObjectKind::PrefetchAsyncContextType,
+                                         ObjectKind::AsyncEventType,
+                                         ObjectKind::AsyncSessionType};
   static constexpr size_t count = sizeof(kinds) / sizeof(ObjectKind);
 };
 
@@ -232,6 +246,36 @@ struct KindTrait<ShapedType> {
                                          ObjectKind::ArrayType};
   static constexpr size_t count = sizeof(kinds) / sizeof(ObjectKind);
 };
+
+// Base/derived containment guards.
+//
+// Every kind listed for a derived base class must also appear in its parent's
+// array, or As<Parent>() silently stops matching a subtree that As<Derived>()
+// still matches. These fire at compile time when a kind is appended to one
+// array and forgotten in the sibling it belongs to as well.
+//
+// Coverage of the ObjectKind enum itself is deliberately *not* asserted: the
+// enum groups kinds by category but does not guarantee that every kind of a
+// given base sits in one contiguous range — WindowBuffer is declared under
+// "Other IR node kinds" yet is a Var subclass — so a range check would be wrong.
+namespace detail {
+template <typename Parent, typename Derived>
+constexpr bool KindsAreSubset() {
+  for (size_t i = 0; i < KindTrait<Derived>::count; ++i) {
+    if (!IsKindInArray<Parent>(KindTrait<Derived>::kinds[i])) return false;
+  }
+  return true;
+}
+}  // namespace detail
+
+static_assert(detail::KindsAreSubset<Expr, BinaryExpr>(),
+              "KindTrait<Expr> must list every kind in KindTrait<BinaryExpr>");
+static_assert(detail::KindsAreSubset<Expr, UnaryExpr>(),
+              "KindTrait<Expr> must list every kind in KindTrait<UnaryExpr>");
+static_assert(detail::KindsAreSubset<Stmt, ScopeStmt>(),
+              "KindTrait<Stmt> must list every kind in KindTrait<ScopeStmt>");
+static_assert(detail::KindsAreSubset<Type, ShapedType>(),
+              "KindTrait<Type> must list every kind in KindTrait<ShapedType>");
 
 /**
  * @brief Check if an IR node is of a specific type (supports inheritance)
@@ -306,6 +350,61 @@ inline VarPtr AsVarLike(const ExprPtr& expr) {
     return std::static_pointer_cast<const Var>(expr);
   }
   return nullptr;
+}
+
+/**
+ * @brief Rewrite every ``ExprPtr`` an attr value references, by stored type.
+ *
+ * The rewriting counterpart of ``ForEachAttrExpr`` (``expr.h``): whatever that
+ * walk reports as a live reference, this one must rewrite, or substitution
+ * leaves the attr pointing at a pre-mutation ``Var``. Sharing one
+ * type-dispatched implementation is what keeps the two in step — the key lists
+ * they replaced had already drifted apart across ``IRMutator`` and the SSA
+ * pass's own ``SubstCallAttrs`` / ``SubstScopeAttrs``.
+ *
+ * The value's stored type is preserved: a ``VarPtr`` attr stays a ``VarPtr``
+ * and never widens to ``ExprPtr``. ``AsVarLike`` (not ``As<Var>``) keeps a
+ * remapped ``IterArg`` matching. Returns ``std::nullopt`` when nothing changed,
+ * so callers keep their copy-on-write short-circuit.
+ *
+ * @param value Attr value to rewrite.
+ * @param remap Callable mapping one ``ExprPtr`` to its replacement.
+ */
+template <typename F>
+std::optional<std::any> MapAttrExprs(const std::any& value, F&& remap) {
+  if (const auto* var = std::any_cast<VarPtr>(&value)) {
+    if (!*var) return std::nullopt;
+    auto next = AsVarLike(remap(ExprPtr(*var)));
+    if (!next || next.get() == var->get()) return std::nullopt;
+    return std::any(std::move(next));
+  }
+  if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&value)) {
+    std::vector<VarPtr> next;
+    next.reserve(vars->size());
+    bool changed = false;
+    for (const auto& v : *vars) {
+      if (!v) {
+        next.push_back(v);
+        continue;
+      }
+      auto remapped = AsVarLike(remap(ExprPtr(v)));
+      if (!remapped) {
+        next.push_back(v);  // Should not happen; keep the original over corrupting the attr.
+        continue;
+      }
+      if (remapped.get() != v.get()) changed = true;
+      next.push_back(std::move(remapped));
+    }
+    if (!changed) return std::nullopt;
+    return std::any(std::move(next));
+  }
+  if (const auto* expr = std::any_cast<ExprPtr>(&value)) {
+    if (!*expr) return std::nullopt;
+    auto next = remap(*expr);
+    if (!next || next.get() == expr->get()) return std::nullopt;
+    return std::any(std::move(next));
+  }
+  return std::nullopt;
 }
 
 /**

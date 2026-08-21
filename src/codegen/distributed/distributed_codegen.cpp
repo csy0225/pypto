@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "pypto/codegen/codegen_preconditions.h"
+#include "pypto/codegen/distributed/comm_layout.h"
 #include "pypto/codegen/distributed/distributed_op_registry.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
@@ -38,6 +39,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -248,19 +250,18 @@ std::vector<ir::FunctionPtr> DistributedCodegen::SortFunctionsByRoleAndLevel() c
 
 void DistributedCodegen::EmitImports() {
   emitter_.EmitLine("import torch");
-  // The unified strided ``Tensor`` + ``DataType`` are used by DistributedTensor
-  // formal emission (host_orch wraps per-rank window-bound regions via
-  // ``Tensor.make(..., child_memory=True)``).
+  // ``DataType`` is used when a comm-domain Buffer constructs its address-free
+  // wire Tensor view.
   // ``CommBufferSpec`` is the spec list passed to ``orch.allocate_domain``
   // inside host_orch when the program declares at least one comm domain;
   // harmless to import for comm-less L3 programs.
   emitter_.EmitLine(
       "from simpler.task_interface import "
-      "CallConfig, CommBufferSpec, DataType, TaskArgs, Tensor, TensorArgType");
+      "CallConfig, CommBufferSpec, DataType, TaskArgs, TensorArgType");
   emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
-  // ``_submit_chip`` wraps ``orch.submit_next_level`` to namespace per-dispatch
-  // DFX ``output_prefix`` (``<base>/rank{worker}/d{k}``, or ``rank_local/d{k}``
-  // for a comm-less dispatch); a no-op when DFX is off.
+  // ``_submit_chip`` resolves a comm-less dispatch's chip and namespaces the
+  // per-dispatch DFX ``output_prefix`` (``<base>/rank{worker}/d{k}``); the
+  // namespacing half is a no-op when DFX is off.
   emitter_.EmitLine("from pypto.runtime.distributed_runner import _submit_chip");
 }
 
@@ -554,17 +555,31 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
   // emitted Python at the point we write ``window_size=`` (it comes
   // ahead of the rest of the body).
   std::vector<std::string> slot_nbytes;
+  std::vector<std::string> slot_alloc_nbytes;
   slot_nbytes.reserve(op->slots_.size());
+  slot_alloc_nbytes.reserve(op->slots_.size());
   for (const auto& slot : op->slots_) {
-    slot_nbytes.push_back(GetCommSlotSizeAsCode(slot->size_));
+    const std::string logical_nbytes = GetCommSlotSizeAsCode(slot->size_);
+    slot_nbytes.push_back(logical_nbytes);
+    slot_alloc_nbytes.push_back("(((" + logical_nbytes + " + " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes - 1) +
+                                ") // " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes) + ") * " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes) + ")");
   }
 
-  // window_size = sum of all slot byte expressions. Parenthesise each summand
-  // to keep operator precedence safe under any sub-expression shape.
+  // Simpler places CommBufferSpecs consecutively. Round every physical
+  // allocation up to the transfer alignment so signal buffers following an
+  // odd-sized FP16 data buffer remain CCU-safe. ``count`` below retains the
+  // logical byte count, so the padding is not exposed through a
+  // DistributedTensor view. Aligning the final slot also provides safe tail
+  // storage for an FP16 remote TLOAD rounded to the same granularity.
+  // Parenthesise each summand to keep operator precedence safe under any
+  // sub-expression shape.
   std::ostringstream window_size_expr;
-  for (size_t i = 0; i < slot_nbytes.size(); ++i) {
+  for (size_t i = 0; i < slot_alloc_nbytes.size(); ++i) {
     if (i > 0) window_size_expr << " + ";
-    window_size_expr << "(" << slot_nbytes[i] << ")";
+    window_size_expr << "(" << slot_alloc_nbytes[i] << ")";
   }
 
   emitter_.EmitLine("with (_domain_provider or orch.allocate_domain)(");
@@ -576,18 +591,25 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
   emitter_.IncreaseIndent();
   for (size_t i = 0; i < op->slots_.size(); ++i) {
     const auto& slot = op->slots_[i];
-    const std::string& nbytes = slot_nbytes[i];
+    const std::string& logical_nbytes = slot_nbytes[i];
+    const std::string& alloc_nbytes = slot_alloc_nbytes[i];
     // dtype="opaque" mirrors the manifest-era placeholder: WindowBuffer is
     // intentionally dtype-agnostic (the field is unused by simpler). count is
-    // also in opaque bytes so it shares the same expression as nbytes.
+    // the exact logical byte length; nbytes is the aligned physical allocation.
     emitter_.EmitLine(std::string("CommBufferSpec(name=\"") + SanitizeName(slot->name_hint_) +
-                      R"(", dtype="opaque", count=)" + nbytes + ", nbytes=" + nbytes + "),");
+                      R"(", dtype="opaque", count=)" + logical_nbytes + ", nbytes=" + alloc_nbytes + "),");
   }
   emitter_.DecreaseIndent();
   emitter_.EmitLine("],");
   emitter_.DecreaseIndent();
   emitter_.EmitLine(") as " + handle_var + ":");
   emitter_.IncreaseIndent();
+
+  // The per-rank comm ordering token for this scope is allocated in
+  // ``_alloc_intermediates`` (see EmitAllocIntermediates), NOT here: it must
+  // exist as a POSIX shared mapping BEFORE ``w.init()`` forks the chip
+  // children, or the children cannot see it and staging the arg fails with
+  // "Failed to stage tensor N to device".
 
   // Push this scope so EmitCallToWorker can resolve DistributedTensor args
   // inside the body to the correct handle var. Pop on exit so a sibling
@@ -743,6 +765,23 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
     return;
   }
 
+  // Tensor→tensor alias: ``t = kernel_param`` — emit as a tensors-dict
+  // reference so both names resolve via ``tensors[...]`` in the generated
+  // Python.  Bare Python names for tensors are invisible to the prepared
+  // runtime's tensor registry (issue #2180).
+  // Only plain TensorType (not DistributedTensorType) goes through the
+  // tensors dict; distributed tensors use window_buffer_ references.
+  if (ir::As<ir::TensorType>(op->var_->GetType()) && ir::AsVarLike(op->value_)) {
+    VisitExpr(op->value_);
+    if (!current_expr_value_.empty()) {
+      emitter_.EmitLine("tensors[\"" + var_name + "\"] = tensors[\"" + current_expr_value_ + "\"]");
+      declared_vars_.insert(var_name);
+      current_expr_value_ = "";
+    }
+    current_target_var_ = "";
+    return;
+  }
+
   // Standard expression
   VisitExpr(op->value_);
 
@@ -813,19 +852,46 @@ void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
 void DistributedCodegen::VisitStmt_(const ir::IfStmtPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null IfStmt";
 
+  // ConvertToSSA always appends an else carrying the phi's incoming values
+  // (convert_to_ssa_pass.cpp:936-939), so a phi is always defined on both paths.
+  INTERNAL_CHECK_SPAN(op->return_vars_.empty() || op->else_body_.has_value(), op->span_)
+      << "Internal error: IfStmt with return_vars_ must carry an else_body "
+         "holding the phi's incoming values";
+
   VisitExpr(op->condition_);
-  std::string condition = current_expr_value_;
+  const std::string condition = current_expr_value_;
   current_expr_value_ = "";
+
+  // Merge each branch's yield into the phi name so post-if consumers see one
+  // name instead of a branch-local SSA name (issue #2180).
+  auto emit_yields = [&](const ir::StmtPtr& body) {
+    const auto yld = ir::transform_utils::GetLastYieldStmt(ir::transform_utils::UnwrapAutoScope(body));
+    if (!yld) return;
+    for (size_t i = 0; i < op->return_vars_.size() && i < yld->value_.size(); ++i) {
+      VisitExpr(yld->value_[i]);
+      const std::string val = current_expr_value_;
+      current_expr_value_ = "";
+      const std::string phi = SanitizeName(op->return_vars_[i]->name_hint_);
+      if (ir::AsTensorTypeLike(op->return_vars_[i]->GetType())) {
+        emitter_.EmitLine("tensors[\"" + phi + "\"] = tensors[\"" + val + "\"]");
+      } else {
+        emitter_.EmitLine(phi + " = " + val);
+      }
+      declared_vars_.insert(phi);
+    }
+  };
 
   emitter_.EmitLine("if " + condition + ":");
   emitter_.IncreaseIndent();
   VisitStmt(op->then_body_);
+  emit_yields(op->then_body_);
   emitter_.DecreaseIndent();
 
   if (op->else_body_.has_value()) {
     emitter_.EmitLine("else:");
     emitter_.IncreaseIndent();
     VisitStmt(*op->else_body_);
+    emit_yields(*op->else_body_);
     emitter_.DecreaseIndent();
   }
 }
@@ -913,8 +979,15 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
     return;
   }
 
+  const std::string& op_name = op->op_->name_;
+  const bool is_unhandled_tensor_or_tile_op =
+      op_name.rfind("tensor.", 0) == 0 || op_name.rfind("tile.", 0) == 0;
+  CHECK_SPAN(!is_unhandled_tensor_or_tile_op, op->span_)
+      << "DistributedCodegen does not support op '" << op_name << "' in function '" << current_func_->name_
+      << "'. Move this operation into a lower-level function or add a registered HOST-orchestrator lowering.";
+
   // Regular op call
-  current_expr_value_ = op->op_->name_ + "(" + FormatArgs(op->args_) + ")";
+  current_expr_value_ = op_name + "(" + FormatArgs(op->args_) + ")";
 }
 
 void DistributedCodegen::VisitExpr_(const ir::VarPtr& op) {
@@ -970,13 +1043,31 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   // Empty string means no ``device=`` was set — comm-less L3 dispatch path.
   std::string rank_expr = ResolveRankExpr(call);
 
+  // Every comm domain whose window buffers this dispatch references, in first-reference
+  // order and deduplicated. One ordering token is appended per domain below.
+  //
+  // Keyed on each buffer's OWNING scope (``ScopeForWindowBuffer``), not on the innermost
+  // lexical scope: a dispatch nested inside an inner domain may consume an outer domain's
+  // buffer, and this path — unlike the builtin-collective emitter, which asserts all its
+  // window args share one scope — places no such restriction on user kernels. Attaching the
+  // WAW edge to the lexically-innermost scope would then chain the dispatch into a domain it
+  // does not actually touch while leaving the domain it *does* touch unordered.
+  std::vector<ir::CommDomainScopeStmtPtr> comm_arg_scopes;
+
   // Build TaskArgs from callee's parameter directions
   emitter_.EmitLine(ta_var + " = TaskArgs()");
 
+  // ``TaskArgs`` requires every tensor to precede every scalar ("cannot add
+  // tensor after scalar"), so scalar emission is buffered and flushed once the
+  // tensor list is complete — otherwise the trailing comm ordering token below
+  // would be rejected at run time. Order within the scalar list is preserved,
+  // so the layout still matches the callee parameter list.
+  std::vector<std::string> scalar_lines;
+
   for (size_t i = 0; i < call->args_.size(); ++i) {
     if (ir::IsA<ir::CommCtxType>(call->args_[i]->GetType())) {
-      emitter_.EmitLine(ta_var + ".add_scalar(" + ResolveCommCtxArg(call->args_[i], rank_expr, call->span_) +
-                        ")");
+      scalar_lines.push_back(ta_var + ".add_scalar(" +
+                             ResolveCommCtxArg(call->args_[i], rank_expr, call->span_) + ")");
       continue;
     }
 
@@ -984,10 +1075,10 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     std::string arg_str = current_expr_value_;
     current_expr_value_ = "";
 
-    // N7: DistributedTensorType formals route through Tensor.make
-    // with ``child_memory=True``. ``As<DistributedTensorType>`` is strict
-    // ObjectKind match, so this branch fires only for DistributedTensor —
-    // plain TensorType falls through to the existing make_tensor_arg path.
+    // DistributedTensorType formals derive an address-free wire Tensor from
+    // the owning comm-domain Buffer. ``As<DistributedTensorType>`` is strict
+    // ObjectKind match, so plain TensorType falls through to the worker-aware
+    // make_tensor_arg path.
     if (auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType())) {
       INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
           << "Call passing DistributedTensor args must carry device= attr "
@@ -1002,10 +1093,15 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       if (i < callee->param_directions_.size()) {
         tag = ParamDirectionToTensorArgType(callee->param_directions_[i]);
       }
-      const std::string handle_var = HandleVarForScope(ScopeForWindowBuffer(window_buffer));
-      emitter_.EmitLine(ta_var + ".add_tensor(Tensor.make(data=" + handle_var + "[" + rank_expr +
-                        "].buffer_ptrs[\"" + name + "\"], shapes=" + shape + ", dtype=" + dtype_enum +
-                        ", child_memory=True), " + tag + ")");
+      const auto owning_scope = ScopeForWindowBuffer(window_buffer);
+      if (std::none_of(
+              comm_arg_scopes.begin(), comm_arg_scopes.end(),
+              [&](const ir::CommDomainScopeStmtPtr& seen) { return seen.get() == owning_scope.get(); })) {
+        comm_arg_scopes.push_back(owning_scope);
+      }
+      const std::string handle_var = HandleVarForScope(owning_scope);
+      emitter_.EmitLine(ta_var + ".add_tensor(" + handle_var + "[" + rank_expr + "].buffers[\"" + name +
+                        "\"].tensor(shapes=" + shape + ", dtype=" + dtype_enum + "), " + tag + ")");
       continue;
     }
 
@@ -1015,14 +1111,15 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       if (i < callee->param_directions_.size()) {
         tag = ParamDirectionToTensorArgType(callee->param_directions_[i]);
       }
-      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + arg_str + "\"]), " + tag + ")");
+      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + arg_str + "\"]), " +
+                        tag + ")");
       continue;
     }
 
     // ScalarType formal: pass through via ``add_scalar`` in IR-argument order
     // so the runtime TaskArgs layout matches the callee parameter list.
     if (ir::As<ir::ScalarType>(call->args_[i]->GetType())) {
-      emitter_.EmitLine(ta_var + ".add_scalar(" + arg_str + ")");
+      scalar_lines.push_back(ta_var + ".add_scalar(" + arg_str + ")");
       continue;
     }
 
@@ -1068,9 +1165,29 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
       emitter_.EmitLine("if \"" + target + "\" not in tensors:");
       emitter_.EmitLine("    tensors[\"" + target + "\"] = torch.zeros(" + shape + ", dtype=torch." +
                         torch_dtype + ").share_memory_()");
-      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(tensors[\"" + target +
+      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + target +
                         "\"]), TensorArgType.OUTPUT_EXISTING)");
     }
+  }
+
+  // Append the per-rank comm ordering token as the LAST TENSOR — after every
+  // real tensor (so their indices are unchanged) but before the scalars, which
+  // TaskArgs requires. Tensor and scalar args are indexed independently, so a
+  // trailing tensor shifts nothing. The chip side never reads it:
+  // `aicpu_orchestration_config` validates `actual_arg_count <
+  // expected_arg_count`, so an extra arg is accepted and the generated
+  // orchestration entry simply does not index it. That is what keeps this fix
+  // host-side only — no chip .cpp regeneration, no `expected_arg_count` change.
+  if (!is_sub && !rank_expr.empty()) {
+    for (const auto& scope : comm_arg_scopes) {
+      const std::string ord_key = HandleVarForScope(scope) + "_ord";
+      emitter_.EmitLine(ta_var + ".add_tensor(make_tensor_arg(orch._worker, tensors[\"" + ord_key + "\"][" +
+                        rank_expr + "]), TensorArgType.INOUT)");
+    }
+  }
+
+  for (const auto& line : scalar_lines) {
+    emitter_.EmitLine(line);
   }
 
   if (is_sub) {
@@ -1079,12 +1196,15 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   } else {
     // CHIP Worker: dispatch via ``_submit_chip`` (wraps orch.submit_next_level).
     // N7: thread the dispatch ``device=`` attr (N3 parser) into the simpler
-    // runtime's ``worker=`` kwarg — a rank-pinned dispatch passes its rank; a
-    // comm-less dispatch (empty rank_expr, no ``device=``) passes ``-1``
-    // (unconstrained; see simpler/python/simpler/orchestrator.py). ``_submit_chip``
-    // owns the per-dispatch DFX ``output_prefix`` namespacing — see its docstring.
+    // runtime's ``worker=`` kwarg. A rank-pinned dispatch passes its rank; a
+    // comm-less dispatch (empty rank_expr, no ``device=``) passes ``None``,
+    // which ``_submit_chip`` resolves to a concrete chip at dispatch time —
+    // simpler no longer accepts an unconstrained target (simpler #1436). The
+    // chip count is only known at run time, so the choice cannot be baked here.
+    // ``_submit_chip`` also owns the per-dispatch DFX ``output_prefix``
+    // namespacing — see its docstring.
     emitter_.EmitLine("_keep.append(" + ta_var + ")");
-    const std::string worker_arg = rank_expr.empty() ? "-1" : rank_expr;
+    const std::string worker_arg = rank_expr.empty() ? "None" : rank_expr;
     emitter_.EmitLine("_submit_chip(orch, callables[\"" + callee->name_ + "\"], " + ta_var + ", config, " +
                       worker_arg + ")");
   }
@@ -1234,6 +1354,34 @@ void RejectNestedTensorCreate(const ir::StmtPtr& stmt, const std::string& contai
   }
 }
 
+// Collects every CommDomainScopeStmt reachable in a body, in source order.
+// Used to allocate each scope's per-rank comm ordering token inside
+// ``_alloc_intermediates`` — those allocations must happen pre-fork, so they
+// cannot be emitted from VisitStmt_(CommDomainScopeStmtPtr), which runs while
+// emitting host_orch's body.
+void CollectCommDomainScopes(const ir::StmtPtr& stmt, std::vector<ir::CommDomainScopeStmtPtr>* out) {
+  if (!stmt) return;
+  if (auto scope = std::dynamic_pointer_cast<const ir::CommDomainScopeStmt>(stmt)) {
+    out->push_back(scope);
+    CollectCommDomainScopes(scope->body_, out);
+    return;
+  }
+  if (auto seq = std::dynamic_pointer_cast<const ir::SeqStmts>(stmt)) {
+    for (const auto& s : seq->stmts_) CollectCommDomainScopes(s, out);
+    return;
+  }
+  if (auto for_stmt = std::dynamic_pointer_cast<const ir::ForStmt>(stmt)) {
+    CollectCommDomainScopes(for_stmt->body_, out);
+    return;
+  }
+  if (auto if_stmt = std::dynamic_pointer_cast<const ir::IfStmt>(stmt)) {
+    CollectCommDomainScopes(if_stmt->then_body_, out);
+    if (if_stmt->else_body_.has_value()) {
+      CollectCommDomainScopes(*if_stmt->else_body_, out);  // NOLINT(bugprone-unchecked-optional-access)
+    }
+  }
+}
+
 // Returns the immediate top-level statements of a function body. The HOST
 // orchestrator body is a SeqStmts in practice; the single-stmt case is
 // handled for safety.
@@ -1277,11 +1425,49 @@ void DistributedCodegen::CollectHostOrchHoistableAllocs(const ir::FunctionPtr& h
 }
 
 void DistributedCodegen::EmitAllocIntermediatesFunction(const ir::FunctionPtr& host_orch) {
-  emitter_.EmitLine("def _alloc_intermediates(tensors):");
+  // ``world_size`` is passed by the runtime (distributed_runner) and defaults
+  // to 1 so an older caller still loads. It sizes the per-rank comm ordering
+  // tokens below, which cannot be sized at codegen time when a domain's worker
+  // list is `*range(world_size)`.
+  emitter_.EmitLine("def _alloc_intermediates(tensors, world_size=1):");
   emitter_.IncreaseIndent();
-  if (hoisted_allocs_.empty()) {
+
+  // Per-rank comm ordering tokens, one per comm domain scope.
+  //
+  // A chip dispatch becomes one `submit_next_level` DAG node whose edges come
+  // ONLY from tensor tags. A comm window carries no such edge, so dispatches
+  // that interact solely through `remote_store`/`notify`/`wait` are independent
+  // to the scheduler and the program order written in host_orch is discarded.
+  // The runtime routes a task to its per-worker FIFO as soon as it is READY
+  // (runtime/docs/scheduler.md: immediately-ready submissions and
+  // dependency-released consumers share one router), and a dispatch whose only
+  // job is to wait usually has NO producer — so it is routed ahead of the same
+  // rank's still-pending send. One task per worker means that spin-wait then
+  // owns the core and the send never runs: deadlock.
+  //
+  // Threading this token through every comm dispatch as INOUT gives a rank's
+  // comm dispatches a WAW chain in program order. It costs no parallelism: a
+  // worker executes one task at a time regardless, so it constrains ORDER, not
+  // concurrency.
+  //
+  // One SEPARATE allocation per rank, held in a list -- not rows of a single tensor. The
+  // runtime memoizes a host-tensor handle by its storage base and keys dependencies on that
+  // identity, so every view of one storage collapses into a single dependency node
+  // (``Worker.make_tensor_arg``: "every ref over the same storage shares one canonical
+  // identity and dependencies key on it"). Slicing one tensor per rank would therefore chain
+  // ALL ranks into one order, not each rank into its own -- and a program whose ranks must be
+  // in flight together, such as a barrier, cannot make progress under that.
+  std::vector<ir::CommDomainScopeStmtPtr> comm_scopes;
+  if (host_orch) CollectCommDomainScopes(host_orch->body_, &comm_scopes);
+  for (const auto& scope : comm_scopes) {
+    emitter_.EmitLine("tensors[\"" + HandleVarForScope(scope) +
+                      "_ord\"] = [torch.zeros((1,), dtype=torch.int32).share_memory_() "
+                      "for _ in range(max(world_size, 1))]");
+  }
+
+  if (hoisted_allocs_.empty() && comm_scopes.empty()) {
     emitter_.EmitLine("pass");
-  } else {
+  } else if (!hoisted_allocs_.empty()) {
     // Walk top-level statements in original order; emit only hoisted allocs.
     // Falls through the normal AssignStmt → Call → EmitTensorCreate path.
     // host_orch_body_after_hoist_ is FALSE here so EmitTensorCreate runs
@@ -1315,7 +1501,7 @@ std::string DistributedCodegen::DataTypeToPythonDType(const DataType& dtype) {
 std::string DistributedCodegen::DataTypeToSimplerEnum(const DataType& dtype) {
   // ``simpler.task_interface.DataType`` exposes the C-style enum names
   // (FLOAT16 / FLOAT32 / BFLOAT16 / INT* / UINT* / BOOL). Map PyPTO's
-  // dtype tags to those names so emitted ``Tensor.make(..., dtype=DataType.<X>)``
+  // dtype tags to those names so emitted ``buffer.tensor(..., dtype=DataType.<X>)``
   // matches at runtime.
   if (dtype == DataType::FP16) return "FLOAT16";
   if (dtype == DataType::FP32) return "FLOAT32";

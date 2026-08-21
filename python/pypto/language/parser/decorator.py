@@ -15,26 +15,47 @@ import inspect
 import linecache
 import sys
 import textwrap
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeAlias, TypeVar, cast, overload
 
+from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.compile_profiling import CompileProfiler, get_active_profiler
 from pypto.pypto_core import ir
 
 from .ast_parser import ASTParser
 from .comment_extractor import extract_line_comments
-from .diagnostics import ParserError, ParserSyntaxError, concise_error_message
+from .diagnostics import BUG_CLASS_EXCEPTIONS, ParserError, ParserSyntaxError, concise_error_message
 from .enum_utils import FUNCTION_TYPE_MAP, LEVEL_MAP, ROLE_MAP, SPLIT_MODE_MAP, extract_enum_value
+from .source_lookup import get_class_source_lines
+
+
+def _is_pl_func_attr_stmt(stmt: ast.stmt) -> bool:
+    """True when ``stmt`` is a ``pl.func_attr({...})`` prologue directive."""
+    if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+        return False
+    func = stmt.value.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "func_attr"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "pl"
+    )
 
 
 def _is_abstract_subworker_body(func_def: ast.FunctionDef) -> bool:
     """True if the SubWorker body is an abstract ``...`` declaration.
 
     An abstract SubWorker declares only ``...`` (optionally preceded by a
-    docstring) and carries no implementation — it is a runtime-bound callback
-    point that must be supplied via ``prepare(callbacks={...})``. A bare ``pass``
-    is *not* abstract: it is a valid no-op SubWorker with a concrete body.
+    docstring and a ``pl.func_attr({...})`` prologue) and carries no
+    implementation — it is a runtime-bound callback point that must be supplied
+    via ``prepare(callbacks={...})``. A bare ``pass`` is *not* abstract: it is a
+    valid no-op SubWorker with a concrete body.
+
+    The prologue is skipped for the same reason the docstring is: it is
+    parse-time metadata, not an implementation, so a SubWorker carrying function
+    attrs stays abstract and keeps a printable spelling for them.
     """
     non_doc = [
         stmt
@@ -44,6 +65,7 @@ def _is_abstract_subworker_body(func_def: ast.FunctionDef) -> bool:
             and isinstance(stmt.value, ast.Constant)
             and isinstance(stmt.value.value, str)
         )
+        and not _is_pl_func_attr_stmt(stmt)
     ]
     return (
         len(non_doc) == 1
@@ -403,30 +425,112 @@ def _extract_function_auto_scope_from_decorator(node: ast.FunctionDef) -> bool |
     return None
 
 
-def _normalize_attrs(attrs: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize function attrs: convert SplitMode enums to int values for C++ storage.
+def _normalize_attrs(attrs: Any) -> dict[str, Any] | None:
+    """Normalize function attrs for C++ storage.
 
-    SplitMode.NONE entries are dropped (equivalent to no split).
+    ``SplitMode`` enums become their int value; ``SplitMode.NONE`` is dropped
+    (equivalent to no split, and the printer filters it for the same reason).
+
+    DSL wrapper values are unwrapped to the IR ``Expr`` they carry. The printer
+    emits that ``Expr`` in DSL spelling (e.g. ``pl.system.available_cluster_count()``),
+    so reparsing printed source evaluates the wrapper again — without this the
+    attr store rejects it as an unsupported kwarg type.
+
     Returns None if the result is empty.
+
+    Raises:
+        ParserSyntaxError: If ``attrs`` is not a dict, a key is not a string, or
+            a value references an SSA binding (see the ``StaticAttrs`` IR
+            property — a Function attr has no legal spelling for one).
     """
-    if not attrs:
-        return None
+    if not isinstance(attrs, dict):
+        raise ParserSyntaxError(
+            f"`@pl.function(attrs=...)` must be a dict, got {type(attrs).__name__}",
+            hint='Use a dict, e.g. attrs={"split": pl.SplitMode.UP_DOWN}.',
+        )
     result: dict[str, Any] = {}
     for key, value in attrs.items():
+        if not isinstance(key, str):
+            raise ParserSyntaxError(
+                f"`@pl.function(attrs=...)` keys must be strings, got {key!r}",
+                hint='Use string keys, e.g. attrs={"core_num": 8}.',
+            )
         if isinstance(value, ir.SplitMode):
             if value != ir.SplitMode.NONE:
                 result[key] = value.value
-        else:
-            result[key] = value
+            continue
+        if hasattr(value, "unwrap"):
+            # Annotation-only wrappers raise on unwrap, but not uniformly:
+            # Scalar/Ptr raise RuntimeError while Tensor/Tile/Array raise
+            # ValueError. Catch both so the actionable diagnostic is not
+            # bypassed by whichever wrapper the caller passed.
+            try:
+                value = value.unwrap()
+            except (RuntimeError, ValueError) as e:
+                raise ParserSyntaxError(
+                    f"@pl.function attr '{key}' is an annotation-only {type(value).__name__}",
+                    hint="Pass a value expression, not a type annotation.",
+                ) from e
+        _reject_ssa_referencing_attr(key, value)
+        result[key] = value
     return result or None
 
 
-# Function-attr key carrying the path to a hand-written external C++ kernel
-# source. When present on an AIC/AIV function, the DSL body is empty (``...``):
-# the compiler assigns the function a kernel func_id and emits the orchestration
-# submit as usual, but skips PyPTO codegen and instead compiles the referenced
-# ``.cpp`` as the InCore kernel (see pto_backend). Stored as an absolute path str.
-EXTERNAL_SOURCE_ATTR = "external_source"
+def _reject_ssa_referencing_attr(key: str, value: Any) -> None:
+    """Reject a Function attr value that references an SSA binding.
+
+    The DSL-side half of the ``StaticAttrs`` IR property. A ``Var`` in a
+    function attr names something the function does not bind: a decorator is
+    evaluated before the body binds anything, and a launch-site value belongs
+    to the *calling* function. Such an attr is unprintable as a decorator and
+    invisible to every pass that walks the use-def chain, so it is rejected at
+    the source rather than surfacing later as a structural mismatch.
+    """
+    if isinstance(value, (list, tuple)):
+        offenders = [v for v in value if isinstance(v, ir.Expr)]
+    else:
+        offenders = [value] if isinstance(value, ir.Expr) else []
+    for expr in offenders:
+        if not _expr_references_ssa(expr):
+            continue
+        raise ParserSyntaxError(
+            f"@pl.function attr '{key}' references a variable, which a function attr cannot carry",
+            hint=(
+                "A decorator is evaluated before the signature binds any name, so it cannot spell a "
+                "reference. To reference a parameter, declare the attr in the body prologue instead: "
+                "`pl.func_attr({'stationary': w})` as the first statement, where the parameters are "
+                "bound. To pass a launch width, use the launch site — `with pl.spmd(n):` rather than "
+                "`attrs={'core_num': n}`."
+            ),
+        )
+
+
+class _SsaRefFinder(ir.IRVisitor):
+    """Detects any Var-like reference inside an attr expression subtree.
+
+    ``Var`` and ``IterArg`` are overridden separately rather than through
+    ``visit_var_like`` because each carries its own ``ObjectKind`` and so
+    dispatches independently (see ``.claude/rules/ir-kind-traits.md``).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.found = False
+
+    def visit_var(self, op: ir.Var) -> None:
+        self.found = True
+
+    def visit_iter_arg(self, op: Any) -> None:
+        self.found = True
+
+    def visit_mem_ref(self, op: Any) -> None:
+        self.found = True
+
+
+def _expr_references_ssa(expr: ir.Expr) -> bool:
+    finder = _SsaRefFinder()
+    finder.visit_expr(expr)
+    return finder.found
 
 
 def _resolve_external_source(external_source: str | Path, caller_frame: Any) -> str:
@@ -461,11 +565,44 @@ def _resolve_external_source(external_source: str | Path, caller_frame: Any) -> 
     return str(path)
 
 
-def _extract_function_attrs_from_decorator(node: ast.FunctionDef) -> dict[str, Any]:
-    """Extract function attrs from @pl.function(attrs={...}) decorator.
+# ``pl.system.available_*_count()`` used as an SPMD launch width can still appear
+# in a decorator's ``attrs["core_num"]`` (a legacy Function-level launch spec —
+# the outliner now puts the spec on the dispatch instead). The printer emits it
+# as the call itself: it binds no variable, so there is no name to reference and
+# recovering it needs no scope, unlike a Var-valued core_num.
+_LAUNCH_QUERY_ATTR_OPS = ("available_cluster_count", "available_aiv_count")
 
-    Supports attrs={"split": pl.SplitMode.UP_DOWN, ...} syntax.
-    Returns a normalized dict with enum values converted to ints.
+
+def _parse_launch_query_call(node: ast.expr) -> Any | None:
+    """Rebuild the IR Call for a ``pl.system.available_*_count()`` attr value.
+
+    Returns ``None`` for any other expression, leaving the caller's existing
+    handling in place.
+    """
+    if not isinstance(node, ast.Call) or node.args or node.keywords:
+        return None
+    func = node.func
+    if not (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == "system"
+        and isinstance(func.value.value, ast.Name)
+        and func.value.value.id == "pl"
+        and func.attr in _LAUNCH_QUERY_ATTR_OPS
+    ):
+        return None
+    from pypto.ir.op import system_ops  # noqa: PLC0415  (avoids an import cycle at module load)
+
+    return getattr(system_ops, func.attr)()
+
+
+def _extract_function_attrs_from_decorator(node: ast.FunctionDef) -> dict[str, Any]:
+    """Extract function attrs from decorator AST when runtime metadata is unavailable.
+
+    The normal ``@pl.program`` path reads the evaluated attrs snapshot retained
+    by :func:`function`. This fallback supports the small set of expressions
+    that can be reconstructed without executing arbitrary source and rejects
+    everything else rather than silently dropping an attr.
     """
     decorator = _find_function_decorator_call(node)
     if decorator is None:
@@ -500,6 +637,13 @@ def _extract_function_attrs_from_decorator(node: ast.FunctionDef) -> dict[str, A
                     attrs["split"] = split_mode.value
             elif isinstance(v, ast.Constant):
                 attrs[attr_key] = v.value
+            elif (launch_query := _parse_launch_query_call(v)) is not None:
+                attrs[attr_key] = launch_query
+            else:
+                raise ParserSyntaxError(
+                    f"Unsupported value for @pl.function attr '{attr_key}': {ast.unparse(v)}",
+                    hint=("Use a scalar literal, pl.SplitMode value, or pl.system.available_*_count() call."),
+                )
         return attrs
     return {}
 
@@ -638,7 +782,7 @@ def _get_source_info(entity: Callable | type, entity_type: str) -> tuple[str, li
     """Get source file, source lines, and starting line for an entity.
 
     Tries multiple strategies:
-    1. Standard inspect.getsourcelines()
+    1. Standard inspect.getsourcelines() (classes take a cached fast path first)
     2. linecache fallback (handles IPython, pre-populated cache)
     3. sys.orig_argv for `python -c` invocations
     4. Clear error with actionable hint
@@ -663,7 +807,13 @@ def _get_source_info(entity: Callable | type, entity_type: str) -> tuple[str, li
     # Strategy 1: Standard inspect
     try:
         source_file = inspect.getfile(entity)
-        source_lines_raw, starting_line = inspect.getsourcelines(entity)
+        if isinstance(entity, type):
+            # inspect.getsourcelines() costs a full-file ast.parse per class on
+            # CPython < 3.13; this returns the same answer for one parse per
+            # file, and defers to inspect elsewhere. See parser/source_lookup.py.
+            source_lines_raw, starting_line = get_class_source_lines(entity)
+        else:
+            source_lines_raw, starting_line = inspect.getsourcelines(entity)
         return source_file, source_lines_raw, starting_line
     except (OSError, TypeError):
         pass
@@ -795,6 +945,15 @@ def function(
     caller_frame = sys._getframe(1)
     closure_vars = {**caller_frame.f_globals, **caller_frame.f_locals}
 
+    if attrs:
+        warnings.warn(
+            "@pl.function(attrs={...}) is deprecated: a decorator is evaluated before the "
+            "signature binds, so it cannot reference parameters. Use pl.func_attr({...}) as "
+            "the first statement of the function body instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     resolved_external_source = (
         _resolve_external_source(external_source, caller_frame) if external_source is not None else None
     )
@@ -804,10 +963,18 @@ def function(
         # If so, return the original function - it will be parsed by @pl.program decorator
         if _is_class_method(f):
             # Don't parse now - let @pl.program handle it with proper global_vars
-            # context. Stash the resolved external_source on the function object so
-            # the @pl.program AST walker can recover it via getattr (the value is a
-            # runtime Path expression, not an AST literal, so it can't be re-read
-            # from the decorator node).
+            # context. Retain an evaluated snapshot of attrs on the function
+            # object: reconstructing the dict from AST loses closure values,
+            # DataType values, and every other non-literal expression. The
+            # @pl.program walker reads this snapshot before building the IR.
+            # Gate on `is not None`, not truthiness: a falsey non-dict such as
+            # `attrs=[]` or `attrs=""` must reach the validator rather than be
+            # silently treated as absent.
+            f._pl_function_attrs = (  # type: ignore[attr-defined]
+                _normalize_attrs(attrs) or {} if attrs is not None else {}
+            )
+            # Stash the resolved external_source for the same reason: the value
+            # is a runtime Path expression that cannot be re-read from the AST.
             if resolved_external_source is not None:
                 f._pl_external_source = resolved_external_source  # type: ignore[attr-defined]
             return f
@@ -844,10 +1011,10 @@ def function(
             )
 
             # Normalize attrs: convert enum values to ints for storage
-            func_attrs = _normalize_attrs(attrs) if attrs else None
+            func_attrs = _normalize_attrs(attrs) if attrs is not None else None
             # Fold auto_scope=False into attrs (absent ⇒ default True).
             if auto_scope is False:
-                func_attrs = {**(func_attrs or {}), "auto_scope": False}
+                func_attrs = {**(func_attrs or {}), AUTO_SCOPE_ATTR: False}
             # Fold external_source into attrs — marks this as a header-only
             # external kernel (empty ``...`` body, backed by hand-written C++).
             if resolved_external_source is not None:
@@ -863,6 +1030,9 @@ def function(
                 )
             except ParserError:
                 # Re-raise ParserError as-is, it already has source lines
+                raise
+            except BUG_CLASS_EXCEPTIONS:
+                # Compiler bug, not a bad kernel - surface it with its type and trace intact.
                 raise
             except Exception as e:
                 # Wrap unexpected exceptions as ParserError
@@ -1078,18 +1248,23 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                 # Extract function type, level/role, and attrs from decorator
                 func_type = _extract_function_type_from_decorator(func_def)
                 func_level, func_role = _extract_function_level_role_from_decorator(func_def)
-                func_attrs = _extract_function_attrs_from_decorator(func_def)
+                method_obj = getattr(c, func_def.name, None)
+                evaluated_attrs = getattr(method_obj, "_pl_function_attrs", None)
+                func_attrs = (
+                    dict(evaluated_attrs)
+                    if evaluated_attrs is not None
+                    else _extract_function_attrs_from_decorator(func_def)
+                )
                 # Fold auto_scope=False into attrs (absent ⇒ default True). The pass
                 # MaterializeRuntimeScopes and the parser both read attrs["auto_scope"].
                 func_auto_scope = _extract_function_auto_scope_from_decorator(func_def)
                 if func_auto_scope is False:
-                    func_attrs["auto_scope"] = False
+                    func_attrs[AUTO_SCOPE_ATTR] = False
 
                 # External C++ kernel: @pl.function(external_source=...) stashed the
                 # resolved path on the method object (the value is a runtime Path
                 # expression, not an AST literal). Fold it into attrs so the parser
                 # emits a header-only function and the backend compiles the .cpp.
-                method_obj = getattr(c, func_def.name, None)
                 external_source = getattr(method_obj, "_pl_external_source", None)
                 if external_source is not None:
                     func_attrs[EXTERNAL_SOURCE_ATTR] = external_source
@@ -1157,6 +1332,9 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
                     ) from e
                 except ParserError:
                     raise
+                except BUG_CLASS_EXCEPTIONS:
+                    # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+                    raise
                 except Exception as e:
                     raise ParserSyntaxError(
                         f"Failed to parse function '{func_def_to_parse.name}': {concise_error_message(e)}",
@@ -1184,8 +1362,10 @@ def program(cls: type | None = None, *, strict_ssa: bool = False) -> ir.Program 
             # Combine internal and external functions
             all_functions = functions + list(external_functions.values())
 
-            # Create Program with class name and span
-            program_span = ir.Span(source_file, starting_line, col_offset)
+            # Create Program with class name and span. ``col_offset`` is the
+            # class's indentation as a character count; Span columns are
+            # 1-indexed, so a class at the left margin starts at column 1.
+            program_span = ir.Span(source_file, starting_line, col_offset + 1)
             prog = ir.Program(all_functions, c.__name__, program_span)
 
             return prog

@@ -48,6 +48,11 @@ namespace ir {
  * - Spmd: SPMD data-parallel dispatch wrapper
  * - Inline: Whole-body substitution at every call site by the InlineFunctions
  *   pass. Eliminated from the program before any other pass runs.
+ * - Graph: A callable orchestration fragment. Its body is orchestration code,
+ *   but each call site is a single task launch that the host_build_graph
+ *   runtime records once and replays thereafter. The runtime identifies the
+ *   recording by the address of the emitted C++ function, so one Graph
+ *   function is one recorded topology with no key to keep in sync.
  */
 enum class FunctionType : uint8_t {
   Opaque = 0,         ///< Default: unspecified function type
@@ -57,7 +62,8 @@ enum class FunctionType : uint8_t {
   AIV = 4,            ///< Vector core kernel (specialized InCore)
   Group = 5,          ///< Co-scheduled group of AIC + AIV kernels
   Spmd = 6,           ///< SPMD data-parallel dispatch
-  Inline = 7          ///< Whole-body substitution at every call site
+  Inline = 7,         ///< Whole-body substitution at every call site
+  Graph = 8           ///< Recordable/replayable orchestration fragment
 };
 
 /**
@@ -258,6 +264,8 @@ inline std::string FunctionTypeToString(FunctionType type) {
       return "Spmd";
     case FunctionType::Inline:
       return "Inline";
+    case FunctionType::Graph:
+      return "Graph";
   }
   throw pypto::TypeError("Unknown FunctionType");
 }
@@ -270,6 +278,8 @@ inline std::string FunctionTypeToString(FunctionType type) {
 inline Level FunctionTypeToLevel(FunctionType type) {
   switch (type) {
     case FunctionType::Orchestration:
+    case FunctionType::Graph:
+      // A Graph body is chip-level orchestration; only its call site differs.
       return Level::CHIP;
     case FunctionType::InCore:
       return Level::CHIP_DIE;
@@ -303,6 +313,23 @@ inline bool IsWrapperType(FunctionType type) {
 }
 
 /**
+ * @brief Check if a FunctionType has an orchestration body (Orchestration or Graph)
+ *
+ * Orchestration and Graph bodies are both host/AICPU task-orchestration code, so
+ * every pass that processes a function *because it orchestrates tasks* must
+ * accept both. Prefer this over `== FunctionType::Orchestration`, which silently
+ * skips Graph bodies and produces a program missing whatever that pass
+ * contributes.
+ *
+ * The exception is code that means "the single compilation entry point" rather
+ * than "an orchestration body" — that must stay a strict comparison, since a
+ * Graph is called by the entry, never the entry itself.
+ */
+inline bool IsOrchestrationLike(FunctionType type) {
+  return type == FunctionType::Orchestration || type == FunctionType::Graph;
+}
+
+/**
  * @brief Convert string to FunctionType
  * @param str String representation
  * @return FunctionType enum value
@@ -325,6 +352,8 @@ inline FunctionType StringToFunctionType(const std::string& str) {
     return FunctionType::Spmd;
   } else if (str == "Inline") {
     return FunctionType::Inline;
+  } else if (str == "Graph") {
+    return FunctionType::Graph;
   } else {
     throw pypto::TypeError("Unknown FunctionType: " + str);
   }
@@ -364,6 +393,110 @@ inline ParamDirection StringToParamDirection(const std::string& str) {
     throw pypto::TypeError("Unknown ParamDirection: " + str);
   }
 }
+
+/**
+ * @brief Reserved Function attr key marking a Group whose body was a
+ * ``pl.cluster(): with pl.spmd(...)`` region.
+ *
+ * Value type: ``bool`` (emitted only when true). Stamped by
+ * ``OutlineClusterScopes``' ``UnwrapNestedSpmd`` when it replaces the nested
+ * Spmd scope with its body and moves the launch spec onto the Group's dispatch
+ * (``kAttrCoreNum`` there — the spec cannot live on the Group, whose scope does
+ * not bind the caller-local Vars it references).
+ *
+ * This marker is what remains function-scoped, and legitimately so: it states a
+ * property of THIS function's body, references nothing outside it, and is a
+ * plain bool that round-trips through the decorator. It tells a launch-site
+ * consumer that dispatching this Group launches the kernels its body calls,
+ * rather than the Group itself as a mixed kernel — the distinction the
+ * occupancy verifier used to draw from the presence of a ``core_num`` attr.
+ */
+inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
+
+/**
+ * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH
+ * vector sub-lanes of a mixed kernel.
+ *
+ * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20) and
+ * ``SplitVectorKernel`` (pass 23) onto the AIV lane, and by
+ * ``ExpandMixedKernel`` (pass 21) for the backend-inferred no-split case
+ * (``BackendHandler::RequiresNoSplitDualAivDispatch``). Read by PTO codegen
+ * (``PTOCodegen::IsDualAivDispatchFunction`` — subblock-aware emission),
+ * orchestration codegen (both-lanes MixedKernel dispatch) and
+ * ``VerifyHardSyncallOccupancy`` (a dual-dispatched AIV kernel is a mixed-kernel
+ * lane, not a standalone AIV launch). Never stripped — it survives to codegen.
+ *
+ * Mode-agnostic on purpose: it states only "both AIV sub-lanes execute this
+ * body". The per-op split geometry rides the ``split`` attr / per-op ints, so a
+ * multi-mode ``pl.split_aiv`` function carries this marker with no
+ * function-level ``split`` mode at all.
+ */
+inline constexpr const char* kAttrDualAivDispatch = "dual_aiv_dispatch";
+
+/**
+ * @brief Reserved Function attr key marking an InCore function outlined from a
+ * scope that held ``pl.split_aiv`` region(s).
+ *
+ * Value type: ``bool``. Written by ``ScopeOutliner`` (pass 8) when it outlines a
+ * CORE_GROUP scope containing ``SplitAivScopeStmt`` regions, and re-stamped by
+ * ``LowerAutoVectorSplit`` (pass 20) on the functions it lowers. Read by
+ * ``SplitVectorKernel`` (pass 23, to stamp ``dual_aiv_dispatch`` without
+ * re-halving an already-lowered body), ``MemoryReuse`` (pass 33 — it gates the
+ * Ascend910B ``tile.load`` + ``tpop_from_aic`` in-place hazard guard) and
+ * ``VerifyAivSplit`` (provenance for the boundary-op checks). Never stripped.
+ *
+ * ``MemoryReuse`` keys on this marker rather than on ``Function::GetSplitMode``
+ * precisely because a multi-mode region function has no single function-level
+ * mode once pass 20 has lowered and erased the per-region ones — dropping the
+ * marker there silently disables a hardware-correctness guard.
+ */
+inline constexpr const char* kAttrSplitAiv = "split_aiv";
+
+/**
+ * @brief Reserved Function attr key recording that ``pl.split_aiv`` regions were
+ * already transpose-hazard-checked per region.
+ *
+ * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20), which
+ * validates each region against its own unambiguous mode. Read by
+ * ``ExpandMixedKernel`` (pass 21) to skip its single-function-mode transpose
+ * check, which would otherwise mis-check a multi-mode function against whichever
+ * mode happened to be stamped function-level. Never stripped.
+ */
+inline constexpr const char* kAttrSplitAivRegionValidated = "split_aiv_region_validated";
+
+/**
+ * @brief Reserved Function attr key naming a hand-written external C++ kernel
+ * source.
+ *
+ * Value type: ``std::string`` (an absolute path). Written by the
+ * ``@pl.function(external_source=...)`` decorator; the function's DSL body is
+ * then an empty ``...``. Read by ``ExpandMixedKernel`` (external members cannot
+ * be ABI-normalised or inferred into dual dispatch),
+ * ``VerifyReturnParamsExplicit`` (a declaration-only body legitimately has no
+ * ``ReturnStmt``), the Python printer, and the backend, which compiles the named
+ * ``.cpp`` in place of PyPTO codegen. Never stripped.
+ *
+ * Decorator-only: the printer emits it as an ``@pl.function(external_source=...)``
+ * keyword rather than a ``pl.func_attr({...})`` body prologue, because the parser
+ * must read it before it walks the body. Kept in sync with the parser's
+ * ``_DECORATOR_ONLY_FUNC_ATTRS``.
+ */
+inline constexpr const char* kAttrExternalSource = "external_source";
+
+/**
+ * @brief Reserved Function attr key opting a function out of automatic
+ * ``RuntimeScopeStmt`` materialization.
+ *
+ * Value type: ``bool``; **absent means true**, so only the opt-out (``false``)
+ * is ever stored. Written by the ``@pl.function(auto_scope=False)`` decorator and
+ * by ``MaterializeRuntimeScopes`` (pass 44), which stamps ``false`` on the
+ * functions it has already processed. Read by that same pass (idempotence),
+ * ``AutoDeriveTaskDependencies`` (pass 38), ``VerifyRuntimeScopesMaterialized``
+ * and the Python printer.
+ *
+ * Decorator-only, for the same reason as ``kAttrExternalSource`` — see there.
+ */
+inline constexpr const char* kAttrAutoScope = "auto_scope";
 
 /**
  * @brief Function definition
@@ -411,10 +544,13 @@ class Function : public IRNode {
     CHECK(params_.size() == param_directions_.size())
         << "params and param_directions must have same size, got " << params_.size() << " vs "
         << param_directions_.size();
-    if (IsInCoreType(func_type_) || func_type_ == FunctionType::Group ||
-        func_type_ == FunctionType::Orchestration) {
+    if (IsInCoreType(func_type_) || func_type_ == FunctionType::Group || IsOrchestrationLike(func_type_)) {
       Level derived_level = FunctionTypeToLevel(func_type_);
-      Role derived_role = (func_type_ == FunctionType::Orchestration) ? Role::Orchestrator : Role::SubWorker;
+      // A Graph body orchestrates tasks, so it is an Orchestrator like any other
+      // orchestration body. Code that must single out the compilation *entry*
+      // therefore cannot key on the role alone — see IsChipOrch in
+      // materialize_comm_domain_scopes_pass.cpp, which excludes Graph explicitly.
+      Role derived_role = IsOrchestrationLike(func_type_) ? Role::Orchestrator : Role::SubWorker;
       if (level_.has_value()) {
         CHECK(*level_ == derived_level)
             << "Function '" << name_ << "' has func_type=" << FunctionTypeToString(func_type_)
@@ -460,10 +596,10 @@ class Function : public IRNode {
   }
 
  public:
-  std::string name_;            // Function name
-  FunctionType func_type_;      // Function type (Opaque, Orchestration, InCore, AIC, AIV, or Group)
-  std::optional<Level> level_;  // Hierarchy level (nullopt = infer from func_type)
-  std::optional<Role> role_;    // Function role (nullopt = default per level)
+  std::string name_;                                     // Function name
+  FunctionType func_type_;                               // Function type (see the FunctionType enum)
+  std::optional<Level> level_;                           // Hierarchy level (nullopt = infer from func_type)
+  std::optional<Role> role_;                             // Function role (nullopt = default per level)
   std::vector<std::pair<std::string, std::any>> attrs_;  // Function-level attributes (key-value metadata)
   bool requires_runtime_binding_ = false;  // SubWorker with abstract (`...`) body: impl bound at runtime
   std::vector<VarPtr> params_;             // Parameter variables
@@ -516,6 +652,16 @@ class Function : public IRNode {
 };
 
 using FunctionPtr = std::shared_ptr<const Function>;
+
+/**
+ * @brief Null-safe overload of IsOrchestrationLike for a function handle
+ *
+ * A null handle is not orchestration-like, so callers that already hold a
+ * possibly-null FunctionPtr need no separate guard.
+ */
+inline bool IsOrchestrationLike(const FunctionPtr& func) {
+  return func != nullptr && IsOrchestrationLike(func->func_type_);
+}
 
 }  // namespace ir
 }  // namespace pypto

@@ -14,12 +14,14 @@
 # pyright: reportUndefinedVariable=false
 
 import pypto.language as pl
+import pytest
 from pypto import backend, codegen, ir
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 M = pl.dynamic("M")
 N = pl.dynamic("N")
+VALID_ONLY = pl.dynamic("VALID_ONLY")
 
 
 @pl.program
@@ -43,7 +45,7 @@ class AddKernelDynamic:
 
 @pl.program
 class AddKernelValidShape:
-    """Add kernel with static tensors but dynamic valid_shapes passed as scalars."""
+    """Add kernel with static tensors but dynamic valid_shape passed as scalars."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def add_kernel(
@@ -55,8 +57,8 @@ class AddKernelValidShape:
         N: pl.Scalar[pl.INDEX],
     ) -> pl.Tensor[[128, 128], pl.FP32]:
         """Loads 128x128 tiles but marks only [M, N] as valid: result = a + b"""
-        a_tile = pl.load(a, [0, 0], [128, 128], valid_shapes=[M, N])
-        b_tile = pl.load(b, [0, 0], [128, 128], valid_shapes=[M, N])
+        a_tile = pl.load(a, [0, 0], [128, 128], valid_shape=[M, N])
+        b_tile = pl.load(b, [0, 0], [128, 128], valid_shape=[M, N])
         result = pl.add(a_tile, b_tile)
         out = pl.store(result, [0, 0], output)
         return out
@@ -64,7 +66,7 @@ class AddKernelValidShape:
 
 @pl.program
 class AddKernelValidShapeExpr:
-    """Add kernel with valid_shapes computed from a runtime expression (regression for #707)."""
+    """Add kernel with valid_shape computed from a runtime expression (regression for #707)."""
 
     @pl.function(type=pl.FunctionType.InCore)
     def add_kernel(
@@ -77,8 +79,8 @@ class AddKernelValidShapeExpr:
     ) -> pl.Tensor[[128, 128], pl.FP32]:
         """valid_shape elements come from pl.min(...) — i.e. ir::Call, not ir::Var."""
         valid_m = pl.min(M, N)
-        a_tile = pl.load(a, [0, 0], [128, 128], valid_shapes=[valid_m, N])
-        b_tile = pl.load(b, [0, 0], [128, 128], valid_shapes=[valid_m, N])
+        a_tile = pl.load(a, [0, 0], [128, 128], valid_shape=[valid_m, N])
+        b_tile = pl.load(b, [0, 0], [128, 128], valid_shape=[valid_m, N])
         result = pl.add(a_tile, b_tile)
         out = pl.store(result, [0, 0], output)
         return out
@@ -181,7 +183,7 @@ def test_add_kernel_dynamic_shape_pto_codegen():
 
 
 def test_add_kernel_valid_shape_pto_codegen():
-    """Test PTO codegen handles load with valid_shapes: tile allocated from shapes, M/N as index scalars."""
+    """Test PTO codegen handles load with valid_shape: tile allocated from shapes, M/N as index scalars."""
     backend.reset_for_testing()
     backend.set_backend_type(BackendType.Ascend910B)
     func = AddKernelValidShape.get_function("add_kernel")
@@ -200,7 +202,7 @@ def test_add_kernel_valid_shape_pto_codegen():
     assert "shape = [%c128_index, %c128_index]" in mlir_code
     assert "strides = [%c128_index, %c1_index]" in mlir_code
     assert "!pto.tensor_view<?x?xf32>" in mlir_code
-    # partition_view follows valid_shapes (dynamic %arg3, %arg4) so the DMA
+    # partition_view follows valid_shape (dynamic %arg3, %arg4) so the DMA
     # only fetches the valid region from GM. The partition_view type therefore
     # uses dynamic dims and its sizes use the valid_shape SSA values directly.
     assert "partition_tensor_view<?x?xf32>" in mlir_code
@@ -268,7 +270,88 @@ def test_add_kernel_loop_dynamic_pto_codegen():
     assert "offsets = [, " not in mlir_code
 
 
-if __name__ == "__main__":
-    import pytest
+@pl.program
+class AddKernelTypeOnlyValidShape:
+    """valid_shape names a dyn symbol that exists only in the annotation.
 
+    VALID_ONLY is not a physical dimension and not a scalar parameter, so nothing
+    in the kernel binds it as written. MaterializeValidShapeSymbols appends it as
+    a trailing Scalar[INDEX] parameter so the extent arrives at run time.
+    """
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def add_kernel(
+        self,
+        a: pl.Tensor[
+            [M, N],
+            pl.FP32,
+            pl.TensorView(valid_shape=[M, VALID_ONLY], layout=pl.TensorLayout.ND),
+        ],
+        output: pl.Tensor[[M, N], pl.FP32],
+    ) -> pl.Tensor[[M, N], pl.FP32]:
+        """Loads the full tile; the load intersects with the source valid region."""
+        a_tile = pl.load(a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec)
+        result = pl.exp(a_tile)
+        return pl.store(result, [0, 0], output)
+
+
+def test_type_only_valid_shape_symbol_becomes_a_kernel_argument():
+    """A valid_shape-only symbol must reach codegen as a real runtime argument.
+
+    Regression: codegen used to log 'not found in MLIR mapping' and continue,
+    emitting an operand-less `arith.minsi , %c128_index : index` that surfaced
+    much later as an opaque ptoas 'expected SSA operand' parse error.
+    """
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B)
+    func = AddKernelTypeOnlyValidShape.get_function("add_kernel")
+    assert func is not None
+    program = ir.Program([func], "test_type_only_valid_shape", ir.Span.unknown())
+    optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
+
+    gen = codegen.PTOCodegen()
+    mlir_code = gen.generate(optimized)
+
+    # VALID_ONLY is a scalar param, so it precedes the M/N dyn-dim args:
+    # [tensors..., scalars...] then the trailing dyn dims.
+    assert "%arg2: index, %arg3: index, %arg4: index" in mlir_code
+    # The load's valid extent is min(VALID_ONLY, 128) and both operands are real.
+    assert "arith.minsi %arg2, %c128_index" in mlir_code
+    # No operand may be blank -- that is the malformed form this guards against.
+    assert "arith.minsi ," not in mlir_code
+    assert "valid_col = %0" in mlir_code
+
+
+def test_valid_shape_symbol_only_in_compound_slot_is_rejected():
+    """A symbol reachable only through a compound slot cannot be read back.
+
+    The call site binds a symbol by reading the actual argument's valid_shape at
+    the same position, so the declared slot has to name the symbol on its own.
+    """
+    scaled = pl.dynamic("VALID_SCALED")
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[
+                [M, N],
+                pl.FP32,
+                pl.TensorView(valid_shape=[M, scaled * 2], layout=pl.TensorLayout.ND),
+            ],
+            output: pl.Tensor[[M, N], pl.FP32],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
+            a_tile = pl.load(a, [0, 0], [128, 128], target_memory=pl.MemorySpace.Vec)
+            return pl.store(a_tile, [0, 0], output)
+
+    func = P.get_function("kernel")
+    assert func is not None
+    program = ir.Program([func], "test_compound_valid_shape", ir.Span.unknown())
+    with pytest.raises(ValueError, match="VALID_SCALED") as exc_info:
+        PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
+    assert "compound valid_shape expression" in str(exc_info.value)
+
+
+if __name__ == "__main__":
     pytest.main([__file__, "-v"])

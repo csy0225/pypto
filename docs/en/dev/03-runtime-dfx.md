@@ -2,14 +2,16 @@
 
 PyPTO exposes Simpler's five runtime diagnostic sub-features as independent
 toggles on [`RunConfig`](../../../python/pypto/runtime/runner.py). Each
-toggle maps 1:1 to a field on Simpler's `CallConfig` and to the matching
-pytest flag in `tests/st/conftest.py`, so the two surfaces stay aligned.
+toggle maps to a field on Simpler's `CallConfig` and to the matching pytest
+flag in `tests/st/conftest.py`. Field names match Simpler's; the former
+`enable_l2_swimlane` / `--enable-l2-swimlane` spellings still work and are
+covered under [Deprecated aliases](#deprecated-aliases).
 
 ## Flag matrix
 
 | `RunConfig` field | pytest flag | `CallConfig` member | Artefact under `dfx_outputs/` | Post-run converter |
 | ----------------- | ----------- | ------------------- | ----------------------------- | ------------------ |
-| `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
+| `enable_chip_swimlane: int` | `--enable-chip-swimlane` (= `4`) / `--chip-swimlane-level N` | `enable_chip_swimlane` (`0` off .. `4` full) | `chip_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
 | `enable_dump_args: int` | `--dump-args [LEVEL]` (bare = `1`) | `enable_dump_args` (`0` off, `1` partial, `2` full) | `args_dump/{args_dump.json,bin}` | `dump_viewer` (manual) |
 | `enable_pmu: int` | `--enable-pmu [N]` (bare = `2`) | `enable_pmu` (`0` off, `>0` event type) | `pmu.csv` | — |
 | `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_viewer` (manual) |
@@ -18,6 +20,31 @@ pytest flag in `tests/st/conftest.py`, so the two surfaces stay aligned.
 The five flags are **fully independent** and may be combined in any
 subset. Enabling *any* of them auto-forces `RunConfig.save_kernels=True`
 so the `<work_dir>/dfx_outputs/` directory survives the run.
+
+### Swimlane collection levels
+
+`enable_chip_swimlane` is a **level**, not a toggle. Each level is a real guard
+in the runtime collectors, so a lower level never stamps the data a higher one
+does and no post-processing recovers it:
+
+| Level | Adds | Unlocks |
+| ----- | ---- | ------- |
+| `0` / `False` | — | collection off |
+| `1` | AICore per-task start / end + task record buffer | per-task lanes |
+| `2` | + AICPU-stamped dispatch / finish | the `[dispatch, start]` pickup gap |
+| `3` | + scheduler main-loop phase records | `simpler_setup.tools.sched_overhead_analysis`, the Toolkit plugin's Scheduler View |
+| `4` / `True` | + orchestrator phase records | the Toolkit plugin's AICPU Orchestrator view |
+
+`True` requests level `4` — the same thing the bare `--enable-chip-swimlane`
+flag requests, in PyPTO and in the runtime harness alike. An out-of-range level
+raises `ValueError` from `RunConfig`.
+
+On the pytest surface the bare flag and the level are **two** options
+(`--enable-chip-swimlane` and `--chip-swimlane-level N`) rather than one
+optional-valued option. An optional-valued flag swallows the following token, so
+`pytest --enable-chip-swimlane tests/st/runtime/` would fail with
+`invalid int value: 'tests/st/runtime/'`. Splitting them keeps the bare flag
+order-independent.
 
 ## Output contract
 
@@ -43,18 +70,29 @@ namespaces the prefix per dispatch:
 ```text
 <work_dir>/dfx_outputs/
 ├── rank0/d0/          # rank 0, its 0th dispatch
+│   └── dispatch_program.json   # which next_levels/<program> ran here
 ├── rank0/d1/          # rank 0, its 1st dispatch
-├── rank1/d0/
-└── rank_local/d0/     # comm-less dispatch — no real rank
+└── rank1/d0/
 ```
 
 `d{k}` counts that card's dispatches within the run, restarting at `d0`
-each run. A dispatch that is not pinned to a rank (a comm-less program,
-which has no `device=` attribute) lands under `rank_local` instead of
-`rank{r}`. Each leaf holds the flat artefacts from the table above, so
-the L2 contract applies unchanged within one dispatch directory.
+each run. Every dispatch is filed under the chip that ran it: a `device=`
+pinned dispatch under its own rank, and a comm-less one (no `device=`)
+under the chip it was placed on — those are handed out round-robin over
+the program's chips in submit order. Each leaf holds the flat artefacts
+from the table above, so the L2 contract applies unchanged within one
+dispatch directory.
 
-## L2 swimlane runs the kernel twice (onboard)
+The path records *where* a dispatch ran, not *what* it ran, so
+`_submit_chip` also drops a `dispatch_program.json` naming the
+`next_levels/<program>` behind it. Kernel names must be resolved through
+it: `func_id` is a per-L2-program namespace — every program numbers its
+kernels from 0 — so a name map merged across programs relabels one
+program's tasks with another's names, silently and plausibly. A dispatch
+whose program cannot be resolved is converted with anonymous labels
+instead of guessed ones.
+
+## Swimlane runs the workload twice (onboard)
 
 The swimlane converter joins per-task timing against a task graph that **only
 `deps.json` carries** — the device hot path no longer records per-task fanout,
@@ -63,8 +101,8 @@ dependency arrows. But dep_gen collection has high overhead that perturbs the
 very timing the swimlane measures. The two captures therefore come from separate
 runs (Simpler's documented "capture the graph once, time many times" workflow).
 
-So enabling `enable_l2_swimlane` on an **onboard** platform runs the kernel
-twice, transparently:
+For **onboard L2**, enabling `enable_chip_swimlane` runs the kernel twice,
+transparently:
 
 1. **Graph pass** — dep_gen only, producing `deps.json`. Runs in a **separate
    subprocess** (`python -m pypto.runtime._dep_gen_capture`). This is required,
@@ -76,7 +114,7 @@ twice, transparently:
    (lanes degrade to anonymous `task(rXtY)`).
 2. **Timing pass** — swimlane (plus any other timing-sensitive DFX such as PMU /
    args-dump / scope-stats), dep_gen forced off, producing the clean
-   `l2_swimlane_records.json` whose timing is reported. Runs in-process.
+   `chip_swimlane_records.json` whose timing is reported. Runs in-process.
 
 Both passes write into the same `dfx_outputs/`, so `swimlane_converter`
 auto-joins the sibling `deps.json` with the records. Adding `--enable-dep-gen`
@@ -85,7 +123,16 @@ explicitly changes nothing about the passes (the graph pass already produced
 hint. Simulator platforms (`*sim`) stay single-pass — swimlane conversion is
 skipped there regardless.
 
-The subprocess rebuilds the orchestration arguments two ways: from `golden.py`
+Distributed L3 uses the same graph/timing split without the L2 capture
+subprocess. The one-shot path creates a fresh Worker lifecycle for each pass.
+A prepared `DistributedWorker` keeps its resident handles and forked hierarchy,
+but enters two separate `Worker.run()` fences: dep-gen-only first, then
+swimlane with dep_gen forced off. Per-card dispatch counters restart for both
+passes, so graph and timing artefacts join in the same `rank{r}/d{k}` directory.
+Both passes execute the program; mutable arguments are not restored between
+them, matching the existing one-shot L3 replay semantics.
+
+The L2 subprocess rebuilds the orchestration arguments two ways: from `golden.py`
 when driven by the pytest harness (deterministic inputs → faithful graph), or
 from a recorded spec when driven by the compiled-program API
 (`execute_compiled`). The task graph can be routed by tensor *values*, not just
@@ -107,7 +154,8 @@ run(
     MyProgram, a, b, c,
     config=RunConfig(
         platform="a2a3sim",
-        enable_l2_swimlane=True,     # produces l2_swimlane_records.json
+        enable_chip_swimlane=4,        # full swimlane -> chip_swimlane_records.json
+                                     # (True is the same level 4; use 1-3 for less)
         enable_dep_gen=True,         # produces deps.json (render with deps_viewer on demand)
         enable_pmu=4,                # PMU event = MEMORY
     ),
@@ -117,11 +165,13 @@ run(
 ### From pytest
 
 ```bash
+# Bare flag = level 4 (full)
 pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
-    --platform a2a3sim --enable-l2-swimlane
+    --platform a2a3sim --enable-chip-swimlane
 
+# AICore timing only — the cheapest capture
 pytest tests/st/runtime/ \
-    --platform a2a3sim --enable-l2-swimlane --enable-dep-gen
+    --platform a2a3sim --chip-swimlane-level 1 --enable-dep-gen
 ```
 
 ## Selective tensor dump
@@ -253,7 +303,7 @@ By default the swimlane / dependency-graph tools label tasks by numeric
 id (`task(rXtY)` / `func_<id>(...)`). To recover real kernel names
 (`matmul(rXtY)`), a name map must sit next to the records. Simpler's own
 SceneTest harness writes this file; pypto does not use SceneTest, so when
-`enable_l2_swimlane` or `enable_dep_gen` is set the runner synthesises
+`enable_chip_swimlane` or `enable_dep_gen` is set the runner synthesises
 `<work_dir>/dfx_outputs/name_map_<case>.json` from the `func_id` / `name`
 fields already in `kernel_config.py`. It is consumed automatically:
 `swimlane_converter` is invoked with `--func-names <name_map>`, and
@@ -285,184 +335,52 @@ this hint at the end of every scope-stats-enabled run.
 | Pipeline bundle | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
 | Per-flag post-run dispatch | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
 | Kernel-name map synthesis | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
+| L3 per-dispatch program marker | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_record_dispatch_program` / `_read_dispatch_program` |
+| L3 per-dispatch swimlane conversion | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_collect_l3_swimlane` / `_write_dispatch_name_map` |
 | pytest entry | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness pipeline ctx | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 
 ## Deprecated aliases
 
-`RunConfig.runtime_profiling` and the pytest flag `--runtime-profiling`
-were the original way to opt into L2 swimlane capture before the four
-DFX features became independently controllable. They are kept as
-aliases for `enable_l2_swimlane` / `--enable-l2-swimlane` so existing
-scripts keep working; both paths emit a `DeprecationWarning` and will
-be removed in a future release. Migrate to the new names.
+`RunConfig.enable_l2_swimlane` and the pytest flag `--enable-l2-swimlane`
+are the former spellings of `enable_chip_swimlane` /
+`--enable-chip-swimlane`. Simpler's Worker/Chip/Core naming migration
+renamed the L2 layer to "chip" (`L2Swimlane*` -> `ChipSwimlane*`,
+`l2_swimlane_records.json` -> `chip_swimlane_records.json`), and PyPTO now
+follows that contract.
+
+Both old spellings keep working and emit a `DeprecationWarning`; they will
+be removed in a future release. Values and semantics are unchanged, so
+migration is a rename:
+
+```python
+RunConfig(enable_l2_swimlane=True)    # deprecated
+RunConfig(enable_chip_swimlane=4)     # same capture
+```
+
+Details worth knowing:
+
+- `enable_l2_swimlane` is **not** a dataclass field — it is a constructor
+  keyword plus a property. That keeps `dataclasses.replace(cfg,
+  enable_chip_swimlane=N)` unambiguous; an alias field would be re-supplied
+  by `replace()` from the old instance and could silently override the value
+  you just passed.
+- Reading `cfg.enable_l2_swimlane` is silent (it returns the canonical
+  level). Passing the old constructor keyword, or assigning to the
+  attribute, warns.
+- Passing both spellings at once raises `ValueError`.
 
 ## Replaying an existing build_output
 
-To re-run a previously compiled `build_output/<jit_dir>/` after editing
-one or more kernel cpp files — typically to verify a hand-tuned change
-under PMU / swimlane / args-dump — use the debug-only
-[`pypto.runtime.debug.replay`](../../../python/pypto/runtime/debug/replay.py)
-module. It reuses the same `execute_compiled` path as the normal
-`pypto.runtime.run` flow, so DFX flags behave identically.
-
-```python
-from pypto.runtime.debug import replay
-from pypto.runtime import RunConfig
-
-replay(
-    "build_output/_jit_xxx/",
-    a, b, c,
-    config=RunConfig(
-        platform="a2a3sim",
-        enable_pmu=2,
-        enable_l2_swimlane=True,
-    ),
-)
-```
-
-CLI form (loads inputs from the directory's `golden.py`):
-
-```bash
-python -m pypto.runtime.debug.replay build_output/_jit_xxx/ \
-    --pmu 2 --swimlane --log-level debug
-```
-
-`recompile=True` (default) deletes cached `.so`/`.bin` artefacts so
-hand-edited cpps are picked up. Pass `recompile=False` (or
-`--no-recompile`) when no cpp changed and you want to skip the rebuild.
-`--log-level` accepts the same values as `PYPTO_RUNTIME_LOG`
-(`debug`, `v0..v9`, `info`, `warn`, `error`, `null`); add
-`--log-sync-pypto` to also push the band to PyPTO's C++ logger.
-
-Pass `validate=True` (or `--validate`) to compare each output tensor
-against the reference produced by `golden.py::compute_golden` using the
-`RTOL`/`ATOL` tolerances declared in `golden.py`. Raises
-`AssertionError` on mismatch. Requires the directory to contain a
-`golden.py` (the default for `ir.compile`-produced artefacts).
-
-### Editing `.pto` instead of cpp
-
-`replay` (and the auto-emitted `debug/run.py`) checks `ptoas/*.pto`
-mtimes before invalidating cpp binaries: any `.pto` newer than its
-sibling `ptoas/<unit>.cpp` triggers a fresh `ptoas` run, and the new
-preprocessed body is spliced between the `// --- ptoas-generated code
----` and `// --- Kernel entry point ---` sentinels in every matching
-`kernels/<core>/<func>.cpp`. The cpp → `.so` rebuild then runs as
-normal.
-
-| You edited | What runs |
-| ---------- | --------- |
-| only `kernels/<core>/<func>.cpp` | `cpp → .so` (existing behaviour) |
-| only `ptoas/<unit>.pto` | `pto → cpp → .so` (new — splice + recompile) |
-| both | `pto` wins for the body region; your wrapper / header edits in the cpp are preserved |
-
-Requires the `ptoas` binary on `PTOAS_ROOT` or `PATH`; silently no-ops
-otherwise. Disable with `--no-rebuild-from-pto` or
-`PYPTO_REBUILD_FROM_PTO=0`. Editing a `.pto` that changes the kernel
-function signature is **out of scope** — the saved wrapper boilerplate
-will not match, and a fresh `ir.compile()` is required.
-
-### Auto-emitted `debug/run.py`
-
-`ir.compile()` writes a self-contained re-runner at
-`<output_dir>/debug/run.py` so the user only ever needs to remember one
-command:
-
-```bash
-python build_output/<jit_dir>/debug/run.py
-```
-
-The script wraps the `replay` flow above:
-
-- When a sibling `golden.py` is present, inputs come from
-  `golden.generate_inputs()` and the run is validated against
-  `compute_golden`.
-- Otherwise (JIT path), inputs are materialised from the shape / dtype
-  metadata embedded in the script. Edit them freely to experiment. The
-  script also exposes a `_user_compare(<param_names>)` hook that runs
-  after `replay` returns — write your own `assert torch.allclose(...)`
-  there to validate kernel output against a hand-rolled reference.
-- The same `.pto` rebuild flow described above applies: edit a `.pto`
-  under `ptoas/`, rerun the script, and the splice happens
-  transparently. Pass `--no-rebuild-from-pto` to skip.
-
-Emission is **best-effort** — programs without a clean orchestration
-entry skip the file silently and the rest of compilation succeeds.
-
-Disable globally by setting `PYPTO_EMIT_DEBUG_RUNNER=0` (also accepts
-`false` / `no`, case-insensitive). Useful for large test suites or
-benchmark pipelines that compile many programs and don't need the
-runner. When disabled, the underlying `pypto.runtime.debug.replay`
-module / CLI is still usable directly against the output directory.
-
-### Replaying an L3 / distributed build
-
-Distributed (L3) programs — a `@pl.jit.host` orchestrator compiled to a
-`DistributedCompiledProgram` — support the same edit-`.pto`-and-rerun loop,
-but their build directory has a different shape: there is **no top-level
-`kernel_config.py`** (per-rank configs live under `next_levels/{rank}/`), the
-host driver is `orchestration/host_orch.py`, and `ir.compile()` writes a
-`distributed_meta.json` sidecar:
-
-```text
-build_output/<jit_dir>/
-  distributed_meta.json          # param metadata + platform + DistributedConfig
-  orchestration/host_orch.py     # L3 host driver
-  next_levels/{rank}/            # one complete single-chip sub-build per rank
-      kernels/{aic,aiv}/*.cpp
-      ptoas/*.pto
-      kernel_config.py
-```
-
-`replay` detects this layout automatically (no top-level `kernel_config.py`
-but `orchestration/host_orch.py` present) and dispatches via simpler
-`Worker(level=3)` instead of `execute_compiled`. The same CLI / `debug/run.py`
-flow works unchanged:
-
-```bash
-python -m pypto.runtime.debug.replay build_output/<jit_dir>/
-# or
-python build_output/<jit_dir>/debug/run.py
-```
-
-The `.pto` → cpp splice and `.so` invalidation recurse into every
-`next_levels/{rank}/`, so editing `next_levels/rank0/ptoas/<unit>.pto` (or the
-kernel cpp directly) is picked up exactly as in the single-chip case.
-
-Under the hood the directory is reconstructed into a callable program from
-`distributed_meta.json` alone — **no pypto recompile, no pass re-run**. Two
-entry points expose this directly:
-
-```python
-from pypto.runtime import execute_distributed_compiled
-# one-shot (distributed counterpart of execute_compiled):
-execute_distributed_compiled("build_output/<jit_dir>/", [a, b, c])
-
-# reusable object (override the persisted platform / devices if needed):
-from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
-prog = DistributedCompiledProgram.from_dir(
-    "build_output/<jit_dir>/",
-    platform="a2a3",
-    distributed_config=DistributedConfig(device_ids=[0, 1]),
-)
-prog(a, b, c)
-```
-
-`from_dir` reads the persisted HOST-orchestrator param metadata (post-SSA names
-matching `host_orch.py`, directions, shapes, dtypes) and rebuilds chip callables
-by walking `next_levels/`; `platform` and `distributed_config` default to the
-values recorded at compile time and can be overridden to replay on a different
-target / device set.
-
-**Limitation:** DFX flags (`--pmu`, `--swimlane`, `--dump-args`, …) are **not
-yet plumbed through the L3 dispatch path** — they apply to single-chip replay
-only. The L3 edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp
-edit) is fully supported.
+Re-running, editing, and re-measuring an existing `build_output/<jit_dir>/`
+(including `debug/run.py`, the `.pto` splice, `benchmark()` against a directory
+replay, and L3 builds) has its own page:
+[Replaying an Existing `build_output`](03-runtime-replay.md). Every DFX flag
+documented above applies unchanged on that path.
 
 ## Related
 
-- Simpler's runtime-side reference: `runtime/docs/dfx/{l2-swimlane,
-  args-dump,pmu-profiling,dep_gen,scope-stats}.md`.
+- Simpler's runtime-side reference: `runtime/docs/dfx/{chip-swimlane-profiling,
+  args-dump,pmu-profiling,dep-gen,scope-stats}.md`.
 - Compile-time profiling (orthogonal, single PyPTO process):
   [01-compile-profiling.md](01-compile-profiling.md).

@@ -33,6 +33,8 @@ from pypto.language.parser.diagnostics.exceptions import (
     UnsupportedFeatureError,
 )
 
+_OP_TENSOR_READ = ir.get_op("tensor.read").name
+
 
 def _flatten(stmt):
     if isinstance(stmt, ir.SeqStmts):
@@ -65,7 +67,7 @@ def _pred_read(p) -> ir.Call:
         return e
 
     def is_read(e):
-        return isinstance(e, ir.Call) and e.op.name == "tensor.read"
+        return isinstance(e, ir.Call) and e.op.name == _OP_TENSOR_READ
 
     lhs, rhs = strip_cast(p.left), strip_cast(p.right)
     read = lhs if is_read(lhs) else rhs
@@ -149,7 +151,7 @@ def test_predicate_populates_submit_fields():
     pred = expert_sub.predicate
     assert isinstance(pred, ir.Gt)
     read = _pred_read(pred)
-    assert read.op.name == "tensor.read"
+    assert read.op.name == _OP_TENSOR_READ
     assert isinstance(read.args[0], ir.Var)  # operand tensor
     assert len(_pred_indices(pred)) == 2  # one index per rank-2 axis
     assert _pred_const(pred).value == 0
@@ -205,7 +207,7 @@ def test_reversed_operand_order_is_normalized():
     # `0 < rc[0,0]` keeps its written `Lt` kind in the IR; orchestration codegen
     # flips it to the runtime's `operand OP target` orientation (GT).
     assert isinstance(expert_sub.predicate, ir.Lt)
-    assert _pred_read(expert_sub.predicate).op.name == "tensor.read"
+    assert _pred_read(expert_sub.predicate).op.name == _OP_TENSOR_READ
     assert _pred_const(expert_sub.predicate).value == 0
 
 
@@ -257,7 +259,12 @@ def test_predicate_operand_without_tracked_producer_allowed():
     # ``rc_in`` is a function parameter, not a submit result — nothing to prove,
     # so the deps= contract check stays out of the way.
     prog = _program("rc_in[0, 0] > 0", deps_src="[]")
-    assert isinstance(_main_submits(prog)[1].predicate, ir.Gt)
+    predicate = _main_submits(prog)[1].predicate
+    assert isinstance(predicate, ir.Gt)
+    # The predicate still reads rc_in[0, 0] and compares against 0
+    assert _pred_read(predicate).op.name == ir.get_op("tensor.read").name
+    assert [c.value for c in _pred_indices(predicate)] == [0, 0]
+    assert _pred_const(predicate).value == 0
 
 
 def test_non_literal_target_rejected():
@@ -280,8 +287,10 @@ def test_predicate_must_be_a_comparison():
 
 def test_no_predicate_leaves_fields_default():
     prog = _program("rc[0, 0] > 0")
-    gate_sub = _main_submits(prog)[0]
+    gate_sub, expert_sub = _main_submits(prog)
+    # Only the submit that was given predicate= carries one
     assert gate_sub.predicate is None
+    assert isinstance(expert_sub.predicate, ir.Gt)
 
 
 def test_print_parse_round_trip():
@@ -315,11 +324,15 @@ def test_unsigned_and_subbyte_operand_rejected(dtype):
 @pytest.mark.parametrize("dtype", ["pl.INT8", "pl.INT16", "pl.INT32", "pl.INT64"])
 def test_signed_integer_operands_accepted(dtype):
     prog = _program("rc[0, 0] > 0", rc_dtype=dtype)
-    assert isinstance(_main_submits(prog)[1].predicate, ir.Gt)
+    predicate = _main_submits(prog)[1].predicate
+    assert isinstance(predicate, ir.Gt)
+    # Accepted for every signed width, with operand and target intact
+    assert [c.value for c in _pred_indices(predicate)] == [0, 0]
+    assert _pred_const(predicate).value == 0
 
 
 def test_negative_constant_index_rejected():
-    # L0PredicateOperand::indices is uint32_t — a negative index wraps to a huge
+    # CorePredicateOperand::indices is uint32_t — a negative index wraps to a huge
     # value and yields an out-of-bounds GM address read at the dispatch point.
     with pytest.raises(ParserTypeError, match="index must be non-negative"):
         _program("rc[-1, 0] > 0")
@@ -445,7 +458,7 @@ def test_scope_predicate_lands_on_scope_attrs():
     assert isinstance(predicate, ir.Gt)
     assert _pred_const(predicate).value == 0
     # Reuses tensor.read rather than a bespoke encoding.
-    assert _pred_read(predicate).op.name == "tensor.read"
+    assert _pred_read(predicate).op.name == _OP_TENSOR_READ
     assert [c.value for c in _pred_indices(predicate)] == [0, 0]
 
 
@@ -487,7 +500,10 @@ def test_scope_predicate_plain_with_form():
 """
     )
     (scope,) = _spmd_scopes(prog)
-    assert isinstance(dict(scope.attrs.items())["predicate"], ir.Gt)
+    predicate = dict(scope.attrs.items())["predicate"]
+    assert isinstance(predicate, ir.Gt)
+    assert [c.value for c in _pred_indices(predicate)] == [0, 0]
+    assert _pred_const(predicate).value == 0
 
 
 def test_scope_predicate_for_form():
@@ -506,7 +522,10 @@ def test_scope_predicate_for_form():
 """
     )
     (scope,) = _spmd_scopes(prog)
-    assert isinstance(dict(scope.attrs.items())["predicate"], ir.Gt)
+    predicate = dict(scope.attrs.items())["predicate"]
+    assert isinstance(predicate, ir.Gt)
+    assert [c.value for c in _pred_indices(predicate)] == [0, 0]
+    assert _pred_const(predicate).value == 0
 
 
 def test_scope_predicate_operand_producer_must_be_in_deps():

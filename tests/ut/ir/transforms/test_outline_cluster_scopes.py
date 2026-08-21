@@ -9,9 +9,26 @@
 
 """Unit tests for OutlineClusterScopes pass."""
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import ir, passes
+
+
+def _funcs_by_type(prog, ftype):
+    """All functions in ``prog`` of the given FunctionType, in program order."""
+    return [f for f in prog.functions.values() if f.func_type == ftype]
+
+
+def _launch_calls(func):
+    """Dispatch Calls in ``func``'s top-level body that carry a launch spec."""
+    body = func.body
+    assert isinstance(body, ir.SeqStmts)
+    return [
+        s.value
+        for s in body.stmts
+        if isinstance(s, ir.AssignStmt) and isinstance(s.value, ir.Call) and "core_num" in s.value.attrs
+    ]
 
 
 class TestOutlineClusterScopes:
@@ -180,7 +197,9 @@ class TestOutlineClusterScopes:
                 out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
                 return out
 
-            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4, "sync_start": True})
+            # The launch spec rides on the DISPATCH, not the wrapper: core_num is
+            # evaluated in the caller's scope, so the callee must not carry it.
+            @pl.function(type=pl.FunctionType.Spmd)
             def main_spmd_0(
                 self,
                 x: pl.Tensor[[64], pl.FP32],
@@ -197,7 +216,7 @@ class TestOutlineClusterScopes:
                 x: pl.Tensor[[64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                out = self.main_spmd_0(x, out)
+                out = self.main_spmd_0(x, out, attrs={"core_num": 4, "sync_start": True})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -352,22 +371,22 @@ class TestOutlineClusterScopes:
             def main_incore_0(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 i = pl.tile.get_block_idx()
                 offset = i * 128
                 tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
                 out_store = pl.store(tile_a, [offset, 0], out)
                 # The outline pass keeps the post-store SSA alias but returns
-                # the InOut param itself (param-identity returns, #1702).
+                # the write param itself (param-identity returns, #1702).
                 out_final: pl.Tensor[[512, 128], pl.FP32] = out_store
                 return out
 
-            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+            @pl.function(type=pl.FunctionType.Spmd)
             def main_spmd_0(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 out_call = self.main_incore_0(a, out)
                 return out
@@ -378,7 +397,7 @@ class TestOutlineClusterScopes:
                 a: pl.Tensor[[512, 128], pl.FP32],
                 out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
-                out = self.main_spmd_0(a, out)
+                out = self.main_spmd_0(a, out, attrs={"core_num": 4})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -413,22 +432,22 @@ class TestOutlineClusterScopes:
             def q_proj(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 i = pl.tile.get_block_idx()
                 offset = i * 128
                 tile_a: pl.Tile[[128, 128], pl.FP32] = pl.load(a, [offset, 0], [128, 128])
                 out_store = pl.store(tile_a, [offset, 0], out)
                 # The outline pass keeps the post-store SSA alias but returns
-                # the InOut param itself (param-identity returns, #1702).
+                # the write param itself (param-identity returns, #1702).
                 out_final: pl.Tensor[[512, 128], pl.FP32] = out_store
                 return out
 
-            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+            @pl.function(type=pl.FunctionType.Spmd)
             def q_proj_spmd(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 out_call = self.q_proj(a, out)
                 return out
@@ -439,7 +458,7 @@ class TestOutlineClusterScopes:
                 a: pl.Tensor[[512, 128], pl.FP32],
                 out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
-                out = self.q_proj_spmd(a, out)
+                out = self.q_proj_spmd(a, out, attrs={"core_num": 4})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -448,12 +467,14 @@ class TestOutlineClusterScopes:
         After = passes.outline_cluster_scopes()(After)
         ir.assert_structural_equal(After, Expected)
 
-    def test_outline_spmd_for_loop_marks_assemble_dest_as_inout(self):
+    def test_outline_spmd_for_loop_marks_assemble_dest_as_written(self):
         """`for n0 in pl.spmd(N): out = pl.assemble(out, slice, [n0, ...])`
-        must make `out` an InOut parameter on both the outlined InCore and
-        Spmd wrapper. Without this, the orchestration codegen later drops the
-        SSA-result alias for the inout call and emits a use of an undeclared
-        ``out__ssa_vN`` C++ identifier.
+        must lift `out` off ``In`` on both the outlined InCore and Spmd
+        wrapper. Without this, the orchestration codegen later drops the
+        SSA-result alias for the call and emits a use of an undeclared
+        ``out__ssa_vN`` C++ identifier. The body only writes ``out`` — the
+        assemble destination slot is its sole use — so the direction is ``Out``
+        rather than ``InOut`` (issue #2415).
         """
 
         @pl.program
@@ -472,13 +493,14 @@ class TestOutlineClusterScopes:
 
         @pl.program
         class Expected:
-            # `out` is the assemble destination, so it becomes InOut on both
-            # the outlined InCore kernel and the Spmd wrapper; `a` stays In.
+            # `out` is the assemble destination and the body never reads it, so
+            # it becomes Out on both the outlined InCore kernel and the Spmd
+            # wrapper; `a` stays In.
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 n0 = pl.tile.get_block_idx()
                 offset = n0 * 128
@@ -486,11 +508,11 @@ class TestOutlineClusterScopes:
                 out_asm = pl.assemble(out, chunk, [offset, 0])
                 return out
 
-            @pl.function(type=pl.FunctionType.Spmd, attrs={"core_num": 4})
+            @pl.function(type=pl.FunctionType.Spmd)
             def main_spmd_0(
                 self,
                 a: pl.Tensor[[512, 128], pl.FP32],
-                out: pl.InOut[pl.Tensor[[512, 128], pl.FP32]],
+                out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
                 out_call = self.main_incore_0(a, out)
                 return out
@@ -501,7 +523,7 @@ class TestOutlineClusterScopes:
                 a: pl.Tensor[[512, 128], pl.FP32],
                 out: pl.Out[pl.Tensor[[512, 128], pl.FP32]],
             ) -> pl.Tensor[[512, 128], pl.FP32]:
-                out = self.main_spmd_0(a, out)
+                out = self.main_spmd_0(a, out, attrs={"core_num": 4})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -512,15 +534,16 @@ class TestOutlineClusterScopes:
 
     def test_nested_spmd_in_cluster_propagates_sync_start(self):
         """`with pl.cluster(): with pl.spmd(N, sync_start=True): ...` keeps a
-        single Group function and moves ``core_num``/``sync_start`` onto the
-        Group's attrs.
+        single Group function and moves ``core_num``/``sync_start`` onto its
+        DISPATCH.
 
-        Semantics (outline_cluster_scopes_pass.cpp:41-70, UnwrapNestedSpmd):
-        the Cluster scope is outlined into a Group function whose body still
-        contains the nested ``SpmdScopeStmt``. The post-outline UnwrapNestedSpmd
-        sweep then (a) copies ``core_num`` and ``sync_start`` from the Spmd
-        scope onto the Group function's attrs and (b) replaces the
-        ``ScopeStmt(Spmd)`` with its body (the single kernel call). No separate
+        Semantics (outline_cluster_scopes_pass.cpp, UnwrapNestedSpmd): the
+        Cluster scope is outlined into a Group function whose body still
+        contains the nested ``SpmdScopeStmt``. UnwrapNestedSpmd then (a) replaces
+        the ``ScopeStmt(Spmd)`` with its body (the single kernel call), (b) hands
+        the launch spec to the call site — translated back through the dispatch's
+        args, since the spec was lifted from inside the callee — and (c) leaves
+        the self-contained ``spmd_unwrapped`` marker on the Group. No separate
         Spmd wrapper is emitted — the doc's "Unwrap Nested Spmd in Group" step.
         """
 
@@ -562,8 +585,9 @@ class TestOutlineClusterScopes:
                 return out
 
             # Single Group function (NOT a Spmd wrapper): the nested Spmd scope
-            # was unwrapped, so core_num/sync_start ride on the Group's attrs.
-            @pl.function(type=pl.FunctionType.Group, attrs={"core_num": 4, "sync_start": True})
+            # was unwrapped, so only the self-contained marker stays here —
+            # core_num/sync_start ride the dispatch below.
+            @pl.function(type=pl.FunctionType.Group, attrs={"spmd_unwrapped": True})
             def main_cluster_0(
                 self,
                 x: pl.Tensor[[64], pl.FP32],
@@ -580,7 +604,7 @@ class TestOutlineClusterScopes:
                 x: pl.Tensor[[64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                out = self.main_cluster_0(x, out)
+                out = self.main_cluster_0(x, out, attrs={"core_num": 4, "sync_start": True})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -589,12 +613,11 @@ class TestOutlineClusterScopes:
         ir.assert_structural_equal(After, Expected)
 
     def test_nested_spmd_in_cluster_omits_sync_start_when_false(self):
-        """Without ``sync_start=True`` the unwrapped Group carries only
-        ``core_num`` — the ``sync_start`` attr is not added.
+        """Without ``sync_start=True`` the dispatch carries only ``core_num`` —
+        the ``sync_start`` attr is not added.
 
-        Pins the conditional in UnwrapNestedSpmd
-        (outline_cluster_scopes_pass.cpp:66-68): ``sync_start`` is appended to
-        the Group attrs only when present AND true. With the default
+        Pins the conditional in LaunchSpecStamper: ``sync_start`` is appended to
+        the dispatch attrs only when present AND true. With the default
         ``sync_start=False`` the attr must be absent, not ``False``.
         """
 
@@ -635,8 +658,9 @@ class TestOutlineClusterScopes:
                 out: pl.Tensor[[64], pl.FP32] = pl.store(y_tile, [0], out)
                 return out
 
-            # core_num only — no sync_start attr (default False is dropped).
-            @pl.function(type=pl.FunctionType.Group, attrs={"core_num": 8})
+            # Only the marker stays on the Group; the dispatch below carries
+            # core_num alone — no sync_start attr (default False is dropped).
+            @pl.function(type=pl.FunctionType.Group, attrs={"spmd_unwrapped": True})
             def main_cluster_0(
                 self,
                 x: pl.Tensor[[64], pl.FP32],
@@ -653,7 +677,7 @@ class TestOutlineClusterScopes:
                 x: pl.Tensor[[64], pl.FP32],
                 out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                out = self.main_cluster_0(x, out)
+                out = self.main_cluster_0(x, out, attrs={"core_num": 8})
                 return out
 
         Before = passes.convert_to_ssa()(Before)
@@ -661,17 +685,67 @@ class TestOutlineClusterScopes:
         After = passes.outline_cluster_scopes()(Before)
         ir.assert_structural_equal(After, Expected)
 
-    def test_cluster_store_target_becomes_inout(self):
+    def test_cluster_callee_out_slot_does_not_demote_inout(self):
+        """Step 3 merges an inner callee's direction; it never overwrites.
+
+        The cluster pass is the only outline pass constructed with a ``program``,
+        so it is the only one that runs ``InferParamDirections`` Step 3 — merging
+        directions from ``GlobalVar`` calls in the scope body. Each source of
+        evidence is a lower bound, so the merge must follow ``In < Out < InOut``.
+        A plain assignment would let a callee that declares its slot ``Out``
+        erase the read this body really performs, dropping a genuine RAW
+        dependency on ``buf``'s incoming contents.
+
+        Here the body loads ``buf`` (a read), stores into it (a write), and then
+        hands the same capture to ``helper``, whose slot is ``Out``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def helper(
+                self,
+                src: pl.Tensor[[16, 128], pl.FP32],
+                dst: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t: pl.Tile[[16, 128], pl.FP32] = pl.load(src, [0, 0], [16, 128])
+                dst = pl.store(t, [0, 0], dst)
+                return dst
+
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                buf: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                with pl.cluster():
+                    back: pl.Tile[[16, 128], pl.FP32] = pl.load(buf, [0, 0], [16, 128])
+                    keep: pl.Tile[[16, 128], pl.FP32] = pl.exp(back)
+                    pl.store(keep, [0, 0], buf)
+                    res = self.helper(x, buf)
+                return res
+
+        After = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = After.get_function("main_cluster_0")
+        assert outlined is not None, f"main_cluster_0 missing from {list(After.functions)}"
+        buf_idx = next(i for i, p in enumerate(outlined.params) if p.name_hint.startswith("buf"))
+        assert outlined.param_directions[buf_idx] == ir.ParamDirection.InOut, (
+            f"expected InOut at outlined callee param {buf_idx}, got {list(outlined.param_directions)}"
+        )
+
+    def test_cluster_store_target_becomes_out(self):
         """A Cluster scope that writes an external tensor via ``pl.store`` marks
-        that tensor as an ``InOut`` parameter on the outlined Group function.
+        that tensor as an ``Out`` parameter on the outlined Group function.
 
         Semantics: ScopeOutliner treats tile.store targets as side-effect
-        outputs (scope_outline_utils.h:560-571) and InferParamDirections Step 1
-        upgrades the corresponding param to ``InOut``
-        (scope_outline_utils.h:1118-1123). The store result is captured into a
-        fresh ``_store`` SSA var, but the Group returns the InOut param itself
-        (param-identity returns, #1702); the call site re-binds the external
-        tensor to that return value (``buf`` -> ``buf2``). Mirrors the
+        outputs and InferParamDirections Step 1 lifts the corresponding param
+        off ``In``. The body never reads ``buf`` — the store target slot is its
+        sole use — so the direction is ``Out``, not ``InOut`` (issue #2415).
+        The store result is captured into a fresh ``_store`` SSA var, but the
+        Group returns the write param itself (param-identity returns, #1702);
+        the call site re-binds the external tensor to that return value
+        (``buf`` -> ``buf2``). Mirrors the
         InCore-pass store-only case, but the parent here is NOT promoted — the
         cluster pass leaves the caller's function type unchanged.
         """
@@ -689,12 +763,13 @@ class TestOutlineClusterScopes:
 
         @pl.program
         class Expected:
-            # buf is a tile.store target, so it becomes InOut on the Group; the
-            # store result lands in a fresh buf_store var, but the Group
-            # returns the InOut param itself (param-identity returns, #1702).
+            # buf is a tile.store target the body never reads, so it becomes Out
+            # on the Group; the store result lands in a fresh buf_store var, but
+            # the Group returns the Out param itself (param-identity returns,
+            # #1702).
             @pl.function(type=pl.FunctionType.Group)
             def main_cluster_0(
-                self, buf: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]
+                self, buf: pl.Out[pl.Tensor[[16, 128], pl.FP32]]
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 tile = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
                 buf_store: pl.Tensor[[16, 128], pl.FP32] = pl.store(tile, [0, 0], buf)
@@ -771,7 +846,7 @@ class TestOutlineClusterScopes:
         props = passes.IRPropertySet()
         props.insert(passes.IRProperty.ClusterOutlined)
 
-        with pytest.raises(Exception, match="Verification failed"):
+        with pytest.raises(pypto.Error, match="Verification failed"):
             passes.verify_properties(props, Program, "OutlineClusterScopes")
 
 
@@ -783,9 +858,10 @@ class TestOutlineSpmdScopeTaskId:
     into a kernel (preserving the outer scope's attrs), then
     ``OutlineClusterScopes``' Spmd outliner — seeing ``kAttrTaskIdVar`` — emits an
     ``ir.Submit`` whose return type ends in ``Scalar[TASK_ID]`` instead of a plain
-    Call. ``core_num`` rides on the outlined Spmd ``Function`` attrs, so the
-    Submit's own ``core_num`` is ``None`` (codegen reads it via the launch-function
-    fallback). Explicit ``deps=[tid]`` fold into the consumer Submit's ``deps``.
+    Call. The launch spec rides the dispatch, so ``core_num`` lands in the
+    Submit's own first-class field — the same shape ``pl.spmd_submit(...,
+    core_num=N)`` produces. Explicit ``deps=[tid]`` fold into the consumer
+    Submit's ``deps``.
     """
 
     @staticmethod
@@ -813,10 +889,6 @@ class TestOutlineSpmdScopeTaskId:
         walk(func.body)
         return found
 
-    @staticmethod
-    def _funcs_by_type(prog, ftype):
-        return [f for f in prog.functions.values() if f.func_type == ftype]
-
     def test_as_tid_outlines_to_submit(self):
         """A captured Spmd dispatch lowers to a deps-free ``ir.Submit`` (not a plain Call)."""
 
@@ -836,18 +908,19 @@ class TestOutlineSpmdScopeTaskId:
 
         After = self._run(Before)
 
-        # A Spmd wrapper function was synthesised carrying the launch spec.
-        spmd_fns = self._funcs_by_type(After, ir.FunctionType.Spmd)
+        # A Spmd wrapper function was synthesised. The launch spec is NOT on it:
+        # core_num is evaluated in the caller's scope, so the callee must not
+        # reference it (a Function is a closed scope).
+        spmd_fns = _funcs_by_type(After, ir.FunctionType.Spmd)
         assert len(spmd_fns) == 1
-        assert "core_num" in spmd_fns[0].attrs
+        assert "core_num" not in spmd_fns[0].attrs
 
         # The orchestration entry lowers the dispatch to exactly one Submit.
-        orch = self._funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
         submits = self._submit_values(orch)
         assert len(submits) == 1
         submit = submits[0]
-        # The Submit carries the launch operand so later caller-side SSA and
-        # orchestration inlining can rewrite a dynamic bound.
+        # core_num rides the dispatch, in Submit's first-class field.
         assert submit.core_num is not None
         # No explicit deps on a lone captured dispatch.
         assert len(submit.deps) == 0
@@ -874,7 +947,7 @@ class TestOutlineSpmdScopeTaskId:
                 return out
 
         After = self._run(Before)
-        orch = self._funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
         submits = self._submit_values(orch)
         assert len(submits) == 2
         # First dispatch has no explicit deps; second carries the first's producer TaskId.
@@ -882,7 +955,7 @@ class TestOutlineSpmdScopeTaskId:
         assert len(submits[1].deps) == 1
         assert isinstance(submits[1].deps[0], ir.Var)
         # Two distinct Spmd wrapper functions were synthesised.
-        assert len(self._funcs_by_type(After, ir.FunctionType.Spmd)) == 2
+        assert len(_funcs_by_type(After, ir.FunctionType.Spmd)) == 2
 
     def test_allow_early_resolve_threads_onto_submit(self):
         """``pl.spmd(..., allow_early_resolve=True) as tid`` sets the Submit's flag."""
@@ -902,7 +975,7 @@ class TestOutlineSpmdScopeTaskId:
                 return out
 
         After = self._run(Before)
-        orch = self._funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
         (submit,) = self._submit_values(orch)
         assert submit.allow_early_resolve is True
 
@@ -937,10 +1010,126 @@ class TestOutlineSpmdScopeTaskId:
                 return out
 
         After = self._run(Before)
-        orch = self._funcs_by_type(After, ir.FunctionType.Orchestration)[0]
+        orch = _funcs_by_type(After, ir.FunctionType.Orchestration)[0]
         (submit,) = self._submit_values(orch)
         assert submit.allow_early_resolve is True
+        # core_num rides the dispatch, in Submit's first-class field.
         assert submit.core_num is not None
+
+
+class TestDynamicSpmdLaunchSpec:
+    """A runtime ``pl.spmd`` block count stays in the caller's scope.
+
+    ``core_num`` may be an expression over caller-local scalars. A Function is a
+    closed scope, so parking that expression on the outlined callee produced a
+    Function referencing a name it does not bind — printed as a decorator, that
+    name is unbound at class-body evaluation time and the program could not be
+    re-parsed. The spec therefore rides the dispatch.
+    """
+
+    M_DYN = pl.dynamic("M_DYN_SPMD_SPEC")
+
+    @staticmethod
+    def _build():
+        M_DYN = TestDynamicSpmdLaunchSpec.M_DYN
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[M_DYN, 128], pl.FP32]],
+            ) -> pl.Tensor[[M_DYN, 128], pl.FP32]:
+                m = pl.tensor.dim(a, 0)
+                with pl.spmd(m // 16):
+                    i = pl.tile.get_block_idx()
+                    t: pl.Tile[[16, 128], pl.FP32] = pl.load(a, [i * 16, 0], [16, 128])
+                    out = pl.store(pl.add(t, t), [i * 16, 0], out)
+                return out
+
+        prog = passes.convert_to_ssa()(Before)
+        prog = passes.outline_incore_scopes()(prog)
+        return passes.outline_cluster_scopes()(prog)
+
+    def test_dynamic_core_num_rides_the_dispatch(self):
+        """The outlined Spmd function must not reference a caller-local scalar."""
+        After = self._build()
+
+        spmd_fns = _funcs_by_type(After, ir.FunctionType.Spmd)
+        assert len(spmd_fns) == 1
+        assert "core_num" not in spmd_fns[0].attrs
+
+        launch = _launch_calls(_funcs_by_type(After, ir.FunctionType.Orchestration)[0])
+        assert len(launch) == 1
+        # An expression over the caller's local scalar, not a folded constant.
+        assert isinstance(launch[0].attrs["core_num"], ir.FloorDiv)
+
+    def test_dynamic_core_num_program_reparses(self):
+        """print -> parse must succeed; a decorator-scoped var raised NameError."""
+        printed = ir.python_print(self._build(), format=False)
+        assert "core_num" in printed
+        # A reparse alone is not proof: a __FREE_VAR-marked name still parses,
+        # it just binds a different Var. The name must be genuinely bound.
+        assert "__FREE_VAR" not in printed
+        reparsed = pl.parse(printed)
+        assert isinstance(reparsed, ir.Program)
+
+    @staticmethod
+    def _build_cluster_nested():
+        M_DYN = TestDynamicSpmdLaunchSpec.M_DYN
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                a: pl.Tensor[[M_DYN, 128], pl.FP32],
+                out: pl.InOut[pl.Tensor[[M_DYN, 128], pl.FP32]],
+                n: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[M_DYN, 128], pl.FP32]:
+                with pl.cluster():
+                    with pl.spmd(n // 16):
+                        i = pl.tile.get_block_idx()
+                        t: pl.Tile[[16, 128], pl.FP32] = pl.load(a, [i * 16, 0], [16, 128])
+                        out = pl.store(pl.add(t, t), [i * 16, 0], out)
+                return out
+
+        prog = passes.convert_to_ssa()(Before)
+        prog = passes.outline_incore_scopes()(prog)
+        return passes.outline_cluster_scopes()(prog)
+
+    def test_cluster_nested_dynamic_core_num_rides_the_dispatch(self):
+        """The unwrapped Group keeps only the self-contained marker.
+
+        The spec is lifted from *inside* the Group, where the count references a
+        Group **param**; it must be translated back through the dispatch's args
+        so the attr names a Var that is live at the call site.
+        """
+        After = self._build_cluster_nested()
+
+        groups = _funcs_by_type(After, ir.FunctionType.Group)
+        assert len(groups) == 1
+        assert "core_num" not in groups[0].attrs
+        assert groups[0].attrs["spmd_unwrapped"] is True
+        group_params = list(groups[0].params)
+
+        launch = _launch_calls(_funcs_by_type(After, ir.FunctionType.Orchestration)[0])
+        assert len(launch) == 1
+        # Translated into the caller's Var space — not left pointing at a param
+        # of the callee it was lifted out of.
+        core_num = launch[0].attrs["core_num"]
+        assert isinstance(core_num, ir.FloorDiv)
+        assert not any(core_num.left is p for p in group_params)
+        assert any(core_num.left is arg for arg in launch[0].args)
+
+    def test_cluster_nested_dynamic_core_num_program_reparses(self):
+        """print -> parse must succeed for the pl.cluster()-nested form too."""
+        printed = ir.python_print(self._build_cluster_nested(), format=False)
+        assert "core_num" in printed
+        assert "__FREE_VAR" not in printed
+        reparsed = pl.parse(printed)
+        assert isinstance(reparsed, ir.Program)
 
 
 class TestOutlinedReturnParamsExplicit:
@@ -998,8 +1187,7 @@ class TestOutlinedReturnParamsExplicit:
                     pre, post, out = self.kernel(a, pre, post, out)
                 return out
 
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            after = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
+        after = passes.outline_cluster_scopes()(passes.convert_to_ssa()(Before))
 
         spmd_fns = [f for f in after.functions.values() if f.func_type == ir.FunctionType.Spmd]
         assert len(spmd_fns) == 1

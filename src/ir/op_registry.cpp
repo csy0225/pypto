@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -32,6 +33,15 @@
 
 namespace pypto {
 namespace ir {
+
+namespace {
+
+/// Format an IR span as a " at <file>:<line>:<col>" suffix, empty when unknown.
+///
+/// Kept out of line so `Span::to_string()` is only paid on the error path.
+std::string LocationSuffix(const Span& span) { return span.is_valid() ? " at " + span.to_string() : ""; }
+
+}  // namespace
 
 void ValidateKwargs(const std::vector<std::pair<std::string, std::any>>& kwargs,
                     const std::unordered_map<std::string, std::type_index>& allowed_kwargs,
@@ -159,9 +169,15 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   TypePtr result_type;
   try {
     result_type = deduce_type_fn(args, kwargs);
+  } catch (const Error& e) {
+    // Append the IR location but keep the concrete exception type and the stack trace
+    // captured at the original throw. Flattening every PyPTO exception to ValueError
+    // here erased the CHECK / INTERNAL_CHECK distinction for all op type deduction.
+    e.RethrowWithMessage(std::string(e.what()) + LocationSuffix(span));
   } catch (const std::exception& e) {
-    std::string location = span.is_valid() ? " at " + span.to_string() : "";
-    throw ValueError(std::string(e.what()) + location);
+    // Non-PyPTO exceptions (e.g. std::bad_any_cast from a wrong-typed kwarg) stay
+    // ValueError: they are reachable from user input and carry no PyPTO trace to keep.
+    throw ValueError(std::string(e.what()) + LocationSuffix(span));
   }
   INTERNAL_CHECK_SPAN(result_type, span) << "Type deduction failed for '" + op_name + "'";
 
@@ -258,6 +274,54 @@ void OpRegistry::ValidateTileOps() const {
         "The following tile ops are missing a memory spec "
         "(add set_output_memory/set_input_memory or no_memory_spec()):";
     for (const auto& name : missing) {
+      msg += "\n  - " + name;
+    }
+    throw ValueError(msg);
+  }
+}
+
+void OpRegistry::ValidateArgEffects() const {
+  std::vector<std::string> unclassified;
+  std::vector<std::string> channel_without_write;
+  for (const auto& [name, entry] : registry_) {
+    // A write channel describes *how* an operator writes, so declaring one
+    // while writing nothing is incoherent — and it is the shape that hides a
+    // missing classification, since `set_write_channel()` creates the effect
+    // spec as a side effect and would otherwise make the operator look
+    // classified.
+    if (entry.GetWriteChannel().has_value() && !entry.WritesAnyArg()) {
+      channel_without_write.push_back(name);
+    }
+    const auto& spec = entry.GetMemorySpec();
+    if (!spec.has_value() || !spec->output_reuses_input_arg.has_value()) continue;
+    const size_t reused = *spec->output_reuses_input_arg;
+    // Ask about the reused argument specifically. A registration that named a
+    // different argument still leaves this one defaulting to `Read`, and the
+    // whole point of the gate is that such a default is a decision nobody made.
+    if (entry.HasDeclaredArgEffect(reused)) continue;
+    unclassified.push_back(name + " (in-place on argument " + std::to_string(reused) + ")");
+  }
+  if (!channel_without_write.empty()) {
+    std::sort(channel_without_write.begin(), channel_without_write.end());
+    std::string msg =
+        "The following ops declare a write channel but write through no argument. A channel says "
+        "how an op writes, so one without a write is either a stray declaration or a missing "
+        "one — add the .set_arg_effect(<index>, ...) that was meant to accompany it, or drop the "
+        ".set_write_channel(...):";
+    for (const auto& name : channel_without_write) {
+      msg += "\n  - " + name;
+    }
+    throw ValueError(msg);
+  }
+  if (!unclassified.empty()) {
+    std::sort(unclassified.begin(), unclassified.end());
+    std::string msg =
+        "The following ops update an argument in place but never declared what they do to it. "
+        "Direction inference reads an undeclared operator as a pure consumer, so the write is "
+        "silently dropped. Add .set_arg_effect(<index>, ArgEffect::Write) — ArgEffect::ReadWrite "
+        "when the op accumulates into the slot — or .no_arg_writes() when the slot is metadata "
+        "rather than data:";
+    for (const auto& name : unclassified) {
       msg += "\n  - " + name;
     }
     throw ValueError(msg);

@@ -15,6 +15,7 @@ self-contained programs, so the default strict-identity mode (with DefField
 auto-mapping at def sites) is sufficient.
 """
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -957,7 +958,7 @@ class TestEdgeCases:
 
         def walk(stmt: ir.Stmt) -> None:
             if isinstance(stmt, ir.AssignStmt) and isinstance(stmt.value, ir.Call):
-                if stmt.value.op.name == "tensor.slice":
+                if stmt.value.op.name == ir.get_op("tensor.slice").name:
                     slice_calls.append(stmt.value)
             if isinstance(stmt, ir.SeqStmts):
                 for s in stmt.stmts:
@@ -1690,7 +1691,9 @@ class TestEscapingVariables:
                 acc: pl.Tensor[[64], pl.FP32] = x
                 for i in pl.range(4):
                     k0 = i * 8
-                    chunk: pl.Tensor[[64], pl.FP32] = pl.add(x, k0)
+                    # ``k0`` is an INDEX scalar; cast it before use as a tensor
+                    # scalar operand (index is not a legal t*s operand type).
+                    chunk: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(k0, pl.INT32))
                     acc = pl.add(acc, chunk)
                 result: pl.Tensor[[64], pl.FP32] = pl.mul(acc, 2.0)
                 return result
@@ -1704,7 +1707,7 @@ class TestEscapingVariables:
                 acc_0 = x_0
                 for i_0, (acc_iter_1,) in pl.range(0, 4, 1, init_values=(acc_0,)):
                     k0_0 = i_0 * 8
-                    chunk_0 = pl.add(x_0, k0_0)
+                    chunk_0 = pl.add(x_0, pl.cast(k0_0, pl.INT32))
                     acc_2 = pl.add(acc_iter_1, chunk_0)
                     acc_1 = pl.yield_(acc_2)
                 result_0 = pl.mul(acc_1, 2.0)
@@ -1885,7 +1888,7 @@ class TestMidBodyYieldGuard:
         program = ir.Program([func], "test_program", span)
 
         ctx = passes.PassContext([], passes.VerificationLevel.NONE)
-        with ctx, pytest.raises(Exception, match="YieldStmt at position"):
+        with ctx, pytest.raises(pypto.InternalError, match="YieldStmt at position"):
             passes.convert_to_ssa()(program)
 
     def test_function_body_with_mid_body_yield_rejected(self):
@@ -1908,7 +1911,7 @@ class TestMidBodyYieldGuard:
         program = ir.Program([func], "test_program", span)
 
         ctx = passes.PassContext([], passes.VerificationLevel.NONE)
-        with ctx, pytest.raises(Exception, match="YieldStmt at position"):
+        with ctx, pytest.raises(pypto.InternalError, match="YieldStmt at position"):
             passes.convert_to_ssa()(program)
 
 
@@ -2369,7 +2372,7 @@ class TestScopeOutlineBoundary:
 
 class TestSplitAivRegionTransparentToSSA:
     """``SplitAivScopeStmt`` is non-boundary / transparent to SSA: it is never
-    outlined and is lowered in place by LowerAutoVectorSplit (pass 21), so its
+    outlined and is lowered in place by LowerAutoVectorSplit (pass 20), so its
     body shares SSA state with the enclosing function. ConvertToSSA must thread
     values through it and version the in-body ``aiv_id`` binding normally."""
 
@@ -2458,6 +2461,81 @@ class TestSplitAivRegionTransparentToSSA:
 
         After = passes.convert_to_ssa()(Before)
         ir.assert_structural_equal(After, Expected)
+
+
+class TestArbitraryAttrKeyRemap:
+    """Attr substitution is keyed on the value's type, not on the attr name.
+
+    The walkers report every reference-valued attr as a live use, so every
+    substitution path must rewrite the same set. A key-gated substitution left
+    an attr under an unenumerated key pointing at its pre-SSA ``Var``, which
+    then fails ``UseAfterDef``.
+    """
+
+    @staticmethod
+    def _use_after_def(program):
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.UseAfterDef)
+        return [
+            d
+            for d in passes.PropertyVerifierRegistry.verify(props, program)
+            if d.severity == passes.DiagnosticSeverity.Error
+        ]
+
+    def test_call_attr_under_arbitrary_key_is_remapped(self):
+        """A Var under a key no walker list enumerates survives ConvertToSSA.
+
+        The reassignment below forces a new SSA version of ``acc``. A key-gated
+        substitution would leave the attr on the pre-SSA ``acc``, which
+        ``UseAfterDef`` then reports as undefined.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t = pl.load(x, [0], [64])
+                out = pl.store(t, [0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.kernel(x, out)
+                out = self.kernel(out, out)
+                return out
+
+        after = passes.convert_to_ssa()(Before)
+        assert self._use_after_def(after) == []
+
+        # Every Var referenced from a Call attr must be one the converted
+        # function actually binds — i.e. remapped alongside the args.
+        main = after.get_function("main")
+        assert main is not None
+        bound: set[int] = {id(p) for p in main.params}
+
+        class _Collect(ir.IRVisitor):
+            def __init__(self):
+                super().__init__()
+                self.attr_vars = []
+
+            def visit_assign_stmt(self, op):
+                bound.add(id(op.var))
+                super().visit_assign_stmt(op)
+
+            def visit_call(self, op):
+                for value in dict(op.attrs).values():
+                    if isinstance(value, ir.Var):
+                        self.attr_vars.append(value)
+                super().visit_call(op)
+
+        collector = _Collect()
+        collector.visit_function(main)
+        for var in collector.attr_vars:
+            assert id(var) in bound, f"Call attr references unbound Var {var.name_hint}"
 
 
 if __name__ == "__main__":

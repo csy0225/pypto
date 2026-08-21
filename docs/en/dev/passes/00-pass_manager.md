@@ -17,7 +17,7 @@ Framework for organizing and executing IR transformation passes on Programs with
 - **Property Tracking**: Passes declare required, produced, and invalidated properties
 - **Instrumentation**: PassContext holds PassInstruments that run before/after each pass
 - **Runtime Verification**: VerificationInstrument checks properties against actual IR
-- **Strategy-based Pipelines**: Pre-configured optimization levels (`Default`, `DebugTileOptimization`)
+- **Strategy-based Pipelines**: Pre-configured optimization levels (`Default`)
 - **Immutable Transformations**: Return new IR nodes, don't modify in place
 
 ## IRProperty System
@@ -34,13 +34,41 @@ Framework for organizing and executing IR transformation passes on Programs with
 | `NormalizedStmtStructure` | Statement structure normalized |
 | `NoRedundantBlocks` | No single-child or nested SeqStmts |
 | `SplitIncoreOrch` | InCore scopes outlined into separate functions |
-| `ClusterOutlined` | Cluster scopes outlined into Group functions |
 | `HasMemRefs` | MemRef objects initialized on variables |
-| `IncoreTileOps` | InCore functions use tile ops |
-| `MixedKernelExpanded` | Mixed InCore functions split into AIC + AIV + Group |
+| `IncoreTileOps` | InCore functions use tile ops (tile types, load/store) |
 | `AllocatedMemoryAddr` | All MemRefs have valid addresses within buffer limits |
+| `MixedKernelExpanded` | Mixed InCore functions split into AIC + AIV + Group |
+| `ClusterOutlined` | Cluster scopes outlined into Group functions |
+| `TileOps2D` | All tile ops in InCore functions use ≤2D tiles |
+| `TileMemoryInferred` | `TileType::memory_space_` populated in InCore functions |
+| `BreakContinueValid` | Break/continue only in sequential/while loops |
+| `UseAfterDef` | All variable uses are dominated by a definition |
+| `HierarchyOutlined` | Hierarchy scopes outlined into level/role functions |
+| `StructuredCtrlFlow` | No BreakStmt/ContinueStmt — only structured control flow |
+| `VectorKernelSplit` | AIV functions with a split mode have tpop shapes and store offsets adjusted |
+| `OutParamNotShadowed` | Out/InOut params are not reassigned with tensor-creating ops |
+| `NoNestedInCore` | No nested InCore scopes (ScopeStmt inside ScopeStmt) |
+| `InOutUseValid` | No reads of InOut/Out-passed variables after the call (RFC #1026) |
+| `PipelineLoopValid` | Bidirectional invariant: `ForStmt.kind_ == Pipeline` ⇔ has a `pipeline_stages` attr |
+| `PipelineResolved` | No `ForKind::Pipeline` survives; produced by CanonicalizeIOOrder |
+| `CallDirectionsResolved` | Every non-builtin Call has explicit `attrs['arg_directions']` |
 | `TileTypeCoherence` | Every TileType has canonical tile_view (implicit views stored as nullopt) |
+| `InlineFunctionsEliminated` | No `FunctionType::Inline` functions or Calls to them remain |
 | `OrchestrationReferencesResolved` | Every non-builtin Call inside a `FunctionType::Orchestration` function targets a Function in the surrounding Program |
+| `TensorViewCanonical` | TensorView canonicality verified (weak: empty stride ok; strict: requires materialization, RFC #1300 §2.2) |
+| `ArrayNotEscaped` | ArrayType never appears as a function parameter or return type |
+| `CommDomainScopesMaterialized` | Host_orch bodies wrapped in CommDomainScopeStmts, and `pld.tensor.window` result types carry `DistributedTensorType::window_buffer_` back-references |
+| `DistTensorCtxMaterialized` | No `pld.system.get_comm_ctx` survives outside host orchestration; every chip-orchestration / device communication context is an explicit CommCtxType SSA value traceable to a parameter |
+| `RuntimeScopesMaterialized` | Orchestration functions carry explicit RuntimeScopeStmt nodes, so codegen emits no implicit `PTO2_SCOPE()` wrappers |
+| `AssignTypeSymmetry` | Every AssignStmt has `structural_equal(var->GetType(), value->GetType())` (memref excluded as an allocation detail) |
+| `ManualDepsOnSubmitOnly` | No plain cross-function Call carries `attrs["manual_dep_edges"]` — manual edges live in `Submit::deps_` |
+| `ReturnParamsExplicit` | InCore/Group/Spmd tensor returns reference function params by pointer identity (#1702) |
+| `UnrollResolved` | No `ForKind::Unroll` survives; produced by UnrollLoops |
+| `AivSplitValid` | SplitAivScopeStmt regions are structurally valid: no cube compute or split-axis reduce inside a region, boundary ops only inside one |
+| `HardSyncallOccupancyValid` | Every hard (FFTS) `system.syncall` is launched at full occupancy — a partial or over launch deadlocks on device (507018) |
+| `IterArgCarryClassified` | Every Orchestration ForStmt with iter_args carries its `iter_arg_rebind_<i>` carry plan, so codegen reads it instead of re-deriving it |
+| `AccToGmStoreValid` | Every `tile.store` from an Acc-resident tile targets a GM dtype the backend's fix-pipe can narrow into |
+| `AtomicAddDtypeValid` | Every atomic-add write into GM targets a destination dtype the backend's store pipe can combine |
 
 ### IRPropertySet
 
@@ -61,40 +89,65 @@ struct PassProperties {
 | Pass | Required | Produced | Invalidated |
 | ---- | -------- | -------- | ----------- |
 | InlineFunctions | — | InlineFunctionsEliminated | — |
-| UnrollLoops | TypeChecked | TypeChecked | — |
-| CtrlFlowTransform | TypeChecked | TypeChecked, StructuredCtrlFlow | — |
-| ConvertToSSA | TypeChecked | TypeChecked, SSAForm | NormalizedStmtStructure |
-| FlattenCallExpr | SSAForm | SSAForm, NoNestedCalls | NormalizedStmtStructure |
-| NormalizeStmtStructure | TypeChecked | TypeChecked, NormalizedStmtStructure | — |
-| OutlineIncoreScopes | TypeChecked, SSAForm | SplitIncoreOrch | — |
-| OutlineClusterScopes | TypeChecked, SSAForm | ClusterOutlined | — |
-| ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
+| UnrollLoops | — | UnrollResolved | — |
+| CtrlFlowTransform | — | StructuredCtrlFlow | — |
+| ConvertToSSA | — | SSAForm | NormalizedStmtStructure |
+| Simplify | — | — | — |
+| NormalizeStmtStructure | — | NormalizedStmtStructure | — |
+| FlattenCallExpr | SSAForm, NormalizedStmtStructure | SSAForm, NoNestedCalls, NormalizedStmtStructure | — |
+| OutlineHierarchyScopes | SSAForm | SSAForm, HierarchyOutlined, OrchestrationReferencesResolved | — |
+| OutlineIncoreScopes | SSAForm | SSAForm, SplitIncoreOrch, AivSplitValid | — |
+| OutlineClusterScopes | SSAForm | SSAForm, ClusterOutlined | — |
+| ConvertTensorToTileOps | SSAForm, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid | AivSplitValid |
+| OptimizeOrchTensors | SplitIncoreOrch, IncoreTileOps | SplitIncoreOrch, IncoreTileOps | — |
 | LowerCompositeOps | — | — | — |
-| FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
-| AutoTileMatmulL0 | SSAForm, IncoreTileOps, TileOps2D | SSAForm, IncoreTileOps, TileOps2D | — |
+| FlattenTileNdTo2D | SSAForm, IncoreTileOps, NormalizedStmtStructure | SSAForm, TileOps2D, NormalizedStmtStructure | — |
+| LegalizeTileCast | — | — | — |
+| AutoTileMatmulL0 | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
 | CanonicalizeTileSlice | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
+| InferTileMemorySpace | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid, AccToGmStoreValid | AivSplitValid |
+| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
-| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
-| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, MixedKernelExpanded | — |
-| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | — | — |
-| InitMemRef | TypeChecked, SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D | HasMemRefs | SSAForm |
-| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| MemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| AllocateMemoryAddr | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
+| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | AivSplitValid |
+| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid | — |
+| InjectGMPipeBuffer | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | — |
+| SplitVectorKernel | SSAForm, MixedKernelExpanded | SSAForm, VectorKernelSplit, NormalizedStmtStructure | — |
+| StampTfreeSplit | SplitIncoreOrch | — | — |
+| NormalizeReturnOrder | SplitIncoreOrch, IncoreTileOps | ReturnParamsExplicit | — |
+| SkewCrossCorePipeline | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineToSlots | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| LowerPipelineLoops | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
+| CanonicalizeIOOrder | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, PipelineResolved | — |
+| MaterializeTensorStrides | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, TensorViewCanonical | — |
+| InitMemRef | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred | HasMemRefs, NormalizedStmtStructure | SSAForm |
+| MaterializeSemanticAliases | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| MemoryReuse | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D, NormalizedStmtStructure | NormalizedStmtStructure | — |
+| AllocateMemoryAddr | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
 | FoldNoOpReshape | SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
-| FuseCreateAssembleToSlice | — | — | — |
+| FuseCreateAssembleToSlice | SplitIncoreOrch | — | — |
 | DeriveCallDirections | SplitIncoreOrch | CallDirectionsResolved | — |
 | AutoDeriveTaskDependencies | SplitIncoreOrch, CallDirectionsResolved | CallDirectionsResolved | — |
 | ExpandManualPhaseFence | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | NoNestedCalls, NormalizedStmtStructure, CallDirectionsResolved | — |
 | SynthesizeAllReduceSignals | — | — | — |
 | MaterializeCommDomainScopes | — | CommDomainScopesMaterialized | — |
 | LowerHostTensorCollectives | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| MaterializeDistTensorCtx | CommDomainScopesMaterialized | CommDomainScopesMaterialized | — |
-| Simplify | — | — | — |
+| MaterializeDistTensorCtx | CommDomainScopesMaterialized, ReturnParamsExplicit | CommDomainScopesMaterialized, DistTensorCtxMaterialized | — |
 | MaterializeRuntimeScopes | SplitIncoreOrch, CallDirectionsResolved | RuntimeScopesMaterialized | — |
 | ClassifyIterArgCarry | CallDirectionsResolved, RuntimeScopesMaterialized | IterArgCarryClassified, RuntimeScopesMaterialized | — |
+| InsertCommFence | SplitIncoreOrch | — | — |
+| MaterializeValidShapeSymbols | — | — | — |
 
-> **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md).
+The table lists every registered pass, in `Default`-strategy execution order. Update the row
+here whenever you add a pass or change its declaration.
+
+Most `PassProperties` constants live in `include/pypto/ir/transforms/pass_properties.h`, but that
+header is not the whole list: `kFuseCreateAssembleToSliceProperties` is declared locally in
+`src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp`. What authoritatively binds a pass
+*name* to its properties is the `CreateFunctionPass` / `CreateProgramPass` call site, since that
+is where `Pass::GetName()` and the constant meet. Regenerate a row from the call sites rather
+than from the header alone, or a pass-local declaration is silently missed.
+
+> **Note**: VerifySSA and TypeCheck are **PropertyVerifiers** (verification rules), not Passes. They run via `VerificationInstrument` or the `run_verifier()` utility — see [Verifier](99-verifier.md). That is why no pass declares `TypeChecked`: it is a *structural* property (`GetStructuralProperties()`), verified once on the pipeline's input IR rather than established by any pass.
 
 ## C++ Pass Infrastructure
 
@@ -198,25 +251,25 @@ RunConfig(dump_passes=True)                     # == PassDumpLevel.CONCISE
 
 ### ReportInstrument
 
-Instrument that generates reports to files after specified passes. Uses `ReportGeneratorRegistry` to dispatch report generation:
+Carries the directory that on-disk pipeline artifacts are written to. It observes no pass itself — `DiagnosticInstrument` reads its `output_dir` to decide where to append `perf_hints.log`:
 
 ```cpp
 class ReportInstrument : public PassInstrument {
   explicit ReportInstrument(std::string output_dir);
-  void EnableReport(ReportType type, std::string trigger_pass);
+  const std::string& GetOutputDir() const;
 };
 ```
 
 ```python
-# Python: generate memory report after AllocateMemoryAddr
 instrument = passes.ReportInstrument("/path/to/report")
-instrument.enable_report(passes.ReportType.Memory, "AllocateMemoryAddr")
 
 with passes.PassContext([instrument]):
     pipeline.run(program)
 ```
 
-`compile()` automatically creates a `ReportInstrument` that generates memory reports to `build_output/<name>/report/`.
+`compile()` creates one pointing at `build_output/<name>/report/`.
+
+Memory usage is no longer reported here. It is rendered from a pass dump by `python -m pypto.tools.memory_map` — see [Memory Map](../07-memory-map.md).
 
 ### RoundtripInstrument
 
@@ -323,26 +376,33 @@ class PassPipeline {
 
 ### Automatic Verification
 
-When `VerificationLevel` is `Basic` (the default), the pipeline automatically verifies a small set of **lightweight properties** exactly once each. This catches common IR errors without requiring manual `PassContext` setup.
-
-**Verified properties**: `{SSAForm, TypeChecked, AllocatedMemoryAddr}`
+When `VerificationLevel` is `Basic` (the default), the pipeline automatically verifies the **lightweight properties** listed by `GetVerifiedProperties()` (`src/ir/transforms/ir_property.cpp`), each one exactly once per time it is produced. This catches common IR errors without requiring manual `PassContext` setup.
 
 **How it works**:
 
-1. After each pass, check if it produced any verified properties not yet checked
-2. Verify those properties using `PropertyVerifierRegistry`
-3. Throw `VerificationError` on errors
-4. Track verified properties to avoid re-checking
+1. At pipeline input, verify `GetStructuralProperties() ∩ GetVerifiedProperties()` — the invariants that hold on the user's own IR before any pass runs
+2. After each pass, verify the properties it *produces* that are in `GetVerifiedProperties()` and not already verified
+3. When a pass *invalidates* such a property, drop it from the verified set so a later producer re-verifies it
+4. Throw `VerificationError` on errors
 
-**With the `Default` strategy**:
+**With the `Default` strategy** (20 checks; the two sets are declared in `ir_property.cpp`, so this schedule follows from them and from the per-pass table above):
 
-| After Pass | Properties Verified | Cumulative |
-| ---------- | ------------------- | ---------- |
-| ConvertToSSA | SSAForm, TypeChecked | 2 |
-| FlattenCallExpr | *(TypeChecked already verified — skipped)* | 2 |
-| AllocateMemoryAddr | AllocatedMemoryAddr | 3 |
+| Verification point | Properties verified |
+| ------------------ | ------------------- |
+| pipeline input | TypeChecked, BreakContinueValid, NoRedundantBlocks, InOutUseValid, ManualDepsOnSubmitOnly, AtomicAddDtypeValid |
+| ConvertToSSA | SSAForm |
+| OutlineIncoreScopes | AivSplitValid |
+| ConvertTensorToTileOps | AivSplitValid *(re-verified — the pass invalidates it, see [10](10-convert_tensor_to_tile_ops.md))* |
+| InferTileMemorySpace | AivSplitValid *(re-verified)*, TileMemoryInferred, AccToGmStoreValid |
+| ExpandMixedKernel | MixedKernelExpanded, HardSyncallOccupancyValid |
+| NormalizeReturnOrder | ReturnParamsExplicit |
+| AllocateMemoryAddr | AllocatedMemoryAddr |
+| DeriveCallDirections | CallDirectionsResolved |
+| MaterializeDistTensorCtx | DistTensorCtxMaterialized |
+| MaterializeRuntimeScopes | RuntimeScopesMaterialized |
+| ClassifyIterArgCarry | IterArgCarryClassified |
 
-**Total: 3 property checks** (each property verified exactly once).
+A pass that under-declares `produced` therefore does not just mis-document itself — it silently removes a verification from this schedule.
 
 **Control via `PassContext`**:
 
@@ -395,46 +455,46 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 
 ### Strategy Notes
 
-The PTO-oriented tile stage shared by `Default` and `DebugTileOptimization` is:
+The PTO-oriented tile stage of `Default` is:
 
 1. [`LowerCompositeOps`](12-lower_composite_ops.md)
 2. [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md)
-3. [`AutoTileMatmulL0`](14-auto_tile_matmul_l0.md)
-4. [`CanonicalizeTileSlice`](15-canonicalize_tile_slice.md)
-5. `InferTileMemorySpace`
-6. [`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md) (self-normalizes statement structure internally)
-7. [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md) (live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form before ExpandMixedKernel)
-8. `ExpandMixedKernel`
-9. [`InjectGMPipeBuffer`](20-inject_gm_pipe_buffer.md)
-10. [`SplitVectorKernel`](21-split_vector_kernel.md) (only stamps attrs for split_aiv functions + handles the no-split dual-AIV path)
-11. [`StampTfreeSplit`](22-stamp_tfree_split.md) (copies each cross-core tpop's split/pipe-id onto its matching tfree op)
-12. `NormalizeReturnOrder`
-13. [`SkewCrossCorePipeline`](24-skew_cross_core_pipeline.md) (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops)
-14. [`LowerPipelineLoops`](25-lower_pipeline_loops.md)
-15. [`CanonicalizeIOOrder`](26-canonicalize_io_order.md)
-16. [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
-17. `InitMemRef`
-18. [`MaterializeSemanticAliases`](29-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
-19. `MemoryReuse`
-20. `AllocateMemoryAddr`
-21. [`FoldNoOpReshape`](32-fold_no_op_reshape.md)
-22. [`FuseCreateAssembleToSlice`](33-fuse_create_assemble_to_slice.md)
-23. [`DeriveCallDirections`](34-derive_call_directions.md)
-24. [`AutoDeriveTaskDependencies`](35-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
-25. [`ExpandManualPhaseFence`](36-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-26. [`SynthesizeAllReduceSignals`](37-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
-27. [`MaterializeCommDomainScopes`](38-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-28. [`LowerHostTensorCollectives`](39-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-29. [`MaterializeDistTensorCtx`](40-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
-30. `Simplify`
-31. [`MaterializeRuntimeScopes`](41-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
-32. [`ClassifyIterArgCarry`](42-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+3. [`LegalizeTileCast`](14-legalize_tile_cast.md) (expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt`)
+4. [`AutoTileMatmulL0`](15-auto_tile_matmul_l0.md)
+5. [`CanonicalizeTileSlice`](16-canonicalize_tile_slice.md)
+6. `InferTileMemorySpace`
+7. [`InsertMxScaleAddr`](18-insert_mx_scale_addr.md) (Ascend950 MX path; inserts internal scale-address bindings after memory spaces are resolved)
+8. [`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) (self-normalizes statement structure internally)
+9. [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) (live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form before ExpandMixedKernel)
+10. `ExpandMixedKernel`
+11. [`InjectGMPipeBuffer`](22-inject_gm_pipe_buffer.md)
+12. [`SplitVectorKernel`](23-split_vector_kernel.md) (only stamps attrs for split_aiv functions + handles the no-split dual-AIV path)
+13. [`StampTfreeSplit`](24-stamp_tfree_split.md) (copies each cross-core tpop's split/pipe-id onto its matching tfree op)
+14. `NormalizeReturnOrder`
+15. [`SkewCrossCorePipeline`](26-skew_cross_core_pipeline.md) (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops)
+16. [`LowerPipelineToSlots`](27-lower_pipeline_to_slots.md) (rotates an eligible `pl.pipeline` body through the slots of one allocation instead of replicating it; self-gated on `memory_planner=PTOAS`, and every loop it declines is left for `LowerPipelineLoops`)
+17. [`LowerPipelineLoops`](28-lower_pipeline_loops.md)
+18. [`CanonicalizeIOOrder`](29-canonicalize_io_order.md)
+19. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
+20. `InitMemRef`
+21. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
+22. `MemoryReuse`
+23. `AllocateMemoryAddr`
+24. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
+25. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
+26. [`DeriveCallDirections`](37-derive_call_directions.md)
+27. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
+28. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+29. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+30. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+31. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+32. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+33. `Simplify`
+34. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+35. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+36. [`InsertCommFence`](46-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
 
-`DebugTileOptimization` is a debug-only strategy for inspecting this tile stage
-without the tensor-only prefix passes. Use `Default` for normal compilation and
-for non-strategy-specific tests so the maintained pipeline stays covered.
-
-[`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md) repairs
+[`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
 For the current PTO row-major elementwise ops, it rewrites `[N, 1]` vector
 operands into `[1, N] row_major` `tile.reshape` operations at the
@@ -442,7 +502,7 @@ constrained use site, where row-major is inferred from the target shape.
 It then reshapes the result back to the original vector shape when
 needed.
 
-[`NormalizeReturnOrder`](23-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
+[`NormalizeReturnOrder`](25-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
 `return[i]` corresponds to the i-th `Out`/`InOut` parameter in declaration order,
 and updates `TupleGetItemExpr` indices at call sites accordingly. This lets
 orchestration codegen map tuple element indices to output parameters with a

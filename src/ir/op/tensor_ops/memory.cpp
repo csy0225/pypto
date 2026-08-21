@@ -166,6 +166,9 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   CHECK(tensor_type) << "tensor.slice requires first argument to be a TensorType or DistributedTensorType, "
                         "but got "
                      << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+             args[0]->span_)
+      << "tensor.slice does not support MX-layout tensors";
 
   // Second argument must be TupleType (shape)
   auto shape_tuple_type = As<TupleType>(args[1]->GetType());
@@ -205,6 +208,9 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   // against the full pre-reduction shape (each must be a static unit dim).
   const ExprPtr drop_dims_arg = args.size() == 5 ? args[4] : nullptr;
   const std::vector<int64_t> drop_dims = ParseSliceDropDims(drop_dims_arg, full_shape, "tensor.slice");
+  CHECK_SPAN(drop_dims.size() < full_shape.size(), args[0]->span_)
+      << "tensor.slice drop_dims cannot erase every dimension; keep one unit axis or use tensor.read "
+         "for a scalar result";
   const std::vector<ExprPtr> new_shape = ApplyDropDims(full_shape, drop_dims);
 
   // Optional pad_value kwarg. Absent means "not overridden": the source's pad
@@ -243,28 +249,9 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
   // OptimizeOrchTensors materializes as strides (e.g. a 2D window over a 3D
   // parent); that form is not a plain rectangle, so it keeps the validity it was
   // given rather than being intersected against the wrong axes.
-  std::vector<ExprPtr> full_valid;
-  if (full_shape.size() == tensor_type->shape_.size() && offsets.size() == full_shape.size()) {
-    full_valid = InferWindowReadValidShape({
-        /*source_physical=*/tensor_type->shape_,
-        /*source_valid=*/GetEffectiveTensorValidShape(*tensor_type),
-        /*offsets=*/offsets,
-        /*window=*/full_shape,
-        /*requested_valid=*/requested_valid,
-        /*kind=*/WindowReadKind::kClampedWindow,
-        /*clamp=*/GetKwargOr<bool>(kwargs, "clamp", false),
-        /*op_name=*/"tensor.slice",
-        /*bounds_remedy=*/
-        "Pass clamp=True -- pl.slice(x, shape, offset, clamp=True) -- to narrow the valid region to "
-        "the source edge instead",
-        /*span=*/args[0]->span_,
-    });
-  } else {
-    CHECK_SPAN(requested_valid.empty() || requested_valid.size() == full_shape.size(), args[0]->span_)
-        << "tensor.slice requires valid_shape to have the same rank as shape, but got valid_shape rank "
-        << requested_valid.size() << " and shape rank " << full_shape.size();
-    full_valid = requested_valid.empty() ? full_shape : requested_valid;
-  }
+  const std::vector<ExprPtr> full_valid =
+      InferTensorSliceFullValidShape(*tensor_type, full_shape, offsets, requested_valid,
+                                     GetKwargOr<bool>(kwargs, "clamp", false), args[0]->span_);
   ValidateDropDimsValidExtents(drop_dims, full_valid, "tensor.slice", args[0]->span_);
   const std::vector<ExprPtr> valid_shape = ApplyDropDims(full_valid, drop_dims);
 
@@ -433,15 +420,50 @@ TypePtr DeduceTensorAssembleType(const std::vector<ExprPtr>& args,
         << dt.ToString();
   }
 
-  // Assemble returns a new tensor type with the same shape and dtype as target.
+  // The assembled result holds what the target already held plus what was just
+  // written. Only the source's valid region is transferred — a padded staging
+  // tensor whose physical allocation is larger than its real contents moves only
+  // the real part — so kValidRegionTransfer is the bound the write must respect.
+  // The rule needs the written region to be a rectangle in target coordinates,
+  // which holds whenever the source, the offsets, and the target share one rank.
+  // A rank-mismatched source is instead a reinterpreting write whose dimension
+  // correspondence OptimizeOrchTensors materializes as strides (e.g. a 2D source
+  // into a 3D parent), so it is not a rectangle on these axes and unioning it
+  // would target the wrong ones. Such a write keeps the result it had before this
+  // rule existed — the same exclusion lower-rank window reads carry.
+  std::vector<ExprPtr> offsets = ExtractTupleElements(args[2], offset_tuple_type->types_.size());
+  const size_t target_rank = target_type->shape_.size();
+  std::vector<ExprPtr> result_valid = target_type->shape_;
+  if (source_type->shape_.size() == target_rank && offsets.size() == target_rank) {
+    result_valid = InferWriteValidShapeUnion({
+        /*target_physical=*/target_type->shape_,
+        /*target_valid=*/GetValidShape(target_type),
+        /*source_physical=*/source_type->shape_,
+        /*source_valid=*/GetValidShape(source_type),
+        /*offsets=*/std::move(offsets),
+        /*kind=*/WriteBoundsKind::kValidRegionTransfer,
+        /*op_name=*/"tensor.assemble",
+        /*bounds_remedy=*/
+        "tensor.assemble transfers only the source's effective valid region, so it is that extent -- "
+        "not the whole source allocation -- that has to fit at this offset",
+        /*span=*/args[0]->span_,
+    });
+  }
+
+  // Assemble returns a new tensor type with the same shape and dtype as target,
+  // carrying that union. A result equal to the physical shape is canonicalized
+  // back to an absent view by the constructor, so a fully valid target still
+  // produces exactly the type it produced before this rule existed.
   // When the target is a DistributedTensorType, the result preserves that kind
   // along with its window_buffer_ — the assembled result is still a view into
   // the same comm-group allocation. A fresh shared_ptr avoids type aliasing.
+  TensorView result_view;
+  result_view.valid_shape = result_valid;
   if (auto dt = As<DistributedTensorType>(args[0]->GetType())) {
     return std::make_shared<DistributedTensorType>(target_type->shape_, target_type->dtype_, std::nullopt,
-                                                   std::nullopt, dt->window_buffer_);
+                                                   std::make_optional(result_view), dt->window_buffer_);
   }
-  return std::make_shared<TensorType>(target_type->shape_, target_type->dtype_);
+  return MakeFreshTensorType(target_type->shape_, target_type->dtype_, std::move(result_valid));
 }
 
 TypePtr DeduceTensorFullType(const std::vector<ExprPtr>& args,
@@ -545,6 +567,20 @@ REGISTER_OP("tensor.assemble")
     .add_argument("source", "Source tensor to write (TensorType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64))")
     .set_attr<int>("atomic")
+    // The result is `target` after the write: a fresh SSA name bound to the same
+    // buffer, not a new allocation. Declaring it here keeps param/buffer lineage
+    // analyses off a hardcoded op list.
+    .set_output_reuses_input(0)
+    // A plain push overwrites the region it lands on; an atomic one accumulates
+    // into it, and accumulating reads the slot first.
+    .set_arg_effect(0,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
+                                     static_cast<int>(AtomicType::kNone)
+                                 ? ArgEffect::Write
+                                 : ArgEffect::ReadWrite;
+                    })
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorAssembleType(args, kwargs);
@@ -843,6 +879,11 @@ REGISTER_OP("tensor.write")
     .add_argument("tensor", "Destination tensor (TensorType)")
     .add_argument("indices", "Index dimensions (TupleType of ScalarType)")
     .add_argument("value", "Value to write (ScalarType)")
+    // Writes one element of `tensor` through the scalar D-cache path. The
+    // channel matters: PyPTO cannot order a scalar write against an MTE3
+    // store to the same GM tensor, and rejects a function that mixes them.
+    .set_arg_effect(0, ArgEffect::Write)
+    .set_write_channel(WriteChannel::Scalar)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorWriteType(args, kwargs);

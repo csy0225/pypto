@@ -15,12 +15,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -39,17 +41,19 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
-#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/allocation_constraint_analysis.h"
 #include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/lifetime_analysis.h"
 #include "pypto/ir/transforms/utils/memory_footprint.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -57,44 +61,7 @@
 namespace pypto {
 namespace ir {
 
-/**
- * @brief Lifetime interval for a TileType variable (based on topological order)
- */
-struct LifetimeInterval {
-  VarPtr variable;           ///< The variable
-  int def_point;             ///< Definition point (topological order)
-  int last_use_point;        ///< Last use point (topological order)
-  MemorySpace memory_space;  ///< Memory space
-  uint64_t size;             ///< Size in bytes
-};
-
 namespace {
-
-/**
- * @brief Result of lifetime computation
- */
-struct LifetimeAnalysisResult {
-  std::vector<LifetimeInterval> lifetimes;
-  std::map<VarPtr, std::vector<VarPtr>> var_sharing_groups;
-  // var -> per-(scf.if, slot) phi family ids (see LifetimeAnalyzer).
-  std::map<const Var*, std::set<int>> phi_family_ids;
-  // var -> its individual [def, last_use] interval (with phi/loop extension), for
-  // the precise per-var pairwise interference check in the reuse packer.
-  std::map<const Var*, std::pair<int, int>> var_liveness;
-  /// Pipeline-stage membership per reuse-interval representative
-  /// (``LifetimeInterval::variable``), read from the defining ``Call``'s
-  /// ``pipeline_membership`` attr, parsed once into ``(group, stage)`` pairs so
-  /// the O(N²) reuse packer never re-parses strings. Empty for non-pipelined
-  /// tiles. Consumed by ``IdentifyReuseOpportunities`` to forbid cross-stage
-  /// buffer coalescing.
-  std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>> pipeline_membership;
-  /// Subset of ``pipeline_membership`` keys whose tile is produced by a *load*
-  /// (``tile.load`` / ``tile.read``) rather than a compute op. Cross-stage reuse
-  /// is forbidden whenever *either* tile is a load (a load buffer must stay
-  /// private for ping-pong); compute↔compute cross-stage reuse is allowed so the
-  /// bulk of intermediates can still coalesce and fit the on-chip budget.
-  std::set<const Var*> pipeline_load_tiles;
-};
 
 /**
  * @brief Collect all Var nodes referenced in an expression.
@@ -308,6 +275,14 @@ inline bool SubtreeWritesBase(const StmtPtr& stmt, const Var* target_base) {
   return c.bases.count(target_base) > 0;
 }
 
+bool IsA5Target() {
+  if (!backend::BackendConfig::IsConfigured()) return false;
+  const auto* ctx = PassContext::Current();
+  return ctx != nullptr && ctx->GetBackendHandler()->GetPtoTargetArch() == "a5";
+}
+
+bool IsA5Prelu(const CallPtr& call) { return IsOp(call, "tile.prelu") && IsA5Target(); }
+
 /// Plans top-down retypes. Produces (old Var -> new Type) map.
 class TopDownRetargeter {
  public:
@@ -469,7 +444,8 @@ class TopDownRetargeter {
       auto seed_def = defs_.find(seed_var);
       if (seed_def == defs_.end() || seed_def->second.kind != VarDef::kAssign) continue;
       // The seed must be a Call producer we can retype; a bare-Var / tuple rename
-      // cannot be retargeted — leave it to YieldFixup rather than hard-failing.
+      // cannot be retargeted. Leave the phi untouched; YieldFixup will reject
+      // the residual Acc mismatch because no legal copy exists.
       auto seed_assign = As<AssignStmt>(seed_def->second.assign_stmt);
       if (!seed_assign || !As<Call>(seed_assign->value_)) continue;
 
@@ -481,7 +457,8 @@ class TopDownRetargeter {
       //  (b) the accumulator buffer is dead *within the branch* after the seed
       //      (exclusivity covers only cross-branch and post-if reads, not a
       //      same-branch tail read between the seed producer and the yield).
-      // When either fails, fall back to YieldFixup (leave the phi untouched here).
+      // When either fails, leave the phi untouched here. YieldFixup will fail
+      // loudly rather than emit an unsupported Acc->Acc move.
       const auto& seed_anc = seed_def->second.ancestors;
       const bool in_branch = std::any_of(seed_anc.begin(), seed_anc.end(),
                                          [&](const StmtPtr& a) { return a.get() == if_stmt.get(); });
@@ -588,11 +565,43 @@ class TopDownRetargeter {
     //      input of the call already lives on `target_base`, retyping the
     //      output onto the same buffer creates an in-place execution that
     //      the op cannot handle and fails at runtime.
-    if (IsOutputMemoryInheritInput(entry)) return false;
+    //   4. Ops with a registered *fixed* output memory space (e.g. every
+    //      `tile.add`-style elementwise op is `set_output_memory(Vec)`) when
+    //      the target sits in a different space.  The op physically cannot
+    //      write there, so retyping the LHS would only mint IR that claims a
+    //      Vec-only op produces DDR.  Declining leaves the carry yielding a
+    //      different buffer than its init, which YieldFixupMutator reconciles
+    //      with a real move (see AlignLoopCarriesToInitMutator's contract).
+    //      Same-space targets are unaffected: only the MemRef base moves.
+    if (IsOutputMemoryInheritInput(entry)) {
+      // Most view ops can carry a sub-region offset, so retargeting their LHS
+      // directly would lose view-relative addressing. tile.set_validshape is
+      // the narrow exception: it is a zero-offset, shape-preserving alias of
+      // its first argument. Retarget that storage producer first, then record
+      // the view result on the same target. This lets padded loop-carried Acc
+      // initializers coalesce with their accumulator instead of leaving a
+      // divergent Acc carry for YieldFixup to reject.
+      if (!IsOp(call, "tile.set_validshape") || call->args_.empty()) return false;
+      auto input_var = AsVarLike(call->args_[0]);
+      if (!input_var) return false;
+      auto input_tile = GetTileTypeWithMemRef(input_var->GetType());
+      auto output_tile = GetTileTypeWithMemRef(var->GetType());
+      if (!input_tile || !output_tile ||
+          !MemRef::SameAllocation(GetDefinedMemRef(input_tile), GetDefinedMemRef(output_tile))) {
+        return false;
+      }
+      if (!TryRetargetVar(input_var, target, target_memory)) return false;
+      PlanRewrite(var, target, target_memory);
+      return true;
+    }
     if (HasKwarg(*call, "target_memory") && !TargetMemoryKwargMatches(*call, target_memory)) {
       return false;
     }
-    if (!entry.IsInplaceSafe() && CallReadsBase(*call, target->base_.get())) return false;
+    if (FixedOutputMemoryConflicts(entry, *call, target_memory)) return false;
+    if (!entry.IsInplaceSafe()) {
+      const size_t read_arg_count = IsA5Prelu(call) ? 2 : call->args_.size();
+      if (CallReadsBase(*call, target->base_.get(), read_arg_count)) return false;
+    }
 
     // Unconstrained: check liveness, then plan retype.  (Skipped for if-phi
     // branch coalescing, where branch exclusivity is a stronger guarantee.)
@@ -604,9 +613,11 @@ class TopDownRetargeter {
   /// True if any argument of the call is a TileType Var whose MemRef base
   /// is `target_base`.  Used to detect would-be in-place execution before
   /// we retype the output onto the same buffer.
-  static bool CallReadsBase(const Call& call, const Var* target_base) {
+  static bool CallReadsBase(const Call& call, const Var* target_base, size_t arg_count) {
     SubtreeReadBaseCollector c;
-    for (const auto& arg : call.args_) c.VisitExpr(arg);
+    for (size_t i = 0; i < std::min(arg_count, call.args_.size()); ++i) {
+      c.VisitExpr(call.args_[i]);
+    }
     return c.bases.count(target_base) > 0;
   }
 
@@ -638,6 +649,22 @@ class TopDownRetargeter {
       return AnyCast<MemorySpace>(v, "kwarg key: target_memory") == *target_memory;
     }
     return false;
+  }
+
+  /// True when the op resolves to a concrete output memory space that differs
+  /// from `target_memory` — i.e. retyping the LHS would claim the op writes
+  /// somewhere it physically cannot.  Ops that defer the choice (the resolver
+  /// returns nullopt: inherit-input and the retargetable `target_memory`-kwarg
+  /// ops) are not constrained here and are handled by their own guards above.
+  static bool FixedOutputMemoryConflicts(const OpRegistryEntry& entry, const Call& call,
+                                         std::optional<MemorySpace> target_memory) {
+    if (!target_memory.has_value()) return false;
+    const auto& spec = entry.GetMemorySpec();
+    if (!spec.has_value() || !spec->deduce_output_memory) return false;
+    // Resolve against the call's own kwargs so a kwarg-driven op reports the
+    // space it actually produces rather than its registered default.
+    auto fixed = spec->deduce_output_memory(call.kwargs_);
+    return fixed.has_value() && *fixed != *target_memory;
   }
 
   /// Retype an IfStmt return_var: recurse into both branches' yield values.
@@ -974,7 +1001,17 @@ class LifetimeAnalyzer : public IRVisitor {
     std::map<const Var*, std::set<int>> phi_family_ids;
   };
 
-  Result Analyze(const StmtPtr& func_body) {
+  Result Analyze(const StmtPtr& func_body, const std::vector<VarPtr>& entry_vars = {}) {
+    // Function parameters have no defining AssignStmt. Seed Tile parameters at
+    // the entry point so function-wide allocation planning includes their
+    // MemRefs and body uses extend their lifetimes normally.
+    for (const VarPtr& var : entry_vars) {
+      const auto tile_type = As<TileType>(var->GetType());
+      if (!tile_type || !tile_type->memref_.has_value()) continue;
+      ordered_defs_.push_back(var);
+      var_def_order_[var] = current_order_;
+    }
+
     // Phase 1: Walk IR tree
     if (func_body) {
       VisitStmt(func_body);
@@ -1255,12 +1292,13 @@ class LifetimeAnalyzer : public IRVisitor {
  * Walks ALL statements
  * including those inside nested control flow (IfStmt/ForStmt/WhileStmt bodies).
  */
-LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
+LifetimeAnalysisResult AnalyzeAllocationLifetimesImpl(const StmtPtr& func_body,
+                                                      const std::vector<VarPtr>& entry_vars = {}) {
   std::vector<LifetimeInterval> lifetimes;
 
   // Step 1: Walk full IR tree to collect variable defs, uses, and ordering
   LifetimeAnalyzer analyzer;
-  auto result = analyzer.Analyze(func_body);
+  auto result = analyzer.Analyze(func_body, entry_vars);
 
   if (result.ordered_defs.empty()) {
     return {lifetimes, {}};
@@ -1305,8 +1343,6 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
       continue;
     }
 
-    const auto& memref = tile_type->memref_.value();
-
     std::vector<VarPtr> sharing_group;
     if (var_sharing_groups.count(var)) {
       sharing_group = var_sharing_groups[var];
@@ -1339,7 +1375,7 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
     INTERNAL_CHECK_SPAN(memory_space.has_value(), sharing_group[0]->span_)
         << "TileType with MemRef must have memory_space for reuse analysis";
     interval.memory_space = *memory_space;
-    interval.size = memref->size_;
+    interval.size = GetDefinedMemRef(representative_tile_type)->size_;
 
     lifetimes.push_back(interval);
 
@@ -1391,34 +1427,12 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
           std::move(pipeline_load_tiles)};
 }
 
-// NOTE: The former whole-tile reuse-compatibility gate (AreTileTypesCompatible:
-// shape + dtype + full TileView) was removed in #1788.  PTO codegen binds a
-// per-var alloc_tile, so tiles that share a MemRef may legally carry different
-// shapes/dtypes (each alloc_tile aliases the same base with its own static
-// signature).  In-place read/write hazards are handled by not_inplace_safe() and
-// forbid_output_alias() (see ForbidAliasCollector below).
-//
-// Vec ND↔NZ is still a hazard: A5 V→C inserts an ND→NZ ``tile.move`` (*_nz)
-// before tpush (NZ signal: effective blayout == col_major, matching
-// expand_mixed_kernel CreateMove).  If MemoryReuse colocates that NZ tile with
-// the ND cast result at one Vec address, even a kept ``pto.tmov`` is an
-// in-place layout adapt that silently mis-transfers (prefill_indexer Hadamard /
-// §3.0 family).  Gate *only* Vec ND↔NZ — allow Left/Right/Mat freely, and allow
-// same-family Vec layout quirks (e.g. fractal-only differences).  Keep
-// cross-shape / cross-dtype L0 reuse (#1595 / #1788).
-static bool IsNzLikeBlayout(TileLayout blayout) { return blayout == TileLayout::col_major; }
-
-static bool AreVecNdNzCompatible(const VarPtr& var1, const VarPtr& var2) {
-  auto t1 = As<TileType>(var1->GetType());
-  auto t2 = As<TileType>(var2->GetType());
-  if (!t1 || !t2) return true;
-  const auto s1 = t1->GetMemorySpace();
-  const auto s2 = t2->GetMemorySpace();
-  if (!s1 || !s2 || *s1 != MemorySpace::Vec || *s2 != MemorySpace::Vec) return true;
-  const TileView v1 = tile_view_semantics::GetEffectiveTileView(*t1);
-  const TileView v2 = tile_view_semantics::GetEffectiveTileView(*t2);
-  return IsNzLikeBlayout(v1.blayout) == IsNzLikeBlayout(v2.blayout);
-}
+// NOTE: The former tile-type reuse-compatibility gate (AreTileTypesCompatible)
+// has been removed. PTO codegen binds a per-var alloc_tile to each tile, so two
+// tiles that share a physical MemRef can legally carry different shapes, dtypes,
+// or TileView attributes. In-place read/write hazards are handled precisely by
+// not_inplace_safe() and per-operand forbid_output_alias() markers (see
+// ForbidAliasCollector below).
 
 /**
  * @brief Check if two lifetimes overlap.
@@ -1462,10 +1476,7 @@ static bool IsLegalTileViewOp(const OpPtr& op) {
          IsOp(op, "tile.reinterpret_view") || IsOp(op, "tensor.slice");
 }
 
-struct HazardInputs {
-  std::unordered_set<const Var*> load_derived;  ///< tile.load outputs + view descendants
-  std::unordered_set<const Var*> reads_tpop;    ///< vars whose def consumes a tpop_from_aic value
-};
+using HazardInputs = AllocationHazardInputs;
 
 class HazardInputCollector : public IRVisitor {
  public:
@@ -1535,7 +1546,7 @@ class HazardInputCollector : public IRVisitor {
 // the output from sharing a buffer with.  Enforcement resolves each operand to
 // the *physical buffer* it ends up on (following both reuse-map reassignment and
 // VIEW inheritance) and blocks the output from landing there — see the use site.
-using ForbidAliasMap = std::map<const Var*, std::vector<VarPtr>>;
+using ForbidAliasMap = AllocationForbidAliasMap;
 
 // Resolve a tile Var to its MemRef base pointer (nullptr if it is not a tile or
 // has no MemRef yet).  View ops share their source's base, so a view and its
@@ -1563,20 +1574,33 @@ class ForbidAliasCollector : public IRVisitor {
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
+    // Multi-result calls are assigned to a tuple temporary and unpacked by
+    // subsequent TupleGetItem assignments. Carry the call's semantic
+    // no-alias inputs onto every physical tile result; the tuple temporary
+    // itself has no allocation interval to constrain.
+    if (const auto get_item = As<TupleGetItemExpr>(op->value_)) {
+      if (const VarPtr tuple = AsVarLike(get_item->tuple_)) {
+        const auto pending = tuple_forbidden_.find(tuple.get());
+        if (pending != tuple_forbidden_.end()) RecordForOutput(op->var_, pending->second);
+      }
+    }
+
     if (auto call = As<Call>(op->value_); call && call->op_) {
       const auto& reg = OpRegistry::GetInstance();
       if (reg.IsRegistered(call->op_->name_)) {
         const auto& entry = reg.GetEntry(call->op_->name_);
-        auto rep_it = member_to_rep_.find(op->var_.get());
-        const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : op->var_.get();
+        std::vector<VarPtr> forbidden_inputs;
         auto forbid_arg = [&](size_t i) {
           if (i < call->args_.size()) {
-            if (auto v = AsVarLike(call->args_[i])) forbidden_[out_key].push_back(v);
+            if (auto v = AsVarLike(call->args_[i])) forbidden_inputs.push_back(v);
           }
         };
         if (!entry.IsInplaceSafe()) {
-          // src != dst required: the output must not alias any input operand.
-          for (size_t i = 0; i < call->args_.size(); ++i) forbid_arg(i);
+          // Non-in-place ops forbid output aliasing active inputs. A5 TPRELU
+          // retains tmp (arg 2) in the ABI but does not read it, so only src
+          // and slope remain active.
+          const size_t forbidden_arg_count = IsA5Prelu(call) ? 2 : call->args_.size();
+          for (size_t i = 0; i < forbidden_arg_count; ++i) forbid_arg(i);
         } else {
           for (size_t i : entry.ForbidOutputAliasArgs()) forbid_arg(i);
         }
@@ -1591,6 +1615,7 @@ class ForbidAliasCollector : public IRVisitor {
           auto in_t = As<TileType>(call->args_[0]->GetType());
           if (out_t && in_t && out_t->dtype_.GetBit() > in_t->dtype_.GetBit()) forbid_arg(0);
         }
+        RecordForOutput(op->var_, forbidden_inputs);
         // tile.transpose is registered not_inplace_safe(), so its output is
         // already forbidden from aliasing any input above (pto.ttrans writes
         // dst directly from src on the scalar path — dst == src corrupts).
@@ -1602,7 +1627,21 @@ class ForbidAliasCollector : public IRVisitor {
   ForbidAliasMap Take() { return std::move(forbidden_); }
 
  private:
+  void RecordForOutput(const VarPtr& output, const std::vector<VarPtr>& forbidden_inputs) {
+    if (!output || forbidden_inputs.empty()) return;
+    if (As<TupleType>(output->GetType())) {
+      tuple_forbidden_[output.get()] = forbidden_inputs;
+      return;
+    }
+    if (!As<TileType>(output->GetType())) return;
+    const auto rep_it = member_to_rep_.find(output.get());
+    const Var* out_key = rep_it != member_to_rep_.end() ? rep_it->second : output.get();
+    auto& recorded = forbidden_[out_key];
+    recorded.insert(recorded.end(), forbidden_inputs.begin(), forbidden_inputs.end());
+  }
+
   ForbidAliasMap forbidden_;
+  std::map<const Var*, std::vector<VarPtr>> tuple_forbidden_;
   std::map<const Var*, const Var*> member_to_rep_;  ///< sharing-group member -> representative
 };
 
@@ -1622,7 +1661,7 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
   // pl.split_aiv regions have their per-region modes lowered + erased by
   // LowerAutoVectorSplit, so no single function-level mode survives. Key on the
   // marker too so the guard still fires for them.
-  if (func->HasAttr("split_aiv") && func->GetAttr<bool>("split_aiv", false)) return true;
+  if (func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false)) return true;
   const auto split_mode = func->GetSplitMode();
   return split_mode.has_value() && *split_mode != SplitMode::None;
 }
@@ -1678,6 +1717,150 @@ struct ShedCandidate {
 /// MaxRelief: shed the group that frees the most bytes per level ⇒ fewest levels lost to fit the space.
 inline double ScoreMaxRelief(const ShedCandidate& c) { return -static_cast<double>(c.bytes_freed); }
 
+/// One tile independently bound to a declared allocation, with its lifetime.
+struct BoundMember {
+  VarPtr var;
+  int def_point;
+  int last_use_point;
+};
+
+/// Group the tiles a user *independently bound* to each pinned buffer.
+///
+/// A tile whose defining op inherits its source's buffer (a view, an in-place
+/// op, or a bare SSA alias) lands on the same base without the author binding it
+/// there — it is the same data, so overlapping with its source is expected and
+/// legal. Only independently produced tiles compete for the buffer's bytes, and
+/// only those are checked for lifetime overlap.
+class IndependentlyBoundCollector : public IRVisitor {
+ public:
+  IndependentlyBoundCollector(const std::set<const Var*>& pinned_bases,
+                              const std::map<const Var*, std::pair<int, int>>& var_liveness)
+      : pinned_bases_(pinned_bases), var_liveness_(var_liveness) {}
+
+  /// One slot of a declared allocation: its base, and the byte offset that tells
+  /// slots of the same allocation apart. `InitMemRef` has already consumed the
+  /// slot index into that offset, so a null offset (a dynamic index) collapses to
+  /// "some slot" — see the note on `by_slot`.
+  struct SlotKey {
+    const Var* base;
+    int64_t byte_offset;
+
+    bool operator<(const SlotKey& other) const {
+      if (base != other.base) return base < other.base;
+      return byte_offset < other.byte_offset;
+    }
+  };
+
+  /// Slot -> the tiles bound to it, with their lifetimes.
+  ///
+  /// Keyed per *slot*, not per allocation: two tiles on different slots of one
+  /// declared allocation are supposed to be live together — that is what a
+  /// ping-pong is — and only tiles landing on the *same* slot can corrupt each
+  /// other. Tiles whose offset is a runtime expression are skipped entirely,
+  /// since which slot they occupy is not a static fact.
+  std::map<SlotKey, std::vector<BoundMember>> by_slot;
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (op && op->var_) Record(op);
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  void Record(const AssignStmtPtr& op) {
+    auto memref = GetTypeMemRef(op->var_->GetType());
+    if (!memref.has_value() || !(*memref)->base_) return;
+    const Var* base = (*memref)->base_.get();
+    if (pinned_bases_.count(base) == 0) return;
+    if (AsVarLike(op->value_)) return;  // bare SSA alias — same data
+    if (auto call = As<Call>(op->value_);
+        call && call->op_ && op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) {
+      return;
+    }
+    auto liveness = var_liveness_.find(op->var_.get());
+    if (liveness == var_liveness_.end()) return;
+    // A runtime slot index leaves no static slot to attribute the tile to, so
+    // there is nothing to compare it against. The author owns the rotation in
+    // that case; isolation from other allocations still holds.
+    auto const_offset = As<ConstInt>((*memref)->byte_offset_);
+    if (!const_offset) return;
+    by_slot[{base, const_offset->value_}].push_back(
+        {op->var_, liveness->second.first, liveness->second.second});
+  }
+
+  const std::set<const Var*>& pinned_bases_;
+  const std::map<const Var*, std::pair<int, int>>& var_liveness_;
+};
+
+/// Reject a declared allocation whose independently bound tiles are co-live.
+///
+/// Binding two co-live tiles to one buffer is not a reuse decision, it is data
+/// corruption: the later write lands on bytes the earlier tile still needs. The
+/// packer refuses such a pairing among its own candidates; a hand-written
+/// binding bypasses that path, so it is re-checked here. Touching is allowed —
+/// one tile's last read may be the statement that produces the next.
+///
+/// Sorted sweep rather than a pairwise scan: a *valid* program is exactly one
+/// where every pair is disjoint, so a pairwise check never exits early and would
+/// be quadratic in the member count — which grows with the IR once a binding
+/// inside a loop body is unrolled.
+void ValidateDeclaredAllocs(const StmtPtr& body, const std::set<const Var*>& pinned_bases,
+                            const std::map<const Var*, std::pair<int, int>>& var_liveness) {
+  if (pinned_bases.empty()) return;
+  IndependentlyBoundCollector collector(pinned_bases, var_liveness);
+  collector.VisitStmt(body);
+
+  for (auto& [slot, members] : collector.by_slot) {
+    const Var* base = slot.base;
+    std::sort(members.begin(), members.end(),
+              [](const BoundMember& a, const BoundMember& b) { return a.def_point < b.def_point; });
+    for (size_t i = 1; i < members.size(); ++i) {
+      const BoundMember& prev = members[i - 1];
+      const BoundMember& cur = members[i];
+      CHECK_SPAN(prev.last_use_point <= cur.def_point, cur.var->span_)
+          << "Tiles '" << prev.var->name_hint_ << "' and '" << cur.var->name_hint_
+          << "' are both bound to the same slot of the declared allocation '" << base->name_hint_
+          << "' but are live at the same time (" << prev.var->name_hint_ << ": [" << prev.def_point << ", "
+          << prev.last_use_point << "], " << cur.var->name_hint_ << ": [" << cur.def_point << ", "
+          << cur.last_use_point
+          << "]). Sharing one slot would overwrite data that is still needed — put them on different "
+             "slots, declare separate allocations, or bind only tiles whose lifetimes do not overlap.";
+    }
+  }
+}
+
+/// Collect the full byte extent of allocations declared by the author.
+///
+/// InitMemRef hoists every alloc to the function body's top level. When an
+/// allocation exists, prepending it forms a SeqStmts; a function with no
+/// allocation may legitimately retain a singleton body such as ReturnStmt.
+/// A multi-slot declaration is larger than any one member MemRef, so DSA-RP
+/// must take the extent from the alloc statement rather than reconstruct it
+/// from members.
+std::map<const Var*, uint64_t> CollectPinnedAllocSizes(const StmtPtr& body, const Span& span,
+                                                       const std::string& consumer) {
+  INTERNAL_CHECK_SPAN(body, span) << consumer << " expected a non-null function body";
+
+  std::map<const Var*, uint64_t> pinned_allocations;
+  auto collect = [&](const StmtPtr& stmt) {
+    auto base = GetPinnedAllocBase(stmt);
+    if (!base) return;
+    auto assign = As<AssignStmt>(stmt);
+    auto call = assign ? As<Call>(assign->value_) : nullptr;
+    auto size = call && call->args_.size() >= 2 ? As<ConstInt>(call->args_[1]) : nullptr;
+    INTERNAL_CHECK_SPAN(size && size->value_ > 0, stmt->span_)
+        << consumer << " expected declared allocation '" << base->name_hint_
+        << "' to have a positive constant byte extent after InitMemRef";
+    pinned_allocations.emplace(base.get(), static_cast<uint64_t>(size->value_));
+  };
+
+  if (auto top_level = As<SeqStmts>(body)) {
+    for (const auto& stmt : top_level->stmts_) collect(stmt);
+  } else {
+    collect(body);
+  }
+  return pinned_allocations;
+}
+
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
@@ -1685,9 +1868,29 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::map<const Var*, std::pair<int, int>>& var_liveness,
     const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
     const std::set<const Var*>& pipeline_load_tiles,
-    const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const FunctionPtr& func,
-    std::vector<Diagnostic>* out_hints) {
+    const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const std::set<const Var*>& pinned_bases,
+    const FunctionPtr& func, std::vector<Diagnostic>* out_hints) {
   std::map<VarPtr, VarPtr> reuse_map;
+
+  // A declared allocation (`pl.Tile[..., pl.MemRef("name"), ...]`) has exactly the membership
+  // the kernel author wrote. The packer neither adds tiles to it nor moves its
+  // tiles into someone else's buffer — that is the whole point of naming it:
+  // coalescing tiles whose lifetimes merely happen not to overlap introduces a
+  // false dependency that serializes them.
+  //
+  // Resolved once per interval rather than inside `can_share`: that predicate is
+  // the innermost step of the O(M^2) pack, which itself re-runs per shed step, so
+  // a type cast + set lookup there would be paid M^2 times — and by every kernel,
+  // including the vast majority that declare no allocation at all. Same reason
+  // `pipeline_membership` is pre-parsed (see LifetimeAnalysisResult).
+  std::vector<bool> is_pinned(lifetimes.size(), false);
+  if (!pinned_bases.empty()) {
+    for (size_t i = 0; i < lifetimes.size(); ++i) {
+      if (!lifetimes[i].variable) continue;
+      auto memref = GetTypeMemRef(lifetimes[i].variable->GetType());
+      is_pinned[i] = memref.has_value() && (*memref)->base_ && pinned_bases.count((*memref)->base_.get()) > 0;
+    }
+  }
 
   // Members of a sharing group (the vars that already physically share one base).
   // Returns a pointer (or nullptr) to avoid copying the vector in the O(M^2) loop.
@@ -1830,7 +2033,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // fit; the predicate is retained verbatim only as the never-worse-than-legacy floor.
   auto is_l0_space = [](MemorySpace s) {
     return s == MemorySpace::Left || s == MemorySpace::Right || s == MemorySpace::Acc ||
-           s == MemorySpace::Bias;
+           s == MemorySpace::Bias || s == MemorySpace::LeftScale || s == MemorySpace::RightScale;
   };
   // Capacity-gated (#1475): keep software-pipelined operands in separate buffers so the pipeline
   // stages double-buffer instead of serializing on a shared buffer. #1900's `pipeline_membership` tags
@@ -1938,10 +2141,10 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // Can `cand` join a single physical buffer that already holds `member`?
   // Lifetimes must not overlap (touching is allowed: a buffer's reader is
   // consumed before the writer at the same statement produces its output), and
-  // neither directional gate may block.  Shape/dtype need not match: PTO binds a
-  // per-var alloc_tile so differing shapes/dtypes legally alias one base, and
-  // largest-first ordering guarantees the buffer is sized to its representative.
-  // On Vec only, ND and NZ must not share — see AreVecNdNzCompatible.
+  // neither directional gate may block. No tile-type / size check is needed:
+  // PTO binds a per-var alloc_tile so differing shapes/dtypes legally alias one
+  // base, and largest-first ordering guarantees the buffer is sized to its
+  // representative (no member is ever larger than the buffer it joins).
   auto can_share = [&](const LifetimeInterval& cand, const LifetimeInterval& member) {
     // Group-interval overlap is a fast reject; when it fires, fall back to the
     // precise per-var check so mutually-exclusive / same-value phi-family tiles
@@ -1951,7 +2154,6 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     if (hazard_blocks(cand, member) || hazard_blocks(member, cand)) return false;
     if (forbid_blocks(cand, member) || forbid_blocks(member, cand)) return false;
     if (pipeline_blocks(cand, member)) return false;  // symmetric — one call suffices
-    if (!AreVecNdNzCompatible(cand.variable, member.variable)) return false;
     return true;
   };
 
@@ -1985,23 +2187,37 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     // earliest on ties). Pure — it does NOT touch reuse_map, since the shed loop below may re-pack.
     auto pack = [&]() {
       std::vector<std::vector<size_t>> buffers;
+      // Parallel to `buffers`: a declared allocation's membership is fixed by the author,
+      // so it opens its own slot and never takes another tile. Handling it here
+      // rather than as a `can_share` gate keeps the check out of the O(M^2) inner
+      // loop, and skips the whole buffer scan for a pinned candidate.
+      std::vector<char> buffer_pinned;
       for (size_t idx : indices) {
+        if (is_pinned[idx]) {
+          buffers.push_back({idx});
+          buffer_pinned.push_back(1);
+          continue;
+        }
         const auto& cand = lifetimes[idx];
         bool placed = false;
-        for (auto& buf : buffers) {
+        for (size_t b = 0; b < buffers.size(); ++b) {
+          if (buffer_pinned[b] != 0) continue;
           bool fits = true;
-          for (size_t member_idx : buf) {
+          for (size_t member_idx : buffers[b]) {
             if (!can_share(cand, lifetimes[member_idx])) {
               fits = false;
               break;
             }
           }
           if (!fits) continue;
-          buf.push_back(idx);
+          buffers[b].push_back(idx);
           placed = true;
           break;
         }
-        if (!placed) buffers.push_back({idx});
+        if (!placed) {
+          buffers.push_back({idx});
+          buffer_pinned.push_back(0);
+        }
       }
       return buffers;
     };
@@ -2069,15 +2285,31 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
           // place (perf hint for a partial reduction below; this Warning for a space that fits at no depth).
           if (out_hints != nullptr) {
             const bool still_overflows = footprint(buffers) > cap;
+            // A single physical buffer larger than the entire space is not a
+            // reuse or pipeline-depth failure.  Legacy packing cannot repair
+            // it, and the final allocator (or an earlier operation-specific
+            // check such as AutoTileMatmulL0's explicit-L0 operand diagnostic)
+            // reports the impossible allocation.  Do not obscure that error
+            // with a fallback warning that suggests reuse or stage count is
+            // responsible.  Keep warning for aggregate pressure: every buffer
+            // fits individually, but their required co-residency does not.
+            const bool has_intrinsically_oversized_buffer =
+                std::any_of(buffers.begin(), buffers.end(), [&](const std::vector<size_t>& buf) {
+                  uint64_t slot = 0;
+                  for (size_t idx : buf) slot = std::max(slot, lifetimes[idx].size);
+                  return slot > cap;
+                });
             const std::string why =
                 within_budget ? "at any double-buffering depth" : "within the shed-repack budget";
-            out_hints->emplace_back(
-                DiagnosticSeverity::Warning, "MemoryReuse", 0,
-                "capacity-gated reuse could not fit memory space " + MemorySpaceToString(space) + " " + why +
-                    "; fell back to the legacy packing" +
-                    (still_overflows ? " (which also overflows — reduce tile size or stage count)" : "") +
-                    ".",
-                func ? func->span_ : Span::unknown());
+            if (!has_intrinsically_oversized_buffer) {
+              out_hints->emplace_back(
+                  DiagnosticSeverity::Warning, "MemoryReuse", 0,
+                  "capacity-gated reuse could not fit memory space " + MemorySpaceToString(space) + " " +
+                      why + "; fell back to the legacy packing" +
+                      (still_overflows ? " (which also overflows — reduce tile size or stage count)" : "") +
+                      ".",
+                  func ? func->span_ : Span::unknown());
+            }
           }
           break;
         }
@@ -2416,9 +2648,10 @@ class AlignLoopCarriesToInitMutator : public IRMutator {
  * Handles both ForStmt and IfStmt:
  * - ForStmt: MemoryReuse may assign different MemRefs to iter_arg and yield value.
  *   Since yield value becomes the next iteration's iter_arg, they must use the
- *   same buffer. When they differ, insert a tile.move before yield.
+ *   same buffer. When they differ, insert a tile.move before yield, except that
+ *   divergent Acc buffers are rejected because Acc->Acc moves are unsupported.
  * - IfStmt: MemoryReuse may change MemRefs of variables inside branches.
- *   Patch return_vars to match the yield value's MemRef.
+ *   Patch return_vars to match the yield value's MemRef, using the same Acc guard.
  */
 class YieldFixupMutator : public IRMutator {
  public:
@@ -2585,6 +2818,14 @@ class YieldFixupMutator : public IRMutator {
                                             std::optional<MemorySpace> target_memory) {
     INTERNAL_CHECK_SPAN(target_memory.has_value(), source->span_)
         << "Internal error: target TileType must have memory_space for tile.move";
+    auto source_tile = GetTileTypeWithMemRef(source->GetType());
+    INTERNAL_CHECK_SPAN(source_tile, source->span_)
+        << "Internal error: YieldFixup tile.move source must be a TileType with MemRef";
+    INTERNAL_CHECK_SPAN(
+        !(source_tile->GetMemorySpace() == MemorySpace::Acc && target_memory.value() == MemorySpace::Acc),
+        source->span_)
+        << "Internal error: MemoryReuse cannot reconcile divergent L0C accumulator buffers with "
+           "tile.move; accumulator control-flow values must be coalesced before YieldFixup.";
     auto& op_reg = OpRegistry::GetInstance();
     std::vector<std::pair<std::string, std::any>> kwargs = {
         {"target_memory", std::any(target_memory.value())}};
@@ -2853,25 +3094,38 @@ FunctionPtr TransformMaterializeSemanticAliases(const FunctionPtr& func) {
     new_body = applier.VisitStmt(new_body);
   }
 
-  // Under memory_planner=PtoAS the whole MemoryReuse pass is skipped, and with it
-  // YieldFixupMutator (its Step 4). That mutator is not an optimization: when a
+  // Under memory_planner=PtoAS or DsaRP the whole MemoryReuse pass is skipped.
+  // DsaRP must therefore run the correctness normalizations from MemoryReuse
+  // Steps 3.75 through 4.5 in the same order. They are not optimizations: when a
+  // peeled accumulator if-phi or
   // loop yields a value living in a different buffer than its iter_arg/return_var,
   // it inserts the `tile.move` that writes the result back into the carry. Without
   // it the carry is never updated and the loop silently becomes a no-op — the
   // `[N, 1]` col-vector carry of an online softmax is the shape that hits this,
   // because its branch producer runs on a `[1, N]` view in its own buffer.
   //
-  // Run it here so both planners reconcile carries by the same mechanism. Under
-  // PyPTO it stays where it is: Step 4 must run *after* the reuse decisions, which
-  // can themselves create fresh mismatches.
+  // Run it here so both alternative planners reconcile carries. Under the
+  // legacy PyPTO planner it stays where it is: Step 4 must run *after* reuse
+  // decisions, which can themselves create fresh mismatches.
   //
-  // Only the ForStmt half: PTO codegen already re-points a branch-local producer
-  // at the if-phi handle, and copies in whatever it declines to re-point
-  // (#1956/#1985). An IR-level `tile.move` there would displace that copy-free
-  // path with an extra buffer plus a `pto.tmov`. Loop carries have no such
-  // codegen path, so they still need the move.
+  // PTOAS needs only the ForStmt YieldFixup half: addr-less codegen already
+  // re-points a branch-local producer at the if-phi handle. DSA-RP emits
+  // explicit addresses, so it must first coalesce peeled accumulator if-phis,
+  // then materialize both IfStmt and ForStmt fixups, and finally repair bare-Var
+  // identity copies before lifetime analysis and placement.
   const auto* ctx = PassContext::Current();
-  if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
+  if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::DsaRP) {
+    TopDownRetargeter acc_coalescer;
+    auto acc_rewrites = acc_coalescer.CoalesceAccumulatorIfPhis(new_body);
+    if (!acc_rewrites.empty()) {
+      RetypeApplier applier(std::move(acc_rewrites));
+      new_body = applier.VisitStmt(new_body);
+    }
+
+    YieldFixupMutator yield_fixup(/*fixup_if_stmts=*/true);
+    new_body = yield_fixup.VisitStmt(new_body);
+    new_body = NormalizeIdentityCopyBuffersMutator().VisitStmt(new_body);
+  } else if (ctx != nullptr && ctx->GetMemoryPlanner() == MemoryPlanner::PtoAS) {
     YieldFixupMutator yield_fixup(/*fixup_if_stmts=*/false);
     new_body = yield_fixup.VisitStmt(new_body);
   }
@@ -2895,7 +3149,7 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   StmtPtr new_body = func->body_;
 
   // Step 1: Compute lifetimes by walking full IR tree
-  auto analysis_result = ComputeLifetimes(new_body);
+  auto analysis_result = AnalyzeAllocationLifetimes(new_body);
 
   if (analysis_result.lifetimes.empty()) {
     LOG_DEBUG << "No TileType variables found in function '" << func->name_ << "', skipping memory reuse";
@@ -2907,18 +3161,10 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
   // forms the hazardous in-place sharing (folds in the former
   // LegalizePTOBufferReuse responsibility).  Off-910B the inputs stay empty and
   // reuse behaviour is unchanged.
-  HazardInputs hazard;
-  if (NeedsLoadTpopHazardGuard(func)) {
-    HazardInputCollector collector;
-    collector.VisitStmt(new_body);
-    hazard = collector.Take();
-  }
-
-  // Per-operand no-alias map (e.g. tile.sel's mask/tmp must not share the
-  // output's buffer). Op-semantic, not backend-gated, so always collected.
-  ForbidAliasCollector forbid_collector(analysis_result.var_sharing_groups);
-  forbid_collector.VisitStmt(new_body);
-  ForbidAliasMap forbid_alias = forbid_collector.Take();
+  const AllocationConstraintAnalysis constraint_analysis =
+      AnalyzeAllocationConstraints(func, analysis_result, "MemoryReuse");
+  const HazardInputs& hazard = constraint_analysis.target_hazard_inputs;
+  const ForbidAliasMap& forbid_alias = constraint_analysis.forbid_alias;
 
   // Per-space reserved end (the SpaceFootprint reserved_start for the exact fit check). Only meaningful
   // with a configured backend; empty otherwise ⇒ reserved_start defaults to 0.
@@ -2931,11 +3177,20 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
       for (const auto& [space, end] : resolution.reserved_end_by_space) reserved_end_by_space[space] = end;
     }
   }
+  // Bases the author declared via a one-argument `pl.MemRef(...)`, materialized by
+  // InitMemRef as a pinned alloc. Their membership is off-limits to the packer.
+  // InitMemRef hoists every alloc to the body's top-level SeqStmts, so this scans
+  // that list in place rather than flattening a copy of the whole body. Missing
+  // that shape must not fail open: an empty `pinned_bases` silently disables both
+  // the packer isolation and the co-liveness check below, handing the author back
+  // exactly the coalescing the binding was written to prevent.
+  const std::set<const Var*>& pinned_bases = constraint_analysis.declared_allocation_bases;
+
   std::vector<Diagnostic> hints;
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
-      analysis_result.pipeline_load_tiles, reserved_end_by_space, func, &hints);
+      analysis_result.pipeline_load_tiles, reserved_end_by_space, pinned_bases, func, &hints);
   // Surface capacity-forced pipeline-depth reductions (perf hints) and legacy-fallback overflows
   // (warnings) through the unified diagnostic channel → perf_hints.log / stderr.
   if (!hints.empty()) EmitDiagnostics(hints, "MemoryReuse");
@@ -2993,6 +3248,39 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
 }
 
 }  // namespace
+
+AllocationConstraintAnalysis AnalyzeAllocationConstraints(const FunctionPtr& func,
+                                                          const LifetimeAnalysisResult& lifetimes,
+                                                          const char* consumer) {
+  AllocationConstraintAnalysis result;
+  result.declared_allocation_sizes = CollectPinnedAllocSizes(func->body_, func->span_, consumer);
+  for (const auto& [base, size] : result.declared_allocation_sizes) {
+    static_cast<void>(size);
+    result.declared_allocation_bases.insert(base);
+  }
+  ValidateDeclaredAllocs(func->body_, result.declared_allocation_bases, lifetimes.var_liveness);
+
+  result.needs_load_tpop_hazard_guard = NeedsLoadTpopHazardGuard(func);
+  if (result.needs_load_tpop_hazard_guard) {
+    HazardInputCollector collector;
+    collector.VisitStmt(func->body_);
+    result.target_hazard_inputs = collector.Take();
+  }
+
+  ForbidAliasCollector forbid_collector(lifetimes.var_sharing_groups);
+  forbid_collector.VisitStmt(func->body_);
+  result.forbid_alias = forbid_collector.Take();
+  return result;
+}
+
+LifetimeAnalysisResult AnalyzeAllocationLifetimes(const StmtPtr& func_body) {
+  return AnalyzeAllocationLifetimesImpl(func_body);
+}
+
+LifetimeAnalysisResult AnalyzeAllocationLifetimes(const FunctionPtr& func) {
+  INTERNAL_CHECK(func != nullptr) << "Cannot analyze allocation lifetimes for a null function";
+  return AnalyzeAllocationLifetimesImpl(func->body_, func->params_);
+}
 
 namespace pass {
 Pass MaterializeSemanticAliases() {

@@ -32,6 +32,7 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/type.h"
 
@@ -45,13 +46,6 @@ class BackendHandler;
 }  // namespace backend
 
 namespace codegen {
-
-/// Order distinct DataTypes by their internal code so containers keyed on
-/// DataType (e.g. the CommRemoteOffset helper dtype set) iterate
-/// deterministically.
-struct DtypeCodeLess {
-  bool operator()(const DataType& a, const DataType& b) const { return a.Code() < b.Code(); }
-};
 
 /**
  * @brief Collect Vars referenced by a tensor-shape expression, in first-seen DFS order.
@@ -114,9 +108,20 @@ class PTOCodegen : public CodegenBase {
    *        on `pto.alloc_tile` from the MemRef byte offset (ptoas
    *        --pto-level=level3). When false, omit `addr` so the ptoas PlanMemory
    *        pass allocates instead (--pto-level=level2).
+   * @param emit_source_loc When true (default), suffix every emitted operation
+   *        with an MLIR `loc("file":line:col)` derived from the IR Span, so
+   *        ptoas diagnostics name the user's source instead of a line in the
+   *        generated `.pto`. Three kinds of line are excluded by design: the
+   *        structural region braces and block labels emitted by
+   *        EmitStructural(), which MLIR forbids a trailing location on; the
+   *        `arith.constant` operations GetOrEmitConstant() writes to the
+   *        constants section, which are deduplicated across every use so no
+   *        single span fits them; and any operation whose span is unknown or
+   *        carries no filename. When false, emit no locations at all.
    * @return MLIR code as string
    */
-  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true);
+  std::string Generate(const ir::ProgramPtr& program, bool emit_tile_addr = true,
+                       bool emit_source_loc = true);
 
   // CodegenBase interface (unified API for operator codegen callbacks)
   [[nodiscard]] std::string GetCurrentResultTarget() const override;
@@ -125,6 +130,36 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetTypeString(const DataType& dtype) const override;
   int64_t GetConstIntValue(const ir::ExprPtr& expr) const override;
   std::string GetVarName(const ir::VarPtr& var) const override;
+
+  /**
+   * @brief Emit one structural (non-operation) MLIR line
+   *
+   * MLIR's trailing `loc(...)` is only legal at the end of a complete
+   * operation. Region openers (`scf.for ... {`), separators (`} else {`,
+   * `} do {`), closers (`}`) and block labels (`^bb0(...):`) are not
+   * operations, so they must bypass the location suffix that Emit() appends.
+   *
+   * @param line Line of MLIR to emit verbatim (indented, no location)
+   */
+  void EmitStructural(const std::string& line);
+
+  /**
+   * @brief Resolve @p var to its MLIR SSA name, or "" when nothing binds it.
+   *
+   * The lenient counterpart to GetVarName, for the rare caller that can
+   * genuinely proceed without a binding. GetVarName is the default: an
+   * unresolvable symbol there is a user error, and emitting an empty operand
+   * would produce MLIR that only fails much later inside ptoas.
+   */
+  [[nodiscard]] std::string LookupVarName(const ir::VarPtr& var) const;
+
+  /**
+   * @brief Explain why @p var has no SSA binding, for the GetVarName failure.
+   *
+   * Names the parameter whose valid_shape introduced the symbol when the origin
+   * is known, so the diagnostic points at editable DSL source.
+   */
+  [[nodiscard]] std::string DescribeUnbindableSymbol(const ir::VarPtr& var) const;
 
   // PTO-specific helper methods for operator codegen functions
 
@@ -302,6 +337,16 @@ class PTOCodegen : public CodegenBase {
   std::pair<std::string, std::string> GetCurrentResultTpopValidShapeOperands();
 
   /**
+   * @brief Get the TileType of the current assignment result, if any.
+   *
+   * Backend emitters use this alongside the result buffer/type helpers when an
+   * operation's transport shape differs temporarily from its logical shape.
+   */
+  std::shared_ptr<const ir::TileType> GetCurrentResultTileType() const {
+    return fs_.current_result_tile_type;
+  }
+
+  /**
    * @brief Get tile_buf type string directly from a TileType
    *
    * Unlike GetTileBufTypeString(memref), this uses the shape/layout from the
@@ -381,6 +426,20 @@ class PTOCodegen : public CodegenBase {
   void SetCurrentResultBuf(const std::string& buf);
   void RegisterTileBufType(const std::string& ssa_name, const std::string& type_string);
   std::string GetSSATileBufType(const std::string& ssa_name) const;
+  /// Record `ssa_name` as a tile *view* — the result of a `pto.subview` or a
+  /// `pto.treshape`, which reinterprets another handle's bytes.
+  void RegisterTileViewName(const std::string& ssa_name);
+  /// Whether `ssa_name` was emitted as a tile view.
+  ///
+  /// A view carries its valid extent in its own type and has no `valid_row` /
+  /// `valid_col` operands, so `pto.set_validshape` cannot mutate one and ptoas
+  /// rejects the attempt. Every other tile handle — an alloc, an `scf.if` result,
+  /// a cross-core pop slot — does accept it.
+  ///
+  /// View-ness has to be tracked, not inferred from the rendered valid dims: a
+  /// `tile.slice` given a runtime `valid_shape` renders `v_row=?, v_col=?`, the
+  /// same way an alloc-backed handle does.
+  bool IsTileViewName(const std::string& ssa_name) const;
   struct SubviewMaterializationInfo {
     std::string source_ssa;
     std::string source_type;
@@ -402,6 +461,11 @@ class PTOCodegen : public CodegenBase {
     /// bare source base — so even a contiguous window would be extracted onto the
     /// source's row 0. See MaterializeSubviewOperandIfNeeded (#1640).
     bool const_offset = false;
+    /// Byte-address residue modulo 32 when it is statically known for every
+    /// runtime value of dynamic offsets; -1 means unknown. Keeping the residue
+    /// (rather than only an aligned flag) lets nested static subviews cancel a
+    /// parent's non-zero residue.
+    int64_t byte_offset_mod_32 = -1;
     bool emitted = false;
   };
   void RegisterSubviewMaterialization(const std::string& subview_ssa, const SubviewMaterializationInfo& info);
@@ -421,6 +485,41 @@ class PTOCodegen : public CodegenBase {
    * @brief Get the recorded GM slot buffer SSA name (empty if none)
    */
   [[nodiscard]] std::string GetGMSlotBufferSSA() const;
+
+  /**
+   * @brief SSA name of the synthetic SDMA workspace pointer parameter.
+   *
+   * When the current function uses prefetch.make_context, PTOCodegen appends
+   * one ``!pto.ptr<i8>`` parameter after the user-derived arguments and before
+   * the synthetic SPMD identity parameters. The kernel wrapper resolves the
+   * pointer from the runtime DMA workspace and forwards it as a hidden call
+   * argument. Returns empty when the function does not use prefetch.
+   */
+  [[nodiscard]] std::string GetSdmaWorkspaceArgSSA() const { return fs_.sdma_workspace_arg_ssa; }
+
+  /**
+   * @brief SSA name of the synthetic raw dispatch-args pointer parameter.
+   *
+   * Functions containing ``pld.system.defer_wait`` receive one hidden
+   * ``!pto.ptr<i64>`` parameter after dynamic dimensions and before other
+   * runtime-owned parameters. The kernel wrapper forwards its ``args`` pointer
+   * through this slot so deferred-completion lowering can reach the runtime's
+   * per-task AsyncCtx. Returns empty for functions without deferred waits.
+   */
+  [[nodiscard]] std::string GetDeferredCompletionRawArgsSSA() const {
+    return fs_.deferred_completion_raw_args_ssa;
+  }
+
+  /**
+   * @brief Register the module-level deferred counter-completion adapter.
+   *
+   * ``pld.system.defer_wait`` lowering calls this when it emits the adapter
+   * call. The declaration is emitted once at module scope and implemented by
+   * the generated C++ kernel wrapper.
+   *
+   * @return Stable adapter symbol name.
+   */
+  std::string RegisterDeferredCompletionAdapter();
 
   /**
    * @brief SSA name of the synthetic SPMD block_idx param.
@@ -499,52 +598,40 @@ class PTOCodegen : public CodegenBase {
   void SetCurrentExprValue(std::string value) { fs_.current_expr_value = std::move(value); }
 
   /**
-   * @brief Name of the module-level ``@CommRemoteOffset_<dtype>`` helper.
+   * @brief Emit the peer-vs-local element offset arithmetic **inline**, into
+   *        the function currently being generated.
    *
-   * Distributed remote ops that need cross-rank peer addressing lower their
-   * per-call peer-rank arithmetic to a ``func.call`` of a per-dtype
-   * module-level helper that returns the **element offset** (``index``)
+   * Distributed remote ops that need cross-rank peer addressing read the
+   * runtime CommContext to compute the **element offset** (``index``)
    * between the local rank's window slice and the peer rank's slice. The
-   * call site then does ``pto.addptr %local_ptr, %delems`` followed by
+   * caller then does ``pto.addptr %local_ptr, %delems`` followed by
    * ``pto.make_tensor_view`` — keeping ``addptr`` and ``make_tensor_view``
    * co-located in the user kernel's ``func.func``, which is what PTOAS's
    * per-func lowering check (``addptr must feed make_tensor_view /
    * initialize_l2g2l_pipe(gm_addr) / load|store_scalar``) requires.
    *
-   * The helper cannot return the peer **pointer** (addptr → func.return
-   * is rejected by PTOAS) and cannot return the **tensor view** (the
-   * view's lowered memref is strided whenever strides are SSA operands,
-   * but ``!pto.tensor_view<…>`` source syntax cannot encode strided
-   * layout, so the func boundary always lowers to plain memref → type
-   * mismatch). Returning the **offset** is the minimum-fanout shape that
-   * shares the CommContext field reads + element-size division across
-   * call sites while leaving both forbidden ops at the call site.
+   * The arithmetic is emitted inline rather than shared through a
+   * module-level ``func.func`` helper. A mixed cube+vector kernel group is
+   * ONE MLIR module holding both the AIC and the AIV function, and PTOAS
+   * compiles that module into a single ``.cpp`` that is built once per
+   * core. A module-level helper carries no ``pto.kernel_kind``, so PTOAS's
+   * section wrapping leaves its value-returning ``return`` outside the
+   * ``__DAV_VEC__`` guard and the cube compile fails on undeclared
+   * identifiers. Emitting into the caller's body instead puts every line
+   * inside that function's own correctly guarded section.
    *
-   * Helper is keyed only on dtype — the only dtype-dependent code in the
-   * body is the element-size constant fed to ``arith.divsi``.
+   * All emitted values get unique SSA names (``NewTemp`` / the shared
+   * constants section), so a function may contain arbitrarily many remote
+   * ops.
    *
-   * @param dtype Element dtype of the DistributedTensor (e.g. ``FP16``,
-   *              ``INT32``).
-   * @return Helper function name (e.g. ``CommRemoteOffset_f16``).
+   * @param ctx_ssa  SSA name of the ``!pto.ptr<i64>`` CommContext pointer.
+   * @param peer_ssa SSA name of the peer rank, already ``index``-typed.
+   * @param dtype    Element dtype of the DistributedTensor (e.g. ``FP16``,
+   *                 ``INT32``); only the element-size divisor depends on it.
+   * @return SSA name holding the element offset (``index``).
    */
-  [[nodiscard]] static std::string GetCommRemoteOffsetFuncName(const DataType& dtype);
-
-  /**
-   * @brief Register a dtype that needs a ``@CommRemoteOffset_<dtype>``
-   *        helper, and return the helper function name.
-   *
-   * Called by op lowering code (``EmitCommRemoteView`` in
-   * ``pto_ops_common.cpp``) at the moment a ``func.call`` to the helper
-   * is emitted. Any op that routes peer addressing through
-   * ``EmitCommRemoteView`` automatically gets the matching helper emitted
-   * at module-flush time — no separate pre-walk of the IR is needed.
-   *
-   * Validates that the dtype is byte-sized (sub-byte dtypes have no
-   * whole-byte element stride and so have no well-defined cross-rank
-   * offset). Failing here surfaces the error at the op call site rather
-   * than at module-emission time.
-   */
-  std::string RegisterCommRemoteOffsetHelper(const DataType& dtype);
+  std::string EmitCommRemoteOffsetInline(const std::string& ctx_ssa, const std::string& peer_ssa,
+                                         const DataType& dtype);
 
   /// Increase/decrease the current indentation level (used by op codegen helpers that emit scf.for blocks)
   void IncreaseIndent() { indent_level_++; }
@@ -586,7 +673,7 @@ class PTOCodegen : public CodegenBase {
    * box (carrying its fillpad'd columns) while PRESERVING the row
    * `valid_shape[0]`: subblock 0's real push stays full and subblock 1's
    * 0-row replay stays a no-op. Genuine `split==1/2` paths widen both axes --
-   * see `EmitSplitTpushTransportValidShape`.
+   * see `EmitTpushTransportValidShape`.
    */
   [[nodiscard]] bool IsDualAivDispatchFunction() const;
 
@@ -654,21 +741,8 @@ class PTOCodegen : public CodegenBase {
    */
   void PrepareGMSlotBufferLayout(const ir::ProgramPtr& program);
 
-  /**
-   * @brief Emit one ``func.func @CommRemoteOffset_<dtype>`` per dtype
-   *        registered via :func:`RegisterCommRemoteOffsetHelper`. Each
-   *        helper performs the runtime CommContext field reads and the
-   *        byte→element division, returning the peer-vs-local element
-   *        offset as ``index``. The call site does ``pto.addptr`` + the
-   *        trailing ``pto.make_tensor_view`` inside the user kernel so
-   *        PTOAS's per-func lowering check (``addptr must feed
-   *        make_tensor_view``) is satisfied locally.
-   *
-   * Emitted at the **end** of the module, after all user functions —
-   * MLIR's symbol table is whole-module so forward references from
-   * ``func.call`` sites earlier in the module resolve normally.
-   */
-  void EmitCommRemoteOffsetHelpers();
+  /// Emit the external declaration implemented by the generated kernel wrapper.
+  void EmitDeferredCompletionAdapterDeclaration();
 
   /**
    * @brief Build variable identity to MemRef mapping from function body
@@ -679,6 +753,8 @@ class PTOCodegen : public CodegenBase {
    * @brief Get the pointer-identity key for a variable
    */
   [[nodiscard]] const ir::Var* GetVarKey(const ir::VarPtr& var) const;
+  void CheckExprVarsBound(const std::vector<ir::ExprPtr>& exprs, const ir::Span& span,
+                          const std::string& context) const;
   void BindVarToMlir(const ir::VarPtr& var, const std::string& mlir_name);
   void BindTensorView(const ir::VarPtr& var, const std::string& tensor_view_name);
   void BindVarToMemRef(const ir::VarPtr& var, const ir::Var* base_ptr);
@@ -707,17 +783,35 @@ class PTOCodegen : public CodegenBase {
     std::string valid_col_ssa;  ///< valid_col operand SSA value (always emitted)
   };
 
+  /// One author-declared multi-slot allocation (`pl.MemRef(slots=N)`), lowered to
+  /// a ptoas `pto.alloc_multi_tile` region whose slots are selected per use by
+  /// `pto.multi_tile_get`. PTOAS-planner mode only — see PlanMultiBufferRegions.
+  struct MultiBufferRegion {
+    std::string region_ssa;     ///< The `%mb` handle the slots are taken from
+    std::string mtb_type_str;   ///< `!pto.multi_tile_buf<<slot>, count=N>`
+    std::string slot_type_str;  ///< The single-slot `!pto.tile_buf<...>` type
+    std::string valid_row_ssa;  ///< valid_row operand (shared by every slot)
+    std::string valid_col_ssa;  ///< valid_col operand (shared by every slot)
+    uint64_t count = 1;         ///< Slot count, in [2, 16] (the ptoas bound)
+  };
+
   /**
    * @brief Compute the type string and (addr, valid_row, valid_col) operands
    *        for a `pto.alloc_tile` op.
    *
    * The result is always dynamic (`v_row=?, v_col=?`) and carries explicit
    * `valid_row` / `valid_col` operands lowered from `tile_type->tile_view_.valid_shape`
-   * when present, falling back to `tile_type->shape_` otherwise.
+   * when present, falling back to `tile_type->shape_` otherwise. Head-declared
+   * control-flow buffers may request the physical shape so their declaration
+   * does not reference a body-local valid-shape SSA value; codegen restores the
+   * logical valid shape at the control-flow site before the buffer is used.
    *
    * @param tile_type Tile type carrying shape/tile_view/memref metadata.
+   * @param use_physical_valid_shape Use `shape_`, ignoring an explicit logical
+   *        `tile_view_.valid_shape`, for the alloc operands.
    */
-  AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type);
+  AllocTileFields ComputeAllocTileFields(const std::shared_ptr<const ir::TileType>& tile_type,
+                                         bool use_physical_valid_shape = false);
 
   /**
    * @brief The tile_buf handle already bound to the buffer `memref` denotes.
@@ -745,6 +839,65 @@ class PTOCodegen : public CodegenBase {
   void EmitExtraAllocTiles();
 
   /**
+   * @brief Decide which author-declared multi-slot allocations become ptoas
+   *        multi-buffer regions, and reserve their `%mb` handles.
+   *
+   * `pl.MemRef(slots=N)` says "one allocation, N uniform slots, this use takes
+   * slot k" — exactly what ptoas `pto.alloc_multi_tile` + `pto.multi_tile_get`
+   * describe, and describing it that way is what lets ptoas plan the slots as one
+   * region and derive per-slot (dynamic event id) synchronization from the slot
+   * expression. Emitting N unrelated `alloc_tile`s instead throws that away.
+   *
+   * Runs only under the PTOAS memory planner (`emit_tile_addr_ == false`). Under
+   * the PyPTO planner, ptoas runs at `--pto-level=level3`, where the fan-out of an
+   * explicit base address is not constant-folded, so its slot narrowing degrades
+   * to conservative aliasing — the multi-buffer form is measurably *worse* there
+   * than the baked-address `alloc_tile` path (an extra false WAR pair between two
+   * constant slots). See hw-native-sys/PTOAS#1106.
+   *
+   * A region is eligible when every tile bound to that allocation selects a slot,
+   * the slots share one tile_buf type and one static valid extent, at most one of
+   * them is live per loop iteration, the memory space is a local one ptoas supports
+   * for multi_tile_buf (vec / mat / acc), and the count is within ptoas's `[2, 16]`.
+   *
+   * The one-slot-per-iteration condition is a ptoas synchronization limit, not a
+   * typing one — see CoLiveSlotCollector.
+   *
+   * Anything else is a `ValueError` naming the shape, *not* a fallback: under this
+   * planner per-slot `alloc_tile`s would leave ptoas free to plan the slots on top
+   * of each other, which is the one thing the declaration exists to prevent. The
+   * ordinary `alloc_tile` path is reached only when no region is planned at all —
+   * under the PyPTO planner, or for an allocation that declares no slots.
+   *
+   * @param func The function being generated (scanned for tile phis, which take a
+   *             head-declared handle a per-use slot cannot provide)
+   */
+  void PlanMultiBufferRegions(const ir::FunctionPtr& func);
+
+  /**
+   * @brief The multi-buffer region `memref` takes a slot of, or null.
+   */
+  [[nodiscard]] const MultiBufferRegion* GetMultiBufferRegion(const ir::MemRefPtr& memref) const;
+
+  /**
+   * @brief Emit `%slot = pto.multi_tile_get %mb[%k]` for a slot of a region.
+   *
+   * Emitted where the ordinary `alloc_tile` would be — at the tile's definition —
+   * so a runtime slot index (`l0c[i % 2]`) is read inside the loop that names it.
+   *
+   * @return false when no region was planned for `memref`'s allocation — it
+   *         declares no slots, or the PyPTO planner is in use. An allocation that
+   *         declares slots this planner cannot describe never reaches here:
+   *         PlanMultiBufferRegions has already raised.
+   */
+  bool TryEmitMultiTileGet(const ir::MemRefPtr& memref, const std::string& tile_buf, const ir::Span& span);
+
+  /**
+   * @brief Emit the `pto.alloc_multi_tile` declarations in the function head.
+   */
+  void EmitMultiBufferRegionAllocs();
+
+  /**
    * @brief Get indent string for current level
    */
   std::string GetIndent() const;
@@ -761,6 +914,11 @@ class PTOCodegen : public CodegenBase {
     std::string constants_indent;  ///< Fixed indent for constants_section (set once per function)
 
     std::map<const ir::Var*, std::string> var_to_mlir;
+    /// Symbols that appear ONLY in a tensor parameter's valid_shape, mapped to
+    /// that parameter's name. Such a symbol is bound at the call site, so a
+    /// precompiled kernel never receives it — read on the GetVarName failure
+    /// path to name the parameter the unbindable symbol came from.
+    std::map<const ir::Var*, std::string> valid_shape_symbol_origin;
     std::map<const ir::Var*, std::string> tensor_to_view;
     std::map<const ir::Var*, std::string> tensor_to_base_ptr;  ///< tensor var → base ptr SSA
     std::map<std::string, std::string>
@@ -782,6 +940,14 @@ class PTOCodegen : public CodegenBase {
     std::vector<ExtraAllocTile> extra_alloc_tiles;
     std::map<std::string, std::string> ssa_to_tile_buf_type;
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
+    /// SSA names emitted as tile views (`pto.subview` / `pto.treshape`).
+    std::set<std::string> tile_view_names;
+
+    /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
+    std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
+    /// The same regions in discovery order — the map is keyed by pointer, which
+    /// is not a stable order to emit declarations in.
+    std::vector<const ir::Var*> multi_buffer_region_order;
 
     int temp_counter = 0;
     std::set<std::string> used_ssa_names;
@@ -819,6 +985,13 @@ class PTOCodegen : public CodegenBase {
     std::map<std::pair<int, int>, std::string> gm_slot_buffer_region_by_pipe;
     std::set<const ir::Var*> ffts_workspace_vars;
 
+    /// SSA name of the synthetic runtime-owned SDMA workspace pointer param.
+    /// Empty when the current function does not use prefetch.make_context.
+    std::string sdma_workspace_arg_ssa;
+
+    /// Raw runtime dispatch-args pointer used by deferred completion adapters.
+    std::string deferred_completion_raw_args_ssa;
+
     /// SSA names of the synthetic SPMD block_idx/block_num params, appended at
     /// the func.func signature tail. Empty when the current function does not
     /// use tile.get_block_idx / tile.get_block_num.
@@ -848,6 +1021,7 @@ class PTOCodegen : public CodegenBase {
       constants_indent.clear();
 
       var_to_mlir.clear();
+      valid_shape_symbol_origin.clear();
       tensor_to_view.clear();
       tensor_to_base_ptr.clear();
       view_ssa_to_base_ptr.clear();
@@ -860,6 +1034,7 @@ class PTOCodegen : public CodegenBase {
       extra_alloc_tiles.clear();
       ssa_to_tile_buf_type.clear();
       subview_materializations.clear();
+      tile_view_names.clear();
 
       temp_counter = 0;
       used_ssa_names.clear();
@@ -871,6 +1046,8 @@ class PTOCodegen : public CodegenBase {
       memref_identity_type.clear();
       memref_identity_mixed_types.clear();
       emitted_tile_alloc_names.clear();
+      multi_buffer_regions.clear();
+      multi_buffer_region_order.clear();
 
       current_function.reset();
       current_result_var.reset();
@@ -882,6 +1059,8 @@ class PTOCodegen : public CodegenBase {
       gm_slot_buffer_region_by_pipe.clear();
       ffts_workspace_vars.clear();
 
+      sdma_workspace_arg_ssa.clear();
+      deferred_completion_raw_args_ssa.clear();
       spmd_block_idx_arg.clear();
       spmd_block_num_arg.clear();
       spmd_subblock_idx_arg.clear();
@@ -900,20 +1079,59 @@ class PTOCodegen : public CodegenBase {
   int indent_level_ = 0;
   std::map<std::pair<int, int>, int64_t> gm_slot_buffer_offsets_;
 
-  /// Element DataTypes of DistributedTensors that need a
-  /// ``@CommRemoteOffset_<dtype>`` helper. Populated lazily by
-  /// :func:`RegisterCommRemoteOffsetHelper` as op lowering emits
-  /// ``func.call`` sites; flushed at module end by
-  /// :func:`EmitCommRemoteOffsetHelpers`. Storing the DataType (not the
-  /// MLIR string) lets the emitter derive both the MLIR type name and
-  /// the element byte size via ``DataType`` accessors.
-  std::set<DataType, DtypeCodeLess> remote_offset_dtypes_;
+  /// True when the module needs the wrapper-defined counter-completion adapter.
+  bool needs_deferred_completion_adapter_ = false;
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
 
   /// When false, `pto.alloc_tile` omits the physical `addr` operand so the
   /// ptoas PlanMemory pass owns allocation (--pto-level=level2). Set by Generate.
   bool emit_tile_addr_ = true;
+
+  /// When false, no operation carries a trailing `loc(...)`. Set by Generate.
+  bool emit_source_loc_ = true;
+
+  /// Source span attached to the operations being emitted right now; null means
+  /// "no location", which makes Emit() behave exactly as it did before locations
+  /// existed. Points into IR-owned storage — see SpanScope.
+  const ir::Span* current_span_ = nullptr;
+
+  /**
+   * @brief RAII guard binding the source location of every op emitted while alive
+   *
+   * Set at two levels: once per statement (PTOCodegen::VisitStmt) and once more
+   * per Call when the Call's own span is a genuine refinement
+   * (PTOCodegen::VisitExpr_(CallPtr)). Restores the previous span on scope exit,
+   * so nesting composes.
+   *
+   * A null @p span leaves the enclosing scope's location in place, which lets
+   * callers express "refine only if the span is trustworthy" without an
+   * `std::optional<SpanScope>`.
+   */
+  class SpanScope {
+   public:
+    SpanScope(PTOCodegen* codegen, const ir::Span* span) : codegen_(codegen), saved_(codegen->current_span_) {
+      if (span != nullptr) codegen_->current_span_ = span;
+    }
+    ~SpanScope() { codegen_->current_span_ = saved_; }
+
+    /// `current_span_` is a non-owning pointer, so a temporary would dangle.
+    SpanScope(PTOCodegen* codegen, ir::Span&& span) = delete;
+    SpanScope(const SpanScope&) = delete;
+    SpanScope& operator=(const SpanScope&) = delete;
+
+   private:
+    PTOCodegen* codegen_;
+    const ir::Span* saved_;
+  };
+
+  /**
+   * @brief Trailing MLIR location for the currently bound span
+   *
+   * @return `" loc(\"file\":line:col)"`, or an empty string when locations are
+   *         disabled or no usable span is bound.
+   */
+  [[nodiscard]] std::string LocSuffix() const;
 
   /// Emit an arith binary op, return SSA result name
   std::string EmitArithBinaryOp(const std::string& mlir_op, const std::string& lhs, const std::string& rhs,

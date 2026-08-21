@@ -11,10 +11,13 @@
 
 #include <algorithm>
 #include <any>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -39,8 +42,16 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/dsa/allocation_plan.h"
+#include "pypto/ir/transforms/dsa/dsa_reuse_penalty_solver.h"
+#include "pypto/ir/transforms/dsa/memref_dsa_adapter.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
+#include "pypto/ir/transforms/utils/core_affinity.h"
+#include "pypto/ir/transforms/utils/cross_core_pipe.h"
+#include "pypto/ir/transforms/utils/lifetime_analysis.h"
 #include "pypto/ir/transforms/utils/memory_footprint.h"
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -57,6 +68,106 @@ namespace {
 using MemRefWithSpace = std::pair<MemRefPtr, MemorySpace>;
 // ReserveBufferBaseMap / ReservedEndBySpace / ResolveReserveBufferBases now live in the shared
 // reserve_buffer_utils.h so AllocateMemoryAddr and MemoryReuse resolve the reserved region identically.
+
+/// Whether `resolution` holds one of the automatic cross-core pipe rings, i.e.
+/// whether `pl.cross_core_slot(slot_num=N)` can actually move these bytes.
+///
+/// Matched EXACTLY, not by suffix. BuildAutomaticPipeSetup mints the ring's name as
+/// BuildPipeBufferName(<mixed kernel name>, dir) while ExpandMixedKernel names the
+/// halves "<mixed kernel name>_aic" / "_aiv", so the expected names are
+/// reconstructible from this function's own name. That precision matters because
+/// `pl.reserve_buffer` takes an arbitrary name: a hand-authored
+/// "scratch_v2c_slot_buffer" would pass a suffix test and then be pointed at a knob
+/// that cannot resize it.
+bool HasCrossCorePipeRing(const ReserveBufferResolution& resolution, const std::string& func_name) {
+  auto strip_suffix = [&func_name](const std::string& suffix) -> std::string {
+    if (func_name.size() <= suffix.size()) return "";
+    if (func_name.compare(func_name.size() - suffix.size(), suffix.size(), suffix) != 0) return "";
+    return func_name.substr(0, func_name.size() - suffix.size());
+  };
+  std::vector<std::string> expected;
+  for (const auto& kernel : {strip_suffix("_aic"), strip_suffix("_aiv")}) {
+    if (kernel.empty()) continue;
+    expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::C2V));
+    expected.push_back(cross_core_pipe::BuildPipeBufferName(kernel, core_affinity::PipeDirection::V2C));
+  }
+  if (expected.empty()) return false;
+  for (const auto& [call, base] : resolution.resolved_bases) {
+    if (!call) continue;
+    const auto name = call->GetKwarg<std::string>("name", "");
+    if (std::find(expected.begin(), expected.end(), name) != expected.end()) return true;
+  }
+  return false;
+}
+
+/// The "the first N bytes ... are reserved" clause appended to a capacity-overflow
+/// message, or empty when `space` pays for no reserve buffer.
+///
+/// A reserve_buffer is NOT a MemRef: every tile is allocated *above* it, so it is
+/// counted in the footprint yet is invisible in the per-tile accounting an author can
+/// inspect. On a cube/vector boundary carrying a large tile the automatic pipe ring is
+/// routinely most of the overflow, so name those bytes — and the knob for them, but
+/// only when the buffer really is a pipe ring.
+///
+/// The figure is `reserved_end_by_space`: the aligned max-END that tiles are placed
+/// above, which is exactly the quantity charged to this overflow. It is deliberately
+/// NOT worded as "bytes the buffers occupy" — an explicitly based buffer
+/// (`base=0x1000, size=4096`) or an alignment gap makes the floor exceed the summed
+/// buffer sizes, so the wording states the floor.
+///
+/// Shared by the in-pass capacity CHECK and the AllocatedMemoryAddr verifier so the two
+/// explain the same overflow identically. Which of them a given compile hits depends on
+/// configuration (the pass CHECK is skipped under memory_planner=PTOAS, which skips the
+/// pass), so the wording must not live in only one of them.
+std::string ReservedBytesNote(const ReserveBufferResolution& resolution, MemorySpace space,
+                              const std::string& func_name) {
+  const auto& ends = resolution.reserved_end_by_space;
+  auto it = ends.find(space);
+  if (it == ends.end() || it->second == 0) return "";
+  std::string note = ". The first " + std::to_string(it->second) +
+                     " bytes of that space are reserved by system.reserve_buffer, so tiles are "
+                     "allocated above them";
+  if (HasCrossCorePipeRing(resolution, func_name)) {
+    note +=
+        " — this is the cross-core pipe ring. Lower its depth with "
+        "optimizations=[pl.cross_core_slot(slot_num=N)] on the enclosing pl.at(...), or shrink the "
+        "tile that crosses the cube/vector boundary";
+  }
+  return note;
+}
+
+class StripPipelineMembershipMutator : public IRMutator {
+ public:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto visited = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(visited);
+    if (!call || !call->HasAttr(kPipelineMembershipAttr)) return visited;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
+                                  StripAttr(call->attrs_, kPipelineMembershipAttr), call->GetType(),
+                                  call->span_);
+  }
+};
+
+bool IsUnusedAllocStmt(const StmtPtr& stmt, const std::set<const Var*>& used_bases) {
+  const auto assign = As<AssignStmt>(stmt);
+  const auto call = assign ? As<Call>(assign->value_) : nullptr;
+  return call && (IsOp(call, "tile.alloc") || IsOp(call, "tensor.alloc")) &&
+         used_bases.count(assign->var_.get()) == 0;
+}
+
+StmtPtr RemoveUnusedAllocStatements(const StmtPtr& body) {
+  const auto used_bases = memref_collectors::CollectUsedBasePtrs(body);
+  const auto sequence = As<SeqStmts>(body);
+  if (!sequence) return body;
+
+  std::vector<StmtPtr> retained;
+  retained.reserve(sequence->stmts_.size());
+  for (const StmtPtr& statement : sequence->stmts_) {
+    if (!IsUnusedAllocStmt(statement, used_bases)) retained.push_back(statement);
+  }
+  return retained.size() == sequence->stmts_.size() ? body
+                                                    : SeqStmts::Flatten(std::move(retained), body->span_);
+}
 
 // Mutator to update MemRef addresses in IR (both variable types and alloc statements)
 class MemRefUpdateMutator : public IRMutator {
@@ -167,6 +278,44 @@ class MemRefUpdateMutator : public IRMutator {
   }
 };
 
+/// Author-declared (`pinned=True`) allocations in a body: base Ptr -> reserved bytes.
+///
+/// InitMemRef clears `is_pinned_` on the MemRefs it resolves — the declaration is
+/// resolved, and the flag is what confines MemRef rebuilds to the window before
+/// this pass. It keeps `slot_count_` / `slot_index_`, but those describe one slot,
+/// not the declaration: no resolved MemRef states the reserved size. So by this
+/// pass the only record of the allocation *as a whole* is its alloc statement.
+/// Two things here depend on it:
+///
+///  * a declared allocation is the one place a *dynamic* address is meaningful;
+///  * it is the one place the allocation is deliberately **larger than any single
+///    MemRef in it**. A multi-slot declaration reserves `slots x slot_size` while
+///    each slot MemRef is sized to its own slot, so sizing the buffer from the
+///    largest member — as every other base can be — would reserve one slot and let
+///    the next allocation land on top of slot 1.
+///
+/// The size therefore has to come from the alloc statement, which InitMemRef
+/// already sized to the whole slot set.
+class PinnedAllocCollector : public IRVisitor {
+ public:
+  std::map<const Var*, uint64_t> alloc_sizes;
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (auto base = GetPinnedAllocBase(op)) {
+      // CreateAllocStatement builds `alloc(memory_space, size)`, so the size is
+      // args_[1]. Absent or non-constant, fall back to the members (0 = no floor).
+      uint64_t size = 0;
+      if (auto call = As<Call>(op->value_); call && call->args_.size() >= 2) {
+        if (auto const_size = As<ConstInt>(call->args_[1]); const_size && const_size->value_ > 0) {
+          size = static_cast<uint64_t>(const_size->value_);
+        }
+      }
+      alloc_sizes.emplace(base.get(), size);
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+};
+
 /**
  * @brief Allocate memory addresses using the given allocation policy
  *
@@ -175,10 +324,17 @@ class MemRefUpdateMutator : public IRMutator {
  * MemRefs (e.g. produced by ``tile.slice``) — every view physically aliases
  * its parent allocation, so they should share one address slot rather than
  * each consuming size_ bytes of fresh L1.
+ *
+ * ``pinned_alloc_sizes`` maps each author-declared allocation's base to the bytes
+ * its alloc statement reserves. Those are the only bases that may receive a
+ * dynamic (expression) address, and the only ones whose buffer can be larger than
+ * their largest member (a multi-slot declaration).
  */
 std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
-    const std::vector<MemRefWithSpace>& memrefs, const ReservedEndBySpace& reserved_end_by_space,
-    const MemoryAllocatorPolicy& policy) {
+    const std::vector<MemRefWithSpace>& memrefs, const ReserveBufferResolution& reserve_resolution,
+    const MemoryAllocatorPolicy& policy, const std::map<const Var*, uint64_t>& pinned_alloc_sizes,
+    const std::string& func_name) {
+  const ReservedEndBySpace& reserved_end_by_space = reserve_resolution.reserved_end_by_space;
   // Group MemRefs by memory space
   std::unordered_map<MemorySpace, std::vector<MemRefPtr>> space_to_memrefs;
   for (const auto& [memref, memory_space] : memrefs) {
@@ -226,8 +382,16 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
             << "'. InitMemRef should reject dynamic or invalid allocation shapes before address assignment.";
         slot_size = std::max(slot_size, static_cast<uint64_t>(ref->size_));
       }
+      // A declared allocation reserves what its alloc statement says, which for a
+      // multi-slot declaration exceeds any single member. Everything else is sized
+      // by its largest member, as before.
+      uint64_t buffer_size = slot_size;
+      auto declared_size = pinned_alloc_sizes.find(base_key);
+      if (declared_size != pinned_alloc_sizes.end()) {
+        buffer_size = std::max(buffer_size, declared_size->second);
+      }
       // Reserve this base-group's physical buffer; base_addr is where its members land.
-      const uint64_t base_addr = footprint.OpenBuffer(slot_size);
+      const uint64_t base_addr = footprint.OpenBuffer(buffer_size);
 
       // Bump the whole group to `current_addr`, then preserve each member's
       // own offset within the slot: new byte_offset = base_addr + old offset.
@@ -243,47 +407,155 @@ std::vector<std::pair<const MemRef*, MemRefPtr>> AllocateMemoryAddresses(
       // derives the offset from the slice op's own operands off the root base.
       for (const auto& old_memref : group) {
         // Fold a const relative offset into a single ConstInt: base + offset.
-        // The AllocatedMemoryAddr property requires byte_offset_ to be a
-        // ConstInt >= 0, and PTO codegen reads `pto.alloc_tile` addr 1:1 from it.
+        // A reshape-of-slice chain inherits the slice's offset but does NOT go
+        // through `pto.subview`, so its address must come from this MemRef
+        // (issue #1510).
         //
-        // A non-const (dynamic) offset cannot be encoded as a ConstInt address,
-        // so it falls back to the bare base. This is safe: a dynamic-offset view
-        // only ever reaches codegen through `tile.slice`, which re-derives the
-        // offset from the slice op's own operands (`pto.subview`) rather than the
-        // result MemRef addr. The fix only matters for const offsets, where a
-        // reshape-of-slice chain inherits the offset but does NOT go through
-        // `pto.subview`, so its address must come from this MemRef (issue #1510).
-        int64_t relative_offset = 0;
-        if (auto old_offset = std::dynamic_pointer_cast<const ConstInt>(old_memref->byte_offset_)) {
-          relative_offset = old_offset->value_;
-        }
+        // A *dynamic* offset cannot fold. For a declared allocation the address
+        // becomes the expression `base_addr + offset` and codegen lowers it into
+        // the tile's runtime address assignment — that is how a runtime slot index
+        // (`l0c[i % 2]`, scaled to a byte offset by InitMemRef) reaches the
+        // hardware. Dropping it would silently address slot 0 every iteration.
+        //
+        // Every OTHER dynamic offset keeps the old behaviour: fall back to the
+        // bare base. Those are `tile.slice` views, which reach codegen through
+        // `pto.subview` and re-derive their offset from the slice op's own
+        // operands, so this address is unused — and emitting the expression anyway
+        // is actively harmful: it is not renderable at the `pto.alloc_tile addr`
+        // position and PTOAS rejects the module with "expected SSA operand".
+        //
         // INT64 dtype is required by the PTOAS dialect's `pto.alloc_tile` addr
         // operand; PTO codegen reads this dtype from the ConstInt 1:1.
-        auto member_addr_expr = std::make_shared<ConstInt>(static_cast<int64_t>(base_addr) + relative_offset,
-                                                           DataType::INT64, Span::unknown());
+        ExprPtr member_addr_expr;
+        auto old_offset = std::dynamic_pointer_cast<const ConstInt>(old_memref->byte_offset_);
+        if (!old_offset && pinned_alloc_sizes.count(old_memref->base_.get()) == 0) {
+          // Not a declared allocation: bare base, exactly as before slots existed.
+          old_offset = std::make_shared<ConstInt>(0, DataType::INT64, Span::unknown());
+        }
+        if (old_offset) {
+          member_addr_expr = std::make_shared<ConstInt>(static_cast<int64_t>(base_addr) + old_offset->value_,
+                                                        DataType::INT64, Span::unknown());
+        } else {
+          auto base_expr =
+              std::make_shared<ConstInt>(static_cast<int64_t>(base_addr), DataType::INDEX, Span::unknown());
+          member_addr_expr =
+              std::make_shared<Add>(base_expr, old_memref->byte_offset_, DataType::INDEX, Span::unknown());
+        }
         // NOTE: MemRef is identity-bearing — each result must get a fresh
         // unique_id_, so build it via the explicit constructor (MutableCopy is
         // static_assert-forbidden for Var/MemRef).
-        auto new_memref = std::make_shared<MemRef>(old_memref->name_hint_, old_memref->base_,
-                                                   member_addr_expr, old_memref->size_, old_memref->span_);
+        auto new_memref = std::make_shared<MemRef>(
+            old_memref->name_hint_, old_memref->base_, member_addr_expr, old_memref->size_, old_memref->span_,
+            old_memref->is_pinned_, old_memref->slot_count_, old_memref->slot_index_);
         memref_pairs.emplace_back(old_memref.get(), new_memref);
       }
     }
+
+    // Capacity is checked HERE because this is the only place the number is exact.
+    // The footprint is built from each buffer'strue reserved size, so it counts a
+    // declared allocation's unbound slots and does not depend on any tile's address
+    // being constant. Reconstructing it downstream from the addressed tiles cannot
+    // do either: a slot nobody binds leaves no MemRef to see, and a runtime slot
+    // index leaves no constant to add up.
+    if (backend::BackendConfig::IsConfigured()) {
+      const uint64_t limit = backend::GetBackend()->GetMemSize(space);
+      const uint64_t used = footprint.HighWater();
+      CHECK(limit == 0 || used <= limit)
+          << MemorySpaceToString(space) << " buffer usage (" << used << " bytes) exceeds platform limit ("
+          << limit << " bytes)" << ReservedBytesNote(reserve_resolution, space, func_name);
+    }
   }
 
-  // Sort by byte_offset (ascending order) so alloc statements are in address order
+  // Sort by byte_offset (ascending order) so alloc statements are in address order.
+  //
+  // Comparing by offset only when *both* sides are constant, and by name
+  // otherwise, is not a strict weak ordering once dynamic offsets are reachable:
+  // with A=(name "z", offset 0), B=(name "a", offset 1) and C=(name "m", dynamic),
+  // A < B by offset and B < C by name, yet A < C is false — and a non-transitive
+  // comparator makes std::sort undefined behaviour. A declared allocation's
+  // runtime slot index made that case reachable.
+  //
+  // Ordering on one total key instead: constants first in address order, then
+  // dynamic addresses by name. `name_hint_` breaks ties among equal offsets so
+  // the result is deterministic (two MemRefs of one base group can share an
+  // offset, e.g. a view over its parent).
   std::sort(memref_pairs.begin(), memref_pairs.end(),
             [](const std::pair<const MemRef*, MemRefPtr>& a, const std::pair<const MemRef*, MemRefPtr>& b) {
               auto off_a = std::dynamic_pointer_cast<const ConstInt>(a.second->byte_offset_);
               auto off_b = std::dynamic_pointer_cast<const ConstInt>(b.second->byte_offset_);
-              if (off_a && off_b) {
+              if (static_cast<bool>(off_a) != static_cast<bool>(off_b)) {
+                return static_cast<bool>(off_a);  // constants before dynamic
+              }
+              if (off_a && off_b && off_a->value_ != off_b->value_) {
                 return off_a->value_ < off_b->value_;
               }
-              // Fallback: sort by name
               return a.second->name_hint_ < b.second->name_hint_;
             });
 
   return memref_pairs;
+}
+
+std::vector<std::pair<const MemRef*, MemRefPtr>> PlanWithDsaRP(
+    const FunctionPtr& func, const MemoryAllocatorPolicy& policy,
+    const ReservedEndBySpace& reserved_end_by_space, const std::vector<MemRefWithSpace>& memrefs) {
+  const dsa_adapter::AllocationPlan allocation_plan = dsa_adapter::BuildDsaAllocationPlan(func);
+  if (allocation_plan.intervals.empty()) return {};
+
+  std::unordered_map<MemorySpace, uint64_t> pool_caps;
+  const backend::Backend* active_backend =
+      backend::BackendConfig::IsConfigured() ? backend::GetBackend() : nullptr;
+  if (active_backend != nullptr) {
+    for (const LifetimeInterval& lifetime : allocation_plan.intervals) {
+      if (pool_caps.count(lifetime.memory_space) != 0) continue;
+      const uint64_t capacity = active_backend->GetMemSize(lifetime.memory_space);
+      if (capacity > 0) pool_caps[lifetime.memory_space] = capacity;
+    }
+  }
+
+  const dsa_adapter::PreparedProblem prepared = dsa_adapter::BuildProblem(
+      func, allocation_plan, policy, reserved_end_by_space, pool_caps, active_backend);
+  if (prepared.strict_problem.buffers.empty()) return {};
+
+  const dsa::CanonicalGreedySolver solver;
+  dsa::DsaProblem solved_problem = prepared.strict_problem;
+  dsa::DsaResult result = solver.Solve(solved_problem);
+  if (result.status == dsa::SolveStatus::kNoFit && !prepared.pipeline_pairs.empty()) {
+    solved_problem = dsa_adapter::RelaxPipelineIntent(prepared);
+    result = solver.Solve(solved_problem);
+  }
+
+  INTERNAL_CHECK_SPAN(result.status != dsa::SolveStatus::kInvalidProblem, func->span_)
+      << "DSA-RP constructed or produced invalid state for '" << func->name_ << "'"
+      << (result.diagnostics.empty() ? std::string() : ": " + result.diagnostics.front());
+  CHECK_SPAN(result.status == dsa::SolveStatus::kFeasible, func->span_)
+      << "DSA-RP could not find a placement for '" << func->name_ << "' within the on-chip memory capacities"
+      << (result.diagnostics.empty() ? std::string() : ": " + result.diagnostics.front());
+  INTERNAL_CHECK_SPAN(result.solution.has_value(), func->span_)
+      << "DSA-RP reported a feasible result without a placement";
+
+  // Revalidate at the compiler boundary even though the in-tree solver
+  // validates its own incumbent. This keeps writeback independent of solver
+  // bookkeeping and catches future solver implementations that violate the
+  // shared solution contract.
+  const std::vector<std::string> validation = dsa::ValidateSolution(solved_problem, *result.solution);
+  INTERNAL_CHECK_SPAN(validation.empty(), func->span_)
+      << "Independent validation rejected DSA-RP placement for '" << func->name_
+      << "': " << validation.front();
+
+  const size_t active_pipeline_pairs =
+      dsa::CountOverlappingPairs(prepared.strict_problem, *result.solution, prepared.pipeline_pairs);
+  if (active_pipeline_pairs != 0) {
+    std::ostringstream message;
+    message << "DSA-RP's bounded strict search did not retain all software-pipeline buffer "
+               "separations for '"
+            << func->name_ << "'; " << active_pipeline_pairs << " of " << prepared.pipeline_pairs.size()
+            << " relaxed pair(s) reuse physical storage. Pipeline overlap may be reduced.";
+    EmitDiagnostics({Diagnostic(DiagnosticSeverity::PerfHint, "AllocateMemoryAddr", 0, "PH-DSA-001",
+                                message.str(), func->span_)},
+                    "AllocateMemoryAddr");
+  }
+
+  return dsa_adapter::BuildMemRefReplacements(prepared, *result.solution, memrefs, policy);
 }
 
 /**
@@ -311,8 +583,21 @@ FunctionPtr TransformAllocateMemoryAddr(const FunctionPtr& func) {
   // Step 2: Collect all unique MemRef objects from TileType variables
   auto memrefs = memref_collectors::CollectMemRefsWithSpace(func->body_);
 
-  // Step 3: Allocate memory addresses using the policy
-  auto memref_pairs = AllocateMemoryAddresses(memrefs, reserve_resolution.reserved_end_by_space, *policy);
+  const PassContext* context = PassContext::Current();
+  const MemoryPlanner planner = context == nullptr ? MemoryPlanner::PyPTO : context->GetMemoryPlanner();
+
+  // Step 3: use the selected in-tree allocator. PTOAS never reaches this pass.
+  std::vector<std::pair<const MemRef*, MemRefPtr>> memref_pairs;
+  if (planner == MemoryPlanner::DsaRP) {
+    memref_pairs = PlanWithDsaRP(func, *policy, reserve_resolution.reserved_end_by_space, memrefs);
+  } else {
+    // Declared allocations are the only ones that may take a dynamic address
+    // (a runtime slot index).
+    PinnedAllocCollector pinned_collector;
+    pinned_collector.VisitStmt(func->body_);
+    memref_pairs = AllocateMemoryAddresses(memrefs, reserve_resolution, *policy, pinned_collector.alloc_sizes,
+                                           func->name_);
+  }
 
   if (memref_pairs.empty() && reserve_resolution.resolved_bases.empty()) {
     return func;
@@ -330,6 +615,16 @@ FunctionPtr TransformAllocateMemoryAddr(const FunctionPtr& func) {
   }
 
   auto new_body = mutator.VisitStmt(func->body_);
+  if (planner == MemoryPlanner::DsaRP) {
+    // DSA-RP consumed the transient stage provenance while constructing its
+    // strict pipeline separations. The legacy planner strips the same
+    // attribute at the end of MemoryReuse.
+    new_body = StripPipelineMembershipMutator().VisitStmt(new_body);
+    // MaterializeSemanticAliases can make the producer's original allocation
+    // unreachable. MemoryReuse normally removes those declarations, but
+    // DSA-RP deliberately skips that pass.
+    new_body = RemoveUnusedAllocStatements(new_body);
+  }
 
   auto new_func = MutableCopy(func);
   new_func->params_ = new_params;
@@ -388,14 +683,30 @@ class AllocatedMemoryAddrVerifier : public IRVisitor {
     if (memory_space == MemorySpace::DDR) return;
     if (!seen_.insert(memref.get()).second) return;
 
-    auto const_offset = std::dynamic_pointer_cast<const ConstInt>(memref->byte_offset_);
-    if (!const_offset || const_offset->value_ < 0) {
+    // An address may legitimately be an expression: a declared allocation's runtime
+    // slot index becomes `base_addr + index * slot_size`, which codegen lowers into
+    // the tile's address assignment. What the property requires is that an address
+    // was *assigned* — a null offset, or a negative constant, means it was not.
+    if (!memref->byte_offset_) {
       diagnostics_.emplace_back(DiagnosticSeverity::Error, "AllocatedMemoryAddr", 0,
                                 "MemRef for variable '" + var_name + "' in " +
-                                    MemorySpaceToString(memory_space) + " has no valid address allocated",
+                                    MemorySpaceToString(memory_space) + " has no address allocated",
                                 span);
       return;
     }
+    auto const_offset = std::dynamic_pointer_cast<const ConstInt>(memref->byte_offset_);
+    if (const_offset && const_offset->value_ < 0) {
+      diagnostics_.emplace_back(DiagnosticSeverity::Error, "AllocatedMemoryAddr", 0,
+                                "MemRef for variable '" + var_name + "' in " +
+                                    MemorySpaceToString(memory_space) + " has a negative address (" +
+                                    std::to_string(const_offset->value_) + ")",
+                                span);
+      return;
+    }
+    // High-water tracking needs a concrete address. A dynamic one is bounded by
+    // the whole declared allocation, which its own root MemRef already accounts
+    // for, so skipping it here cannot under-report the space's footprint.
+    if (!const_offset) return;
 
     uint64_t end = static_cast<uint64_t>(const_offset->value_) + memref->size_;
     auto& hw = high_water_[memory_space];
@@ -422,15 +733,32 @@ class AllocatedMemoryAddrPropertyVerifierImpl : public PropertyVerifier {
 
       if (!be) continue;
 
+      // Resolved lazily and reused across spaces: only an overflow reads it, and that
+      // path aborts the compile — so on every green build this costs nothing. Shares
+      // ResolveReserveBufferBases with the transform half of this pass (see
+      // reserve_buffer_utils.h, "the SINGLE source of truth"), so the attributed
+      // bytes ARE the floor tiles were placed above, not an independent re-sum.
+      std::optional<ReserveBufferResolution> reserved;
+
       for (const auto& [space, used] : verifier.GetHighWaterMarks()) {
         uint64_t limit = be->GetMemSize(space);
-        if (limit > 0 && used > limit) {
-          diagnostics.emplace_back(DiagnosticSeverity::Error, "AllocatedMemoryAddr", 1,
-                                   "Function '" + func->name_ + "': " + MemorySpaceToString(space) +
-                                       " buffer usage (" + std::to_string(used) +
-                                       " bytes) exceeds platform limit (" + std::to_string(limit) + " bytes)",
-                                   func->span_);
+        if (limit == 0 || used <= limit) continue;
+        std::string message = "Function '" + func->name_ + "': " + MemorySpaceToString(space) +
+                              " buffer usage (" + std::to_string(used) + " bytes) exceeds platform limit (" +
+                              std::to_string(limit) + " bytes)";
+        if (!reserved.has_value()) {
+          reserved.emplace();
+          // Only InCore-variant functions carry reserve_buffer; the space resolution
+          // inside is unreachable for the others (Group / Orchestration / Opaque).
+          if (IsInCoreType(func->func_type_)) {
+            auto policy = be->CreateMemoryAllocatorPolicy();
+            INTERNAL_CHECK_SPAN(policy, func->span_)
+                << "Internal error: Backend::CreateMemoryAllocatorPolicy() returned null";
+            *reserved = ResolveReserveBufferBases(func, *policy);
+          }
         }
+        message += ReservedBytesNote(*reserved, space, func->name_);
+        diagnostics.emplace_back(DiagnosticSeverity::Error, "AllocatedMemoryAddr", 1, message, func->span_);
       }
     }
   }

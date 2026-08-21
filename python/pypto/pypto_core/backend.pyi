@@ -9,6 +9,8 @@
 
 """Type stubs for backend module."""
 
+from typing import ClassVar
+
 from pypto import ir
 
 class BackendType:
@@ -16,6 +18,8 @@ class BackendType:
 
     Ascend910B: BackendType
     Ascend950: BackendType
+    __members__: ClassVar[dict[str, BackendType]]
+    """Every member, keyed by name — the canonical way to enumerate the enum."""
     @property
     def name(self) -> str:
         """The member name (e.g. ``"Ascend910B"``)."""
@@ -92,8 +96,11 @@ class BackendHandler:
     def get_l0a_capacity_bytes(self) -> int: ...
     def get_l0b_capacity_bytes(self) -> int: ...
     def get_l0c_capacity_bytes(self) -> int: ...
+    def get_bias_capacity_bytes(self) -> int: ...
+    def supports_mat_to_bias_move(self, source_dtype: ir.DataType, bias_dtype: ir.DataType) -> bool: ...
     def get_mat_capacity_bytes(self) -> int: ...
     def get_l0_fractal_alignment(self) -> int: ...
+    def get_l0c_m_alignment(self, accumulator_dtype: ir.DataType) -> int: ...
     def get_min_l0_tile_dim(self) -> int: ...
 
 class Backend:

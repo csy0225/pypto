@@ -70,7 +70,7 @@ def configure_log(level: int | str, *, sync_pypto: bool = False) -> None:
 
     Args:
         level: Python ``logging`` int (e.g. ``20``) or string (``"debug"``,
-            ``"v0".."v9"``, ``"info"``, ``"warn"``, ``"error"``, ``"null"``).
+            ``"info"``, ``"timing"``, ``"warn"``, ``"error"``, ``"null"``).
             Case-insensitive. See :data:`simpler_setup.log_config.LOG_LEVEL_CHOICES`.
         sync_pypto: When ``True``, also push the closest PyPTO ``LogLevel`` to
             the C++ side so both subsystems display the same band. Defaults to
@@ -89,19 +89,20 @@ def configure_log(level: int | str, *, sync_pypto: bool = False) -> None:
 def _sync_to_pypto(threshold: int) -> None:
     """Map the unified threshold onto PyPTO's coarser LogLevel enum.
 
-    Bands mirror :func:`simpler._log._split_threshold`:
-    ``<=14`` DEBUG, ``15..24`` (V0..V9) INFO, ``25..39`` WARN,
-    ``40..59`` ERROR, ``>=60`` NUL/NONE.
+    Bands follow the severity thresholds parsed by
+    :func:`simpler_setup.log_config.parse_level`. Simpler's TIMING tier maps
+    to PyPTO WARN because PyPTO has no timing-only level; mapping it to INFO
+    would also enable ordinary compiler information messages.
     """
     from pypto.pypto_core import LogLevel, set_log_level  # noqa: PLC0415
 
-    if threshold <= 14:
+    if threshold <= 10:
         set_log_level(LogLevel.DEBUG)
-    elif threshold <= 24:
+    elif threshold <= 20:
         set_log_level(LogLevel.INFO)
-    elif threshold <= 39:
+    elif threshold <= 30:
         set_log_level(LogLevel.WARN)
-    elif threshold <= 59:
+    elif threshold <= 40:
         set_log_level(LogLevel.ERROR)
     else:
         set_log_level(LogLevel.NONE)

@@ -15,9 +15,11 @@ This package provides Python bindings for the PyPTO C++ library.
 
 from . import arith, codegen, ir, passes, testing
 from .logging import (
+    Error,
     InternalError,
     LogLevel,
     check,
+    get_log_level,
     internal_check,
     internal_check_span,
     log_debug,
@@ -27,6 +29,12 @@ from .logging import (
     log_info,
     log_warn,
     set_log_level,
+)
+from .logging import (
+    _clear_thread_log_level as _clear_thread_log_level,
+)
+from .logging import (
+    _set_thread_log_level as _set_thread_log_level,
 )
 
 class DataType:
@@ -47,6 +55,7 @@ class DataType:
     FP4: DataType  # 4-bit floating point
     FP8E4M3FN: DataType  # 8-bit floating point (IEEE 754 e4m3fn format)
     FP8E5M2: DataType  # 8-bit floating point (IEEE 754 e5m2 format)
+    FP8E8M0: DataType  # 8-bit floating point (E8M0 MX block-scale exponent)
     FP16: DataType  # 16-bit floating point (IEEE 754 half precision)
     FP32: DataType  # 32-bit floating point (IEEE 754 single precision)
     BF16: DataType  # 16-bit brain floating point
@@ -159,10 +168,12 @@ __all__ = [
     # Code generation
     "codegen",
     # Error classes
+    "Error",
     "InternalError",
     # Logging framework
     "LogLevel",
     "set_log_level",
+    "get_log_level",
     "log_debug",
     "log_info",
     "log_warn",

@@ -36,6 +36,24 @@ std::string DataTypeToMLIR(DataType dtype) {
     return "f16";
   } else if (dtype == DataType::BF16) {
     return "bf16";
+  } else if (dtype == DataType::FP8E4M3FN) {
+    // PTOAS v0.48 tile_buf dtype spelling (lowercase f8e4m3 does not parse).
+    return "f8E4M3FN";
+  } else if (dtype == DataType::FP8E5M2) {
+    return "f8E5M2";
+  } else if (dtype == DataType::FP8E8M0) {
+    // Bare `f8E8M0` does not parse; PTOAS v0.48+ requires the dialect type.
+    // EmitC maps loc=scaling + !pto.f8E8M0 → TileType::ScaleLeft/ScaleRight
+    // (ui8 would wrongly become Fixpipe TileType::Scaling).
+    return "!pto.f8E8M0";
+  } else if (dtype == DataType::HF8) {
+    return "!pto.hif8";
+  } else if (dtype == DataType::FP4) {
+    // MXFP4 E2M1 packed form used by pto-isa / PTOAS for MX matmul. Bare
+    // `f4E2M1x2` does not parse in PTOAS (the bare-keyword parser lacks it);
+    // the dialect type `!pto.f4E2M1x2` (TableGen mnemonic) is accepted in all
+    // emit contexts (ptr<>, tile_buf dtype=, tensor_view element).
+    return "!pto.f4E2M1x2";
   } else if (dtype == DataType::INT32) {
     return "i32";
   } else if (dtype == DataType::UINT32) {
@@ -87,6 +105,10 @@ std::string MemorySpaceToMLIR(ir::MemorySpace space) {
     return "acc";
   } else if (space == ir::MemorySpace::Bias) {
     return "bias";
+  } else if (space == ir::MemorySpace::LeftScale || space == ir::MemorySpace::RightScale) {
+    // PTOAS v0.48 exposes a single MLIR loc `scaling` for scale / fixpipe buffers
+    // (TileType::ScaleLeft/ScaleRight are not yet distinct tile_buf locs).
+    return "scaling";
   } else {
     throw ValueError("Invalid MemorySpace value");
   }
@@ -108,8 +130,8 @@ const char* TileLayoutToStr(ir::TileLayout layout) {
 
 std::string FormatTileBufTypeString(const std::string& loc, const std::string& dtype_str, int64_t rows,
                                     int64_t cols, ir::TileLayout blayout, ir::TileLayout slayout,
-                                    uint64_t fractal, ir::PadValue pad, int64_t v_row, int64_t v_col,
-                                    bool v_row_dynamic, bool v_col_dynamic) {
+                                    uint64_t fractal, ir::PadValue pad, ir::CompactMode compact,
+                                    int64_t v_row, int64_t v_col, bool v_row_dynamic, bool v_col_dynamic) {
   std::ostringstream oss;
   oss << "!pto.tile_buf<loc=" << loc << ", dtype=" << dtype_str;
   oss << ", rows=" << rows << ", cols=" << cols;
@@ -118,13 +140,35 @@ std::string FormatTileBufTypeString(const std::string& loc, const std::string& d
   oss << ", blayout=" << TileLayoutToStr(blayout);
   oss << ", slayout=" << TileLayoutToStr(slayout);
   oss << ", fractal=" << fractal;
-  oss << ", pad=" << static_cast<int>(pad) << ">";
+  oss << ", pad=" << static_cast<int>(pad);
+  if (compact != ir::CompactMode::null) {
+    oss << ", compact=" << static_cast<int>(compact);
+  }
+  oss << ">";
+  return oss.str();
+}
+
+std::string FormatMultiTileBufTypeString(const std::string& slot_type_str, uint64_t count) {
+  INTERNAL_CHECK(count >= kMinMultiTileBufSlots && count <= kMaxMultiTileBufSlots)
+      << "Internal error: multi_tile_buf count must be in [" << kMinMultiTileBufSlots << ", "
+      << kMaxMultiTileBufSlots << "], got " << count;
+  std::ostringstream oss;
+  oss << "!pto.multi_tile_buf<" << slot_type_str << ", count=" << count << ">";
   return oss.str();
 }
 
 TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std::string& dtype_str_override) {
   TileTypeComponents c;
   c.dtype_str = dtype_str_override.empty() ? DataTypeToMLIR(tile_type.dtype_) : dtype_str_override;
+
+  // Effective view encodes implicit defaults for the memory space (Mat/Right/Acc),
+  // so read it before lowering the shape. PTOAS represents FP4 Vec tiles in
+  // physical x2-carrier coordinates: the packed BLayout axis is half the PyPTO
+  // logical nibble extent. Matrix spaces deliberately keep their logical MX
+  // dimensions because PTOAS/TMATMUL_MX use a separate packed-matrix contract.
+  ir::TileView view = ir::tile_view_semantics::GetEffectiveTileView(tile_type);
+  const bool packed_fp4_vec =
+      tile_type.dtype_ == DataType::FP4 && tile_type.GetMemorySpace() == ir::MemorySpace::Vec;
 
   if (tile_type.shape_.size() >= 2) {
     if (auto c0 = As<ir::ConstInt>(tile_type.shape_[0])) c.rows = c0->value_;
@@ -135,6 +179,13 @@ TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std:
       c.cols = c0->value_;
     }
   }
+  if (packed_fp4_vec) {
+    int64_t* packed_dim = view.blayout == ir::TileLayout::col_major ? &c.rows : &c.cols;
+    CHECK(*packed_dim > 0 && *packed_dim % 2 == 0)
+        << "FP4 Vec tile packed dimension must be a positive even logical extent for PTOAS, got "
+        << *packed_dim;
+    *packed_dim /= 2;
+  }
   // Valid extent is always conveyed dynamically via `valid_row` / `valid_col`
   // operands on `pto.alloc_tile`; the type string therefore always reads
   // `v_row=?, v_col=?`.  Subview result types infer static valid dims via
@@ -144,14 +195,11 @@ TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std:
   c.v_row_dynamic = true;
   c.v_col_dynamic = true;
 
-  // Effective view encodes implicit defaults for the memory space (Mat/Right/Acc),
-  // so reading via GetEffectiveTileView preserves layout after the constructor's
-  // canonicalization elides views that match the implicit semantics.
-  ir::TileView view = ir::tile_view_semantics::GetEffectiveTileView(tile_type);
   c.blayout = view.blayout;
   c.slayout = view.slayout;
   c.fractal = view.fractal;
   c.pad = view.pad;
+  c.compact = view.compact;
   return c;
 }
 

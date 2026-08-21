@@ -6,9 +6,8 @@ from simpler.task_interface import ArgDirection as _D
 _ROOT_DIR = Path(__file__).parent
 
 RUNTIME_CONFIG = {
-    "runtime": "tensormap_and_ringbuffer",
-    "aicpu_thread_num": 4,
-    "block_dim": 1,
+    "runtime": "{{runtime}}",
+    "aicpu_thread_num": 0,
 }
 
 ORCHESTRATION = {

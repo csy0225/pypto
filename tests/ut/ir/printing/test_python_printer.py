@@ -11,12 +11,14 @@
 
 import textwrap
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import DataType, ir
 from pypto.ir import MemorySpace
 from pypto.ir.op import tile
 from pypto.ir.printer import python_print
+from pypto.language.parser.diagnostics import ParserSyntaxError
 
 
 def test_python_print_basic_expressions():
@@ -616,6 +618,36 @@ def test_python_print_distributed_tensor_explicit_layout_surfaces_window_buffer(
     explicit_wb = python_print(dt_wb, explicit_layout=True)
     assert "window_buffer=wbuf" in explicit_wb
     assert explicit_plain != explicit_wb
+
+
+def test_python_print_var_subclasses_reach_the_expression_printer():
+    """Every Var subclass must print as an Expr, not as the unsupported sentinel.
+
+    ``IRPythonPrinter::Print`` gates its expression arm on ``As<Expr>(node)``,
+    which consults the ``KindTrait<Expr>::kinds`` array. A Var subclass carrying
+    its own ``ObjectKind`` but missing from that array falls straight through to
+    ``"<unsupported IRNode type>"`` even though the printer has a working
+    ``VisitExpr_`` overload for it. That is exactly what happened to
+    ``WindowBuffer``: the overload at ``python_printer.cpp`` printed the
+    inherited name hint, but ``Print`` never reached it.
+    """
+    span = ir.Span.unknown()
+    index_ty = ir.ScalarType(DataType.INDEX)
+    unsupported = "<unsupported IRNode type>"
+
+    nodes = {
+        "Var": ir.Var("v", index_ty, span),
+        "IterArg": ir.IterArg("acc", index_ty, ir.ConstInt(0, DataType.INDEX, span), span),
+        "MemRef": ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, DataType.INDEX, span), 256, 0),
+        "WindowBuffer": ir.WindowBuffer(
+            ir.Var("wbuf", ir.PtrType(), span), ir.ConstInt(4096, DataType.INT32, span), span=span
+        ),
+    }
+    for name, node in nodes.items():
+        assert python_print(node, format=False) != unsupported, f"{name} did not reach the Expr printer"
+
+    # WindowBuffer prints through the name hint inherited from its base Ptr Var.
+    assert python_print(nodes["WindowBuffer"], format=False) == "wbuf"
 
 
 def test_python_print_all_scalar_types():
@@ -1737,6 +1769,270 @@ def test_full_special_case_preserves_serialized_attrs():
     reparsed = pl.parse_program(printed)
     ir.assert_structural_equal(program, reparsed)
     assert python_print(reparsed, format=False) == printed
+
+
+@pytest.mark.parametrize(
+    ("op_name", "dsl_name"),
+    [("and", "and_"), ("or", "or_"), ("not", "not_")],
+)
+def test_keyword_named_ops_print_with_dsl_underscore(op_name, dsl_name):
+    """``tile.and`` must print as ``pl.tile.and_`` — the bare name is not valid Python.
+
+    ``and``/``or``/``not`` are reserved words, so their DSL wrappers carry a trailing
+    underscore while the IR keeps the bare operator name. Printing the bare name
+    produced ``pl.tile.and(a, b)``, which the round-trip parser could not even
+    compile.
+    """
+    span = ir.Span.unknown()
+    tile_type = ir.TileType([ir.ConstInt(16, DataType.INT32, span)], DataType.INT16)
+    lhs = ir.Var("a", tile_type, span)
+    args = [lhs] if op_name == "not" else [lhs, ir.Var("b", tile_type, span)]
+
+    printed = ir.create_op_call(f"tile.{op_name}", args, {}, span).as_python()
+
+    assert f"tile.{dsl_name}(" in printed
+    assert f"tile.{op_name}(" not in printed
+
+
+@pytest.mark.parametrize("dsl_name", ["and_", "or_"])
+def test_keyword_named_tile_op_round_trips(dsl_name):
+    """A program using tile.and / tile.or survives print -> parse -> structural compare."""
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main(
+            self,
+            a: pl.Tensor[[128, 128], pl.INT32],
+            b: pl.Tensor[[128, 128], pl.INT32],
+            output: pl.Tensor[[128, 128], pl.INT32],
+        ) -> pl.Tensor[[128, 128], pl.INT32]:
+            tile_a: pl.Tile[[32, 32], pl.INT32] = pl.load(a, [0, 0], [32, 32])
+            tile_b: pl.Tile[[32, 32], pl.INT32] = pl.load(b, [0, 0], [32, 32])
+            tile_c: pl.Tile[[32, 32], pl.INT32] = pl.and_(tile_a, tile_b)
+            tile_d: pl.Tile[[32, 32], pl.INT32] = pl.or_(tile_c, tile_b)
+            return pl.store(tile_d, [0, 0], output)
+
+    printed = python_print(Program, format=False)
+    assert f"pl.tile.{dsl_name}(" in printed
+    ir.assert_structural_equal(Program, pl.parse_program(printed))
+
+
+@pytest.mark.parametrize("dsl_name", ["and_", "or_", "not_"])
+def test_keyword_named_tensor_op_round_trips(dsl_name):
+    """The tensor bitwise ops (issue #2216) round-trip through their underscore names."""
+
+    @pl.program
+    class Program:
+        @pl.function
+        def main(
+            self,
+            x: pl.Tensor[[128, 128], pl.INT16],
+            mask: pl.Tensor[[128, 128], pl.INT16],
+        ) -> pl.Tensor[[128, 128], pl.INT16]:
+            masked: pl.Tensor[[128, 128], pl.INT16] = pl.tensor.and_(x, mask)
+            merged: pl.Tensor[[128, 128], pl.INT16] = pl.tensor.or_(masked, mask)
+            return pl.tensor.not_(merged)
+
+    printed = python_print(Program, format=False)
+    assert f"pl.tensor.{dsl_name}(" in printed
+    ir.assert_structural_equal(Program, pl.parse_program(printed))
+
+
+def test_builtin_op_call_generic_attrs_roundtrip():
+    """Every non-bespoke attr on a builtin-op Call round-trips, not just two keys.
+
+    The builtin-op writer used to be a hardcoded 2-key allowlist
+    (``pipeline_membership`` / the Tensor-to-Mat bridge marker), so any other key
+    was silently dropped on print with no diagnostic. Writer and reader are now
+    the same open-world denylist/``PrintAttrValue`` pair the GlobalVar-call and
+    Submit branches use, so an arbitrary key of any codec-supported value type
+    survives print -> reparse.
+    """
+    source = textwrap.dedent("""\
+        @pl.program
+        class BuiltinOpAttrs:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                t = pl.tile.load(
+                    a,
+                    [0, 0],
+                    [128, 128],
+                    [128, 128],
+                    target_memory=pl.Mem.Vec,
+                    attrs={
+                        "my_int_attr": 11,
+                        "my_float_attr": 2.5,
+                        "my_bool_attr": True,
+                        "my_str_attr": "hello",
+                        "my_dtype_attr": pl.FP16,
+                        "my_memory_attr": pl.Mem.Vec,
+                        "my_tensor_layout_attr": pl.TensorLayout.ND,
+                        "my_tile_layout_attr": pl.TileLayout.row_major,
+                        "my_pad_attr": pl.PadValue.zero,
+                        "my_direction_attr": pl.adir.input,
+                        "pipeline_membership": "0:3",
+                        "dump_vars": [a],
+                    },
+                )
+                r = pl.tile.store(t, [0, 0], out)
+                return r
+    """)
+
+    program = pl.parse_program(source)
+    printed = python_print(program, format=False)
+    for key in ("my_int_attr", "my_float_attr", "my_bool_attr", "my_str_attr", "dump_vars"):
+        assert key in printed, printed
+    # DataType attrs print in the ``pl.<DTYPE>`` form the dtype resolver reads back.
+    assert '"my_dtype_attr": pl.FP16' in printed, printed
+    assert '"my_memory_attr": pl.Mem.Vec' in printed, printed
+    assert '"my_tensor_layout_attr": pl.TensorLayout.ND' in printed, printed
+    assert '"my_tile_layout_attr": pl.TileLayout.row_major' in printed, printed
+    assert '"my_pad_attr": pl.PadValue.zero' in printed, printed
+    assert '"my_direction_attr": pl.adir.input' in printed, printed
+
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert python_print(reparsed, format=False) == printed
+
+    loads: list[ir.Call] = []
+
+    class _CollectLoads(ir.IRVisitor):
+        def visit_call(self, op):
+            if op.op.name == ir.get_op("tile.load").name:
+                loads.append(op)
+            super().visit_call(op)
+
+    _CollectLoads().visit_program(reparsed)
+    assert len(loads) == 1
+    attrs = dict(loads[0].attrs)
+    assert attrs["my_int_attr"] == 11
+    assert attrs["my_float_attr"] == 2.5
+    assert attrs["my_bool_attr"] is True
+    assert attrs["my_str_attr"] == "hello"
+    assert attrs["my_dtype_attr"] == DataType.FP16
+    assert attrs["my_memory_attr"] == ir.MemorySpace.Vec
+    assert attrs["my_tensor_layout_attr"] == ir.TensorLayout.ND
+    assert attrs["my_tile_layout_attr"] == ir.TileLayout.row_major
+    assert attrs["my_pad_attr"] == ir.PadValue.zero
+    assert attrs["my_direction_attr"] == ir.ArgDirection.Input
+    assert attrs["pipeline_membership"] == "0:3"
+    # The Var-list attr resolves back to the very same operand, by identity.
+    assert list(attrs["dump_vars"]) == [loads[0].args[0]]
+
+
+def test_task_dummy_extra_attr_roundtrips_alongside_deps():
+    """``system.task_dummy`` keeps its bespoke ``deps=`` surface AND an extra attr.
+
+    ``manual_dep_edges`` prints as ``deps=[...]`` and ``dummy_task`` is re-derived
+    from the op, so both stay out of the ``attrs={...}`` dict. Any third key must
+    still survive — the printer emits it, so the ``task_dummy`` parse path has to
+    accept ``attrs=`` rather than reject it as an unknown kwarg.
+    """
+    source = textwrap.dedent("""\
+        @pl.program
+        class TaskDummyAttrs:
+            @pl.function
+            def kernel(self) -> pl.Scalar[pl.TASK_ID]:
+                return pl.system.task_invalid()
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self) -> pl.Scalar[pl.TASK_ID]:
+                with pl.manual_scope():
+                    tids = pl.array.create(4, pl.TASK_ID)
+                    barrier = pl.system.task_dummy(deps=[tids], attrs={"my_marker": 7})
+                    for p in pl.parallel(4):
+                        a, a_tid = pl.submit(self.kernel, deps=[barrier])
+                return pl.system.task_invalid()
+    """)
+
+    program = pl.parse_program(source)
+    printed = python_print(program, format=False)
+    assert "deps=[tids]" in printed, printed
+    assert 'attrs={"my_marker": 7}' in printed, printed
+    # dummy_task / manual_dep_edges keep their bespoke surfaces, so neither leaks
+    # into the generic dict.
+    assert "dummy_task" not in printed, printed
+    assert "manual_dep_edges" not in printed, printed
+
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert python_print(reparsed, format=False) == printed
+
+    dummies: list[ir.Call] = []
+
+    class _CollectDummies(ir.IRVisitor):
+        def visit_call(self, op):
+            if op.op.name == ir.get_op("system.task_dummy").name:
+                dummies.append(op)
+            super().visit_call(op)
+
+    _CollectDummies().visit_program(reparsed)
+    assert len(dummies) == 1
+    attrs = dict(dummies[0].attrs)
+    assert attrs["my_marker"] == 7
+    assert attrs["dummy_task"] is True
+    assert len(list(attrs["manual_dep_edges"])) == 1
+
+
+def test_dep_edge_attrs_are_rejected_outside_task_dummy():
+    """`manual_dep_edges` / `dummy_task` are skipped ONLY on system.task_dummy.
+
+    Both keys are omitted from the printed ``attrs={...}`` dict because
+    task_dummy carries them on bespoke surfaces (``deps=[...]`` / re-derivation
+    from the op). No other op has those surfaces, so skipping the key there
+    would be exactly the silent drop the denylist exists to remove. The printer
+    must fail loud, and the parser must refuse to build such IR in the first
+    place.
+    """
+    source = textwrap.dedent("""\
+        @pl.program
+        class DepAttrOnPlainOp:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+            ) -> pl.Tensor[[128, 128], pl.FP32]:
+                t = pl.tile.load(a, [0, 0], [128, 128], [128, 128], attrs={"manual_dep_edges": [a]})
+                r = pl.tile.store(t, [0, 0], out)
+                return r
+    """)
+    # Parser side: refuses to attach a dep-edge attr to a plain op call.
+    with pytest.raises(ParserSyntaxError, match="manual_dep_edges"):
+        pl.parse_program(source)
+
+    # Printer side: IR built directly (bypassing the parser) still fails loud
+    # instead of dropping the attr.
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            a: pl.Tensor[[128, 128], pl.FP32],
+            out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
+        ) -> pl.Tensor[[128, 128], pl.FP32]:
+            t = pl.tile.load(a, [0, 0], [128, 128])
+            r = pl.tile.store(t, [0, 0], out)
+            return r
+
+    class _StampDepEdges(ir.IRMutator):
+        def visit_call(self, op):
+            expr = super().visit_call(op)
+            call = expr if isinstance(expr, ir.Call) else op
+            if call.op.name != ir.get_op("tile.load").name:
+                return expr
+            attrs = dict(call.attrs)
+            attrs["manual_dep_edges"] = [call.args[0]]
+            return ir.Call(call.op, list(call.args), dict(call.kwargs), attrs, call.type, call.span)
+
+    stamped = _StampDepEdges().visit_program(Prog)
+    with pytest.raises(pypto.InternalError, match="system.task_dummy"):
+        python_print(stamped, format=False)
 
 
 if __name__ == "__main__":

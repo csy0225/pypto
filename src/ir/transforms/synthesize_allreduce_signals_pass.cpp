@@ -96,7 +96,7 @@ class AllReduceSignalSynthesizer : public IRMutator {
       return op;
     }
 
-    auto [prefix, signal] = MakeSignalBinding(call->span_);
+    auto [prefix, signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
     auto target = VisitExpr(call->args_[0]);
     auto rewritten_call = MakeAllReduceCall(call, target, signal);
     auto result = MutableCopy(op);
@@ -116,7 +116,7 @@ class AllReduceSignalSynthesizer : public IRMutator {
       return op;
     }
 
-    auto [prefix, signal] = MakeSignalBinding(call->span_);
+    auto [prefix, signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
     auto target = VisitExpr(call->args_[0]);
     auto rewritten_call = MakeAllReduceCall(call, target, signal);
     std::vector<StmtPtr> stmts = std::move(prefix);
@@ -145,7 +145,7 @@ class AllReduceSignalSynthesizer : public IRMutator {
       auto target = VisitExpr(call->args_[0]);
       ExprPtr signal;
       if (call->args_.size() == 1) {
-        auto [prefix, synthesized_signal] = MakeSignalBinding(call->span_);
+        auto [prefix, synthesized_signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
         for (auto& stmt : prefix) prelude.push_back(std::move(stmt));
         signal = synthesized_signal;
       } else {
@@ -187,9 +187,16 @@ class AllReduceSignalSynthesizer : public IRMutator {
     CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
         << "pld.tensor.allreduce expects target[, signal], got " << call->args_.size()
         << " positional arguments";
-    CHECK_SPAN(repeating_scope_depth_ == 0, call->span_)
-        << "pld.tensor.allreduce is not supported inside a for/while loop. "
-           "The signal protocol is single-use and cannot reuse a signal across dynamic invocations.";
+    // Only a *synthesized* signal is loop-bound: the binding this pass inserts
+    // cannot be allocated once per dynamic iteration, and every rank has to land
+    // on the same symmetric window. An explicit signal needs no synthesis, and
+    // the lowered kernel restores its cells to zero before returning, so
+    // carrying one across iterations is safe.
+    CHECK_SPAN(repeating_scope_depth_ == 0 || call->args_.size() == 2, call->span_)
+        << "pld.tensor.allreduce without an explicit signal is not supported inside a for/while "
+           "loop on the HOST rail: the synthesized signal binding cannot be allocated per dynamic "
+           "iteration. Pass an explicit signal buffer — it is self-clearing and reusable across "
+           "iterations — or hoist the call out of the loop.";
   }
 
   struct SignalNames {
@@ -224,15 +231,19 @@ class AllReduceSignalSynthesizer : public IRMutator {
     }
   }
 
-  [[nodiscard]] std::pair<std::vector<StmtPtr>, VarPtr> MakeSignalBinding(const Span& span) {
+  [[nodiscard]] std::pair<std::vector<StmtPtr>, VarPtr> MakeSignalBinding(const Span& span, int core_num) {
     auto names = FreshSignalNames();
+    INTERNAL_CHECK_SPAN(core_num > 0, span)
+        << "SynthesizeAllReduceSignals requires a positive allreduce core_num";
 
     auto world_size_call = OpRegistry::GetInstance().Create("pld.system.world_size", {}, span);
     auto world_size_var = std::make_shared<Var>(names.world_size_name, world_size_call->GetType(), span);
     auto world_size_assign = std::make_shared<AssignStmt>(world_size_var, world_size_call, span);
 
+    auto core_num_expr = std::make_shared<ConstInt>(core_num, DataType::INT64, span);
     auto four = std::make_shared<ConstInt>(4, DataType::INT64, span);
-    auto size_bytes = MakeMul(world_size_var, four, span);
+    auto signal_elements = MakeMul(world_size_var, core_num_expr, span);
+    auto size_bytes = MakeMul(signal_elements, four, span);
 
     std::vector<std::pair<std::string, std::any>> alloc_kwargs = {{"name", names.buf_name}};
     auto alloc_call =
@@ -240,8 +251,8 @@ class AllReduceSignalSynthesizer : public IRMutator {
     auto buf_var = std::make_shared<Var>(names.buf_name, alloc_call->GetType(), span);
     auto buf_assign = std::make_shared<AssignStmt>(buf_var, alloc_call, span);
 
-    auto one = std::make_shared<ConstInt>(1, DataType::INT64, span);
-    auto signal_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{world_size_var, one}, span);
+    auto signal_shape =
+        std::make_shared<MakeTuple>(std::vector<ExprPtr>{world_size_var, core_num_expr}, span);
     std::vector<std::pair<std::string, std::any>> window_kwargs = {{"dtype", DataType::INT32}};
     auto window_call =
         OpRegistry::GetInstance().Create("pld.tensor.window", {buf_var, signal_shape}, window_kwargs, span);
