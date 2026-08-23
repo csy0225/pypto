@@ -113,12 +113,20 @@ class TestDeviceTensorImmutability:
 
 class TestDeviceTensorReshape:
     def test_metadata_only_reshape_preserves_storage(self):
-        t = DeviceTensor(0x1000, (2, 3, 4), torch.float16)
+        class FakeBuffer:
+            base = 0x1000
+
+            def tensor(self, shapes, dtype):
+                return (shapes, dtype)
+
+        buffer = FakeBuffer()
+        t = DeviceTensor(buffer.base, (2, 3, 4), torch.float16, buffer=buffer)
         view = t.reshape((6, 4))
         assert view.data_ptr == t.data_ptr
         assert view.shape == (6, 4)
         assert view.dtype is t.dtype
         assert view.nbytes == t.nbytes
+        assert view.buffer is t.buffer is buffer
 
     def test_element_count_mismatch_raises(self):
         t = DeviceTensor(0x1000, (2, 3, 4), torch.float32)
