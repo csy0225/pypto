@@ -411,13 +411,13 @@ void DistributedCodegen::EmitTaskArgsCachePreamble(const ir::FunctionPtr& func) 
   emitter_.EmitLine("_pypto_task_args_cache = _task_args_cache_for_orch(orch, _domain_provider)");
 
   std::ostringstream args;
-  args << "_task_args_signature((";
+  args << "(";
   for (size_t i = 0; i < func->params_.size(); ++i) {
     if (i != 0) args << ", ";
     args << "tensors[\"" << SanitizeName(func->params_[i]->name_hint_) << "\"]";
   }
   if (func->params_.size() == 1) args << ",";
-  args << "))";
+  args << ")";
   emitter_.EmitLine("_pypto_task_args_signature = _task_args_signature_for_cache("
                     "_pypto_task_args_cache, " + args.str() +
                     " if _pypto_task_args_cache is not None else None)");
@@ -558,19 +558,6 @@ bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, 
   const std::string entry_var = "_pypto_task_args_entry_" + suffix;
   const std::string build_ta_var = "_ta_" + std::to_string(task_args_counter_);
   const auto scopes = CollectCommArgScopes(call);
-  std::vector<std::pair<std::string, std::string>> comm_buffers;
-  for (const auto& arg : call->args_) {
-    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
-    if (!dist_type || !dist_type->window_buffer_.has_value()) continue;
-    const auto scope = ScopeForWindowBuffer(dist_type->window_buffer_.value());
-    const std::string handle = HandleVarForScope(scope);
-    const std::string name = SanitizeName(dist_type->window_buffer_.value()->name_hint_);
-    if (std::none_of(comm_buffers.begin(), comm_buffers.end(), [&](const auto& item) {
-          return item.first == handle && item.second == name;
-        })) {
-      comm_buffers.emplace_back(handle, name);
-    }
-  }
 
   std::ostringstream slot;
   slot << "(_PYPTO_TASK_ARGS_CACHE_NAMESPACE, id(orch._worker), id(tensors), " << callsite << ", (";
@@ -587,17 +574,8 @@ bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, 
          << "].device_ctx))";
   }
   if (scopes.size() == 1) slot << ",";
-  slot << "), (";
-  for (size_t i = 0; i < comm_buffers.size(); ++i) {
-    if (i != 0) slot << ", ";
-    const auto& [handle, name] = comm_buffers[i];
-    slot << "(id(" << handle << "[" << rank_expr << "].buffers[\"" << name
-         << "\"]), bytes(" << handle << "[" << rank_expr << "].buffers[\"" << name
-         << "\"].identity.owner_instance_id), int(" << handle << "[" << rank_expr
-         << "].buffers[\"" << name << "\"].identity.buffer_id), int(" << handle << "["
-         << rank_expr << "].buffers[\"" << name << "\"].identity.generation))";
-  }
-  if (comm_buffers.size() == 1) slot << ",";
+  // Persistent domain leases are spec-validated and reused by handle identity.
+  // Avoid rebuilding every retained buffer descriptor on each decode step.
   slot << "))";
 
   emitter_.EmitLine(entry_var + " = None");
