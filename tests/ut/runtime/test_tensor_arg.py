@@ -17,6 +17,7 @@ It must:
 - delegate a host ``torch.Tensor`` to simpler's worker-aware wire helper.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -154,6 +155,118 @@ def test_host_tensor_delegates_to_simpler():
 
     impl.assert_called_once_with(worker, host)
     assert result is sentinel
+
+
+def test_task_args_signature_ignores_in_place_payload_mutation():
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    before = _task_args_signature((host,))
+    host.add_(1)
+    assert _task_args_signature((host,)) == before
+
+
+def test_task_args_signature_tracks_tensor_descriptor_replacement():
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    before = _task_args_signature((host,))
+    replacement = host.view(2, 8)
+    assert _task_args_signature((replacement,)) != before
+
+
+def test_task_args_signature_tracks_same_object_stride_change():
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    before = _task_args_signature((host,))
+    host.transpose_(0, 1)
+    assert _task_args_signature((host,)) != before
+
+
+def test_task_args_signature_tracks_device_and_stacked_buffer_lifetime():
+    from pypto.runtime import StackedDeviceTensor  # noqa: PLC0415
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    class FakeBuffer:
+        def __init__(self, base: int, buffer_id: int) -> None:
+            self.base = base
+            self.closed = False
+            self.identity = SimpleNamespace(
+                owner_instance_id=b"owner-id",
+                buffer_id=buffer_id,
+                generation=1,
+            )
+            self.address_space = 1
+            self.access = 2
+            self.backend_kind = 4
+            self.nbytes = 64
+            self.owner_worker_path_id = 7
+            self.body = base.to_bytes(8, "little")
+
+        def tensor(self, *, shapes, dtype):
+            return shapes, dtype
+
+    first_buffer = FakeBuffer(0x1000, 1)
+    second_buffer = FakeBuffer(0x2000, 2)
+    first = DeviceTensor(first_buffer.base, (4,), torch.float32, buffer=first_buffer)
+    second = DeviceTensor(second_buffer.base, (4,), torch.float32, buffer=second_buffer)
+    stacked = StackedDeviceTensor((first, second), (2, 4), (0, 1))
+
+    before = _task_args_signature((first, stacked))
+    assert _task_args_signature((first, stacked)) == before
+    first_buffer.closed = True
+    assert _task_args_signature((first, stacked)) != before
+
+
+def test_task_args_signature_tracks_simpler_tensor_descriptor():
+    from simpler.buffer import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        AccessMode,
+        AddressSpace,
+        BackendKind,
+        BufferDescriptor,
+        CanonicalIdentity,
+        DataType,
+        Tensor,
+    )
+
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    identity = CanonicalIdentity(b"owner-id", 11, 1)
+    descriptor = BufferDescriptor(
+        identity,
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.FORK_SHM,
+        64,
+        (0x1000).to_bytes(8, "little"),
+    )
+    first = Tensor(descriptor, 0, (4,), (1,), DataType.FLOAT32)
+    replacement = Tensor(descriptor, 0, (4,), (1,), DataType.FLOAT32)
+    changed_identity = CanonicalIdentity(b"owner-id", 12, 1)
+    changed_descriptor = BufferDescriptor(
+        changed_identity,
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.FORK_SHM,
+        64,
+        (0x1000).to_bytes(8, "little"),
+    )
+    changed = Tensor(changed_descriptor, 0, (4,), (1,), DataType.FLOAT32)
+
+    before = _task_args_signature((first,))
+    assert _task_args_signature((first,)) == before
+    assert _task_args_signature((replacement,)) == before
+    assert _task_args_signature((changed,)) != before
+
+
+def test_task_args_signature_disables_unknown_and_cyclic_values():
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
+
+    assert _task_args_signature((object(),)) is None
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    assert _task_args_signature((cyclic,)) is None
 
 
 if __name__ == "__main__":

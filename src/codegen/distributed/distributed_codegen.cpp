@@ -15,6 +15,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -39,6 +40,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 
@@ -91,6 +93,7 @@ std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
   tuple_element_tensors_.clear();
   emitted_builtin_variants_.clear();
   builtin_next_level_specs_.clear();
+  active_loop_vars_.clear();
 
   comm_domain_stack_.clear();
 
@@ -258,16 +261,23 @@ void DistributedCodegen::EmitImports() {
   emitter_.EmitLine(
       "from simpler.task_interface import "
       "CallConfig, CommBufferSpec, DataType, TaskArgs, TensorArgType");
-  emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
+  emitter_.EmitLine(
+      "from pypto.runtime.tensor_arg import make_tensor_arg, _task_args_signature, "
+      "_task_args_signature_for_cache, _task_args_cache_for_orch, _task_args_cache_store");
   // ``_submit_chip`` resolves a comm-less dispatch's chip and namespaces the
   // per-dispatch DFX ``output_prefix`` (``<base>/rank{worker}/d{k}``); the
   // namespacing half is a no-op when DFX is off.
   emitter_.EmitLine("from pypto.runtime.distributed_runner import _submit_chip");
+  emitter_.EmitLine("_PYPTO_TASK_ARGS_CACHE_NAMESPACE = object()");
 }
 
 void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   declared_vars_.clear();
   task_args_counter_ = 0;
+  task_args_cache_callsite_counter_ = 0;
+  emitting_cached_task_args_build_ = false;
+  cached_task_args_var_.clear();
+  active_loop_vars_.clear();
   current_func_ = func;
 
   bool is_sub_worker = func->role_.has_value() && *func->role_ == ir::Role::SubWorker;
@@ -304,6 +314,10 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   // conditions.  Emitting ``name = tensors["name"]`` at the top of the
   // function body ensures the bare name resolves correctly.
   RegisterParamsAndEmitScalarBindings(func);
+
+  if (func->level_.has_value() && ir::LevelToLinquLevel(*func->level_) >= 3) {
+    EmitTaskArgsCachePreamble(func);
+  }
 
   // For HOST orchestrators, pre-collect AssignStmt defs so the upcoming
   // ``VisitStmt_(CommDomainScopeStmtPtr)`` can unwrap CSE / SSA-hoisted
@@ -355,13 +369,263 @@ class HostOrchVarDefCollector : public ir::IRVisitor {
   std::unordered_map<const ir::Var*, ir::ExprPtr>& defs_;
 };
 
+class HostOrchVarUseCounter : public ir::IRVisitor {
+ public:
+  explicit HostOrchVarUseCounter(std::unordered_map<const ir::Var*, size_t>& counts) : counts_(counts) {}
+
+ protected:
+  void VisitExpr_(const ir::VarPtr& op) override {
+    ++counts_[op.get()];
+  }
+
+  void VisitExpr_(const ir::IterArgPtr& op) override {
+    ++counts_[op.get()];
+  }
+
+  void VisitStmt_(const ir::AssignStmtPtr& op) override {
+    // Count RHS reads only; the AssignStmt LHS is a definition, not a use.
+    VisitExpr(op->value_);
+  }
+
+ private:
+  std::unordered_map<const ir::Var*, size_t>& counts_;
+};
+
 }  // namespace
 
 void DistributedCodegen::CollectHostOrchVarDefs(const ir::FunctionPtr& func) {
   host_orch_var_defs_.clear();
+  host_orch_var_use_counts_.clear();
+  host_orch_param_vars_.clear();
   if (!func->body_) return;
   HostOrchVarDefCollector collector(host_orch_var_defs_);
   collector.VisitStmt(func->body_);
+  HostOrchVarUseCounter use_counter(host_orch_var_use_counts_);
+  use_counter.VisitStmt(func->body_);
+  for (const auto& param : func->params_) {
+    host_orch_param_vars_.insert(param.get());
+  }
+}
+
+void DistributedCodegen::EmitTaskArgsCachePreamble(const ir::FunctionPtr& func) {
+  emitter_.EmitLine("_pypto_task_args_cache = _task_args_cache_for_orch(orch, _domain_provider)");
+
+  std::ostringstream args;
+  args << "_task_args_signature((";
+  for (size_t i = 0; i < func->params_.size(); ++i) {
+    if (i != 0) args << ", ";
+    args << "tensors[\"" << SanitizeName(func->params_[i]->name_hint_) << "\"]";
+  }
+  if (func->params_.size() == 1) args << ",";
+  args << "))";
+  emitter_.EmitLine("_pypto_task_args_signature = _task_args_signature_for_cache("
+                    "_pypto_task_args_cache, " + args.str() +
+                    " if _pypto_task_args_cache is not None else None)");
+}
+
+bool DistributedCodegen::IsTaskArgsViewPrep(const ir::AssignStmtPtr& stmt) const {
+  if (!stmt || !ir::AsTensorTypeLike(stmt->var_->GetType())) return false;
+  auto call = ir::As<ir::Call>(stmt->value_);
+  if (!call) return false;
+  return ir::IsOp(call, "tensor.slice") || ir::IsOp(call, "tensor.reshape");
+}
+
+std::vector<ir::CommDomainScopeStmtPtr> DistributedCodegen::CollectCommArgScopes(
+    const ir::CallPtr& call) const {
+  std::vector<ir::CommDomainScopeStmtPtr> scopes;
+  if (!call) return scopes;
+  for (const auto& arg : call->args_) {
+    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
+    if (!dist_type || !dist_type->window_buffer_.has_value()) continue;
+    auto scope = ScopeForWindowBuffer(dist_type->window_buffer_.value());
+    if (std::none_of(scopes.begin(), scopes.end(), [&](const auto& seen) {
+          return seen.get() == scope.get();
+        })) {
+      scopes.push_back(scope);
+    }
+  }
+  return scopes;
+}
+
+bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, size_t start, size_t* next) {
+  if (!op || !next || !current_func_ || !current_func_->level_.has_value() ||
+      ir::LevelToLinquLevel(*current_func_->level_) < 3 || start >= op->stmts_.size()) {
+    return false;
+  }
+  auto first_prep = ir::As<ir::AssignStmt>(op->stmts_[start]);
+  if (!IsTaskArgsViewPrep(first_prep)) return false;
+  size_t call_index = start;
+  while (call_index < op->stmts_.size() &&
+         IsTaskArgsViewPrep(ir::As<ir::AssignStmt>(op->stmts_[call_index]))) {
+    ++call_index;
+  }
+  if (call_index == start || call_index >= op->stmts_.size()) return false;
+  auto eval = ir::As<ir::EvalStmt>(op->stmts_[call_index]);
+  if (!eval) return false;
+  auto call = ir::As<ir::Call>(eval->expr_);
+  if (!call) return false;
+
+  auto gv = std::dynamic_pointer_cast<const ir::GlobalVar>(call->op_);
+  if (!gv) return false;
+  auto callee = program_->GetFunction(gv->name_);
+  if (!callee || IsSubWorker(callee) ||
+      (callee->func_type_ != ir::FunctionType::Orchestration &&
+       callee->func_type_ != ir::FunctionType::InCore)) {
+    return false;
+  }
+  const std::string rank_expr = ResolveRankExpr(call);
+  if (rank_expr.empty()) return false;
+
+  std::vector<ir::AssignStmtPtr> prep;
+  prep.reserve(call_index - start);
+  for (size_t i = start; i < call_index; ++i) {
+    auto assignment = ir::As<ir::AssignStmt>(op->stmts_[i]);
+    if (!assignment) return false;
+    auto use_it = host_orch_var_use_counts_.find(assignment->var_.get());
+    if (use_it == host_orch_var_use_counts_.end() || use_it->second != 1) return false;
+    prep.push_back(assignment);
+  }
+  // Prove every prep expression is rooted in stable function inputs, active
+  // loop indices, or a materialized communication window. Intermediate prep
+  // vars are allowed and recursively checked, but arbitrary temporaries disable
+  // caching rather than risking stale TaskArgs.
+  std::unordered_set<const ir::Var*> visiting;
+  std::function<bool(const ir::Var*)> stable_root = [&](const ir::Var* root) {
+    if (host_orch_param_vars_.count(root) != 0) return true;
+    for (const auto& loop_var : active_loop_vars_) {
+      if (loop_var == SanitizeName(root->name_hint_)) return true;
+    }
+    if (!visiting.insert(root).second) return false;
+    auto def_it = host_orch_var_defs_.find(root);
+    if (def_it == host_orch_var_defs_.end() || !def_it->second) {
+      visiting.erase(root);
+      return false;
+    }
+    if (auto root_call = ir::As<ir::Call>(def_it->second);
+        root_call && ir::IsOp(root_call, "pld.tensor.window")) {
+      visiting.erase(root);
+      return true;
+    }
+    class RootCollector : public ir::IRVisitor {
+     public:
+      std::unordered_set<const ir::Var*> vars;
+      void VisitExpr_(const ir::VarPtr& value) override { vars.insert(value.get()); }
+      void VisitExpr_(const ir::IterArgPtr& value) override { vars.insert(value.get()); }
+    } roots;
+    roots.VisitExpr(def_it->second);
+    for (const auto* child : roots.vars) {
+      if (!stable_root(child)) {
+        visiting.erase(root);
+        return false;
+      }
+    }
+    visiting.erase(root);
+    return true;
+  };
+  for (const auto& assignment : prep) {
+    class RootCollector : public ir::IRVisitor {
+     public:
+      std::unordered_set<const ir::Var*> vars;
+      void VisitExpr_(const ir::VarPtr& value) override { vars.insert(value.get()); }
+      void VisitExpr_(const ir::IterArgPtr& value) override { vars.insert(value.get()); }
+    } roots;
+    roots.VisitExpr(assignment->value_);
+    for (const auto* root : roots.vars) {
+      if (!stable_root(root)) return false;
+    }
+  }
+
+  const int callsite = task_args_cache_callsite_counter_++;
+  const std::string suffix = std::to_string(callsite);
+  const std::string slot_var = "_pypto_task_args_slot_" + suffix;
+  const std::string entry_var = "_pypto_task_args_entry_" + suffix;
+  const std::string build_ta_var = "_ta_" + std::to_string(task_args_counter_);
+  const auto scopes = CollectCommArgScopes(call);
+  std::vector<std::pair<std::string, std::string>> comm_buffers;
+  for (const auto& arg : call->args_) {
+    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
+    if (!dist_type || !dist_type->window_buffer_.has_value()) continue;
+    const auto scope = ScopeForWindowBuffer(dist_type->window_buffer_.value());
+    const std::string handle = HandleVarForScope(scope);
+    const std::string name = SanitizeName(dist_type->window_buffer_.value()->name_hint_);
+    if (std::none_of(comm_buffers.begin(), comm_buffers.end(), [&](const auto& item) {
+          return item.first == handle && item.second == name;
+        })) {
+      comm_buffers.emplace_back(handle, name);
+    }
+  }
+
+  std::ostringstream slot;
+  slot << "(_PYPTO_TASK_ARGS_CACHE_NAMESPACE, id(orch._worker), id(tensors), " << callsite << ", (";
+  for (size_t i = 0; i < active_loop_vars_.size(); ++i) {
+    if (i != 0) slot << ", ";
+    slot << active_loop_vars_[i];
+  }
+  if (active_loop_vars_.size() == 1) slot << ",";
+  slot << "), id(callables[\"" << callee->name_ << "\"]), int(world_size), " << rank_expr << ", (";
+  for (size_t i = 0; i < scopes.size(); ++i) {
+    if (i != 0) slot << ", ";
+    const std::string handle = HandleVarForScope(scopes[i]);
+    slot << "(id(" << handle << "[" << rank_expr << "]), int(" << handle << "[" << rank_expr
+         << "].device_ctx))";
+  }
+  if (scopes.size() == 1) slot << ",";
+  slot << "), (";
+  for (size_t i = 0; i < comm_buffers.size(); ++i) {
+    if (i != 0) slot << ", ";
+    const auto& [handle, name] = comm_buffers[i];
+    slot << "(id(" << handle << "[" << rank_expr << "].buffers[\"" << name
+         << "\"]), bytes(" << handle << "[" << rank_expr << "].buffers[\"" << name
+         << "\"].identity.owner_instance_id), int(" << handle << "[" << rank_expr
+         << "].buffers[\"" << name << "\"].identity.buffer_id), int(" << handle << "["
+         << rank_expr << "].buffers[\"" << name << "\"].identity.generation))";
+  }
+  if (comm_buffers.size() == 1) slot << ",";
+  slot << "))";
+
+  emitter_.EmitLine(entry_var + " = None");
+  emitter_.EmitLine("if _pypto_task_args_cache is not None and _pypto_task_args_signature is not None:");
+  emitter_.IncreaseIndent();
+  emitter_.EmitLine(slot_var + " = " + slot.str());
+  emitter_.EmitLine(entry_var + " = _pypto_task_args_cache.get(" + slot_var + ")");
+  emitter_.EmitLine("if " + entry_var + " is not None and " + entry_var +
+                    "[0] != _pypto_task_args_signature:");
+  emitter_.IncreaseIndent();
+  emitter_.EmitLine(entry_var + " = None");
+  emitter_.DecreaseIndent();
+  emitter_.DecreaseIndent();
+  emitter_.EmitLine(build_ta_var + " = " + entry_var + "[1] if " + entry_var + " is not None else None");
+  emitter_.EmitLine("if " + build_ta_var + " is None:");
+  emitter_.IncreaseIndent();
+
+  emitting_cached_task_args_build_ = true;
+  cached_task_args_var_.clear();
+  for (const auto& assignment : prep) {
+    VisitStmt(assignment);
+  }
+  EmitCallToWorker(call, callee, true);
+  const std::string ta_var = cached_task_args_var_;
+  INTERNAL_CHECK(!ta_var.empty()) << "cached dispatch did not emit TaskArgs";
+  // EmitCallToWorker allocates the next `_ta_N`; make the miss value explicit
+  // in the slot variable so the hit and miss paths feed exactly one runtime
+  // object into keep/submit. This avoids relying on a coincidental counter
+  // alignment if prep lowering ever starts allocating temporaries.
+  emitter_.EmitLine(build_ta_var + " = " + ta_var);
+  emitting_cached_task_args_build_ = false;
+
+  emitter_.EmitLine("if _pypto_task_args_cache is not None and _pypto_task_args_signature is not None:");
+  emitter_.IncreaseIndent();
+  emitter_.EmitLine("_task_args_cache_store(_pypto_task_args_cache, " + slot_var + ", _pypto_task_args_signature, " + build_ta_var + ")");
+  emitter_.DecreaseIndent();
+  emitter_.DecreaseIndent();
+
+  emitter_.EmitLine("_keep.append(" + build_ta_var + ")");
+  emitter_.EmitLine("_submit_chip(orch, callables[\"" + callee->name_ + "\"], " + build_ta_var + ", config, " +
+                    rank_expr + ")");
+
+  cached_task_args_var_.clear();
+  *next = call_index + 1;
+  return true;
 }
 
 namespace {
@@ -839,6 +1103,7 @@ void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
 
   emitter_.EmitLine("for " + loop_var + " in range(" + start + ", " + stop + ", " + step + "):");
   emitter_.IncreaseIndent();
+  active_loop_vars_.push_back(loop_var);
 
   if (op->body_) {
     VisitStmt(op->body_);
@@ -846,6 +1111,7 @@ void DistributedCodegen::VisitStmt_(const ir::ForStmtPtr& op) {
     emitter_.EmitLine("pass");
   }
 
+  active_loop_vars_.pop_back();
   emitter_.DecreaseIndent();
 }
 
@@ -898,8 +1164,15 @@ void DistributedCodegen::VisitStmt_(const ir::IfStmtPtr& op) {
 
 void DistributedCodegen::VisitStmt_(const ir::SeqStmtsPtr& op) {
   INTERNAL_CHECK(op != nullptr) << "Internal error: null SeqStmts";
-  for (const auto& stmt : op->stmts_) {
-    VisitStmt(stmt);
+  size_t index = 0;
+  while (index < op->stmts_.size()) {
+    size_t next = index;
+    if (TryEmitCachedDispatchRegion(op, index, &next)) {
+      index = next;
+      continue;
+    }
+    VisitStmt(op->stmts_[index]);
+    ++index;
   }
 }
 
@@ -1033,9 +1306,15 @@ void DistributedCodegen::VisitExpr_(const ir::ConstBoolPtr& op) {
 // Call-site lowering
 // ========================================================================
 
-void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee) {
+void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee,
+                                          bool build_only) {
+  build_only = build_only || emitting_cached_task_args_build_;
   bool is_sub = IsSubWorker(callee);
   std::string ta_var = "_ta_" + std::to_string(task_args_counter_++);
+  if (build_only) {
+    INTERNAL_CHECK(!is_sub) << "cached TaskArgs build is only valid for ordinary CHIP dispatch";
+    cached_task_args_var_ = ta_var;
+  }
 
   // ``device=`` attr (set by N3 parser) is the single source of truth for
   // both the per-rank ``__comm_d0[<r>]`` subscript (used by DistributedTensor
@@ -1193,7 +1472,7 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   if (is_sub) {
     // HOST Worker = SubWorker: orch.submit_sub(callable_id, task_args)
     emitter_.EmitLine("orch.submit_sub(sub_ids[\"" + callee->name_ + "\"], " + ta_var + ")");
-  } else {
+  } else if (!build_only) {
     // CHIP Worker: dispatch via ``_submit_chip`` (wraps orch.submit_next_level).
     // N7: thread the dispatch ``device=`` attr (N3 parser) into the simpler
     // runtime's ``worker=`` kwarg. A rank-pinned dispatch passes its rank; a

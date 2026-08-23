@@ -192,7 +192,8 @@ class DistributedCodegen : public CodegenBase {
   void EmitEntryMarker(const std::string& func_name);
 
   // Call-site lowering
-  void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);
+  void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee,
+                        bool build_only = false);
   /**
    * @brief Emit a same-level worker / next-level orchestrator call if @p expr
    *        is one. Returns true if it emitted; false if @p expr is not a
@@ -220,6 +221,26 @@ class DistributedCodegen : public CodegenBase {
   /// AssignStmt — so referenced temps are not yet bound in the emitted Python
   /// when the scope's ``window_size`` / ``CommBufferSpec`` lines are written.
   void CollectHostOrchVarDefs(const ir::FunctionPtr& func);
+
+  /// Emit the persistent-only descriptor signature/cache setup used by
+  /// cacheable HOST -> CHIP dispatch regions. Ordinary dispatch leaves the
+  /// cache disabled and pays no descriptor walk.
+  void EmitTaskArgsCachePreamble(const ir::FunctionPtr& func);
+
+  /// Recognize and emit one conservative cacheable region beginning at
+  /// ``op->stmts_[start]``. The accepted shape is a contiguous block of
+  /// single-use metadata-only tensor.slice/tensor.reshape AssignStmts followed
+  /// by an ordinary rank-pinned CHIP dispatch EvalStmt. On success, ``next`` is
+  /// set to the first statement after the dispatch.
+  [[nodiscard]] bool TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, size_t start, size_t* next);
+
+  /// True only for metadata-only HOST view preparation accepted inside a
+  /// TaskArgs cache miss block.
+  [[nodiscard]] bool IsTaskArgsViewPrep(const ir::AssignStmtPtr& stmt) const;
+
+  /// Collect the comm-domain scopes whose buffers are embedded in one
+  /// dispatch's TaskArgs, in first-reference order.
+  [[nodiscard]] std::vector<ir::CommDomainScopeStmtPtr> CollectCommArgScopes(const ir::CallPtr& call) const;
 
   /// Emit ``<dim> = tensors["<param>"].shape[<i>]`` (or an inverted affine
   /// form) at the top of a HOST-orchestrator body for every ``pl.dynamic()``
@@ -299,6 +320,14 @@ class DistributedCodegen : public CodegenBase {
   std::set<std::string> declared_vars_;
   bool is_worker_context_{false};
   int task_args_counter_{0};  // Counter for generating unique TaskArgs variable names
+  int task_args_cache_callsite_counter_{0};
+  bool emitting_cached_task_args_build_{false};
+  std::string cached_task_args_var_;
+
+  // Names of lexically active loop variables. A cacheable dispatch includes
+  // their values in its bounded slot so distinct ranks/iterations cannot
+  // reuse one another's TaskArgs.
+  std::vector<std::string> active_loop_vars_;
 
   // HOST orchestrator alloc-hoisting state. Populated by
   // CollectHostOrchHoistableAllocs() before EmitFunction() runs on the HOST
@@ -315,6 +344,8 @@ class DistributedCodegen : public CodegenBase {
 
   // HOST orchestrator AssignStmt defs, populated before comm-domain emission.
   std::unordered_map<const ir::Var*, ir::ExprPtr> host_orch_var_defs_;
+  std::unordered_map<const ir::Var*, size_t> host_orch_var_use_counts_;
+  std::unordered_set<const ir::Var*> host_orch_param_vars_;
   bool unwrap_hoisted_var_refs_{false};
 
   std::unordered_set<std::string> emitted_builtin_variants_;

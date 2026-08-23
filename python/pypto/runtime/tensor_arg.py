@@ -25,11 +25,16 @@ this path through :mod:`pypto.runtime.task_interface`: its compatibility
 ``make_tensor_arg`` alias is chip-only and produces a ``ChipTensor``.
 """
 
+import math
 import weakref
 from functools import cache
 from typing import Any
 
+import torch
+
 _PYPTO_OWNER_REF_ATTR = "_pypto_tensor_owner_ref"
+_UNSUPPORTED = object()
+_PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES = 4096
 
 
 def bind_tensor_arg_owner(worker: Any, owner: Any) -> None:
@@ -63,6 +68,200 @@ def _require_device_tensor_owner(worker: Any, arg: Any) -> None:
             "Worker's current initialized backend."
         )
     owner._require_owned_resident_tensor(arg, "Tensor argument")
+
+
+def _enum_value(value: Any) -> int | str:
+    """Return a stable scalar for a Python enum or an already numeric field."""
+    raw = getattr(value, "value", value)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return str(raw)
+
+
+def _buffer_signature(buffer: Any) -> tuple[Any, ...] | object:
+    """Describe a simpler BufferDescriptor without relying on wrapper identity."""
+    identity = getattr(buffer, "identity", None)
+    if identity is None:
+        return _UNSUPPORTED
+    try:
+        identity_sig = (
+            bytes(identity.owner_instance_id),
+            int(identity.buffer_id),
+            int(identity.generation),
+        )
+        return (
+            identity_sig,
+            _enum_value(buffer.address_space),
+            _enum_value(buffer.access),
+            _enum_value(buffer.backend_kind),
+            int(buffer.nbytes),
+            int(buffer.owner_worker_path_id),
+            bytes(buffer.body),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return _UNSUPPORTED
+
+
+def _task_arg_identity(value: Any, seen: set[int]) -> tuple[Any, ...] | object:
+    """Build a descriptor-only signature; payload contents are intentionally omitted."""
+    if isinstance(value, torch.Tensor):
+        try:
+            storage = value.untyped_storage()
+            storage_nbytes = storage.nbytes()
+            return (
+                "torch",
+                value.device.type,
+                value.device.index,
+                int(storage.data_ptr()),
+                int(storage_nbytes),
+                int(value.data_ptr()),
+                tuple(int(dim) for dim in value.shape),
+                tuple(int(stride) for stride in value.stride()),
+                int(value.storage_offset()),
+                str(value.dtype),
+                bool(value.is_shared()),
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return _UNSUPPORTED
+
+    if value is None or isinstance(value, (bool, int, str, bytes)):
+        return (type(value).__module__, type(value).__qualname__, value)
+    if isinstance(value, float):
+        return (
+            type(value).__module__,
+            type(value).__qualname__,
+            float(value).hex() if not math.isnan(value) else "nan",
+        )
+
+    if isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            return _UNSUPPORTED
+        seen.add(marker)
+        try:
+            children = tuple(_task_arg_identity(item, seen) for item in value)
+            if any(child is _UNSUPPORTED for child in children):
+                return _UNSUPPORTED
+            return (type(value).__name__, children)
+        finally:
+            seen.remove(marker)
+
+    # Avoid importing the optional runtime stack for arbitrary user objects.
+    # Known wire-wrapper classes live under these modules; everything else is
+    # unsupported and keeps caching fail-open.
+    value_module = type(value).__module__
+    if not (
+        value_module.startswith("pypto.runtime.")
+        or value_module.startswith("simpler.")
+        or value_module == "_task_interface"
+    ):
+        return _UNSUPPORTED
+
+    task_interface, device_tensor, _torch_interop = _modules()
+    stacked_cls = getattr(device_tensor, "StackedDeviceTensor", None)
+    if stacked_cls is not None and isinstance(value, stacked_cls):
+        marker = id(value)
+        if marker in seen:
+            return _UNSUPPORTED
+        seen.add(marker)
+        try:
+            shards = tuple(_task_arg_identity(shard, seen) for shard in value.shards)
+            if any(shard is _UNSUPPORTED for shard in shards):
+                return _UNSUPPORTED
+            return (
+                "stacked",
+                tuple(int(dim) for dim in value.full_shape),
+                tuple(int(worker) for worker in value.worker_ids),
+                str(value.dtype),
+                shards,
+            )
+        except (AttributeError, TypeError, ValueError):
+            return _UNSUPPORTED
+        finally:
+            seen.remove(marker)
+
+    device_cls = getattr(device_tensor, "DeviceTensor", None)
+    if device_cls is not None and isinstance(value, device_cls):
+        try:
+            buffer = value.buffer
+            if buffer is None:
+                return _UNSUPPORTED
+            buffer_sig = _buffer_signature(buffer)
+            if buffer_sig is _UNSUPPORTED:
+                return _UNSUPPORTED
+            return (
+                "device",
+                int(value.data_ptr),
+                tuple(int(dim) for dim in value.shape),
+                str(value.dtype),
+                buffer_sig,
+                bool(getattr(buffer, "closed", False)),
+                int(buffer.base),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return _UNSUPPORTED
+
+    if isinstance(value, task_interface.Tensor):
+        try:
+            buffer_sig = _buffer_signature(value.buffer)
+            if buffer_sig is _UNSUPPORTED:
+                return _UNSUPPORTED
+            return (
+                "simpler_tensor",
+                buffer_sig,
+                int(value.byte_offset),
+                int(value.ndims),
+                tuple(int(dim) for dim in value.shapes),
+                tuple(int(stride) for stride in value.strides),
+                int(value.dtype),
+            )
+        except (AttributeError, TypeError, ValueError):
+            return _UNSUPPORTED
+
+    return _UNSUPPORTED
+
+
+def _task_args_signature(values: Any) -> tuple[Any, ...] | None:
+    """Return a bounded, descriptor-only signature or ``None`` to disable caching."""
+    try:
+        items = tuple(values)
+        signature = tuple(_task_arg_identity(value, set()) for value in items)
+        if any(item is _UNSUPPORTED for item in signature):
+            return None
+        return signature
+    except Exception:  # noqa: BLE001 - optimization must fail open
+        return None
+
+
+def _task_args_signature_for_cache(cache: Any, values: Any) -> tuple[Any, ...] | None:
+    """Compute a signature only when a persistent cache is enabled."""
+    if cache is None:
+        return None
+    return _task_args_signature(values)
+
+
+def _task_args_cache_for_orch(orch: Any, provider: Any) -> dict[Any, tuple[Any, Any]] | None:
+    """Return the persistent cache for a provider-backed orchestrator invocation."""
+    if provider is None:
+        return None
+    cache = getattr(orch, "_pypto_task_args_cache_v1", None)
+    if cache is None:
+        cache = {}
+        orch._pypto_task_args_cache_v1 = cache
+    return cache
+
+
+def _task_args_cache_store(
+    cache: dict[Any, tuple[Any, Any]], slot: Any, signature: Any, task_args: Any
+) -> None:
+    """Store one TaskArgs entry while keeping the persistent cache hard-bounded."""
+    try:
+        if slot not in cache and len(cache) >= _PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)))
+        cache[slot] = (signature, task_args)
+    except Exception:  # noqa: BLE001 - cache failures must not block dispatch
+        return
 
 
 @cache

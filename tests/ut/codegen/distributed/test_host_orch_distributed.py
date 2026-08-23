@@ -170,12 +170,12 @@ def test_host_orch_unhandled_tensor_op_is_rejected():
     @pl.program
     class Prog:
         @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self) -> pl.Tensor[[8, 32], pl.FP32]:
-            tmp = pl.create_tensor([256], dtype=pl.FP32)
-            reshaped = pl.reshape(tmp, [8, 32])
-            return reshaped
+        def host_orch(self) -> pl.Tensor[[32, 8], pl.FP32]:
+            tmp = pl.create_tensor([8, 32], dtype=pl.FP32)
+            transposed = pl.transpose(tmp, 0, 1)
+            return transposed
 
-    with pytest.raises(ValueError, match=r"does not support op 'tensor\.reshape'.*host_orch"):
+    with pytest.raises(ValueError, match=r"does not support op 'tensor\.transpose'.*host_orch"):
         _lower(Prog, convert_to_ssa=True)
 
 
@@ -1602,6 +1602,45 @@ def test_if_cross_branch_phi_yields_tensors() -> None:
     assert not re.search(r"boundary__ssa_v\d+\s*=.*\w+__ssa", then_block), (
         "Then-branch must not contain bare Python tensor assignments:\n" + code
     )
+
+
+def test_host_orch_task_args_cache_codegen_uses_one_hit_miss_taskargs_var():
+    """A cache hit must submit the entry loaded before the miss branch.
+
+    The prep and TaskArgs construction stay inside the miss branch, while the
+    keep/submit lines consume the branch-neutral variable. This catches the
+    regression where a hit referenced a `_ta_N` name emitted only on a miss.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, x: pl.Tensor[[2, SIZE], pl.FP32]):
+            for r in pl.range(2):
+                x_r = x[r]
+                self.chip_orch(x_r, device=r)
+
+    code = _lower(Prog)
+    compile(code, "<host_orch_cache>", "exec")
+    assert "_task_args_cache_for_orch" in code, code
+    assert "_task_args_signature_for_cache" in code, code
+    assert "_task_args_cache_store(" in code, code
+    assert "if _pypto_task_args_cache is not None" in code, code
+    match = re.search(
+        r"(_ta_\d+) = _pypto_task_args_entry_\d+\[1\] if _pypto_task_args_entry_\d+ is not None else None",
+        code,
+    )
+    assert match is not None, code
+    task_args_var = match.group(1)
+    assert re.search(rf"_keep\.append\({re.escape(task_args_var)}\)", code), code
+    assert re.search(
+        rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code
+    ), code
+
 
 
 if __name__ == "__main__":
