@@ -228,15 +228,22 @@ class DistributedCodegen : public CodegenBase {
   void EmitTaskArgsCachePreamble(const ir::FunctionPtr& func);
 
   /// Recognize and emit one conservative cacheable region beginning at
-  /// ``op->stmts_[start]``. The accepted shape is a contiguous block of
-  /// single-use metadata-only tensor.slice/tensor.reshape AssignStmts followed
-  /// by an ordinary rank-pinned CHIP dispatch EvalStmt. On success, ``next`` is
-  /// set to the first statement after the dispatch.
+  /// ``op->stmts_[start]``. The accepted shape is a contiguous block beginning
+  /// with single-use metadata-only tensor.slice/tensor.reshape AssignStmts,
+  /// optionally followed by HOST-only communication materialization markers
+  /// (``pld.tensor.window`` / ``pld.system.get_comm_ctx``), and ending in an
+  /// ordinary rank-pinned CHIP dispatch EvalStmt. On success, ``next`` is set
+  /// to the first statement after the dispatch.
   [[nodiscard]] bool TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, size_t start, size_t* next);
 
   /// True only for metadata-only HOST view preparation accepted inside a
   /// TaskArgs cache miss block.
   [[nodiscard]] bool IsTaskArgsViewPrep(const ir::AssignStmtPtr& stmt) const;
+
+  /// True for HOST-only communication materialization markers accepted between
+  /// view preparation and a cacheable dispatch. These AssignStmts are lowered
+  /// through the comm-domain handle and do not emit Python bindings.
+  [[nodiscard]] bool IsTaskArgsMaterialization(const ir::AssignStmtPtr& stmt) const;
 
   /// Collect the comm-domain scopes whose buffers are embedded in one
   /// dispatch's TaskArgs, in first-reference order.

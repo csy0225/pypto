@@ -430,6 +430,13 @@ bool DistributedCodegen::IsTaskArgsViewPrep(const ir::AssignStmtPtr& stmt) const
   return ir::IsOp(call, "tensor.slice") || ir::IsOp(call, "tensor.reshape");
 }
 
+bool DistributedCodegen::IsTaskArgsMaterialization(const ir::AssignStmtPtr& stmt) const {
+  if (!stmt) return false;
+  auto call = ir::As<ir::Call>(stmt->value_);
+  if (!call) return false;
+  return ir::IsOp(call, "pld.tensor.window") || ir::IsOp(call, "pld.system.get_comm_ctx");
+}
+
 std::vector<ir::CommDomainScopeStmtPtr> DistributedCodegen::CollectCommArgScopes(
     const ir::CallPtr& call) const {
   std::vector<ir::CommDomainScopeStmtPtr> scopes;
@@ -455,8 +462,9 @@ bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, 
   auto first_prep = ir::As<ir::AssignStmt>(op->stmts_[start]);
   if (!IsTaskArgsViewPrep(first_prep)) return false;
   size_t call_index = start;
-  while (call_index < op->stmts_.size() &&
-         IsTaskArgsViewPrep(ir::As<ir::AssignStmt>(op->stmts_[call_index]))) {
+  while (call_index < op->stmts_.size()) {
+    auto assignment = ir::As<ir::AssignStmt>(op->stmts_[call_index]);
+    if (!IsTaskArgsViewPrep(assignment) && !IsTaskArgsMaterialization(assignment)) break;
     ++call_index;
   }
   if (call_index == start || call_index >= op->stmts_.size()) return false;
@@ -481,6 +489,14 @@ bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, 
   for (size_t i = start; i < call_index; ++i) {
     auto assignment = ir::As<ir::AssignStmt>(op->stmts_[i]);
     if (!assignment) return false;
+    // Window/context materialization is a HOST marker: its value is resolved
+    // from the comm-domain handle while lowering the dispatch and the
+    // AssignStmt visitor intentionally emits no Python binding. It may be
+    // retained in the miss region even when its SSA value has multiple users.
+    if (IsTaskArgsMaterialization(assignment)) {
+      prep.push_back(assignment);
+      continue;
+    }
     auto use_it = host_orch_var_use_counts_.find(assignment->var_.get());
     if (use_it == host_orch_var_use_counts_.end() || use_it->second != 1) return false;
     prep.push_back(assignment);
@@ -523,6 +539,7 @@ bool DistributedCodegen::TryEmitCachedDispatchRegion(const ir::SeqStmtsPtr& op, 
     return true;
   };
   for (const auto& assignment : prep) {
+    if (IsTaskArgsMaterialization(assignment)) continue;
     class RootCollector : public ir::IRVisitor {
      public:
       std::unordered_set<const ir::Var*> vars;

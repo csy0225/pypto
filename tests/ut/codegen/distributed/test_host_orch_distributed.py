@@ -1642,6 +1642,49 @@ def test_host_orch_task_args_cache_codegen_uses_one_hit_miss_taskargs_var():
     ), code
 
 
+def test_host_orch_task_args_cache_accepts_comm_materialization_markers():
+    """Window/context markers may sit between a view prep and its dispatch.
+
+    ``MaterializeDistTensorCtx`` inserts HOST-only ``pld.tensor.window`` and
+    ``pld.system.get_comm_ctx`` AssignStmts in this shape. They must stay in
+    the cache miss walk (their visitors emit no Python) instead of making the
+    conservative region recognizer fall back to rebuilding TaskArgs every
+    iteration.
+    """
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], data: pld.DistributedTensor[[SIZE], pl.FP32]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, x: pl.Tensor[[2, SIZE], pl.FP32]):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            for r in pl.range(2):
+                data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+                x_r = x[r]
+                self.chip_orch(x_r, data, device=r)
+
+    code = _lower(Prog)
+    compile(code, "<host_orch_cache_comm_materialization>", "exec")
+    assert "_task_args_cache_for_orch" in code, code
+    assert "_task_args_cache_store(" in code, code
+    # The buffer tensor and context are reconstructed only while a miss builds
+    # the cached TaskArgs; the submit below consumes the branch-neutral object.
+    miss = re.search(r"if (_ta_\d+) is None:\n(?P<body>(?:        .*\n)+?)\s+_keep\.append\(\1\)", code)
+    assert miss is not None, code
+    assert '.buffers["data_buf"].tensor(' in miss.group("body"), code
+    assert ".device_ctx)" in miss.group("body"), code
+    task_args_var = miss.group(1)
+    assert re.search(rf"_keep\.append\({re.escape(task_args_var)}\)", code), code
+    assert re.search(
+        rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code
+    ), code
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
