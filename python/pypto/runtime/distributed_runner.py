@@ -2080,22 +2080,31 @@ class DistributedWorker(Worker):
                 )
             reset_elapsed_ns = time.perf_counter_ns() - reset_start_ns
         else:
-            assert self._persistent_zero is not None
-            zero_ptr = int(self._persistent_zero.data_ptr())
-            chunk_size = int(self._persistent_zero.numel())
+            if reset_buffers is None:
+                raise RuntimeError(
+                    "persistent CommDomain host-copy reset requires prepared zero buffers"
+                )
             for generated_name, (spec, handle) in domains.items():
                 call_start_ns = time.perf_counter_ns()
+                _workers, window_nbytes, buffer_specs = spec
                 for worker_id in handle.workers:
-                    context = handle[worker_id]
-                    window_size = int(context.actual_window_size)
-                    for offset in range(0, window_size, chunk_size):
-                        nbytes = min(chunk_size, window_size - offset)
-                        orch.copy_to(
-                            int(worker_id),
-                            int(context.local_window_base) + offset,
-                            zero_ptr,
-                            nbytes,
+                    actual_window_size = int(handle[worker_id].actual_window_size)
+                    if actual_window_size != int(window_nbytes):
+                        raise RuntimeError(
+                            f"persistent CommDomain {generated_name!r} changed window size "
+                            f"on worker {worker_id}: {actual_window_size} != {window_nbytes}"
                         )
+                for buffer_name, _dtype, _count, buffer_nbytes in buffer_specs:
+                    nbytes = int(buffer_nbytes)
+                    zero_buffer = reset_buffers[nbytes]
+                    for worker_id in handle.workers:
+                        dst_buffer = handle[worker_id].buffers[buffer_name]
+                        if int(dst_buffer.nbytes) != nbytes:
+                            raise RuntimeError(
+                                f"persistent CommDomain buffer {buffer_name!r} changed size: "
+                                f"{dst_buffer.nbytes} != {nbytes}"
+                            )
+                        orch.copy_to(dst_buffer, zero_buffer)
                 call_elapsed_ns = time.perf_counter_ns() - call_start_ns
                 trace_domains.append(
                     {
@@ -2230,16 +2239,19 @@ class DistributedWorker(Worker):
         program_id = str(state["persistent_id"])
         program_domains = domains_by_program.get(program_id)
         reset_buffers: dict[int, Any] = {}
+        needs_host_reset_buffers = bool(
+            program_domains
+            and self._reset_persistent_windows
+            and not self._w.device_memset_available
+        )
+        if needs_host_reset_buffers:
+            # Host reset Buffers are required only by runtimes without the
+            # device memset path. Create them before entering Simpler's
+            # serialized graph callback and release them after the run retires.
+            def release_reset_buffers() -> None:
+                self._release_persistent_reset_buffers(reset_buffers)
 
-        def release_reset_buffers() -> None:
-            self._release_persistent_reset_buffers(reset_buffers)
-
-        # Buffer creation is direct control and must happen before Simpler
-        # enters the serialized graph callback. Its release is registered on
-        # the PyPTO dispatch frame and therefore runs only after the async
-        # native handle reaches a terminal state (or submission is rejected).
-        cleanup.append(release_reset_buffers)
-        if program_domains and self._reset_persistent_windows:
+            cleanup.append(release_reset_buffers)
             self._prepare_persistent_reset_buffers(program_domains, reset_buffers)
 
         def run_request(
@@ -2907,6 +2919,14 @@ class DistributedWorker(Worker):
                 "DistributedWorker.submit/run requires a DistributedCompiledProgram "
                 "registered when this worker was constructed."
             )
+
+        if self._persistent:
+            # Retained CommDomain windows are reset at request start. A
+            # persistent request must therefore wait for every earlier native
+            # handle to finish and publish cleanup before reusing its domain.
+            drain_error = self._drain_dispatch_handles()
+            if drain_error is not None:
+                raise drain_error
 
         param_infos = state["param_infos"]
         n_params = len(param_infos)

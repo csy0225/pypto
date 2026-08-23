@@ -51,11 +51,11 @@ from pypto.runtime.distributed_runner import (
     _collect_l3_swimlane,
     _construct_worker,
     _make_call_config,
-    _reset_dfx_dispatch_state,
     _prepare_reused_dep_gen_dirs,
+    _reset_dfx_dispatch_state,
     _submit_chip,
 )
-from pypto.runtime.runner import RunConfig
+from pypto.runtime.runner import _CHIP_SWIMLANE_RECORDS_NAME, RunConfig
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -179,6 +179,7 @@ def patched_setup():
     worker._live_domains = {}
     worker._building_run_resources = None
     worker.alloc_child_tensor.return_value = _FakeBuffer(0xDEAD0000, 1 << 20)
+    worker.device_memset_available = False
     worker.create_buffer.side_effect = lambda nbytes: _FakeBuffer(0, nbytes, host=True)
     worker.submit.side_effect = lambda fn: (fn(worker._orch, None, None), _ImmediateNativeHandle())[1]
 
@@ -596,7 +597,7 @@ class TestPerTaskRingSizing:
         dep_dir = tmp_path / "dfx_outputs" / "rank0" / "d0"
         dep_dir.mkdir(parents=True)
         (dep_dir / "deps.json").write_text("{}", encoding="utf-8")
-        (dep_dir / "l2_swimlane_records.json").write_text("stale", encoding="utf-8")
+        (dep_dir / _CHIP_SWIMLANE_RECORDS_NAME).write_text("stale", encoding="utf-8")
         rt = DistributedWorker(compiled)
 
         rc = RunConfig(
@@ -612,13 +613,13 @@ class TestPerTaskRingSizing:
                 "pypto.runtime.distributed_runner._collect_l3_swimlane",
             ),
         ):
-            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=rc)
+            rt(_resident(rt, (16, 16)), config=rc)
 
         clear.assert_not_called()
         rebuild = m["make_call_config"].call_args
         assert rebuild.kwargs["co_enable_swimlane_dep_gen"] is False
         assert (dep_dir / "deps.json").is_file()
-        assert not (dep_dir / "l2_swimlane_records.json").exists()
+        assert not (dep_dir / _CHIP_SWIMLANE_RECORDS_NAME).exists()
         rt.close()
 
 
@@ -1002,6 +1003,7 @@ class TestDeviceMemoryApi:
             rt.copy_to(ptr + 32, ctypes.addressof(host), 32)
         rt.free(ptr)
         rt.close()
+
     def test_import_ipc_all_delegates_to_simpler_worker(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled)
@@ -1012,7 +1014,7 @@ class TestDeviceMemoryApi:
         }
 
         assert rt.import_ipc_all(keys) == {8: 0x10000008, 9: 0x10000009}
-        patched_setup["worker"].import_ipc_all.assert_called_once_with(keys)
+        patched_setup["worker"].import_ipc_all.assert_called_once_with(keys, region_bytes=None)
         rt.close()
 
     def test_import_ipc_all_rejects_after_close(self, patched_setup):
@@ -2377,7 +2379,7 @@ class TestPrepareReusedDepGenDirs:
             disp.mkdir(parents=True)
             (disp / "deps.json").write_text("{}", encoding="utf-8")
             (disp / "name_map.json").write_text("{}", encoding="utf-8")
-            (disp / "l2_swimlane_records.json").write_text("old", encoding="utf-8")
+            (disp / _CHIP_SWIMLANE_RECORDS_NAME).write_text("old", encoding="utf-8")
             (disp / "merged_swimlane_old.json").write_text("old", encoding="utf-8")
             (disp / "critical_path_report.md").write_text("old", encoding="utf-8")
 
@@ -2387,7 +2389,7 @@ class TestPrepareReusedDepGenDirs:
         for disp in dispatches:
             assert (disp / "deps.json").is_file()
             assert (disp / "name_map.json").is_file()
-            assert not (disp / "l2_swimlane_records.json").exists()
+            assert not (disp / _CHIP_SWIMLANE_RECORDS_NAME).exists()
             assert not (disp / "merged_swimlane_old.json").exists()
             assert not (disp / "critical_path_report.md").exists()
 
@@ -2857,8 +2859,11 @@ def _persistent_entry(
     seen_handles: list[Any],
     *,
     buffer_nbytes: tuple[int, ...] | None = None,
+    buffer_names: tuple[str, ...] | None = None,
 ):
     sizes = (window_size,) if buffer_nbytes is None else buffer_nbytes
+    names = tuple(f"buffer_{index}" for index in range(len(sizes))) if buffer_names is None else buffer_names
+    assert len(names) == len(sizes)
 
     def entry(
         orch,
@@ -2879,8 +2884,8 @@ def _persistent_entry(
             workers=[*range(world_size)],
             window_size=window_size,
             buffers=[
-                SimpleNamespace(name=f"buffer_{index}", dtype="opaque", count=size, nbytes=size)
-                for index, size in enumerate(sizes)
+                SimpleNamespace(name=name, dtype="opaque", count=size, nbytes=size)
+                for name, size in zip(names, sizes, strict=True)
             ],
         ) as domain:
             seen_handles.append(domain)
@@ -2998,7 +3003,175 @@ class TestPersistentDistributedWorker:
         assert handle.freed
         assert m["worker"]._live_domains == {}
 
-    def test_warm_domain_supports_two_bounded_handles_and_single_close_release(self, patched_setup):
+    def test_device_memset_reset_skips_unused_host_zero_buffers(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        m["worker"].device_memset_available = True
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (
+            orch.run(fn),
+            _ImmediateNativeHandle(),
+        )[1]
+        m["load_entry"].return_value = (_persistent_entry(64, []), None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = _resident(rt, (16, 16))
+
+        rt(arg)
+        handle = orch.handles[0]
+        m["worker"].create_buffer.reset_mock()
+        m["worker"].release_buffer.reset_mock()
+        m["worker"].memset_all.reset_mock()
+
+        rt(arg)
+
+        m["worker"].create_buffer.assert_not_called()
+        m["worker"].release_buffer.assert_not_called()
+        m["worker"].memset_all.assert_called_once_with(
+            {
+                0: (handle[0].local_window_base, 64),
+                1: (handle[1].local_window_base, 64),
+            }
+        )
+        assert orch.copy_calls == []
+        rt.close()
+
+    def test_device_memset_k8_prefix_traces_only_reused_domain(
+        self,
+        patched_setup,
+        monkeypatch,
+        tmp_path,
+    ):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        m["worker"].device_memset_available = True
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (
+            orch.run(fn),
+            _ImmediateNativeHandle(),
+        )[1]
+        control_names = (
+            "dense_attn_signal_stack_buf",
+            "dense_mlp_signal_stack_buf",
+            "moe_attn_signal_stack_buf",
+            "moe_meta_arrived_stack_buf",
+            "moe_data_arrived_stack_buf",
+            "moe_sh_signal_stack_buf",
+            "moe_combine_arrived_stack_buf",
+        )
+        data_names = (
+            "dense_attn_tmp_stack_buf",
+            "dense_mlp_tmp_stack_buf",
+            "moe_attn_tmp_stack_buf",
+            "moe_recv_meta_stack_buf",
+            "moe_recv_x_stack_buf",
+            "moe_recv_aux_stack_buf",
+            "moe_recv_route_stack_buf",
+            "moe_sh_tmp_stack_buf",
+            "moe_routed_y_buf_stack_buf",
+        )
+        control_nbytes = (4096, 4096, 4096, 8192, 8192, 8192, 10752)
+        buffer_nbytes = control_nbytes + (1,) * len(data_names)
+        window_nbytes = sum(buffer_nbytes)
+        buffer_names = tuple(f"{name}__ssa_v0" for name in control_names + data_names)
+        m["load_entry"].return_value = (
+            _persistent_entry(
+                window_nbytes,
+                [],
+                buffer_nbytes=buffer_nbytes,
+                buffer_names=buffer_names,
+            ),
+            None,
+        )
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+        trace_path = tmp_path / "persistent_reset.jsonl"
+        monkeypatch.setenv("PYPTO_PERSISTENT_RESET_TRACE", str(trace_path))
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = _resident(rt, (16, 16))
+
+        rt(arg)
+        handle = orch.handles[0]
+        m["worker"].memset_all.assert_not_called()
+        m["worker"].create_buffer.assert_not_called()
+        m["worker"].release_buffer.assert_not_called()
+        assert not trace_path.exists()
+
+        rt(arg)
+
+        worker_ranges = {
+            0: (handle[0].local_window_base, 47616),
+            1: (handle[1].local_window_base, 47616),
+        }
+        m["worker"].memset_all.assert_called_once_with(worker_ranges)
+        m["worker"].create_buffer.assert_not_called()
+        m["worker"].release_buffer.assert_not_called()
+        assert orch.copy_calls == []
+        records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+        assert len(records) == 1
+        record = records[0]
+        assert record["schema"] == "pypto.persistent-reset-trace.v1"
+        assert record["seq"] == 0
+        assert record["device_memset_available"] is True
+        assert record["domain_count"] == 1
+        domain = record["domains"][0]
+        assert domain["requested_window_size"] == window_nbytes
+        assert domain["actual_window_sizes"] == {"0": window_nbytes, "1": window_nbytes}
+        assert domain["k8_prefix_applied"] is True
+        assert domain["k8_control_bytes"] == 47616
+        assert domain["k8_control_range_count"] == 1
+        assert domain["k8_control_ranges"] == [[handle[0].local_window_base, 47616]]
+        assert domain["k8_full_window_bytes"] == window_nbytes
+        assert domain["memset_all_us"] >= 0
+        assert record["reset_body_us"] >= domain["memset_all_us"]
+        rt.close()
+
+    def test_host_reset_zero_buffer_lives_until_native_completion(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        native = _ControlledNativeHandle()
+        native_handles = [_ImmediateNativeHandle(), native]
+
+        def worker_submit(fn):
+            orch.run(fn)
+            return native_handles.pop(0)
+
+        m["worker"].submit.side_effect = worker_submit
+        m["load_entry"].return_value = (_persistent_entry(64, []), None)
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled, persistent=True)
+        arg = _resident(rt, (16, 16))
+        rt(arg)
+        created: list[_FakeBuffer] = []
+        released: list[_FakeBuffer] = []
+
+        def create_dirty_host_buffer(nbytes: int) -> _FakeBuffer:
+            buffer = _FakeBuffer(0, nbytes, host=True)
+            ctypes.memset(int(buffer.base), 0xA5, nbytes)
+            created.append(buffer)
+            return buffer
+
+        def release_after_completion(buffer: _FakeBuffer) -> None:
+            assert m["worker"]._building_run_resources is None
+            released.append(buffer)
+
+        m["worker"].create_buffer.side_effect = create_dirty_host_buffer
+        m["worker"].release_buffer.side_effect = release_after_completion
+
+        handle = rt.submit(compiled, arg)
+
+        assert len(created) == 1
+        assert released == []
+        assert handle.done is False
+        native.complete()
+        handle.result()
+        assert released == created
+        m["worker"].release_buffer.assert_called_once_with(created[0])
+        rt.close()
+
+    def test_warm_domain_serializes_submit_until_prior_native_completion(self, patched_setup):
         m = patched_setup
         m["worker"]._live_domains = {}
         orch = _PersistentOrch(m["worker"])
@@ -3018,22 +3191,51 @@ class TestPersistentDistributedWorker:
         arg = _resident(rt, (16, 16))
 
         rt(arg)
-        rt.submit(compiled, arg)
-        rt.submit(compiled, arg)
+        first = rt.submit(compiled, arg)
         domain = orch.handles[0]
-        assert len(rt._active_dispatch_handles) == 2
+        reset_count_before_second = len(orch.copy_calls)
+        second_result: list[Any] = []
+        second_error: list[BaseException] = []
+
+        def submit_second() -> None:
+            try:
+                second_result.append(rt.submit(compiled, arg))
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                second_error.append(exc)
+
+        caller = threading.Thread(target=submit_second)
+        caller.start()
+        assert first_native.result_started.wait(timeout=2)
+        # The second submit is blocked in the persistent admission drain. It
+        # must not invoke generated orchestration or reset the retained domain
+        # while the first native request can still be using that window.
+        assert caller.is_alive()
+        assert not second_result
+        assert not second_error
+        assert len(rt._active_dispatch_handles) == 1
+        assert len(orch.copy_calls) == reset_count_before_second
+        assert seen_handles == [domain, domain]
+
+        first_native.complete()
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+        assert not second_error
+        assert len(second_result) == 1
+        second = second_result[0]
+
+        # The second request is admitted only after the first handle's result
+        # cleanup retires its frame, so its reset and domain reuse are ordered.
+        assert len(rt._active_dispatch_handles) == 1
+        assert len(orch.copy_calls) > reset_count_before_second
         assert len(orch.allocate_calls) == 1
         assert seen_handles == [domain, domain, domain]
+        assert second.done is False
 
-        closer = threading.Thread(target=rt.close)
-        closer.start()
-        assert first_native.result_started.wait(timeout=2)
-        first_native.complete()
-        assert second_native.result_started.wait(timeout=2)
         second_native.complete()
-        closer.join(timeout=2)
+        first.result()
+        second.result()
+        rt.close()
 
-        assert not closer.is_alive()
         assert domain.release_count == 1
         assert domain.backend_release_count == 1
         assert domain.freed
