@@ -2459,6 +2459,31 @@ class DistributedWorker(Worker):
         self._require_open("import_ipc_all")
         return self._w.import_ipc_all(device_key_map, region_bytes=region_bytes)
 
+    def imported_tensor(
+        self,
+        ptr: int,
+        shape: "Sequence[int]",
+        dtype: torch.dtype,
+        *,
+        worker_id: int = 0,
+    ) -> DeviceTensor:
+        """Wrap one interior slice of an imported IPC pool as a dispatchable DeviceTensor.
+
+        :meth:`import_ipc_all` returns a pool base; callers carve per-tensor views out of
+        it at ``base + offset``.  Public dispatch derives its address-free wire descriptor
+        from a retained owner ``Buffer`` and ``DeviceTensor`` requires ``buffer.base ==
+        data_ptr``, so an interior view needs a Buffer of its own — this mints it and
+        registers it as a live allocation, which is what the dispatch guard checks.
+
+        Use this instead of constructing ``DeviceTensor(pool_base + offset, ...)`` directly:
+        a raw-pointer DeviceTensor carries no Buffer and cannot cross the wire ABI.
+        """
+        self._require_open("imported_tensor")
+        nbytes = DeviceTensor(int(ptr), tuple(shape), dtype).nbytes
+        handle = self._w.imported_region_buffer(int(worker_id), int(ptr), int(nbytes))
+        self._device_buffers[(int(worker_id), int(ptr))] = handle
+        return DeviceTensor(int(ptr), tuple(shape), dtype, buffer=handle)
+
     def free(self, ptr: int, *, worker_id: int = 0) -> None:
         """Release a pointer previously returned by :meth:`malloc`."""
         self._require_open("free")

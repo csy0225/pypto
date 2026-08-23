@@ -140,7 +140,10 @@ class DeviceTensor:
                 f"source shape {self.shape} has {old_elems} elements, "
                 f"target shape {raw_shape} has {new_elems}"
             )
-        return DeviceTensor(self.data_ptr, raw_shape, self.dtype)
+        # Same address, dtype and byte size, so the owner Buffer still names this
+        # region exactly; dropping it here would silently make a reshaped resident
+        # weight undispatchable.
+        return DeviceTensor(self.data_ptr, raw_shape, self.dtype, buffer=self.buffer)
 
     def __getitem__(self, index: "int | slice | tuple[int | slice, ...]") -> "DeviceTensor":
         """Return a contiguous sub-view as a new :class:`DeviceTensor`.
@@ -203,6 +206,9 @@ class DeviceTensor:
         if not new_shape:
             raise IndexError("DeviceTensor: indexing away every dimension is not supported")
         elem = torch.tensor([], dtype=self.dtype).element_size()
+        # No buffer: a sub-view's address is interior to its parent's, and
+        # ``buffer.base`` must equal ``data_ptr``, so the parent's Buffer cannot name
+        # it. A dispatched sub-view needs provenance re-minted by its allocator.
         return DeviceTensor(self.data_ptr + offset * elem, tuple(new_shape), self.dtype)
 
     def __repr__(self) -> str:
