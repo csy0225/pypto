@@ -111,6 +111,23 @@ class _ControlledNativeHandle:
             raise self.error
 
 
+class _ObservedLock:
+    """A regular mutex that exposes when a second thread blocks on admission."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.blocked = threading.Event()
+
+    def __enter__(self) -> "_ObservedLock":
+        if self._lock.locked():
+            self.blocked.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._lock.release()
+
+
 class _NamedHostRange:
     """What ``wrap_fork_inherited`` returns: a host range named in place, never copied."""
 
@@ -129,6 +146,17 @@ class _FakeBuffer:
         self.owner_worker_id = owner_worker_id
         self._backing = (ctypes.c_ubyte * nbytes)() if host else None
         self.base = ctypes.addressof(self._backing) if self._backing is not None else base
+        self.closed = False
+        self.identity = SimpleNamespace(
+            owner_instance_id=b"owner-id",
+            buffer_id=max(1, int(self.base)),
+            generation=1,
+        )
+        self.address_space = 1
+        self.access = 2
+        self.backend_kind = 4
+        self.owner_worker_path_id = owner_worker_id
+        self.body = int(self.base).to_bytes(8, "little")
 
     def tensor(self, shapes, dtype):
         return shapes, dtype
@@ -259,6 +287,179 @@ class TestSetupOnce:
         m["assemble"].assert_called_once()
         m["construct"].assert_called_once()
         assert m["worker"].init.call_count == 1
+        rt.close()
+
+    def test_prepared_descriptor_key_tracks_payload_and_tensor_metadata(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4, 4])], [])
+        rt = DistributedWorker(compiled)
+        host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+
+        before = rt._prepared_task_args_descriptor_key((host,))
+        host.add_(1)
+        assert rt._prepared_task_args_descriptor_key((host,)) == before
+        host.transpose_(0, 1)
+        assert rt._prepared_task_args_descriptor_key((host,)) != before
+        rt.close()
+
+    def test_prepared_descriptor_key_tracks_device_and_stacked_lifecycle(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4])], [])
+        rt = DistributedWorker(compiled)
+        first = _resident(rt, (4,), worker_id=0)
+        second = _resident(rt, (4,), worker_id=1)
+        stacked = StackedDeviceTensor((first, second), (2, 4), (0, 1))
+
+        before = rt._prepared_task_args_descriptor_key((first, stacked))
+        assert before is not None
+        first.buffer.identity.generation += 1
+        assert rt._prepared_task_args_descriptor_key((first, stacked)) != before
+        first.buffer.closed = True
+        assert rt._prepared_task_args_descriptor_key((first, stacked)) is None
+        first.buffer.closed = False
+        rt.close()
+
+    def test_prepared_descriptor_key_fails_open_for_mutable_and_unknown_values(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4])], [])
+        rt = DistributedWorker(compiled)
+        cyclic: list[object] = []
+        cyclic.append(cyclic)
+
+        assert rt._prepared_task_args_descriptor_key(([1],)) is None
+        assert rt._prepared_task_args_descriptor_key(((1, 2),)) is None
+        assert rt._prepared_task_args_descriptor_key((cyclic,)) is None
+        assert rt._prepared_task_args_descriptor_key((object(),)) is None
+        rt.close()
+
+    def test_prepared_descriptor_key_fails_open_on_broken_buffer(self, patched_setup):
+        class BrokenBuffer:
+            closed = False
+
+            @property
+            def identity(self):
+                raise RuntimeError("descriptor unavailable")
+
+        assert DistributedWorker._prepared_buffer_descriptor_key(BrokenBuffer()) is None
+
+    def test_prepared_descriptor_key_fails_open_for_raw_simpler_tensor(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4])], [])
+        rt = DistributedWorker(compiled)
+        raw = object()
+
+        with patch("pypto.runtime.distributed_runner._is_simpler_tensor", return_value=True):
+            assert rt._prepared_task_args_descriptor_key((raw,)) is None
+        rt.close()
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            "torch_metadata",
+            "device_generation",
+            "device_closed",
+            "stacked_placement",
+            "scalar_value",
+        ],
+    )
+    def test_prepared_descriptor_key_is_not_weaker_than_full_signature(
+        self,
+        patched_setup,
+        case,
+    ):
+        from pypto.runtime import device_tensor, tensor_arg
+
+        rt = DistributedWorker(_fake_compiled([_param("a", [4])], []))
+        if case == "torch_metadata":
+            value = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+            values = [value]
+
+            def mutate():
+                value.transpose_(0, 1)
+
+        elif case in {"device_generation", "device_closed"}:
+            value = _resident(rt, (4,))
+            values = [value]
+
+            def mutate():
+                if case == "device_generation":
+                    value.buffer.identity.generation += 1
+                else:
+                    value.buffer.closed = True
+
+        elif case == "stacked_placement":
+            first = _resident(rt, (4,), worker_id=0)
+            second = _resident(rt, (4,), worker_id=1)
+            values = [StackedDeviceTensor((first, second), (2, 4), (0, 1))]
+
+            def mutate():
+                values[0] = StackedDeviceTensor((first, second), (2, 4), (1, 0))
+
+        else:
+            values = [7]
+
+            def mutate():
+                values[0] = 8
+
+        wire_tensor = type("WireTensor", (), {})
+        modules = (SimpleNamespace(Tensor=wire_tensor), device_tensor, None)
+        with patch.object(tensor_arg, "_modules", return_value=modules):
+            before_value = values[0]
+            before_signature = tensor_arg._task_args_signature((before_value,))
+            before_key = rt._prepared_task_args_descriptor_key((before_value,))
+            mutate()
+            after_value = values[0]
+            after_signature = tensor_arg._task_args_signature((after_value,))
+            after_key = rt._prepared_task_args_descriptor_key((after_value,))
+
+        assert before_signature is not None
+        assert after_signature is not None
+        assert before_signature != after_signature
+        assert before_key is None or after_key is None or before_key != after_key
+        rt.close()
+
+    def test_unpublished_frame_release_preserves_signature_generation(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4])], [])
+        rt = DistributedWorker(compiled)
+        frame = rt._dispatch_frames[0]
+        frame.in_use = True
+        frame.task_args_descriptor_key = ("old",)
+        frame.task_args_signature_generation = 7
+        frame.task_args_signature_token = ("token", 7)
+
+        rt._release_unpublished_dispatch_frame(frame)
+
+        assert frame.task_args_descriptor_key is None
+        assert frame.task_args_signature_generation == 7
+        assert frame.task_args_signature_token is None
+        rt.close()
+
+    def test_failed_submit_retry_advances_signature_token(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [4])], [])
+        rt = DistributedWorker(compiled)
+        arg = _resident(rt, (4,))
+        submit_prepared = rt._submit_prepared_native
+        signature_tokens: list[Any] = []
+
+        def flaky_submit(state, tensors, call_config, keepalive, cleanup, token):
+            signature_tokens.append(token)
+            if len(signature_tokens) == 1:
+                raise RuntimeError("injected pre-submit failure")
+            return submit_prepared(
+                state,
+                tensors,
+                call_config,
+                keepalive,
+                cleanup,
+                token,
+            )
+
+        with patch.object(rt, "_submit_prepared_native", side_effect=flaky_submit):
+            with pytest.raises(RuntimeError, match="injected pre-submit failure"):
+                rt.submit(compiled, arg)
+            handle = rt.submit(compiled, arg)
+            handle.result()
+
+        assert signature_tokens[0] is not None
+        assert signature_tokens[1] is not None
+        assert signature_tokens[1] != signature_tokens[0]
+        assert rt._dispatch_frames[0].task_args_signature_generation == 2
         rt.close()
 
 
@@ -2860,6 +3061,7 @@ def _persistent_entry(
     *,
     buffer_nbytes: tuple[int, ...] | None = None,
     buffer_names: tuple[str, ...] | None = None,
+    signature_tokens: list[Any] | None = None,
 ):
     sizes = (window_size,) if buffer_nbytes is None else buffer_nbytes
     names = tuple(f"buffer_{index}" for index in range(len(sizes))) if buffer_names is None else buffer_names
@@ -2879,6 +3081,8 @@ def _persistent_entry(
     ):
         del orch, _args, config, tensors, callables, sub_ids, _keep
         assert _domain_provider is not None
+        if signature_tokens is not None:
+            signature_tokens.append(getattr(_domain_provider, "_pypto_task_args_signature_token", None))
         with _domain_provider(
             name="comm_d0",
             workers=[*range(world_size)],
@@ -3002,6 +3206,124 @@ class TestPersistentDistributedWorker:
         assert handle.backend_release_count == 1
         assert handle.freed
         assert m["worker"]._live_domains == {}
+
+    def test_persistent_provider_reuses_and_invalidates_prepared_signature_token(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (
+            orch.run(fn),
+            _ImmediateNativeHandle(),
+        )[1]
+        signature_tokens: list[Any] = []
+        m["load_entry"].return_value = (
+            _persistent_entry(64, [], signature_tokens=signature_tokens),
+            None,
+        )
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(
+            compiled,
+            persistent=True,
+            reset_persistent_windows=False,
+        )
+        arg = _resident(rt, (16, 16))
+
+        rt(arg)
+        rt(arg)
+        assert signature_tokens[0] is not None
+        assert signature_tokens[1] == signature_tokens[0]
+
+        arg.buffer.identity.generation += 1
+        rt(arg)
+        assert signature_tokens[2] != signature_tokens[1]
+        rt.close()
+
+    def test_persistent_free_waits_until_signature_token_is_consumed(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        submit_entered = threading.Event()
+        continue_submit = threading.Event()
+        signature_tokens: list[Any] = []
+
+        def worker_submit(fn):
+            submit_entered.set()
+            assert continue_submit.wait(timeout=5)
+            orch.run(fn)
+            return _ImmediateNativeHandle()
+
+        m["worker"].submit.side_effect = worker_submit
+        m["load_entry"].return_value = (
+            _persistent_entry(64, [], signature_tokens=signature_tokens),
+            None,
+        )
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(
+            compiled,
+            persistent=True,
+            reset_persistent_windows=False,
+        )
+        observed_lock = _ObservedLock()
+        rt._dispatch_submit_mu = observed_lock
+        arg = _resident(rt, (16, 16))
+
+        def free_arg():
+            rt.free_tensor(arg)
+
+        def free_buffer(buffer):
+            assert signature_tokens
+            buffer.closed = True
+
+        m["worker"].free.side_effect = free_buffer
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            submit_future = pool.submit(rt, arg)
+            assert submit_entered.wait(timeout=5)
+            free_future = pool.submit(free_arg)
+            assert observed_lock.blocked.wait(timeout=5)
+            m["worker"].free.assert_not_called()
+            continue_submit.set()
+            submit_future.result(timeout=5)
+            free_future.result(timeout=5)
+
+        assert signature_tokens[0] is not None
+        m["worker"].free.assert_called_once_with(arg.buffer)
+        rt.close()
+
+    def test_persistent_signature_token_advances_after_unsupported_args(self, patched_setup):
+        m = patched_setup
+        m["worker"]._live_domains = {}
+        orch = _PersistentOrch(m["worker"])
+        m["worker"].submit.side_effect = lambda fn: (
+            orch.run(fn),
+            _ImmediateNativeHandle(),
+        )[1]
+        signature_tokens: list[Any] = []
+        m["load_entry"].return_value = (
+            _persistent_entry(64, [], signature_tokens=signature_tokens),
+            None,
+        )
+        scalar = _ParamInfo(
+            name="seq_len",
+            direction=ParamDirection.In,
+            shape=None,
+            dtype=DataType.FP32,
+        )
+        compiled = _fake_compiled([scalar], [])
+        rt = DistributedWorker(
+            compiled,
+            persistent=True,
+            reset_persistent_windows=False,
+        )
+
+        rt(7)
+        rt([7])
+        rt(7)
+
+        assert signature_tokens[0] is not None
+        assert signature_tokens[1] is None
+        assert signature_tokens[2] is not None
+        assert signature_tokens[2] != signature_tokens[0]
+        rt.close()
 
     def test_device_memset_reset_skips_unused_host_zero_buffers(self, patched_setup):
         m = patched_setup

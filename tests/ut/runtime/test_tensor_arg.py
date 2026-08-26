@@ -17,7 +17,7 @@ It must:
 - delegate a host ``torch.Tensor`` to simpler's worker-aware wire helper.
 """
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,8 +25,7 @@ import torch
 from pypto.runtime import DeviceTensor
 
 # ``task_interface`` eagerly imports the optional ``simpler`` runtime package;
-# skip the module when simpler is unavailable (same pattern as
-# test_execute_compiled_device_tensor.py).
+# keep pure descriptor/cache tests active and skip only tests that need Simpler.
 try:
     import simpler  # noqa: F401  # pyright: ignore[reportMissingImports]
 except ImportError:
@@ -34,9 +33,10 @@ except ImportError:
 else:
     _has_simpler = True
 
-pytestmark = pytest.mark.skipif(not _has_simpler, reason="make_tensor_arg requires the simpler package")
+requires_simpler = pytest.mark.skipif(not _has_simpler, reason="make_tensor_arg requires the simpler package")
 
 
+@requires_simpler
 def test_device_tensor_derives_wire_tensor_from_retained_buffer():
     captured: dict = {"tensor_calls": []}
 
@@ -69,6 +69,7 @@ def test_device_tensor_derives_wire_tensor_from_retained_buffer():
     assert call["dtype"] == "<dtype:torch.float16>"
 
 
+@requires_simpler
 def test_retained_buffer_is_rejected_without_pypto_owner_binding():
     class FakeBuffer:
         base = 0xABCD
@@ -84,6 +85,7 @@ def test_retained_buffer_is_rejected_without_pypto_owner_binding():
         make_tensor_arg(MagicMock(name="unbound_worker"), dt)
 
 
+@requires_simpler
 def test_owner_liveness_failure_prevents_wire_tensor_creation():
     class FakeBuffer:
         base = 0xABCD
@@ -104,6 +106,7 @@ def test_owner_liveness_failure_prevents_wire_tensor_creation():
         make_tensor_arg(worker, dt)
 
 
+@requires_simpler
 def test_stale_raw_backend_is_rejected_before_owner_validation():
     class FakeBuffer:
         base = 0xABCD
@@ -125,6 +128,7 @@ def test_stale_raw_backend_is_rejected_before_owner_validation():
     owner._require_owned_resident_tensor.assert_not_called()
 
 
+@requires_simpler
 def test_raw_pointer_device_tensor_is_rejected_for_wire_dispatch():
     from pypto.runtime.tensor_arg import make_tensor_arg  # noqa: PLC0415
 
@@ -132,6 +136,7 @@ def test_raw_pointer_device_tensor_is_rejected_for_wire_dispatch():
         make_tensor_arg(MagicMock(name="worker"), DeviceTensor(0x1000, (4,), torch.float32))
 
 
+@requires_simpler
 def test_wire_tensor_passes_through():
     from pypto.runtime.tensor_arg import make_tensor_arg  # noqa: PLC0415
 
@@ -143,6 +148,7 @@ def test_wire_tensor_passes_through():
         assert make_tensor_arg(MagicMock(name="worker"), wire) is wire
 
 
+@requires_simpler
 def test_host_tensor_delegates_to_simpler():
     host = torch.zeros(4, 4, dtype=torch.float32)
     sentinel = MagicMock(name="Tensor(host)")
@@ -184,6 +190,7 @@ def test_task_args_signature_tracks_same_object_stride_change():
     assert _task_args_signature((host,)) != before
 
 
+@requires_simpler
 def test_task_args_signature_tracks_device_and_stacked_buffer_lifetime():
     from pypto.runtime import StackedDeviceTensor  # noqa: PLC0415
     from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
@@ -219,7 +226,9 @@ def test_task_args_signature_tracks_device_and_stacked_buffer_lifetime():
     assert _task_args_signature((first, stacked)) != before
 
 
+@requires_simpler
 def test_task_args_signature_tracks_simpler_tensor_descriptor():
+    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
     from simpler.buffer import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         AccessMode,
         AddressSpace,
@@ -229,8 +238,6 @@ def test_task_args_signature_tracks_simpler_tensor_descriptor():
         DataType,
         Tensor,
     )
-
-    from pypto.runtime.tensor_arg import _task_args_signature  # noqa: PLC0415
 
     identity = CanonicalIdentity(b"owner-id", 11, 1)
     descriptor = BufferDescriptor(
@@ -267,6 +274,186 @@ def test_task_args_signature_disables_unknown_and_cyclic_values():
     cyclic: list[object] = []
     cyclic.append(cyclic)
     assert _task_args_signature((cyclic,)) is None
+
+
+def test_task_args_signature_for_cache_memoizes_validated_token():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    setattr(provider, "_pypto_task_args_signature_token", ("program", 0, 7))
+    orch = SimpleNamespace()
+    cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        first = tensor_arg._task_args_signature_for_cache(cache, (host,))
+        second = tensor_arg._task_args_signature_for_cache(cache, (host,))
+
+    assert first == second
+    assert signature.call_count == 1
+
+
+def test_task_args_signature_for_cache_recomputes_when_validated_token_changes():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    orch = SimpleNamespace()
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        setattr(provider, "_pypto_task_args_signature_token", ("program", 0, 1))
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        tensor_arg._task_args_signature_for_cache(cache, (host,))
+        setattr(provider, "_pypto_task_args_signature_token", ("program", 0, 2))
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        tensor_arg._task_args_signature_for_cache(cache, (host,))
+
+    assert signature.call_count == 2
+
+
+def test_task_args_signature_for_cache_without_token_recomputes_and_never_memoizes_none():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    orch = SimpleNamespace()
+    values = ([1],)
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        first = tensor_arg._task_args_signature_for_cache(cache, values)
+        values[0].append(2)
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        second = tensor_arg._task_args_signature_for_cache(cache, values)
+
+    assert first != second
+    assert signature.call_count == 2
+    assert cache is not None
+    memo = cache.get(tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY, {})
+    assert None not in memo
+
+
+def test_task_args_signature_memo_is_bounded_and_refreshes_lru_hits():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    orch = SimpleNamespace()
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    limit = tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_MEMO_MAX_ENTRIES
+    tokens = [("program", 0, generation) for generation in range(limit + 2)]
+
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        for token in tokens[: limit + 1]:
+            setattr(provider, "_pypto_task_args_signature_token", token)
+            cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+            tensor_arg._task_args_signature_for_cache(cache, (host,))
+
+        assert cache is not None
+        memo = cache[tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY]
+        assert len(memo) == limit
+        assert tokens[0] not in memo
+
+        setattr(provider, "_pypto_task_args_signature_token", tokens[1])
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        tensor_arg._task_args_signature_for_cache(cache, (host,))
+        setattr(provider, "_pypto_task_args_signature_token", tokens[-1])
+        cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+        tensor_arg._task_args_signature_for_cache(cache, (host,))
+
+    memo = cache[tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY]
+    assert len(memo) == limit
+    assert tokens[1] in memo
+    assert tokens[2] not in memo
+    assert tokens[-1] in memo
+    assert signature.call_count == limit + 2
+
+
+def test_task_args_cache_helpers_fail_open_on_broken_metadata():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    class ReadOnlyOrch:
+        @property
+        def _pypto_task_args_cache_v1(self):
+            return None
+
+    class BrokenOrch:
+        @property
+        def _pypto_task_args_cache_v1(self):
+            raise RuntimeError("cache unavailable")
+
+    class BrokenProvider:
+        @property
+        def _pypto_task_args_signature_token(self):
+            raise RuntimeError("token unavailable")
+
+    class BrokenCache:
+        def get(self, _key):
+            raise RuntimeError("metadata unavailable")
+
+    assert (
+        tensor_arg._task_args_cache_for_orch(
+            SimpleNamespace(_pypto_task_args_cache_v1=MappingProxyType({})), provider
+        )
+        is None
+    )
+    assert tensor_arg._task_args_cache_for_orch(ReadOnlyOrch(), provider) is None
+    assert tensor_arg._task_args_cache_for_orch(BrokenOrch(), provider) is None
+    assert tensor_arg._task_args_cache_for_orch(SimpleNamespace(), BrokenProvider()) is None
+
+    values = ([1],)
+    expected = tensor_arg._task_args_signature(values)
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        assert tensor_arg._task_args_signature_for_cache(BrokenCache(), values) == expected
+    assert signature.call_count == 1
+
+
+def test_task_args_cache_cold_insert_uses_entry_count_without_iteration():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    class NoIterDict(dict):
+        def __iter__(self):
+            raise AssertionError("cold TaskArgs insertion must not scan the cache")
+
+    slot = ("slot", 0)
+    cache = NoIterDict({tensor_arg._PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY: 0})
+    tensor_arg._task_args_cache_store(cache, slot, ("sig", 0), "ta0")
+    tensor_arg._task_args_cache_store(cache, slot, ("sig", 1), "ta1")
+
+    assert cache[slot] == (("sig", 1), "ta1")
+    assert cache[tensor_arg._PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY] == 1
+
+
+def test_task_args_cache_eviction_preserves_signature_metadata():
+    from pypto.runtime import tensor_arg  # noqa: PLC0415
+
+    def provider(**_kwargs):
+        return None
+
+    token = ("program", 0, 1)
+    setattr(provider, "_pypto_task_args_signature_token", token)
+    orch = SimpleNamespace()
+    cache = tensor_arg._task_args_cache_for_orch(orch, provider)
+    assert cache is not None
+    host = torch.zeros(4, 4, dtype=torch.float32).share_memory_()
+    tensor_arg._task_args_signature_for_cache(cache, (host,))
+
+    with patch.object(tensor_arg, "_PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES", 2):
+        tensor_arg._task_args_cache_store(cache, ("slot", 0), ("sig", 0), "ta0")
+        tensor_arg._task_args_cache_store(cache, ("slot", 1), ("sig", 1), "ta1")
+        tensor_arg._task_args_cache_store(cache, ("slot", 2), ("sig", 2), "ta2")
+
+    assert cache[tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_TOKEN_KEY] == token
+    assert token in cache[tensor_arg._PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY]
+    slots = [key for key in cache if isinstance(key, tuple) and key[:1] == ("slot",)]
+    assert slots == [("slot", 1), ("slot", 2)]
 
 
 if __name__ == "__main__":

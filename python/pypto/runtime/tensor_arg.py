@@ -35,6 +35,11 @@ import torch
 _PYPTO_OWNER_REF_ATTR = "_pypto_tensor_owner_ref"
 _UNSUPPORTED = object()
 _PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES = 4096
+_PYPTO_TASK_ARGS_SIGNATURE_TOKEN_ATTR = "_pypto_task_args_signature_token"
+_PYPTO_TASK_ARGS_SIGNATURE_TOKEN_KEY = object()
+_PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY = object()
+_PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY = object()
+_PYPTO_TASK_ARGS_SIGNATURE_MEMO_MAX_ENTRIES = 16
 
 
 def bind_tensor_arg_owner(worker: Any, owner: Any) -> None:
@@ -235,30 +240,98 @@ def _task_args_signature(values: Any) -> tuple[Any, ...] | None:
 
 
 def _task_args_signature_for_cache(cache: Any, values: Any) -> tuple[Any, ...] | None:
-    """Compute a signature only when a persistent cache is enabled."""
+    """Return the descriptor signature for one validated prepared-argument token.
+
+    The persistent prepared path validates every public argument before entering
+    generated orchestration. It publishes a token that changes whenever those
+    validated descriptors change. Reuse the expensive full descriptor walk for
+    a matching token; callers without that proof keep the conservative behavior
+    and recompute on every invocation.
+    """
     if cache is None:
         return None
-    return _task_args_signature(values)
+    try:
+        token = cache.get(_PYPTO_TASK_ARGS_SIGNATURE_TOKEN_KEY)
+        if token is None:
+            return _task_args_signature(values)
+        memo = cache.get(_PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY)
+        if not isinstance(memo, dict) or memo.__class__ is not dict:
+            memo = {}
+            cache[_PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY] = memo
+        try:
+            signature = memo.pop(token)
+        except (KeyError, TypeError):
+            signature = _task_args_signature(values)
+            if signature is None:
+                return None
+            try:
+                while len(memo) >= _PYPTO_TASK_ARGS_SIGNATURE_MEMO_MAX_ENTRIES:
+                    memo.pop(next(iter(memo)))
+                memo[token] = signature
+            except Exception:  # noqa: BLE001 - optimization must fail open
+                pass
+            return signature
+        memo[token] = signature
+        return signature
+    except Exception:  # noqa: BLE001 - metadata failures fall back to live validation
+        return _task_args_signature(values)
 
 
-def _task_args_cache_for_orch(orch: Any, provider: Any) -> dict[Any, tuple[Any, Any]] | None:
+def _is_task_args_cache_metadata_key(key: Any) -> bool:
+    """Whether *key* belongs to cache bookkeeping rather than a TaskArgs slot."""
+    return (
+        key is _PYPTO_TASK_ARGS_SIGNATURE_TOKEN_KEY
+        or key is _PYPTO_TASK_ARGS_SIGNATURE_MEMO_KEY
+        or key is _PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY
+    )
+
+
+def _task_args_cache_for_orch(orch: Any, provider: Any) -> dict[Any, Any] | None:
     """Return the persistent cache for a provider-backed orchestrator invocation."""
     if provider is None:
         return None
-    cache = getattr(orch, "_pypto_task_args_cache_v1", None)
-    if cache is None:
-        cache = {}
-        orch._pypto_task_args_cache_v1 = cache
+    try:
+        cache = getattr(orch, "_pypto_task_args_cache_v1", None)
+        if cache is None:
+            cache = {}
+            orch._pypto_task_args_cache_v1 = cache
+        if not isinstance(cache, dict) or cache.__class__ is not dict:
+            return None
+        if _PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY not in cache:
+            entry_count = sum(
+                1 for key in cache if not _is_task_args_cache_metadata_key(key)
+            )
+            cache[_PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY] = entry_count
+        cache[_PYPTO_TASK_ARGS_SIGNATURE_TOKEN_KEY] = getattr(
+            provider, _PYPTO_TASK_ARGS_SIGNATURE_TOKEN_ATTR, None
+        )
+    except Exception:  # noqa: BLE001 - cache metadata must remain fail open
+        return None
     return cache
 
 
-def _task_args_cache_store(
-    cache: dict[Any, tuple[Any, Any]], slot: Any, signature: Any, task_args: Any
-) -> None:
+def _task_args_cache_store(cache: dict[Any, Any], slot: Any, signature: Any, task_args: Any) -> None:
     """Store one TaskArgs entry while keeping the persistent cache hard-bounded."""
     try:
-        if slot not in cache and len(cache) >= _PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES:
-            cache.pop(next(iter(cache)))
+        if slot not in cache:
+            if _PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES <= 0:
+                return
+            entry_count = cache.get(_PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY)
+            if not isinstance(entry_count, int) or entry_count < 0:
+                entry_count = sum(
+                    1 for key in cache if not _is_task_args_cache_metadata_key(key)
+                )
+            while entry_count >= _PYPTO_TASK_ARGS_CACHE_MAX_ENTRIES:
+                oldest_entry = next(
+                    (key for key in cache if not _is_task_args_cache_metadata_key(key)),
+                    None,
+                )
+                if oldest_entry is None:
+                    entry_count = 0
+                    break
+                cache.pop(oldest_entry)
+                entry_count -= 1
+            cache[_PYPTO_TASK_ARGS_CACHE_ENTRY_COUNT_KEY] = entry_count + 1
         cache[slot] = (signature, task_args)
     except Exception:  # noqa: BLE001 - cache failures must not block dispatch
         return

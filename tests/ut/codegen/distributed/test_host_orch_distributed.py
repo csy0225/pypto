@@ -32,15 +32,20 @@ Plus regressions:
   ``allocate_domain`` wrapper.
 """
 
+import ast
 import re
 from importlib import resources
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
+import torch
 from pypto import codegen
 from pypto.backend import BackendType, pto_backend
 from pypto.pypto_core import passes  # match the import path used by ut/conftest.py
+from pypto.runtime import tensor_arg
 
 SIZE = 64
 
@@ -86,6 +91,108 @@ def _lower_host_collectives(program):
     cg = codegen.DistributedCodegen()
     code = cg.generate(program)
     return code, cg
+
+
+def _load_generated_host_orch(code: str) -> SimpleNamespace:
+    """Execute generated orchestration with counted, device-free runtime fakes."""
+    module = ast.parse(code)
+    module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
+    task_args_builds = []
+    tensor_conversions = []
+    submits = []
+    group_submits = []
+
+    class FakeTaskArgs:
+        def __init__(self):
+            task_args_builds.append(self)
+
+        def add_tensor(self, *_args, **_kwargs):
+            return None
+
+        def add_scalar(self, *_args, **_kwargs):
+            return None
+
+    class FakeOrch:
+        def __init__(self):
+            self._worker = object()
+
+        def allocate_domain(self, **_kwargs):
+            raise AssertionError("generated comm orchestration must use the supplied domain provider")
+
+        def submit_next_level_group(self, *_args, **kwargs):
+            group_submits.append(tuple(kwargs.get("workers", ())))
+
+    def make_tensor_arg(_worker, arg):
+        tensor_conversions.append(arg)
+        return object()
+
+    def submit_chip(_orch, _callable, _task_args, _config, worker):
+        submits.append(worker)
+
+    def submit_chip_group(_orch, _callable, _task_args, _config, workers):
+        group_submits.append(tuple(workers))
+
+    namespace = {
+        "__name__": "_generated_host_orch_test",
+        "torch": torch,
+        "TaskArgs": FakeTaskArgs,
+        "TensorArgType": SimpleNamespace(
+            INPUT="input",
+            OUTPUT="output",
+            INOUT="inout",
+            OUTPUT_EXISTING="output_existing",
+        ),
+        "DataType": SimpleNamespace(FLOAT32="float32", INT32="int32"),
+        "CommBufferSpec": lambda **kwargs: SimpleNamespace(**kwargs),
+        "make_tensor_arg": make_tensor_arg,
+        "_task_args_signature": tensor_arg._task_args_signature,
+        "_task_args_signature_for_cache": tensor_arg._task_args_signature_for_cache,
+        "_task_args_cache_for_orch": tensor_arg._task_args_cache_for_orch,
+        "_task_args_cache_store": tensor_arg._task_args_cache_store,
+        "_submit_chip": submit_chip,
+        "_submit_chip_group": submit_chip_group,
+    }
+    exec(compile(module, "<generated_host_orch>", "exec"), namespace)  # noqa: S102
+    orch = FakeOrch()
+    callables = {"chip_orch": object()}
+    config = SimpleNamespace(output_prefix="")
+
+    def run(tensors, provider, *, world_size=8):
+        namespace["host_orch"](
+            orch,
+            None,
+            config,
+            tensors=tensors,
+            callables=callables,
+            sub_ids={},
+            _keep=[],
+            world_size=world_size,
+            _domain_provider=provider,
+        )
+
+    return SimpleNamespace(
+        run=run,
+        task_args_builds=task_args_builds,
+        tensor_conversions=tensor_conversions,
+        submits=submits,
+        group_submits=group_submits,
+    )
+
+
+def _assert_eight_independent_submits(code: str, tensors, provider) -> None:
+    call_names = {
+        call.func.id if isinstance(call.func, ast.Name) else call.func.attr
+        for call in ast.walk(ast.parse(code))
+        if isinstance(call, ast.Call) and isinstance(call.func, (ast.Name, ast.Attribute))
+    }
+    assert "_submit_chip_group" not in call_names, code
+    assert "submit_next_level_group" not in call_names, code
+
+    harness = _load_generated_host_orch(code)
+    harness.run(tensors, provider, world_size=8)
+    assert harness.submits == list(range(8))
+    assert harness.group_submits == []
+    assert len(harness.task_args_builds) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -1637,9 +1744,143 @@ def test_host_orch_task_args_cache_codegen_uses_one_hit_miss_taskargs_var():
     assert match is not None, code
     task_args_var = match.group(1)
     assert re.search(rf"_keep\.append\({re.escape(task_args_var)}\)", code), code
-    assert re.search(
-        rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code
-    ), code
+    assert re.search(rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code), (
+        code
+    )
+
+
+def test_generated_host_orch_reuses_task_args_until_prepared_descriptor_changes():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, x: pl.Tensor[[8, SIZE], pl.FP32]):
+            for r in pl.range(pld.world_size()):
+                x_r = x[r]
+                self.chip_orch(x_r, device=r)
+
+    harness = _load_generated_host_orch(_lower(Prog))
+
+    def provider(**_kwargs):
+        return None
+
+    setattr(provider, "_pypto_task_args_signature_token", ("program", 0, 1))
+    host = torch.zeros(8, SIZE, dtype=torch.float32).share_memory_()
+    tensors = {"x": host}
+    expected_ranks = list(range(8))
+
+    with patch.object(tensor_arg, "_task_args_signature", wraps=tensor_arg._task_args_signature) as signature:
+        harness.run(tensors, provider, world_size=8)
+        assert signature.call_count == 1
+        assert len(harness.task_args_builds) == 8
+        assert len(harness.tensor_conversions) == 8
+
+        harness.run(tensors, provider, world_size=8)
+        assert signature.call_count == 1
+        assert len(harness.task_args_builds) == 8
+        assert len(harness.tensor_conversions) == 8
+
+        host.add_(1)
+        harness.run(tensors, provider, world_size=8)
+        assert signature.call_count == 1
+        assert len(harness.task_args_builds) == 8
+        assert len(harness.tensor_conversions) == 8
+
+        tensors["x"] = torch.ones_like(host).share_memory_()
+        setattr(provider, "_pypto_task_args_signature_token", ("program", 0, 2))
+        harness.run(tensors, provider, world_size=8)
+
+    assert signature.call_count == 2
+    assert len(harness.task_args_builds) == 16
+    assert len(harness.tensor_conversions) == 16
+    assert harness.submits == expected_ranks * 4
+    assert harness.group_submits == []
+
+
+def test_host_parallel_rank_loop_keeps_independent_chip_submits():
+    """Parallel syntax must submit exactly one independent task per rank."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, x: pl.Tensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, x: pl.Tensor[[8, SIZE], pl.FP32]):
+            for r in pl.parallel(pld.world_size()):
+                x_r = x[r]
+                self.chip_orch(x_r, device=r)
+
+    def provider(**_kwargs):
+        return None
+
+    setattr(provider, "_pypto_task_args_signature_token", ("program", "plain", 1))
+    tensors = {"x": torch.zeros(8, SIZE, dtype=torch.float32).share_memory_()}
+    _assert_eight_independent_submits(_lower(Prog), tensors, provider)
+
+
+def test_host_parallel_comm_loop_keeps_independent_chip_submits():
+    """Comm materialization must not re-enable one grouped DAG submission."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(
+            self, x: pl.Tensor[[SIZE], pl.FP32], data: pld.DistributedTensor[[SIZE], pl.FP32]
+        ) -> pl.Tensor[[SIZE], pl.FP32]:
+            return x
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self, x: pl.Tensor[[8, SIZE], pl.FP32]):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            for r in pl.parallel(pld.world_size()):
+                data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+                x_r = x[r]
+                self.chip_orch(x_r, data, device=r)
+
+    class FakeBuffer:
+        def tensor(self, **_kwargs):
+            return object()
+
+    class FakeDomain:
+        def __init__(self):
+            self.contexts = {
+                rank: SimpleNamespace(
+                    buffers={"data_buf": FakeBuffer()},
+                    device_ctx=100 + rank,
+                )
+                for rank in range(8)
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __getitem__(self, rank):
+            return self.contexts[rank]
+
+    class DomainProvider:
+        def __init__(self):
+            self._pypto_task_args_signature_token = ("program", "comm", 1)
+            self.domain = FakeDomain()
+
+        def __call__(self, **_kwargs):
+            return self.domain
+
+    code = _lower(Prog)
+    tensors = {"x": torch.zeros(8, SIZE, dtype=torch.float32).share_memory_()}
+    ordering_keys = set(re.findall(r'tensors\["([^"]+_ord)"\]', code))
+    assert ordering_keys, code
+    for key in ordering_keys:
+        tensors[key] = torch.zeros(8, 1, dtype=torch.int32).share_memory_()
+
+    _assert_eight_independent_submits(code, tensors, DomainProvider())
 
 
 def test_host_orch_task_args_cache_accepts_comm_materialization_markers():
@@ -1680,10 +1921,9 @@ def test_host_orch_task_args_cache_accepts_comm_materialization_markers():
     assert ".device_ctx)" in miss.group("body"), code
     task_args_var = miss.group(1)
     assert re.search(rf"_keep\.append\({re.escape(task_args_var)}\)", code), code
-    assert re.search(
-        rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code
-    ), code
-
+    assert re.search(rf'_submit_chip\(orch, callables\["chip_orch"\], {re.escape(task_args_var)},', code), (
+        code
+    )
 
 
 if __name__ == "__main__":

@@ -94,6 +94,9 @@ class _DispatchFrame:
     keepalive: list[Any] = field(default_factory=list)
     cleanup: list[Callable[[], None]] = field(default_factory=list)
     handle: DistributedRunHandle | None = None
+    task_args_descriptor_key: tuple[Any, ...] | None = None
+    task_args_signature_generation: int = 0
+    task_args_signature_token: tuple[Any, ...] | None = None
 
 
 class DistributedRunHandle:
@@ -1046,6 +1049,8 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
         encoding="utf-8",
     )
     return name_map_path
+
+
 def _prepare_reused_dep_gen_dirs(dfx_base: Path) -> list[Path]:
     """Validate a prepared-worker dep-gen capture and discard stale timings.
 
@@ -1851,6 +1856,8 @@ class DistributedWorker(Worker):
                 frame.tensors.clear()
                 frame.keepalive.clear()
                 frame.handle = None
+                frame.task_args_descriptor_key = None
+                frame.task_args_signature_token = None
                 frame.in_use = False
                 self._dispatch_cv.notify_all()
 
@@ -1990,7 +1997,7 @@ class DistributedWorker(Worker):
                     _full = str(_name)
                     _marker = "__ssa_v"
                     _idx = _full.rfind(_marker)
-                    if _idx != -1 and _full[_idx + len(_marker):].isdigit():
+                    if _idx != -1 and _full[_idx + len(_marker) :].isdigit():
                         _full = _full[:_idx]
                     _k8_items.append((_full, int(_nbytes)))
                 _k8_bases = [_b for _b, _nb in _k8_items]
@@ -2029,8 +2036,7 @@ class DistributedWorker(Worker):
                         )
                     if _k8_carved != int(spec[1]):
                         raise RuntimeError(
-                            f"K8 prefix reset: carved {_k8_carved} != requested window "
-                            f"{int(spec[1])}"
+                            f"K8 prefix reset: carved {_k8_carved} != requested window {int(spec[1])}"
                         )
                     for worker_id in handle.workers:
                         actual = int(handle[worker_id].actual_window_size)
@@ -2042,8 +2048,7 @@ class DistributedWorker(Worker):
                 worker_ranges = {
                     int(worker_id): (
                         int(handle[worker_id].local_window_base),
-                        int(_k8_control_bytes) if _k8_applies
-                        else int(handle[worker_id].actual_window_size),
+                        int(_k8_control_bytes) if _k8_applies else int(handle[worker_id].actual_window_size),
                     )
                     for worker_id in handle.workers
                 }
@@ -2074,16 +2079,16 @@ class DistributedWorker(Worker):
                         "k8_control_range_count": 1,
                         "k8_control_ranges": [
                             [int(_r[0]), int(_r[1])] for _r in [next(iter(worker_ranges.values()))]
-                        ] if _k8_applies else None,
+                        ]
+                        if _k8_applies
+                        else None,
                         "k8_full_window_bytes": int(_k8_carved) if _k8_applies else None,
                     }
                 )
             reset_elapsed_ns = time.perf_counter_ns() - reset_start_ns
         else:
             if reset_buffers is None:
-                raise RuntimeError(
-                    "persistent CommDomain host-copy reset requires prepared zero buffers"
-                )
+                raise RuntimeError("persistent CommDomain host-copy reset requires prepared zero buffers")
             for generated_name, (spec, handle) in domains.items():
                 call_start_ns = time.perf_counter_ns()
                 _workers, window_nbytes, buffer_specs = spec
@@ -2232,6 +2237,7 @@ class DistributedWorker(Worker):
         call_config: Any,
         keepalive: list[Any],
         cleanup: list[Callable[[], None]],
+        task_args_signature_token: tuple[Any, ...] | None,
     ) -> Any:
         """Submit one persistent request directly through Simpler."""
         self._raise_persistent_error()
@@ -2240,9 +2246,7 @@ class DistributedWorker(Worker):
         program_domains = domains_by_program.get(program_id)
         reset_buffers: dict[int, Any] = {}
         needs_host_reset_buffers = bool(
-            program_domains
-            and self._reset_persistent_windows
-            and not self._w.device_memset_available
+            program_domains and self._reset_persistent_windows and not self._w.device_memset_available
         )
         if needs_host_reset_buffers:
             # Host reset Buffers are required only by runtimes without the
@@ -2278,6 +2282,8 @@ class DistributedWorker(Worker):
                             f"for program {program_id}"
                         )
                 return _RetainedDomainLease(handle)
+
+            setattr(domain_provider, "_pypto_task_args_signature_token", task_args_signature_token)
 
             program_domains = domains_by_program.get(program_id)
             if program_domains and self._reset_persistent_windows:
@@ -2315,10 +2321,13 @@ class DistributedWorker(Worker):
         call_config: Any,
         keepalive: list[Any],
         cleanup: list[Callable[[], None]],
+        task_args_signature_token: tuple[Any, ...] | None = None,
     ) -> Any:
         """Submit through either the ordinary or persistent prepared path."""
         if self._persistent:
-            return self._submit_persistent(state, tensors, call_config, keepalive, cleanup)
+            return self._submit_persistent(
+                state, tensors, call_config, keepalive, cleanup, task_args_signature_token
+            )
         return _submit_dispatch(
             self._w,
             state["entry_fn"],
@@ -2348,6 +2357,7 @@ class DistributedWorker(Worker):
                 call_config,
                 frame.keepalive,
                 frame.cleanup,
+                frame.task_args_signature_token,
             )
         except BaseException as exc:
             if native_handle is None:
@@ -2496,12 +2506,20 @@ class DistributedWorker(Worker):
         self._device_buffers[(int(worker_id), int(ptr))] = handle
         return DeviceTensor(int(ptr), tuple(shape), dtype, buffer=handle)
 
-    def free(self, ptr: int, *, worker_id: int = 0) -> None:
-        """Release a pointer previously returned by :meth:`malloc`."""
+    def _free_device_buffer(self, ptr: int, worker_id: int) -> None:
+        """Release one owned Buffer while its lifecycle caller holds admission."""
         self._require_open("free")
         handle = self._device_buffer(ptr, worker_id, "free")
         self._w.free(handle)
         del self._device_buffers[(worker_id, ptr)]
+
+    def free(self, ptr: int, *, worker_id: int = 0) -> None:
+        """Release a pointer previously returned by :meth:`malloc`."""
+        # submit() holds this mutex through validation, token publication, and
+        # synchronous graph construction. Keep an owned Buffer live across that
+        # whole proof window so a cache hit cannot submit its stale TaskArgs.
+        with self._dispatch_submit_mu:
+            self._free_device_buffer(ptr, worker_id)
 
     def committed_device_memory(self, worker_id: int = 0) -> int:
         """Total device HBM (bytes) committed by chip *worker_id*'s ``MemoryAllocator``
@@ -2897,6 +2915,112 @@ class DistributedWorker(Worker):
                 f"StackedDeviceTensor, or a simpler Tensor."
             )
 
+    @staticmethod
+    def _prepared_buffer_descriptor_key(buffer: Any) -> tuple[Any, ...] | None:
+        """Return a stable key for one live PyPTO-owned simpler Buffer."""
+        try:
+            if bool(buffer.closed):
+                return None
+            identity = buffer.identity
+
+            def enum_value(value: Any) -> int | str:
+                raw = getattr(value, "value", value)
+                try:
+                    return int(raw)
+                except (TypeError, ValueError):
+                    return str(raw)
+
+            return (
+                id(buffer),
+                bytes(identity.owner_instance_id),
+                int(identity.buffer_id),
+                int(identity.generation),
+                enum_value(buffer.address_space),
+                enum_value(buffer.access),
+                enum_value(buffer.backend_kind),
+                int(buffer.nbytes),
+                int(buffer.owner_worker_path_id),
+                bytes(buffer.body),
+                int(buffer.base),
+            )
+        except Exception:  # noqa: BLE001 - descriptor memoization must fail open
+            return None
+
+    @classmethod
+    def _prepared_task_arg_descriptor_key(cls, arg: Any) -> tuple[Any, ...] | None:
+        """Build one validated descriptor stamp, or fail open for unknown values."""
+        try:
+            if isinstance(arg, torch.Tensor):
+                storage = arg.untyped_storage()
+                return (
+                    "torch",
+                    int(storage.data_ptr()),
+                    int(storage.nbytes()),
+                    int(arg.data_ptr()),
+                    tuple(int(dim) for dim in arg.shape),
+                    tuple(int(stride) for stride in arg.stride()),
+                    int(arg.storage_offset()),
+                    str(arg.dtype),
+                    str(arg.device),
+                    bool(arg.is_shared()),
+                )
+
+            if isinstance(arg, DeviceTensor):
+                if arg.buffer is None:
+                    return None
+                buffer_key = cls._prepared_buffer_descriptor_key(arg.buffer)
+                if buffer_key is None:
+                    return None
+                return (
+                    "device",
+                    int(arg.data_ptr),
+                    tuple(int(dim) for dim in arg.shape),
+                    str(arg.dtype),
+                    buffer_key,
+                )
+
+            if isinstance(arg, StackedDeviceTensor):
+                shards = tuple(cls._prepared_task_arg_descriptor_key(shard) for shard in arg.shards)
+                if any(shard is None for shard in shards):
+                    return None
+                return (
+                    "stacked",
+                    tuple(int(dim) for dim in arg.full_shape),
+                    tuple(int(worker) for worker in arg.worker_ids),
+                    str(arg.dtype),
+                    shards,
+                )
+
+            if _is_simpler_tensor(arg):
+                # A raw wire Tensor does not retain its owner Buffer, so the
+                # prepared boundary cannot prove backing liveness cheaply.
+                return None
+
+            if arg is None or isinstance(arg, (bool, int, str, bytes)):
+                return (type(arg).__module__, type(arg).__qualname__, arg)
+            if isinstance(arg, float):
+                return (
+                    type(arg).__module__,
+                    type(arg).__qualname__,
+                    float(arg).hex() if not math.isnan(arg) else "nan",
+                )
+        except Exception:  # noqa: BLE001 - descriptor memoization must fail open
+            return None
+        # Mutable containers, ctypes scalars, and arbitrary user objects keep
+        # the existing full-signature-per-call behavior.
+        return None
+
+    @classmethod
+    def _prepared_task_args_descriptor_key(cls, args: tuple[Any, ...]) -> tuple[Any, ...] | None:
+        """Build a memo token only when every validated descriptor is stable."""
+        key: list[Any] = []
+        for arg in args:
+            item = cls._prepared_task_arg_descriptor_key(arg)
+            if item is None:
+                return None
+            key.append(item)
+        return tuple(key)
+
     def _submit_compiled(
         self, compiled: DistributedCompiledProgram, *args: Any, config: RunConfig | None = None
     ) -> DistributedRunHandle:
@@ -2955,6 +3079,21 @@ class DistributedWorker(Worker):
                     continue
                 self._validate_prepared_dispatch_arg(info, arg)
                 tensors[info.name] = arg
+
+            descriptor_key = self._prepared_task_args_descriptor_key(args)
+            if descriptor_key is None:
+                frame.task_args_descriptor_key = None
+                frame.task_args_signature_token = None
+            else:
+                if descriptor_key != frame.task_args_descriptor_key:
+                    frame.task_args_signature_generation += 1
+                    frame.task_args_descriptor_key = descriptor_key
+                frame.task_args_signature_token = (
+                    "pypto.prepared-task-args.v1",
+                    id(state["entry_fn"]),
+                    frame.slot_id,
+                    frame.task_args_signature_generation,
+                )
 
             if two_pass_swimlane:
                 assert config is not None
