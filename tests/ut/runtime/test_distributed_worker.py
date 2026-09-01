@@ -3097,6 +3097,73 @@ def _persistent_entry(
     return entry
 
 
+_K8_LEGACY_CONTROL_NAMES = (
+    "dense_attn_signal_stack_buf",
+    "dense_mlp_signal_stack_buf",
+    "moe_attn_signal_stack_buf",
+    "moe_meta_arrived_stack_buf",
+    "moe_data_arrived_stack_buf",
+    "moe_sh_signal_stack_buf",
+    "moe_combine_arrived_stack_buf",
+)
+_K8_LEGACY_DATA_NAMES = (
+    "dense_attn_tmp_stack_buf",
+    "dense_mlp_tmp_stack_buf",
+    "moe_attn_tmp_stack_buf",
+    "moe_recv_meta_stack_buf",
+    "moe_recv_x_stack_buf",
+    "moe_recv_aux_stack_buf",
+    "moe_recv_route_stack_buf",
+    "moe_sh_tmp_stack_buf",
+    "moe_routed_y_buf_stack_buf",
+)
+_K8_LEGACY_CONTROL_NBYTES = (1536, 1536, 21504, 512, 512, 21504, 512)
+_K8_LEGACY_DATA_NBYTES = (393216, 393216, 5505024, 1280, 18874368, 147456, 147456, 5505024, 1048576)
+_K8_LOCAL_OWNER_CONTROL_NAMES = (
+    "dense_attn_signal_stack_buf",
+    "dense_mlp_signal_stack_buf",
+    "moe_attn_signal_stack_buf",
+    "moe_sh_signal_stack_buf",
+)
+_K8_LOCAL_OWNER_DATA_NAMES = (
+    "dense_attn_tmp_stack_buf",
+    "dense_mlp_tmp_stack_buf",
+    "moe_attn_tmp_stack_buf",
+    "moe_sh_tmp_stack_buf",
+)
+_K8_LOCAL_OWNER_CONTROL_NBYTES = (1536, 1536, 21504, 21504)
+_K8_LOCAL_OWNER_DATA_NBYTES = (393216, 393216, 5505024, 5505024)
+
+
+def _device_memset_persistent_runtime(
+    patched_setup: dict[str, Any],
+    *,
+    buffer_names: tuple[str, ...],
+    buffer_nbytes: tuple[int, ...],
+) -> tuple[_PersistentOrch, DistributedWorker, DeviceTensor]:
+    """Construct a reused persistent domain backed by device memset."""
+    patched_setup["worker"]._live_domains = {}
+    patched_setup["worker"].device_memset_available = True
+    orch = _PersistentOrch(patched_setup["worker"])
+    patched_setup["worker"].submit.side_effect = lambda fn: (
+        orch.run(fn),
+        _ImmediateNativeHandle(),
+    )[1]
+    patched_setup["load_entry"].return_value = (
+        _persistent_entry(
+            sum(buffer_nbytes),
+            [],
+            buffer_nbytes=buffer_nbytes,
+            buffer_names=buffer_names,
+        ),
+        None,
+    )
+    compiled = _fake_compiled([_param("a", [16, 16])], [])
+    compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
+    rt = DistributedWorker(compiled, persistent=True)
+    return orch, rt, _resident(rt, (16, 16))
+
+
 class TestPersistentDistributedWorker:
     def test_window_reset_requires_persistent_mode(self):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
@@ -3359,59 +3426,69 @@ class TestPersistentDistributedWorker:
         assert orch.copy_calls == []
         rt.close()
 
+    @pytest.mark.parametrize(
+        (
+            "control_names",
+            "data_names",
+            "control_nbytes",
+            "data_nbytes",
+            "expected_control_bytes",
+            "expected_window_bytes",
+        ),
+        [
+            pytest.param(
+                _K8_LEGACY_CONTROL_NAMES,
+                _K8_LEGACY_DATA_NAMES,
+                _K8_LEGACY_CONTROL_NBYTES,
+                _K8_LEGACY_DATA_NBYTES,
+                47616,
+                32063232,
+                id="legacy-ep",
+            ),
+            pytest.param(
+                _K8_LEGACY_CONTROL_NAMES,
+                _K8_LEGACY_DATA_NAMES,
+                (4096, 4096, 4096, 8192, 8192, 8192, 10752),
+                (1,) * len(_K8_LEGACY_DATA_NAMES),
+                47616,
+                47625,
+                id="legacy-flexible-capacity",
+            ),
+            pytest.param(
+                _K8_LOCAL_OWNER_CONTROL_NAMES,
+                _K8_LOCAL_OWNER_DATA_NAMES,
+                _K8_LOCAL_OWNER_CONTROL_NBYTES,
+                _K8_LOCAL_OWNER_DATA_NBYTES,
+                46080,
+                11842560,
+                id="local-owner",
+            ),
+        ],
+    )
     def test_device_memset_k8_prefix_traces_only_reused_domain(
         self,
         patched_setup,
         monkeypatch,
         tmp_path,
+        control_names,
+        data_names,
+        control_nbytes,
+        data_nbytes,
+        expected_control_bytes,
+        expected_window_bytes,
     ):
         m = patched_setup
-        m["worker"]._live_domains = {}
-        m["worker"].device_memset_available = True
-        orch = _PersistentOrch(m["worker"])
-        m["worker"].submit.side_effect = lambda fn: (
-            orch.run(fn),
-            _ImmediateNativeHandle(),
-        )[1]
-        control_names = (
-            "dense_attn_signal_stack_buf",
-            "dense_mlp_signal_stack_buf",
-            "moe_attn_signal_stack_buf",
-            "moe_meta_arrived_stack_buf",
-            "moe_data_arrived_stack_buf",
-            "moe_sh_signal_stack_buf",
-            "moe_combine_arrived_stack_buf",
-        )
-        data_names = (
-            "dense_attn_tmp_stack_buf",
-            "dense_mlp_tmp_stack_buf",
-            "moe_attn_tmp_stack_buf",
-            "moe_recv_meta_stack_buf",
-            "moe_recv_x_stack_buf",
-            "moe_recv_aux_stack_buf",
-            "moe_recv_route_stack_buf",
-            "moe_sh_tmp_stack_buf",
-            "moe_routed_y_buf_stack_buf",
-        )
-        control_nbytes = (4096, 4096, 4096, 8192, 8192, 8192, 10752)
-        buffer_nbytes = control_nbytes + (1,) * len(data_names)
-        window_nbytes = sum(buffer_nbytes)
+        buffer_nbytes = control_nbytes + data_nbytes
+        assert sum(control_nbytes) == expected_control_bytes
+        assert sum(buffer_nbytes) == expected_window_bytes
         buffer_names = tuple(f"{name}__ssa_v0" for name in control_names + data_names)
-        m["load_entry"].return_value = (
-            _persistent_entry(
-                window_nbytes,
-                [],
-                buffer_nbytes=buffer_nbytes,
-                buffer_names=buffer_names,
-            ),
-            None,
-        )
-        compiled = _fake_compiled([_param("a", [16, 16])], [])
-        compiled._distributed_config = DistributedConfig(device_ids=[0, 1])
         trace_path = tmp_path / "persistent_reset.jsonl"
         monkeypatch.setenv("PYPTO_PERSISTENT_RESET_TRACE", str(trace_path))
-        rt = DistributedWorker(compiled, persistent=True)
-        arg = _resident(rt, (16, 16))
+        orch, rt, arg = _device_memset_persistent_runtime(
+            m,
+            buffer_names=buffer_names,
+            buffer_nbytes=buffer_nbytes,
+        )
 
         rt(arg)
         handle = orch.handles[0]
@@ -3423,8 +3500,8 @@ class TestPersistentDistributedWorker:
         rt(arg)
 
         worker_ranges = {
-            0: (handle[0].local_window_base, 47616),
-            1: (handle[1].local_window_base, 47616),
+            0: (handle[0].local_window_base, expected_control_bytes),
+            1: (handle[1].local_window_base, expected_control_bytes),
         }
         m["worker"].memset_all.assert_called_once_with(worker_ranges)
         m["worker"].create_buffer.assert_not_called()
@@ -3438,15 +3515,148 @@ class TestPersistentDistributedWorker:
         assert record["device_memset_available"] is True
         assert record["domain_count"] == 1
         domain = record["domains"][0]
-        assert domain["requested_window_size"] == window_nbytes
-        assert domain["actual_window_sizes"] == {"0": window_nbytes, "1": window_nbytes}
+        assert domain["requested_window_size"] == expected_window_bytes
+        assert domain["actual_window_sizes"] == {
+            "0": expected_window_bytes,
+            "1": expected_window_bytes,
+        }
         assert domain["k8_prefix_applied"] is True
-        assert domain["k8_control_bytes"] == 47616
+        assert domain["k8_control_bytes"] == expected_control_bytes
         assert domain["k8_control_range_count"] == 1
-        assert domain["k8_control_ranges"] == [[handle[0].local_window_base, 47616]]
-        assert domain["k8_full_window_bytes"] == window_nbytes
+        assert domain["k8_control_ranges"] == [[handle[0].local_window_base, expected_control_bytes]]
+        assert domain["k8_full_window_bytes"] == expected_window_bytes
         assert domain["memset_all_us"] >= 0
         assert record["reset_body_us"] >= domain["memset_all_us"]
+        rt.close()
+
+    def test_device_memset_k8_prefix_rejects_control_after_data(self, patched_setup):
+        m = patched_setup
+        names = _K8_LOCAL_OWNER_CONTROL_NAMES + _K8_LOCAL_OWNER_DATA_NAMES
+        nbytes = _K8_LOCAL_OWNER_CONTROL_NBYTES + _K8_LOCAL_OWNER_DATA_NBYTES
+        reordered_names = (names[4],) + names[:4] + names[5:]
+        reordered_nbytes = (nbytes[4],) + nbytes[:4] + nbytes[5:]
+        orch, rt, arg = _device_memset_persistent_runtime(
+            m,
+            buffer_names=tuple(f"{name}__ssa_v0" for name in reordered_names),
+            buffer_nbytes=reordered_nbytes,
+        )
+
+        rt(arg)
+        assert len(orch.handles) == 1
+        with pytest.raises(RuntimeError, match="control buffer .* appears after"):
+            rt(arg)
+
+        m["worker"].memset_all.assert_not_called()
+        rt.close()
+
+    @pytest.mark.parametrize(
+        "swap_indices",
+        [
+            pytest.param((0, 1), id="equal-sized-controls"),
+            pytest.param((4, 5), id="equal-sized-data"),
+        ],
+    )
+    def test_device_memset_k8_local_owner_prefix_rejects_order_permutation(
+        self,
+        patched_setup,
+        swap_indices,
+    ):
+        m = patched_setup
+        names = list(_K8_LOCAL_OWNER_CONTROL_NAMES + _K8_LOCAL_OWNER_DATA_NAMES)
+        nbytes = _K8_LOCAL_OWNER_CONTROL_NBYTES + _K8_LOCAL_OWNER_DATA_NBYTES
+        first, second = swap_indices
+        names[first], names[second] = names[second], names[first]
+        orch, rt, arg = _device_memset_persistent_runtime(
+            m,
+            buffer_names=tuple(f"{name}__ssa_v0" for name in names),
+            buffer_nbytes=nbytes,
+        )
+
+        rt(arg)
+        assert len(orch.handles) == 1
+        with pytest.raises(RuntimeError, match="ordered buffer fingerprint changed"):
+            rt(arg)
+
+        m["worker"].memset_all.assert_not_called()
+        rt.close()
+
+    @pytest.mark.parametrize(
+        ("size_deltas", "error_match"),
+        [
+            pytest.param(((0, 1),), "control bytes 46081 != pinned 46080", id="control-prefix"),
+            pytest.param(((4, 1),), "pinned full window 11842560", id="full-window"),
+            pytest.param(
+                ((0, 1), (1, -1)),
+                "ordered buffer fingerprint changed",
+                id="control-redistribution",
+            ),
+            pytest.param(
+                ((4, 1), (5, -1)),
+                "ordered buffer fingerprint changed",
+                id="data-redistribution",
+            ),
+        ],
+    )
+    def test_device_memset_k8_local_owner_prefix_rejects_size_mismatch(
+        self,
+        patched_setup,
+        size_deltas,
+        error_match,
+    ):
+        m = patched_setup
+        names = _K8_LOCAL_OWNER_CONTROL_NAMES + _K8_LOCAL_OWNER_DATA_NAMES
+        nbytes = list(_K8_LOCAL_OWNER_CONTROL_NBYTES + _K8_LOCAL_OWNER_DATA_NBYTES)
+        for size_index, delta in size_deltas:
+            nbytes[size_index] += delta
+        orch, rt, arg = _device_memset_persistent_runtime(
+            m,
+            buffer_names=tuple(f"{name}__ssa_v0" for name in names),
+            buffer_nbytes=tuple(nbytes),
+        )
+
+        rt(arg)
+        assert len(orch.handles) == 1
+        with pytest.raises(RuntimeError, match=error_match):
+            rt(arg)
+
+        m["worker"].memset_all.assert_not_called()
+        rt.close()
+
+    def test_device_memset_unknown_layout_falls_back_to_full_window(
+        self,
+        patched_setup,
+        monkeypatch,
+        tmp_path,
+    ):
+        m = patched_setup
+        window_nbytes = 128
+        trace_path = tmp_path / "persistent_reset.jsonl"
+        monkeypatch.setenv("PYPTO_PERSISTENT_RESET_TRACE", str(trace_path))
+        orch, rt, arg = _device_memset_persistent_runtime(
+            m,
+            buffer_names=(
+                "dense_attn_signal_stack_buf__ssa_v0",
+                "unknown_data_buf__ssa_v0",
+            ),
+            buffer_nbytes=(16, 112),
+        )
+
+        rt(arg)
+        handle = orch.handles[0]
+        rt(arg)
+
+        m["worker"].memset_all.assert_called_once_with(
+            {
+                0: (handle[0].local_window_base, window_nbytes),
+                1: (handle[1].local_window_base, window_nbytes),
+            }
+        )
+        record = json.loads(trace_path.read_text(encoding="utf-8"))
+        domain = record["domains"][0]
+        assert domain["k8_prefix_applied"] is False
+        assert domain["k8_control_bytes"] is None
+        assert domain["k8_control_ranges"] is None
+        assert domain["k8_full_window_bytes"] is None
         rt.close()
 
     def test_host_reset_zero_buffer_lives_until_native_completion(self, patched_setup):

@@ -1967,7 +1967,7 @@ class DistributedWorker(Worker):
         reset_start_ns = time.perf_counter_ns()
         if self._w.device_memset_available:
             for generated_name, (spec, handle) in domains.items():
-                _K8_CONTROL = (
+                _K8_LEGACY_CONTROL = (
                     "dense_attn_signal_stack_buf",
                     "dense_mlp_signal_stack_buf",
                     "moe_attn_signal_stack_buf",
@@ -1976,7 +1976,7 @@ class DistributedWorker(Worker):
                     "moe_sh_signal_stack_buf",
                     "moe_combine_arrived_stack_buf",
                 )
-                _K8_DATA = (
+                _K8_LEGACY_DATA = (
                     "dense_attn_tmp_stack_buf",
                     "dense_mlp_tmp_stack_buf",
                     "moe_attn_tmp_stack_buf",
@@ -1987,7 +1987,32 @@ class DistributedWorker(Worker):
                     "moe_sh_tmp_stack_buf",
                     "moe_routed_y_buf_stack_buf",
                 )
-                _K8_CONTROL_BYTES_PINNED = 47616
+                _K8_LOCAL_OWNER_CONTROL = (
+                    "dense_attn_signal_stack_buf",
+                    "dense_mlp_signal_stack_buf",
+                    "moe_attn_signal_stack_buf",
+                    "moe_sh_signal_stack_buf",
+                )
+                _K8_LOCAL_OWNER_DATA = (
+                    "dense_attn_tmp_stack_buf",
+                    "dense_mlp_tmp_stack_buf",
+                    "moe_attn_tmp_stack_buf",
+                    "moe_sh_tmp_stack_buf",
+                )
+                # The legacy EP model can vary data-window capacity without
+                # changing the audited control prefix.  The local-owner model
+                # is pinned to the production WholeDecode ABI so a future
+                # buffer-size change requires an explicit re-audit.
+                _K8_LAYOUTS = (
+                    (_K8_LEGACY_CONTROL, _K8_LEGACY_DATA, 47616, None, None),
+                    (
+                        _K8_LOCAL_OWNER_CONTROL,
+                        _K8_LOCAL_OWNER_DATA,
+                        46080,
+                        11842560,
+                        (1536, 1536, 21504, 21504, 393216, 393216, 5505024, 5505024),
+                    ),
+                )
 
                 # (base name, nbytes) in carve order.  The SSA suffix is
                 # stripped inline rather than in a nested helper so that the
@@ -2005,14 +2030,33 @@ class DistributedWorker(Worker):
                 # program keeps the original full-window clear: an unrecognised
                 # buffer set is not an error there, it just means the prefix
                 # optimisation does not apply to that domain.
-                _k8_applies = sorted(_k8_bases) == sorted(_K8_CONTROL + _K8_DATA)
+                _k8_control: tuple[str, ...] = ()
+                _k8_data: tuple[str, ...] = ()
+                _k8_control_bytes_pinned = 0
+                _k8_full_window_bytes_pinned: int | None = None
+                _k8_expected_nbytes: tuple[int, ...] | None = None
+                for (
+                    _candidate_control,
+                    _candidate_data,
+                    _candidate_control_bytes,
+                    _candidate_full_window_bytes,
+                    _candidate_nbytes,
+                ) in _K8_LAYOUTS:
+                    if sorted(_k8_bases) == sorted(_candidate_control + _candidate_data):
+                        _k8_control = _candidate_control
+                        _k8_data = _candidate_data
+                        _k8_control_bytes_pinned = _candidate_control_bytes
+                        _k8_full_window_bytes_pinned = _candidate_full_window_bytes
+                        _k8_expected_nbytes = _candidate_nbytes
+                        break
+                _k8_applies = bool(_k8_control)
                 _k8_carved = 0
                 _k8_control_bytes = 0
                 if _k8_applies:
                     _k8_seen_control: list[str] = []
                     _k8_seen_data = 0
                     for base, nbytes in _k8_items:
-                        if base in _K8_CONTROL:
+                        if base in _k8_control:
                             if _k8_seen_data:
                                 raise RuntimeError(
                                     f"K8 prefix reset: control buffer {base!r} appears after "
@@ -2024,16 +2068,33 @@ class DistributedWorker(Worker):
                         else:
                             _k8_seen_data += 1
                         _k8_carved += nbytes
-                    if len(_k8_seen_control) != len(_K8_CONTROL):
+                    if len(_k8_seen_control) != len(_k8_control):
                         raise RuntimeError(
-                            f"K8 prefix reset: expected {len(_K8_CONTROL)} control buffers, "
+                            f"K8 prefix reset: expected {len(_k8_control)} control buffers, "
                             f"saw {_k8_seen_control}"
                         )
-                    if _k8_control_bytes != _K8_CONTROL_BYTES_PINNED:
+                    if _k8_control_bytes != _k8_control_bytes_pinned:
                         raise RuntimeError(
                             f"K8 prefix reset: control bytes {_k8_control_bytes} != pinned "
-                            f"{_K8_CONTROL_BYTES_PINNED}; the model revision changed, re-audit"
+                            f"{_k8_control_bytes_pinned}; the model revision changed, re-audit"
                         )
+                    if (
+                        _k8_full_window_bytes_pinned is not None
+                        and _k8_carved != _k8_full_window_bytes_pinned
+                    ):
+                        raise RuntimeError(
+                            f"K8 prefix reset: carved {_k8_carved} != pinned full window "
+                            f"{_k8_full_window_bytes_pinned}; the model revision changed, re-audit"
+                        )
+                    if _k8_expected_nbytes is not None:
+                        _k8_expected_items = list(
+                            zip(_k8_control + _k8_data, _k8_expected_nbytes, strict=True)
+                        )
+                        if _k8_items != _k8_expected_items:
+                            raise RuntimeError(
+                                "K8 prefix reset: ordered buffer fingerprint changed; "
+                                f"expected {_k8_expected_items}, saw {_k8_items}; re-audit"
+                            )
                     if _k8_carved != int(spec[1]):
                         raise RuntimeError(
                             f"K8 prefix reset: carved {_k8_carved} != requested window {int(spec[1])}"
