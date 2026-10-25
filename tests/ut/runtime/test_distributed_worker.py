@@ -16,7 +16,7 @@ setup helpers vs. ``_dispatch`` run.
 """
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -27,7 +27,11 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
-from pypto.runtime.distributed_runner import DistributedWorker, _assemble_chip_callables
+from pypto.runtime.distributed_runner import (
+    DistributedWorker,
+    _assemble_chip_callables,
+    _make_call_config,
+)
 
 
 def _param(name: str, shape: list[int], direction: ParamDirection = ParamDirection.In) -> _ParamInfo:
@@ -77,6 +81,66 @@ def patched_setup():
             "register": register,
             "dispatch": dispatch,
         }
+
+
+class _FakeCallConfig:
+    def __init__(self) -> None:
+        self.block_dim: int | None = None
+        self.aicpu_thread_num = 4
+        self.output_prefix: str | None = None
+        self.enable_dep_gen = False
+        self.enable_l2_swimlane: bool | int = False
+
+
+class TestMakeCallConfigDfxEnv:
+    """Environment-driven DFX options for distributed ``CallConfig``."""
+
+    @staticmethod
+    def _install_fake_simpler(monkeypatch) -> None:
+        simpler = ModuleType("simpler")
+        simpler.__path__ = []  # type: ignore[attr-defined]
+        task_interface = ModuleType("simpler.task_interface")
+        task_interface.CallConfig = _FakeCallConfig  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "simpler", simpler)
+        monkeypatch.setitem(sys.modules, "simpler.task_interface", task_interface)
+
+    def test_environment_overrides_dfx_options(self, monkeypatch):
+        self._install_fake_simpler(monkeypatch)
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_DFX_PREFIX", "/tmp/dfx")
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_DEP_GEN", "1")
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_L2_SWIMLANE", "2")
+
+        cfg = _make_call_config(DistributedConfig(aicpu_thread_num=7))
+
+        assert cfg.aicpu_thread_num == 7
+        assert cfg.output_prefix == "/tmp/dfx"
+        assert cfg.enable_dep_gen is True
+        assert cfg.enable_l2_swimlane == 2
+
+    def test_no_prefix_keeps_dfx_disabled(self, monkeypatch):
+        self._install_fake_simpler(monkeypatch)
+        monkeypatch.delenv("PYPTO_DISTRIBUTED_DFX_PREFIX", raising=False)
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_DEP_GEN", "1")
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_L2_SWIMLANE", "2")
+
+        cfg = _make_call_config(DistributedConfig())
+
+        assert cfg.output_prefix is None
+        assert cfg.enable_dep_gen is False
+        assert cfg.enable_l2_swimlane is False
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("1", True), ("true", True), ("YES", True), ("off", False)],
+    )
+    def test_l2_swimlane_accepts_bool_like_values(self, monkeypatch, raw, expected):
+        self._install_fake_simpler(monkeypatch)
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_DFX_PREFIX", "/tmp/dfx")
+        monkeypatch.setenv("PYPTO_DISTRIBUTED_L2_SWIMLANE", raw)
+
+        cfg = _make_call_config(DistributedConfig())
+
+        assert cfg.enable_l2_swimlane is expected
 
 
 class TestSetupOnce:

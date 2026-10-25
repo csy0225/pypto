@@ -348,9 +348,27 @@ prog(a, b, c)
 重建 chip callables；`platform` 与 `distributed_config` 默认取编译时
 记录的值，可覆盖以在不同目标 / 设备集上重放。
 
-**限制**：DFX 标志（`--pmu`、`--swimlane`、`--dump-tensor` 等）**尚未
-透传到 L3 派发路径**——目前仅对单芯片重放生效。L3 的「改完再跑」循环
-本身（改 `.pto`/cpp 后的正确性复检）是完整支持的。
+#### L3 DFX 环境变量覆盖
+
+L3 派发路径支持通过环境变量启用部分 DFX 选项。必须先设置
+`PYPTO_DISTRIBUTED_DFX_PREFIX`；未设置时，分布式 `CallConfig` 保持默认值。
+
+| 环境变量 | 作用 |
+| -------- | ---- |
+| `PYPTO_DISTRIBUTED_DFX_PREFIX` | 设置 `CallConfig.output_prefix` |
+| `PYPTO_DISTRIBUTED_DEP_GEN=1` | 启用 `deps.json` 采集 |
+| `PYPTO_DISTRIBUTED_L2_SWIMLANE=<N>` | 设置 L2 swimlane 采集级别（也接受 `1`/`true`/`yes` 表示 `True`） |
+
+```bash
+PYPTO_DISTRIBUTED_DFX_PREFIX=build_output/dfx \
+PYPTO_DISTRIBUTED_DEP_GEN=1 \
+PYPTO_DISTRIBUTED_L2_SWIMLANE=1 \
+python -m pypto.runtime.debug.replay build_output/<jit_dir>/
+```
+
+**限制**：PMU、tensor dump 和 scope-stats 标志**尚未透传到 L3 派发
+路径**——目前仅对单芯片重放生效。L3 的「改完再跑」循环本身（改
+`.pto`/cpp 后的正确性复检）是完整支持的。
 
 ## 相关文档
 

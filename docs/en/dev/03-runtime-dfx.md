@@ -373,10 +373,29 @@ by walking `next_levels/`; `platform` and `distributed_config` default to the
 values recorded at compile time and can be overridden to replay on a different
 target / device set.
 
-**Limitation:** DFX flags (`--pmu`, `--swimlane`, `--dump-tensor`, …) are **not
-yet plumbed through the L3 dispatch path** — they apply to single-chip replay
-only. The L3 edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp
-edit) is fully supported.
+#### L3 DFX environment overrides
+
+The L3 dispatch path accepts a subset of DFX options through environment
+variables. `PYPTO_DISTRIBUTED_DFX_PREFIX` is required to enable any of them;
+without it, the distributed `CallConfig` keeps its defaults.
+
+| Environment variable | Effect |
+| -------------------- | ------ |
+| `PYPTO_DISTRIBUTED_DFX_PREFIX` | Sets `CallConfig.output_prefix` |
+| `PYPTO_DISTRIBUTED_DEP_GEN=1` | Enables `deps.json` collection |
+| `PYPTO_DISTRIBUTED_L2_SWIMLANE=<N>` | Sets the L2 swimlane capture level (`1`/`true`/`yes` are also accepted as `True`) |
+
+```bash
+PYPTO_DISTRIBUTED_DFX_PREFIX=build_output/dfx \
+PYPTO_DISTRIBUTED_DEP_GEN=1 \
+PYPTO_DISTRIBUTED_L2_SWIMLANE=1 \
+python -m pypto.runtime.debug.replay build_output/<jit_dir>/
+```
+
+**Limitation:** PMU, tensor dump, and scope-stats flags are **not yet plumbed
+through the L3 dispatch path** — they apply to single-chip replay only. The L3
+edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp edit) is
+fully supported.
 
 ## Related
 

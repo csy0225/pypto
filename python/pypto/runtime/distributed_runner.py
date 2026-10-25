@@ -15,6 +15,7 @@ import ctypes
 import importlib.util
 import inspect
 import json
+import os
 import sys
 import types
 import warnings
@@ -348,6 +349,16 @@ def _make_call_config(dc: DistributedConfig) -> Any:
     if dc.block_dim is not None:
         call_config.block_dim = dc.block_dim
     call_config.aicpu_thread_num = dc.aicpu_thread_num
+
+    dfx_prefix = os.environ.get("PYPTO_DISTRIBUTED_DFX_PREFIX")
+    if dfx_prefix:
+        call_config.output_prefix = dfx_prefix
+        call_config.enable_dep_gen = os.environ.get("PYPTO_DISTRIBUTED_DEP_GEN", "0") == "1"
+        l2 = os.environ.get("PYPTO_DISTRIBUTED_L2_SWIMLANE", "0")
+        try:
+            call_config.enable_l2_swimlane = int(l2)
+        except ValueError:
+            call_config.enable_l2_swimlane = l2.lower() in ("1", "true", "yes")
     return call_config
 
 
